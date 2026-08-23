@@ -11,25 +11,35 @@
 #include <QStringList>
 #include <QTemporaryDir>
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <vector>
-#include <cstdint>
 
 namespace term = vnm_terminal::internal;
 
 namespace {
 
 constexpr int k_surface_default_scrollback_limit = 10000;
+// A deadline-driven backend-output command is released in 4 KiB slices by
+// Terminal_session while retaining one command sequence for its final slice.
+constexpr qsizetype k_replay_backend_callback_slice_bytes = 4096;
+constexpr std::uint64_t k_fnv1a64_basis = 14695981039346656037ULL;
+constexpr std::uint64_t k_fnv1a64_prime = 1099511628211ULL;
 
 QString usage_text()
 {
     return QStringLiteral(
         "usage: vnm_terminal_transcript_replay [--strict-all-snapshots] <transcript.ndjson>\n"
         "\n"
-        "  --strict-all-snapshots  compare every recorded production snapshot (default)\n");
+        "  --strict-all-snapshots  validate causal ownership and compare every recorded\n"
+        "                          semantic checkpoint inside its owning group (default)\n");
 }
 
 QString buffer_name(term::Terminal_buffer_id buffer)
@@ -94,14 +104,18 @@ QString hex_u64(std::uint64_t value)
         QLatin1Char('0'));
 }
 
-std::uint64_t fnv1a64(QByteArrayView bytes)
+std::uint64_t fnv1a64_append(std::uint64_t hash, QByteArrayView bytes)
 {
-    std::uint64_t hash = 14695981039346656037ULL;
     for (char byte : bytes) {
         hash ^= static_cast<unsigned char>(byte);
-        hash *= 1099511628211ULL;
+        hash *= k_fnv1a64_prime;
     }
     return hash;
+}
+
+std::uint64_t fnv1a64(QByteArrayView bytes)
+{
+    return fnv1a64_append(k_fnv1a64_basis, bytes);
 }
 
 QString text_hash64(const QString& text)
@@ -274,15 +288,37 @@ void remove_snapshot_envelope_fields(QJsonObject& object)
 QJsonObject comparable_model_snapshot_object(QJsonObject object)
 {
     remove_snapshot_envelope_fields(object);
+    object.remove(QStringLiteral("snapshot_sequence"));
     object.remove(QStringLiteral("dirty_row_range_count"));
     object.remove(QStringLiteral("dirty_row_ranges"));
     return object;
 }
 
-QByteArray canonical_model_json(QJsonObject object)
+struct Semantic_digest
 {
-    return QJsonDocument(comparable_model_snapshot_object(std::move(object))).toJson(
-        QJsonDocument::Compact);
+    std::uint64_t hash64     = 0U;
+    std::uint64_t byte_count = 0U;
+
+    bool operator==(const Semantic_digest&) const = default;
+};
+
+struct Semantic_digest_hash
+{
+    std::size_t operator()(const Semantic_digest& digest) const noexcept
+    {
+        return static_cast<std::size_t>(
+            digest.hash64 ^ (digest.byte_count + 0x9e3779b97f4a7c15ULL));
+    }
+};
+
+Semantic_digest semantic_digest(const QJsonObject& comparable_object)
+{
+    const QByteArray canonical =
+        QJsonDocument(comparable_object).toJson(QJsonDocument::Compact);
+    return {
+        fnv1a64(QByteArrayView(canonical)),
+        static_cast<std::uint64_t>(canonical.size()),
+    };
 }
 
 QJsonObject comparable_dirty_snapshot_object(const QJsonObject& object)
@@ -304,24 +340,35 @@ bool dirty_snapshot_fields_differ(
     return comparable_dirty_snapshot_object(recorded) != comparable_dirty_snapshot_object(replayed);
 }
 
-bool viewport_offset_matches_recorded_after(
-    const term::Terminal_viewport_state&   viewport,
-    const term::Terminal_transcript_event& event)
+bool viewport_matches_object(
+    const term::Terminal_viewport_state& viewport,
+    const QJsonObject&                   object)
 {
-    const QJsonObject viewport_after =
-        event.object.value(QStringLiteral("viewport_after")).toObject();
-    return viewport.offset_from_tail ==
-        viewport_after.value(QStringLiteral("offset_from_tail")).toInt();
+    const term::Terminal_viewport_state recorded = viewport_from_object(object);
+    return
+        viewport.active_buffer == recorded.active_buffer &&
+        viewport.scrollback_rows == recorded.scrollback_rows &&
+        viewport.visible_rows == recorded.visible_rows &&
+        viewport.offset_from_tail == recorded.offset_from_tail &&
+        viewport.follow_tail == recorded.follow_tail &&
+        viewport.alternate_screen_scroll_policy ==
+            recorded.alternate_screen_scroll_policy;
 }
 
-bool visible_viewport_offset_matches_recorded_after(
-    const term::Terminal_session&          session,
-    const term::Terminal_transcript_event& event)
+term::Terminal_viewport_state visible_viewport_state(
+    const term::Terminal_session& session)
 {
     const std::optional<term::Terminal_render_snapshot> snapshot =
         session.latest_render_snapshot();
-    return snapshot.has_value() &&
-        viewport_offset_matches_recorded_after(snapshot->viewport, event);
+    return snapshot.has_value() ? snapshot->viewport : session.viewport_state();
+}
+
+bool session_viewport_matches_object(
+    const term::Terminal_session& session,
+    const QJsonObject&            object)
+{
+    return viewport_matches_object(session.viewport_state(), object) ||
+        viewport_matches_object(visible_viewport_state(session), object);
 }
 
 int max_recorded_scrollback_rows(const std::vector<term::Terminal_transcript_event>& events)
@@ -525,6 +572,19 @@ struct Replay_result
     int matching_snapshot_events           = 0;
     int divergent_snapshot_events          = 0;
     int dirty_mismatch_snapshot_events     = 0;
+    int unpaired_recorded_dirty_snapshot_events = 0;
+    int unpaired_replayed_dirty_snapshot_events = 0;
+    int recorded_snapshot_runs             = 0;
+    int replayed_snapshot_runs             = 0;
+    int matching_snapshot_runs             = 0;
+    int divergent_snapshot_runs            = 0;
+    int surplus_replayed_snapshot_runs     = 0;
+    int snapshot_alignment_comparison_work = 0;
+    int semantic_digest_object_checks      = 0;
+    int recorded_causal_groups             = 0;
+    int replayed_causal_groups             = 0;
+    int causal_driver_divergences          = 0;
+    int causal_protocol_divergences        = 0;
     int public_projection_scroll_snapshot_events = 0;
     int semantic_selection_events          = 0;
     int surface_scroll_intents             = 0;
@@ -632,86 +692,955 @@ bool snapshot_is_public_projection_scroll(const QJsonObject& object)
             QStringLiteral("SCROLL");
 }
 
-std::vector<term::Terminal_transcript_event> snapshot_events_from(
-    const std::vector<term::Terminal_transcript_event>& events)
+bool is_causal_driver_event(const term::Terminal_transcript_event& event)
 {
-    std::vector<term::Terminal_transcript_event> snapshots;
-    for (const term::Terminal_transcript_event& event : events) {
-        if (event.kind == QStringLiteral("snapshot")) {
-            snapshots.push_back(event);
-        }
-    }
-    return snapshots;
+    return
+        event.kind != QStringLiteral("header") &&
+        event.kind != QStringLiteral("snapshot") &&
+        !is_replay_transparent_diagnostic_event(event.kind);
 }
 
-void compare_recorded_snapshot(
-    Replay_result&                         replay,
-    const term::Terminal_transcript_event& recorded,
-    const std::optional<QJsonObject>&      replayed)
+std::optional<std::uint64_t> event_session_sequence(
+    const term::Terminal_transcript_event& event)
 {
-    const bool recorded_public_projection_scroll =
-        snapshot_is_public_projection_scroll(recorded.object);
-    if (!replayed.has_value()) {
-        ++replay.divergent_snapshot_events;
-        record_first_snapshot_divergence(replay, recorded, std::nullopt);
-        return;
+    const QJsonValue value = event.object.value(QStringLiteral("session_sequence"));
+    if (!value.isDouble()) {
+        return std::nullopt;
     }
+    return static_cast<std::uint64_t>(value.toDouble());
+}
 
-    if (recorded_public_projection_scroll &&
-        !snapshot_is_public_projection_scroll(*replayed))
+struct Snapshot_run
+{
+    Semantic_digest                                     digest;
+    QJsonObject                                         comparable_object;
+    std::vector<const term::Terminal_transcript_event*> publications;
+
+    const term::Terminal_transcript_event& representative() const
     {
-        ++replay.divergent_snapshot_events;
-        record_first_snapshot_divergence(replay, recorded, *replayed);
-        return;
+        return *publications.back();
     }
+};
 
-    if (dirty_snapshot_fields_differ(recorded.object, *replayed)) {
-        ++replay.dirty_mismatch_snapshot_events;
-        record_first_dirty_mismatch(replay, recorded, *replayed);
+struct Causal_snapshot_group
+{
+    std::vector<Snapshot_run> runs;
+};
+
+struct Causal_event_signature
+{
+    QString                                           kind;
+    Semantic_digest                                   digest;
+    const term::Terminal_transcript_event*            event = nullptr;
+};
+
+struct Causal_group_signature
+{
+    QString                                           owner_kind;
+    Semantic_digest                                   backend_output_digest{
+        k_fnv1a64_basis,
+        0U,
+    };
+    std::vector<const term::Terminal_transcript_event*> backend_output_events;
+    std::vector<Causal_event_signature>                other_events;
+    std::optional<Semantic_digest>                     host_resize_semantic_digest;
+    const term::Terminal_transcript_event*             host_resize_result = nullptr;
+};
+
+struct Causal_driver_layout
+{
+    bool                                                    valid = true;
+    QString                                                 error;
+    std::vector<const term::Terminal_transcript_event*> drivers;
+    std::vector<std::size_t>                                group_for_driver;
+    std::vector<QString>                                    group_driver_kinds;
+    std::vector<Causal_group_signature>                     group_signatures;
+    std::vector<std::vector<const term::Terminal_transcript_event*>>
+                                                            snapshots_by_group;
+};
+
+void invalidate_causal_layout(Causal_driver_layout& layout, QString error)
+{
+    if (layout.valid) {
+        layout.valid = false;
+        layout.error = std::move(error);
     }
+}
 
-    const QByteArray recorded_json = canonical_model_json(recorded.object);
-    const QByteArray replayed_json = canonical_model_json(*replayed);
-    if (recorded_json == replayed_json) {
-        if (recorded_public_projection_scroll) {
-            ++replay.public_projection_scroll_snapshot_events;
+bool optional_json_field_equal(
+    const QJsonObject& left,
+    const QJsonObject& right,
+    const QString&     field)
+{
+    return left.contains(field) == right.contains(field) &&
+        (!left.contains(field) || left.value(field) == right.value(field));
+}
+
+bool recorded_scroll_result_matches_intent(
+    const term::Terminal_transcript_event& result,
+    const term::Terminal_transcript_event& intent)
+{
+    return
+        result.object.value(QStringLiteral("source")) ==
+            intent.object.value(QStringLiteral("source")) &&
+        result.object.value(QStringLiteral("requested_line_delta")) ==
+            intent.object.value(QStringLiteral("requested_line_delta")) &&
+        optional_json_field_equal(
+            result.object,
+            intent.object,
+            QStringLiteral("requested_offset_from_tail")) &&
+        result.object.value(QStringLiteral("viewport_before")) ==
+            intent.object.value(QStringLiteral("viewport_before"));
+}
+
+bool known_sequence_event(const QString& kind)
+{
+    return
+        kind == QStringLiteral("session.start")                    ||
+        kind == QStringLiteral("backend.output")                   ||
+        kind == QStringLiteral("host.write")                       ||
+        kind == QStringLiteral("session.resize_request")           ||
+        kind == QStringLiteral("session.resize")                   ||
+        kind == QStringLiteral("session.backend_error")            ||
+        kind == QStringLiteral("session.process_exit")             ||
+        kind == QStringLiteral("session.text_area_resize_request");
+}
+
+struct Sequence_owner
+{
+    QString     kind;
+    std::size_t group = 0U;
+};
+
+QJsonObject comparable_causal_event_object(QJsonObject object)
+{
+    object.remove(QStringLiteral("event_index"));
+    object.remove(QStringLiteral("session_sequence"));
+    return object;
+}
+
+QJsonObject host_resize_semantic_object(QJsonObject object)
+{
+    object = comparable_causal_event_object(std::move(object));
+    object.insert(QStringLiteral("kind"), QStringLiteral("host.resize"));
+    return object;
+}
+
+bool resize_result_matches_request(
+    const term::Terminal_transcript_event& result,
+    const term::Terminal_transcript_event& request)
+{
+    for (const QString& field : {
+             QStringLiteral("transaction_id"),
+             QStringLiteral("target_grid_size"),
+             QStringLiteral("source_width"),
+             QStringLiteral("source_height"),
+             QStringLiteral("active_buffer")})
+    {
+        if (result.object.value(field) != request.object.value(field)) {
+            return false;
         }
-        ++replay.matching_snapshot_events;
+    }
+    return true;
+}
+
+void append_causal_event_signature(
+    Causal_driver_layout&                    layout,
+    std::size_t                              group,
+    const term::Terminal_transcript_event&   event)
+{
+    Causal_group_signature& signature = layout.group_signatures[group];
+    if (event.kind == QStringLiteral("backend.output")) {
+        const QByteArray bytes = event_bytes(event);
+        signature.backend_output_digest.hash64 = fnv1a64_append(
+            signature.backend_output_digest.hash64,
+            QByteArrayView(bytes));
+        signature.backend_output_digest.byte_count +=
+            static_cast<std::uint64_t>(bytes.size());
+        signature.backend_output_events.push_back(&event);
         return;
     }
 
-    ++replay.divergent_snapshot_events;
-    record_first_snapshot_divergence(replay, recorded, *replayed);
+    const QJsonObject comparable = comparable_causal_event_object(event.object);
+    signature.other_events.push_back({
+        event.kind,
+        semantic_digest(comparable),
+        &event,
+    });
+    if (event.kind == QStringLiteral("session.resize")) {
+        const QJsonObject host_resize = host_resize_semantic_object(event.object);
+        signature.host_resize_semantic_digest = semantic_digest(host_resize);
+        signature.host_resize_result = &event;
+    }
+}
+
+Causal_driver_layout validated_causal_driver_layout(
+    const std::vector<term::Terminal_transcript_event>& events,
+    bool require_dense_sequence_ownership = true)
+{
+    Causal_driver_layout layout;
+    if (events.empty() || events.front().kind != QStringLiteral("header")) {
+        invalidate_causal_layout(layout, QStringLiteral("transcript header is not first"));
+        return layout;
+    }
+
+    const bool has_resize_request = std::any_of(
+        events.begin(),
+        events.end(),
+        [](const term::Terminal_transcript_event& event) {
+            return event.kind == QStringLiteral("session.resize_request");
+        });
+    std::map<std::uint64_t, Sequence_owner> sequence_owners;
+    std::map<std::uint64_t, const term::Terminal_transcript_event*> resize_requests;
+    std::optional<std::size_t> current_group;
+    std::optional<std::uint64_t> open_backend_sequence;
+    const term::Terminal_transcript_event* pending_scroll_intent = nullptr;
+    bool started = false;
+
+    const auto add_group = [
+        &layout,
+        &current_group,
+        &open_backend_sequence](const QString& kind) {
+        layout.group_driver_kinds.push_back(kind);
+        layout.group_signatures.push_back({kind});
+        layout.snapshots_by_group.emplace_back();
+        current_group = layout.group_driver_kinds.size() - 1U;
+        open_backend_sequence.reset();
+        return *current_group;
+    };
+
+    for (std::size_t event_position = 0U;
+         event_position < events.size() && layout.valid;
+         ++event_position)
+    {
+        const term::Terminal_transcript_event& event = events[event_position];
+        if (event.kind == QStringLiteral("header")) {
+            if (event_position != 0U) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("duplicate transcript header at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+            }
+            continue;
+        }
+        if (is_replay_transparent_diagnostic_event(event.kind)) {
+            continue;
+        }
+
+        if (event.kind == QStringLiteral("snapshot")) {
+            if (!current_group.has_value()) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("snapshot has no causal owner at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            const std::optional<std::uint64_t> sequence = event_session_sequence(event);
+            if (!sequence.has_value()) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("snapshot has no session sequence at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+
+            std::size_t snapshot_group = *current_group;
+            const auto owner = sequence_owners.find(*sequence);
+            if (owner != sequence_owners.end()) {
+                snapshot_group = owner->second.group;
+            }
+            else {
+                const QString& current_kind =
+                    layout.group_driver_kinds[*current_group];
+                if (current_kind != QStringLiteral("surface.scroll_intent") &&
+                    current_kind != QStringLiteral("surface.selection_drag"))
+                {
+                    invalidate_causal_layout(
+                        layout,
+                        QStringLiteral("snapshot sequence has no command owner at event %1")
+                            .arg(static_cast<qulonglong>(event.event_index)));
+                    continue;
+                }
+                sequence_owners.emplace(
+                    *sequence,
+                    Sequence_owner{
+                        QStringLiteral("surface.publication"),
+                        snapshot_group,
+                    });
+            }
+            layout.snapshots_by_group[snapshot_group].push_back(&event);
+            continue;
+        }
+
+        if (!started && event.kind != QStringLiteral("session.start")) {
+            invalidate_causal_layout(
+                layout,
+                QStringLiteral("causal event appeared before session.start at event %1")
+                    .arg(static_cast<qulonglong>(event.event_index)));
+            continue;
+        }
+        if (pending_scroll_intent != nullptr &&
+            event.kind != QStringLiteral("surface.scroll"))
+        {
+            // Old captures may omit a result for an intent that did not move
+            // the viewport. Such an intent cannot authorize a later result.
+            pending_scroll_intent = nullptr;
+        }
+
+        std::optional<std::size_t> event_group;
+        if (event.kind == QStringLiteral("session.start")) {
+            if (started || !layout.drivers.empty()) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("duplicate or reordered session.start at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            const std::optional<std::uint64_t> sequence = event_session_sequence(event);
+            if (!sequence.has_value() || *sequence != 1U) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("session.start does not own sequence 1"));
+                continue;
+            }
+            event_group = add_group(event.kind);
+            sequence_owners.emplace(
+                *sequence,
+                Sequence_owner{event.kind, *event_group});
+            started = true;
+        }
+        else
+        if (event.kind == QStringLiteral("surface.scroll_intent")) {
+            if (pending_scroll_intent != nullptr) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("duplicate surface.scroll_intent at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            event_group = add_group(event.kind);
+            pending_scroll_intent = &event;
+        }
+        else
+        if (event.kind == QStringLiteral("surface.scroll")) {
+            if (pending_scroll_intent == nullptr || !current_group.has_value() ||
+                !recorded_scroll_result_matches_intent(event, *pending_scroll_intent))
+            {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("orphan or corrupt surface.scroll result at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            event_group = current_group;
+            pending_scroll_intent = nullptr;
+        }
+        else
+        if (event.kind == QStringLiteral("surface.selection_drag")) {
+            event_group = add_group(event.kind);
+        }
+        else {
+            if (!known_sequence_event(event.kind)) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("unknown causal event kind %1 at event %2")
+                        .arg(event.kind)
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            const std::optional<std::uint64_t> sequence = event_session_sequence(event);
+            if (!sequence.has_value()) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("causal event has no session sequence at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            const auto owner = sequence_owners.find(*sequence);
+            const bool resize_result =
+                event.kind == QStringLiteral("session.resize") && has_resize_request;
+            const bool text_area_resize_request =
+                event.kind == QStringLiteral("session.text_area_resize_request");
+            const bool terminal_reply =
+                event.kind == QStringLiteral("host.write") &&
+                event.object.value(QStringLiteral("source")).toString() ==
+                    QStringLiteral("terminal_reply");
+            if (owner != sequence_owners.end()) {
+                const bool owner_is_current =
+                    current_group.has_value() && *current_group == owner->second.group;
+                const auto resize_request = resize_requests.find(*sequence);
+                const bool backend_continuation =
+                    event.kind == QStringLiteral("backend.output") &&
+                    owner->second.kind == QStringLiteral("backend.output") &&
+                    owner_is_current && open_backend_sequence == sequence;
+                const bool matching_resize_result =
+                    resize_result && owner_is_current &&
+                    owner->second.kind == QStringLiteral("session.resize_request") &&
+                    resize_request != resize_requests.end() &&
+                    resize_result_matches_request(event, *resize_request->second);
+                const bool matching_text_area_resize_request =
+                    text_area_resize_request && owner_is_current &&
+                    owner->second.kind == QStringLiteral("backend.output");
+                const bool matching_backend_error =
+                    event.kind == QStringLiteral("session.backend_error");
+                if (!backend_continuation && !matching_resize_result &&
+                    !matching_text_area_resize_request && !matching_backend_error)
+                {
+                    invalidate_causal_layout(
+                        layout,
+                        QStringLiteral(
+                            "session sequence has an invalid continuation or derived owner at "
+                            "event %1")
+                            .arg(static_cast<qulonglong>(event.event_index)));
+                    continue;
+                }
+                event_group = owner->second.group;
+                current_group = event_group;
+            }
+            else
+            if (resize_result || text_area_resize_request) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral("derived event has no session-sequence owner at event %1")
+                        .arg(static_cast<qulonglong>(event.event_index)));
+                continue;
+            }
+            else
+            if (terminal_reply) {
+                if (!current_group.has_value() ||
+                    layout.group_driver_kinds[*current_group] !=
+                        QStringLiteral("backend.output"))
+                {
+                    invalidate_causal_layout(
+                        layout,
+                        QStringLiteral("terminal reply has no backend causal owner at event %1")
+                            .arg(static_cast<qulonglong>(event.event_index)));
+                    continue;
+                }
+                event_group = current_group;
+                sequence_owners.emplace(
+                    *sequence,
+                    Sequence_owner{
+                        QStringLiteral("host.write.terminal_reply"),
+                        *event_group,
+                    });
+            }
+            else {
+                event_group = add_group(event.kind);
+                sequence_owners.emplace(
+                    *sequence,
+                    Sequence_owner{event.kind, *event_group});
+            }
+        }
+
+        layout.drivers.push_back(&event);
+        layout.group_for_driver.push_back(*event_group);
+        append_causal_event_signature(layout, *event_group, event);
+        if (event.kind == QStringLiteral("session.resize_request")) {
+            resize_requests.emplace(*event_session_sequence(event), &event);
+        }
+        if (event.kind == QStringLiteral("backend.output")) {
+            const std::optional<std::uint64_t> sequence = event_session_sequence(event);
+            open_backend_sequence =
+                sequence.has_value() &&
+                    event_bytes(event).size() == k_replay_backend_callback_slice_bytes
+                ? sequence
+                : std::nullopt;
+        }
+        else
+        if (layout.group_driver_kinds[*event_group] != QStringLiteral("backend.output") ||
+            (event.kind != QStringLiteral("host.write") &&
+             event.kind != QStringLiteral("session.text_area_resize_request")))
+        {
+            open_backend_sequence.reset();
+        }
+    }
+
+    if (layout.valid && !started) {
+        invalidate_causal_layout(layout, QStringLiteral("transcript contains no session.start"));
+    }
+    if (layout.valid && require_dense_sequence_ownership) {
+        std::uint64_t expected_sequence = 1U;
+        for (const auto& [sequence, owner] : sequence_owners) {
+            (void)owner;
+            if (sequence != expected_sequence) {
+                invalidate_causal_layout(
+                    layout,
+                    QStringLiteral(
+                        "session sequence ownership is split: expected %1, observed %2")
+                        .arg(static_cast<qulonglong>(expected_sequence))
+                        .arg(static_cast<qulonglong>(sequence)));
+                break;
+            }
+            ++expected_sequence;
+        }
+    }
+    return layout;
+}
+
+void append_snapshot_run(
+    Causal_snapshot_group&                  group,
+    const term::Terminal_transcript_event& event,
+    Replay_result&                         replay)
+{
+    QJsonObject comparable = comparable_model_snapshot_object(event.object);
+    const Semantic_digest digest = semantic_digest(comparable);
+    if (!group.runs.empty() && group.runs.back().digest == digest) {
+        ++replay.semantic_digest_object_checks;
+        if (group.runs.back().comparable_object == comparable) {
+            group.runs.back().publications.push_back(&event);
+            return;
+        }
+    }
+    group.runs.push_back({digest, std::move(comparable), {&event}});
+}
+
+std::vector<Causal_snapshot_group> grouped_snapshot_runs(
+    const std::vector<std::vector<const term::Terminal_transcript_event*>>&
+        snapshots_by_group,
+    Replay_result& replay)
+{
+    std::vector<Causal_snapshot_group> groups(snapshots_by_group.size());
+    for (std::size_t group_index = 0U;
+         group_index < snapshots_by_group.size();
+         ++group_index)
+    {
+        for (const term::Terminal_transcript_event* event :
+             snapshots_by_group[group_index])
+        {
+            append_snapshot_run(groups[group_index], *event, replay);
+        }
+    }
+    return groups;
+}
+
+bool backend_output_streams_equal(
+    const std::vector<const term::Terminal_transcript_event*>& left,
+    const std::vector<const term::Terminal_transcript_event*>& right)
+{
+    std::size_t left_index = 0U;
+    std::size_t right_index = 0U;
+    qsizetype left_offset = 0;
+    qsizetype right_offset = 0;
+    QByteArray left_bytes;
+    QByteArray right_bytes;
+    while (left_index < left.size() && right_index < right.size()) {
+        if (left_offset == 0) {
+            left_bytes = event_bytes(*left[left_index]);
+        }
+        if (right_offset == 0) {
+            right_bytes = event_bytes(*right[right_index]);
+        }
+        const qsizetype count = std::min(
+            left_bytes.size() - left_offset,
+            right_bytes.size() - right_offset);
+        if (left_bytes.sliced(left_offset, count) !=
+            right_bytes.sliced(right_offset, count))
+        {
+            return false;
+        }
+        left_offset += count;
+        right_offset += count;
+        if (left_offset == left_bytes.size()) {
+            ++left_index;
+            left_offset = 0;
+        }
+        if (right_offset == right_bytes.size()) {
+            ++right_index;
+            right_offset = 0;
+        }
+    }
+    return left_index == left.size() && right_index == right.size();
+}
+
+bool is_legacy_direct_resize_signature(const Causal_group_signature& signature)
+{
+    return
+        signature.owner_kind == QStringLiteral("session.resize") &&
+        signature.backend_output_events.empty() &&
+        signature.other_events.size() == 1U &&
+        signature.other_events.front().kind == QStringLiteral("session.resize") &&
+        signature.host_resize_semantic_digest.has_value() &&
+        signature.host_resize_result != nullptr;
+}
+
+bool is_modern_resize_pair_signature(const Causal_group_signature& signature)
+{
+    return
+        signature.owner_kind == QStringLiteral("session.resize_request") &&
+        signature.backend_output_events.empty() &&
+        signature.other_events.size() == 2U &&
+        signature.other_events[0].kind == QStringLiteral("session.resize_request") &&
+        signature.other_events[1].kind == QStringLiteral("session.resize") &&
+        signature.host_resize_semantic_digest.has_value() &&
+        signature.host_resize_result != nullptr;
+}
+
+bool legacy_and_modern_resize_signatures_equal(
+    const Causal_group_signature& left,
+    const Causal_group_signature& right,
+    Replay_result&                replay)
+{
+    const bool compatible_shapes =
+        (is_legacy_direct_resize_signature(left) &&
+         is_modern_resize_pair_signature(right)) ||
+        (is_modern_resize_pair_signature(left) &&
+         is_legacy_direct_resize_signature(right));
+    if (!compatible_shapes ||
+        left.host_resize_semantic_digest != right.host_resize_semantic_digest)
+    {
+        return false;
+    }
+    ++replay.semantic_digest_object_checks;
+    return
+        host_resize_semantic_object(left.host_resize_result->object) ==
+        host_resize_semantic_object(right.host_resize_result->object);
+}
+
+bool causal_group_signatures_equal(
+    const Causal_group_signature& recorded,
+    const Causal_group_signature& replayed,
+    Replay_result&                replay)
+{
+    if (recorded.owner_kind != replayed.owner_kind) {
+        return legacy_and_modern_resize_signatures_equal(recorded, replayed, replay);
+    }
+    if (recorded.backend_output_digest != replayed.backend_output_digest ||
+        recorded.other_events.size() != replayed.other_events.size())
+    {
+        return false;
+    }
+    if (!recorded.backend_output_events.empty()) {
+        ++replay.semantic_digest_object_checks;
+        if (!backend_output_streams_equal(
+                recorded.backend_output_events,
+                replayed.backend_output_events))
+        {
+            return false;
+        }
+    }
+    for (std::size_t index = 0U; index < recorded.other_events.size(); ++index) {
+        const Causal_event_signature& recorded_event = recorded.other_events[index];
+        const Causal_event_signature& replayed_event = replayed.other_events[index];
+        if (recorded_event.kind != replayed_event.kind ||
+            recorded_event.digest != replayed_event.digest)
+        {
+            return false;
+        }
+        ++replay.semantic_digest_object_checks;
+        if (comparable_causal_event_object(recorded_event.event->object) !=
+            comparable_causal_event_object(replayed_event.event->object))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool semantic_runs_equal(
+    const Snapshot_run& recorded,
+    const Snapshot_run& replayed,
+    Replay_result&      replay)
+{
+    if (recorded.digest != replayed.digest) {
+        return false;
+    }
+    ++replay.semantic_digest_object_checks;
+    return recorded.comparable_object == replayed.comparable_object;
+}
+
+void compare_dirty_publications(
+    Replay_result&      replay,
+    const Snapshot_run& recorded,
+    const Snapshot_run& replayed)
+{
+    const std::size_t paired_count = std::min(
+        recorded.publications.size(),
+        replayed.publications.size());
+    replay.unpaired_recorded_dirty_snapshot_events += static_cast<int>(
+        recorded.publications.size() - paired_count);
+    replay.unpaired_replayed_dirty_snapshot_events += static_cast<int>(
+        replayed.publications.size() - paired_count);
+
+    const std::size_t recorded_start = recorded.publications.size() - paired_count;
+    const std::size_t replayed_start = replayed.publications.size() - paired_count;
+    for (std::size_t pair_index = 0U; pair_index < paired_count; ++pair_index) {
+        const term::Terminal_transcript_event& recorded_event =
+            *recorded.publications[recorded_start + pair_index];
+        const term::Terminal_transcript_event& replayed_event =
+            *replayed.publications[replayed_start + pair_index];
+        if (!dirty_snapshot_fields_differ(recorded_event.object, replayed_event.object)) {
+            continue;
+        }
+        ++replay.dirty_mismatch_snapshot_events;
+        record_first_dirty_mismatch(replay, recorded_event, replayed_event.object);
+    }
+}
+
+void record_semantic_match(
+    Replay_result&      replay,
+    const Snapshot_run& recorded,
+    const Snapshot_run& replayed)
+{
+    ++replay.matching_snapshot_runs;
+    replay.matching_snapshot_events +=
+        static_cast<int>(recorded.publications.size());
+    if (snapshot_is_public_projection_scroll(recorded.representative().object)) {
+        replay.public_projection_scroll_snapshot_events +=
+            static_cast<int>(recorded.publications.size());
+    }
+    compare_dirty_publications(replay, recorded, replayed);
+}
+
+struct Semantic_positions
+{
+    QJsonObject              comparable_object;
+    std::vector<std::size_t> positions;
+    std::size_t              cursor = 0U;
+};
+
+using Semantic_position_index = std::unordered_map<
+    Semantic_digest,
+    std::vector<Semantic_positions>,
+    Semantic_digest_hash>;
+
+Semantic_position_index index_semantic_positions(
+    const std::vector<Snapshot_run>& runs,
+    std::size_t                      count,
+    Replay_result&                   replay)
+{
+    Semantic_position_index index;
+    index.reserve(count);
+    for (std::size_t position = 0U; position < count; ++position) {
+        const Snapshot_run& run = runs[position];
+        std::vector<Semantic_positions>& classes = index[run.digest];
+        auto semantic_class = classes.end();
+        for (auto candidate = classes.begin(); candidate != classes.end(); ++candidate) {
+            ++replay.semantic_digest_object_checks;
+            if (candidate->comparable_object == run.comparable_object) {
+                semantic_class = candidate;
+                break;
+            }
+        }
+        if (semantic_class == classes.end()) {
+            classes.push_back({run.comparable_object, {}, 0U});
+            semantic_class = std::prev(classes.end());
+        }
+        semantic_class->positions.push_back(position);
+    }
+    return index;
+}
+
+Semantic_positions* find_semantic_positions(
+    Semantic_position_index& index,
+    const Snapshot_run&      run,
+    Replay_result&           replay)
+{
+    const auto digest = index.find(run.digest);
+    if (digest == index.end()) {
+        return nullptr;
+    }
+    for (Semantic_positions& candidate : digest->second) {
+        ++replay.semantic_digest_object_checks;
+        if (candidate.comparable_object == run.comparable_object) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+void compare_snapshot_group(
+    Replay_result&                        replay,
+    const Causal_snapshot_group&          recorded_group,
+    const Causal_snapshot_group&          replayed_group)
+{
+    const std::vector<Snapshot_run>& recorded_runs = recorded_group.runs;
+    const std::vector<Snapshot_run>& replayed_runs = replayed_group.runs;
+    if (recorded_runs.empty() && replayed_runs.empty()) {
+        return;
+    }
+    if (recorded_runs.empty()) {
+        replay.divergent_snapshot_runs += static_cast<int>(replayed_runs.size());
+        for (const Snapshot_run& run : replayed_runs) {
+            replay.divergent_snapshot_events +=
+                static_cast<int>(run.publications.size());
+        }
+        record_first_surplus_replayed_snapshot_divergence(
+            replay,
+            replayed_runs.back().representative());
+        return;
+    }
+    if (replayed_runs.empty()) {
+        replay.divergent_snapshot_runs += static_cast<int>(recorded_runs.size());
+        for (const Snapshot_run& run : recorded_runs) {
+            replay.divergent_snapshot_events +=
+                static_cast<int>(run.publications.size());
+        }
+        record_first_snapshot_divergence(
+            replay,
+            recorded_runs.back().representative(),
+            std::nullopt);
+        return;
+    }
+
+    const std::size_t recorded_prefix_count = recorded_runs.size() - 1U;
+    const std::size_t replayed_prefix_count = replayed_runs.size() - 1U;
+    ++replay.snapshot_alignment_comparison_work;
+    const bool final_matches = semantic_runs_equal(
+        recorded_runs.back(), replayed_runs.back(), replay);
+    if (final_matches) {
+        record_semantic_match(replay, recorded_runs.back(), replayed_runs.back());
+    }
+    else {
+        ++replay.divergent_snapshot_runs;
+        replay.divergent_snapshot_events += static_cast<int>(
+            recorded_runs.back().publications.size());
+        record_first_snapshot_divergence(
+            replay,
+            recorded_runs.back().representative(),
+            replayed_runs.back().representative().object);
+    }
+
+    Semantic_position_index positions = index_semantic_positions(
+        replayed_runs,
+        replayed_prefix_count,
+        replay);
+    std::size_t replayed_cursor = 0U;
+    for (std::size_t recorded_index = 0U;
+         recorded_index < recorded_prefix_count;
+         ++recorded_index)
+    {
+        const Snapshot_run& recorded_run = recorded_runs[recorded_index];
+        ++replay.snapshot_alignment_comparison_work;
+        Semantic_positions* matching_positions =
+            find_semantic_positions(positions, recorded_run, replay);
+        if (matching_positions != nullptr) {
+            while (matching_positions->cursor < matching_positions->positions.size() &&
+                matching_positions->positions[matching_positions->cursor] < replayed_cursor)
+            {
+                ++matching_positions->cursor;
+            }
+        }
+        if (matching_positions == nullptr ||
+            matching_positions->cursor == matching_positions->positions.size())
+        {
+            ++replay.divergent_snapshot_runs;
+            replay.divergent_snapshot_events += static_cast<int>(
+                recorded_run.publications.size());
+            const std::optional<QJsonObject> candidate =
+                replayed_cursor < replayed_prefix_count
+                    ? std::optional<QJsonObject>(
+                        replayed_runs[replayed_cursor].representative().object)
+                    : std::nullopt;
+            record_first_snapshot_divergence(
+                replay,
+                recorded_run.representative(),
+                candidate);
+            continue;
+        }
+
+        const std::size_t matched_position =
+            matching_positions->positions[matching_positions->cursor++];
+        const std::size_t skipped_count = matched_position - replayed_cursor;
+        replay.surplus_replayed_snapshot_runs += static_cast<int>(skipped_count);
+        replay.snapshot_alignment_comparison_work += static_cast<int>(skipped_count);
+        replayed_cursor = matched_position + 1U;
+        record_semantic_match(
+            replay,
+            recorded_run,
+            replayed_runs[matched_position]);
+    }
+    const std::size_t remaining_count = replayed_prefix_count - replayed_cursor;
+    replay.surplus_replayed_snapshot_runs += static_cast<int>(remaining_count);
+    replay.snapshot_alignment_comparison_work += static_cast<int>(remaining_count);
 }
 
 void compare_recorded_snapshots(
     Replay_result&                                      replay,
     const std::vector<term::Terminal_transcript_event>& recorded_events,
+    const Causal_driver_layout&                         recorded_layout,
     const std::vector<term::Terminal_transcript_event>& replayed_events)
 {
-    const std::vector<term::Terminal_transcript_event> recorded_snapshots =
-        snapshot_events_from(recorded_events);
-    const std::vector<term::Terminal_transcript_event> replayed_snapshots =
-        snapshot_events_from(replayed_events);
+    replay.recorded_snapshot_events = static_cast<int>(std::count_if(
+        recorded_events.begin(),
+        recorded_events.end(),
+        [](const term::Terminal_transcript_event& event) {
+            return event.kind == QStringLiteral("snapshot");
+        }));
+    replay.replayed_snapshot_events = static_cast<int>(std::count_if(
+        replayed_events.begin(),
+        replayed_events.end(),
+        [](const term::Terminal_transcript_event& event) {
+            return event.kind == QStringLiteral("snapshot");
+        }));
+    if (replay.recorded_snapshot_events == 0) {
+        ++replay.divergent_snapshot_events;
+        ++replay.divergent_snapshot_runs;
+        replay.error = QStringLiteral("recorded transcript contains no snapshot diagnostics");
+        return;
+    }
 
-    replay.recorded_snapshot_events = static_cast<int>(recorded_snapshots.size());
-    replay.replayed_snapshot_events = static_cast<int>(replayed_snapshots.size());
-    const std::size_t snapshot_count =
-        std::max(recorded_snapshots.size(), replayed_snapshots.size());
-    for (std::size_t index = 0U; index < snapshot_count; ++index) {
-        if (index >= recorded_snapshots.size()) {
+    const Causal_driver_layout replayed_layout =
+        validated_causal_driver_layout(replayed_events, false);
+    replay.recorded_causal_groups = static_cast<int>(
+        recorded_layout.group_signatures.size());
+    replay.replayed_causal_groups = static_cast<int>(
+        replayed_layout.group_signatures.size());
+    if (!replayed_layout.valid) {
+        replay.causal_protocol_divergences = 1;
+        replay.error = QStringLiteral("replay causal protocol invalid: %1")
+            .arg(replayed_layout.error);
+        return;
+    }
+    if (recorded_layout.group_signatures.size() !=
+        replayed_layout.group_signatures.size())
+    {
+        replay.causal_driver_divergences = 1;
+        ++replay.divergent_snapshot_events;
+        ++replay.divergent_snapshot_runs;
+        replay.error = QStringLiteral(
+            "recorded and replayed normalized causal group counts diverged");
+        return;
+    }
+    for (std::size_t group_index = 0U;
+         group_index < recorded_layout.group_signatures.size();
+         ++group_index)
+    {
+        if (!causal_group_signatures_equal(
+                recorded_layout.group_signatures[group_index],
+                replayed_layout.group_signatures[group_index],
+                replay))
+        {
+            replay.causal_driver_divergences = 1;
             ++replay.divergent_snapshot_events;
-            record_first_surplus_replayed_snapshot_divergence(
-                replay,
-                replayed_snapshots[index]);
-            continue;
+            ++replay.divergent_snapshot_runs;
+            replay.error = QStringLiteral(
+                "recorded and replayed causal group signatures diverged at group %1")
+                .arg(static_cast<qulonglong>(group_index));
+            return;
         }
+    }
 
-        const std::optional<QJsonObject> replayed =
-            index < replayed_snapshots.size()
-                ? std::optional<QJsonObject>(replayed_snapshots[index].object)
-                : std::nullopt;
-        compare_recorded_snapshot(replay, recorded_snapshots[index], replayed);
+    const std::vector<Causal_snapshot_group> recorded_groups = grouped_snapshot_runs(
+        recorded_layout.snapshots_by_group,
+        replay);
+    const std::vector<Causal_snapshot_group> replayed_groups = grouped_snapshot_runs(
+        replayed_layout.snapshots_by_group,
+        replay);
+    for (const Causal_snapshot_group& group : recorded_groups) {
+        replay.recorded_snapshot_runs += static_cast<int>(group.runs.size());
+    }
+    for (const Causal_snapshot_group& group : replayed_groups) {
+        replay.replayed_snapshot_runs += static_cast<int>(group.runs.size());
+    }
+    for (std::size_t group_index = 0U;
+         group_index < recorded_groups.size();
+         ++group_index)
+    {
+        compare_snapshot_group(
+            replay,
+            recorded_groups[group_index],
+            replayed_groups[group_index]);
     }
 }
 
@@ -721,16 +1650,19 @@ struct Pending_scroll_intent
     int                                   requested_line_delta = 0;
     std::optional<int>                    requested_offset_from_tail;
     term::Terminal_viewport_scroll_result result;
+    term::Terminal_viewport_state         viewport_before;
 };
 
 Pending_scroll_intent pending_scroll_intent_from_event(
     const term::Terminal_transcript_event&       event,
-    const term::Terminal_viewport_scroll_result& result)
+    const term::Terminal_viewport_scroll_result& result,
+    const term::Terminal_viewport_state&         viewport_before)
 {
     Pending_scroll_intent pending;
     pending.source               = event.object.value(QStringLiteral("source")).toString();
     pending.requested_line_delta = event.object.value(QStringLiteral("requested_line_delta")).toInt();
     pending.result               = result;
+    pending.viewport_before      = viewport_before;
     if (event.object.contains(QStringLiteral("requested_offset_from_tail"))) {
         pending.requested_offset_from_tail =
             event.object.value(QStringLiteral("requested_offset_from_tail")).toInt();
@@ -748,7 +1680,10 @@ bool scroll_event_matches_pending_intent(
         event.object.value(QStringLiteral("applied_line_delta")).toInt() !=
             pending.result.applied_line_delta ||
         event.object.value(QStringLiteral("action")).toString() !=
-            scroll_action_name(pending.result.action))
+            scroll_action_name(pending.result.action) ||
+        !viewport_matches_object(
+            pending.viewport_before,
+            event.object.value(QStringLiteral("viewport_before")).toObject()))
     {
         return false;
     }
@@ -834,9 +1769,33 @@ void apply_selection_event(
     }
 }
 
+std::optional<term::terminal_grid_position_t> optional_position_from_event(
+    const term::Terminal_transcript_event& event,
+    const QString&                         field_name)
+{
+    if (!event.object.contains(field_name)) {
+        return std::nullopt;
+    }
+    return position_from_object(event.object.value(field_name).toObject());
+}
+
 Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& events)
 {
     Replay_result replay;
+    replay.recorded_snapshot_events = static_cast<int>(std::count_if(
+        events.begin(),
+        events.end(),
+        [](const term::Terminal_transcript_event& event) {
+            return event.kind == QStringLiteral("snapshot");
+        }));
+    const Causal_driver_layout recorded_layout =
+        validated_causal_driver_layout(events);
+    if (!recorded_layout.valid) {
+        replay.causal_protocol_divergences = 1;
+        replay.error = QStringLiteral("recorded causal protocol invalid: %1")
+            .arg(recorded_layout.error);
+        return replay;
+    }
 
     QTemporaryDir replay_transcript_dir;
     if (!replay_transcript_dir.isValid()) {
@@ -861,6 +1820,7 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
     Replay_backend* backend_ptr = backend.get();
     term::Terminal_session_config config = replay_session_config(events);
     config.transcript_recorder = replay_recorder;
+    config.backend_event_notifier = []() {};
     auto session = std::make_unique<term::Terminal_session>(std::move(backend), config);
 
     const bool has_resize_request = std::any_of(
@@ -872,11 +1832,36 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
 
     bool started = false;
     std::optional<Pending_scroll_intent> pending_scroll_intent;
+    std::vector<QByteArray> backend_bytes_by_group(
+        recorded_layout.group_driver_kinds.size());
+    std::vector<std::size_t> backend_event_count_by_group(
+        recorded_layout.group_driver_kinds.size(),
+        0U);
+    for (std::size_t driver_index = 0U;
+         driver_index < recorded_layout.drivers.size();
+         ++driver_index)
+    {
+        if (recorded_layout.drivers[driver_index]->kind ==
+            QStringLiteral("backend.output"))
+        {
+            const std::size_t group = recorded_layout.group_for_driver[driver_index];
+            const QByteArray bytes = event_bytes(*recorded_layout.drivers[driver_index]);
+            backend_bytes_by_group[group] += bytes;
+            ++backend_event_count_by_group[group];
+        }
+    }
+    std::set<std::size_t> emitted_backend_groups;
+    std::size_t driver_index = 0U;
     for (const term::Terminal_transcript_event& event : events) {
         if (event.kind == QStringLiteral("header") ||
             is_replay_transparent_diagnostic_event(event.kind))
         {
             continue;
+        }
+
+        std::optional<std::size_t> event_group;
+        if (is_causal_driver_event(event)) {
+            event_group = recorded_layout.group_for_driver[driver_index++];
         }
 
         if (event.kind == QStringLiteral("session.start")) {
@@ -896,8 +1881,20 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
         }
 
         if (event.kind == QStringLiteral("backend.output")) {
-            backend_ptr->emit_output(event_bytes(event));
-            session->process_backend_callback_events();
+            if (!emitted_backend_groups.insert(*event_group).second) {
+                continue;
+            }
+            backend_ptr->emit_output(backend_bytes_by_group[*event_group]);
+            if (backend_event_count_by_group[*event_group] > 1U) {
+                while (session->process_backend_callback_events_for(
+                        std::chrono::steady_clock::duration::zero()) !=
+                    term::Backend_callback_drain_stop::COMPLETE)
+                {
+                }
+            }
+            else {
+                session->process_backend_callback_events();
+            }
         }
         else
         if (event.kind == QStringLiteral("host.write")) {
@@ -953,38 +1950,94 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
         }
         else
         if (event.kind == QStringLiteral("surface.scroll_intent")) {
-            term::Terminal_viewport_scroll_result result;
-            if (!apply_scroll_event(*session, event, &result, &replay.error)) {
+            if (!session_viewport_matches_object(
+                    *session,
+                    event.object.value(QStringLiteral("viewport_before")).toObject()))
+            {
+                const term::Terminal_viewport_state recorded_viewport = viewport_from_object(
+                    event.object.value(QStringLiteral("viewport_before")).toObject());
+                const term::Terminal_viewport_state actual_viewport =
+                    visible_viewport_state(*session);
+                replay.causal_protocol_divergences = 1;
+                replay.error = QStringLiteral(
+                    "surface.scroll_intent viewport_before diverged at event %1 "
+                    "(recorded scrollback=%2 offset=%3, replayed scrollback=%4 offset=%5)")
+                    .arg(static_cast<qulonglong>(event.event_index))
+                    .arg(recorded_viewport.scrollback_rows)
+                    .arg(recorded_viewport.offset_from_tail)
+                    .arg(actual_viewport.scrollback_rows)
+                    .arg(actual_viewport.offset_from_tail);
                 return replay;
             }
-            pending_scroll_intent.reset();
-            if (result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
-                result.action ==
-                    term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED)
-            {
-                pending_scroll_intent = pending_scroll_intent_from_event(event, result);
+            const term::Terminal_viewport_state viewport_before =
+                visible_viewport_state(*session);
+            const QString source = event.object.value(QStringLiteral("source")).toString();
+            const int requested_line_delta =
+                event.object.value(QStringLiteral("requested_line_delta")).toInt();
+            std::optional<int> requested_offset_from_tail;
+            if (event.object.contains(QStringLiteral("requested_offset_from_tail"))) {
+                requested_offset_from_tail =
+                    event.object.value(QStringLiteral("requested_offset_from_tail")).toInt();
             }
+            (void)replay_recorder->record_surface_scroll_intent({
+                source,
+                requested_line_delta,
+                requested_offset_from_tail,
+                viewport_before,
+            });
+            term::Terminal_viewport_scroll_result result;
+            if (!apply_scroll_event(*session, event, &result, &replay.error)) {
+                replay.causal_protocol_divergences = 1;
+                return replay;
+            }
+            pending_scroll_intent = pending_scroll_intent_from_event(
+                event,
+                result,
+                viewport_before);
             ++replay.surface_scroll_intents;
         }
         else
         if (event.kind == QStringLiteral("surface.scroll")) {
-            const bool pending_result_already_applied =
-                pending_scroll_intent.has_value() &&
-                scroll_event_matches_pending_intent(event, *pending_scroll_intent) &&
-                (pending_scroll_intent->result.action ==
-                    term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED ||
-                    viewport_offset_matches_recorded_after(session->viewport_state(), event) ||
-                    visible_viewport_offset_matches_recorded_after(*session, event));
-            pending_scroll_intent.reset();
-            if (!pending_result_already_applied) {
-                term::Terminal_viewport_scroll_result result;
-                if (!apply_scroll_event(*session, event, &result, &replay.error)) {
-                    return replay;
-                }
+            if (!pending_scroll_intent.has_value() ||
+                !scroll_event_matches_pending_intent(event, *pending_scroll_intent) ||
+                !session_viewport_matches_object(
+                    *session,
+                    event.object.value(QStringLiteral("viewport_after")).toObject()))
+            {
+                replay.causal_protocol_divergences = 1;
+                replay.error = QStringLiteral(
+                    "surface.scroll result did not match its applied intent at event %1")
+                    .arg(static_cast<qulonglong>(event.event_index));
+                return replay;
             }
+            const term::Terminal_viewport_scroll_result result =
+                pending_scroll_intent->result;
+            const term::Terminal_viewport_state viewport_before =
+                pending_scroll_intent->viewport_before;
+            pending_scroll_intent.reset();
+            std::optional<int> requested_offset_from_tail;
+            if (event.object.contains(QStringLiteral("requested_offset_from_tail"))) {
+                requested_offset_from_tail =
+                    event.object.value(QStringLiteral("requested_offset_from_tail")).toInt();
+            }
+            (void)replay_recorder->record_surface_scroll({
+                event.object.value(QStringLiteral("source")).toString(),
+                event.object.value(QStringLiteral("requested_line_delta")).toInt(),
+                requested_offset_from_tail,
+                result,
+                viewport_before,
+                visible_viewport_state(*session),
+            });
         }
         else
         if (event.kind == QStringLiteral("surface.selection_drag")) {
+            (void)replay_recorder->record_surface_selection_drag({
+                event.object.value(QStringLiteral("phase")).toString(),
+                optional_position_from_event(event, QStringLiteral("anchor")),
+                optional_position_from_event(event, QStringLiteral("focus")),
+                selection_range_from_event(event),
+                event.object.value(QStringLiteral("moved")).toBool(),
+            });
             apply_selection_event(*session, event);
             ++replay.semantic_selection_events;
         }
@@ -1016,8 +2069,8 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
         return replay;
     }
 
-    compare_recorded_snapshots(replay, events, *replayed_events);
-    if (replay.divergent_snapshot_events != 0) {
+    compare_recorded_snapshots(replay, events, recorded_layout, *replayed_events);
+    if (replay.divergent_snapshot_events != 0 && replay.error.isEmpty()) {
         replay.error = QStringLiteral("recorded snapshot diagnostics diverged from replayed model");
     }
     return replay;
@@ -1127,7 +2180,26 @@ int main(int argc, char** argv)
         << " replayed_snapshot_events=" << replay.replayed_snapshot_events
         << " matching_snapshot_events=" << replay.matching_snapshot_events
         << " divergent_snapshot_events=" << replay.divergent_snapshot_events << '\n'
-        << "dirty_mismatch_snapshot_events=" << replay.dirty_mismatch_snapshot_events << '\n'
+        << "recorded_snapshot_runs=" << replay.recorded_snapshot_runs
+        << " replayed_snapshot_runs=" << replay.replayed_snapshot_runs
+        << " matching_snapshot_runs=" << replay.matching_snapshot_runs
+        << " divergent_snapshot_runs=" << replay.divergent_snapshot_runs
+        << " surplus_replayed_snapshot_runs="
+        << replay.surplus_replayed_snapshot_runs << '\n'
+        << "snapshot_alignment_comparison_work="
+        << replay.snapshot_alignment_comparison_work
+        << " semantic_digest_object_checks="
+        << replay.semantic_digest_object_checks << '\n'
+        << "recorded_causal_groups=" << replay.recorded_causal_groups
+        << " replayed_causal_groups=" << replay.replayed_causal_groups << '\n'
+        << "causal_driver_divergences=" << replay.causal_driver_divergences
+        << " causal_protocol_divergences="
+        << replay.causal_protocol_divergences << '\n'
+        << "dirty_mismatch_snapshot_events=" << replay.dirty_mismatch_snapshot_events
+        << " unpaired_recorded_dirty_snapshot_events="
+        << replay.unpaired_recorded_dirty_snapshot_events
+        << " unpaired_replayed_dirty_snapshot_events="
+        << replay.unpaired_replayed_dirty_snapshot_events << '\n'
         << "public_projection_scroll_snapshot_events="
         << replay.public_projection_scroll_snapshot_events << '\n'
         << "terminal_reply_host_writes_skipped="

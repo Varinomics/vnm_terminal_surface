@@ -14,9 +14,11 @@
 #include <QStringList>
 #include <QTemporaryDir>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -752,7 +754,11 @@ int insert_final_snapshot_copy_before_last_snapshot(const QString& path)
     rewritten_objects.reserve(objects.size() + 1U);
     for (std::size_t index = 0U; index < objects.size(); ++index) {
         if (index == *last_snapshot_index) {
-            rewritten_objects.push_back(objects[index]);
+            QJsonObject duplicate = objects[index];
+            duplicate.insert(
+                QStringLiteral("snapshot_sequence"),
+                duplicate.value(QStringLiteral("snapshot_sequence")).toInteger() + 1000);
+            rewritten_objects.push_back(std::move(duplicate));
         }
         rewritten_objects.push_back(std::move(objects[index]));
     }
@@ -816,6 +822,515 @@ int remove_last_snapshot_event(const QString& path)
     }
 
     return write_transcript_lines(path, lines) ? 1 : 0;
+}
+
+std::optional<std::vector<QJsonObject>> read_transcript_objects(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return std::nullopt;
+    }
+
+    std::vector<QJsonObject> objects;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return std::nullopt;
+        }
+        objects.push_back(document.object());
+    }
+    return objects;
+}
+
+bool write_transcript_objects(
+    const QString&                  path,
+    std::vector<QJsonObject>        objects)
+{
+    std::vector<QByteArray> lines;
+    lines.reserve(objects.size());
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+        objects[index].insert(
+            QStringLiteral("event_index"),
+            static_cast<qint64>(index));
+        lines.push_back(json_line(std::move(objects[index])));
+    }
+    return write_transcript_lines(path, lines);
+}
+
+bool remove_first_event_kind(const QString& path, const QString& kind)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+    const auto event = std::find_if(
+        objects->begin(),
+        objects->end(),
+        [&kind](const QJsonObject& object) {
+            return object.value(QStringLiteral("kind")).toString() == kind;
+        });
+    if (event == objects->end()) {
+        return false;
+    }
+    objects->erase(event);
+    return write_transcript_objects(path, std::move(*objects));
+}
+
+QJsonObject comparable_test_snapshot(QJsonObject object)
+{
+    object.remove(QStringLiteral("kind"));
+    object.remove(QStringLiteral("event_index"));
+    object.remove(QStringLiteral("session_sequence"));
+    object.remove(QStringLiteral("reason"));
+    object.remove(QStringLiteral("snapshot_sequence"));
+    object.remove(QStringLiteral("dirty_row_range_count"));
+    object.remove(QStringLiteral("dirty_row_ranges"));
+    return object;
+}
+
+int remove_intermediate_snapshot_run_within_group(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return 0;
+    }
+
+    std::vector<std::uint64_t> backend_sequences;
+    for (const QJsonObject& object : *objects) {
+        if (object.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("backend.output"))
+        {
+            backend_sequences.push_back(static_cast<std::uint64_t>(
+                object.value(QStringLiteral("session_sequence")).toInteger()));
+        }
+    }
+
+    for (std::uint64_t sequence : backend_sequences) {
+        std::vector<std::vector<std::size_t>> runs;
+        for (std::size_t index = 0U; index < objects->size(); ++index) {
+            const QJsonObject& object = (*objects)[index];
+            if (object.value(QStringLiteral("kind")).toString() !=
+                    QStringLiteral("snapshot") ||
+                static_cast<std::uint64_t>(
+                    object.value(QStringLiteral("session_sequence")).toInteger()) != sequence)
+            {
+                continue;
+            }
+
+            if (runs.empty() ||
+                comparable_test_snapshot((*objects)[runs.back().back()]) !=
+                    comparable_test_snapshot(object))
+            {
+                runs.push_back({});
+            }
+            runs.back().push_back(index);
+        }
+        if (runs.size() < 3U) {
+            continue;
+        }
+
+        const std::vector<std::size_t>& removed_run = runs[1];
+        for (auto it = removed_run.rbegin(); it != removed_run.rend(); ++it) {
+            const auto offset =
+                static_cast<std::vector<QJsonObject>::difference_type>(*it);
+            objects->erase(objects->begin() + offset);
+        }
+        return write_transcript_objects(path, std::move(*objects))
+            ? static_cast<int>(removed_run.size())
+            : 0;
+    }
+    return 0;
+}
+
+int remove_all_snapshots_except_last(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return 0;
+    }
+
+    std::optional<std::size_t> last_snapshot_index;
+    int snapshot_count = 0;
+    for (std::size_t index = 0U; index < objects->size(); ++index) {
+        if ((*objects)[index].value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            last_snapshot_index = index;
+            ++snapshot_count;
+        }
+    }
+    if (!last_snapshot_index.has_value() || snapshot_count < 2) {
+        return 0;
+    }
+
+    const std::uint64_t final_event_index = static_cast<std::uint64_t>(
+        (*objects)[*last_snapshot_index].value(QStringLiteral("event_index")).toInteger());
+    std::erase_if(
+        *objects,
+        [final_event_index](const QJsonObject& object) {
+            return
+                object.value(QStringLiteral("kind")).toString() ==
+                    QStringLiteral("snapshot") &&
+                static_cast<std::uint64_t>(
+                    object.value(QStringLiteral("event_index")).toInteger()) != final_event_index;
+        });
+    return write_transcript_objects(path, std::move(*objects)) ? snapshot_count - 1 : 0;
+}
+
+int remove_snapshots_for_middle_backend_group(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return 0;
+    }
+
+    std::vector<std::uint64_t> backend_sequences;
+    for (const QJsonObject& object : *objects) {
+        if (object.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("backend.output"))
+        {
+            backend_sequences.push_back(static_cast<std::uint64_t>(
+                object.value(QStringLiteral("session_sequence")).toInteger()));
+        }
+    }
+    if (backend_sequences.size() < 3U) {
+        return 0;
+    }
+
+    const std::uint64_t middle_sequence = backend_sequences[1];
+    const std::size_t before = objects->size();
+    std::erase_if(
+        *objects,
+        [middle_sequence](const QJsonObject& object) {
+            return
+                object.value(QStringLiteral("kind")).toString() ==
+                    QStringLiteral("snapshot") &&
+                static_cast<std::uint64_t>(
+                    object.value(QStringLiteral("session_sequence")).toInteger()) ==
+                    middle_sequence;
+        });
+    const int removed = static_cast<int>(before - objects->size());
+    return removed > 0 && write_transcript_objects(path, std::move(*objects)) ? removed : 0;
+}
+
+bool replace_early_group_tail_with_final_snapshot(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+
+    std::vector<std::uint64_t> backend_sequences;
+    for (const QJsonObject& object : *objects) {
+        if (object.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("backend.output"))
+        {
+            backend_sequences.push_back(static_cast<std::uint64_t>(
+                object.value(QStringLiteral("session_sequence")).toInteger()));
+        }
+    }
+    if (backend_sequences.size() < 2U) {
+        return false;
+    }
+
+    std::optional<std::size_t> early_tail;
+    std::optional<std::size_t> final_snapshot;
+    for (std::size_t index = 0U; index < objects->size(); ++index) {
+        const QJsonObject& object = (*objects)[index];
+        if (object.value(QStringLiteral("kind")).toString() != QStringLiteral("snapshot")) {
+            continue;
+        }
+        const std::uint64_t sequence = static_cast<std::uint64_t>(
+            object.value(QStringLiteral("session_sequence")).toInteger());
+        if (sequence == backend_sequences.front()) {
+            early_tail = index;
+        }
+        final_snapshot = index;
+    }
+    if (!early_tail.has_value() || !final_snapshot.has_value() ||
+        *early_tail == *final_snapshot)
+    {
+        return false;
+    }
+
+    const QJsonObject early_envelope = (*objects)[*early_tail];
+    QJsonObject replacement = (*objects)[*final_snapshot];
+    for (const QString& field : {
+             QStringLiteral("event_index"),
+             QStringLiteral("session_sequence"),
+             QStringLiteral("reason"),
+             QStringLiteral("snapshot_sequence"),
+             QStringLiteral("dirty_row_range_count"),
+             QStringLiteral("dirty_row_ranges")})
+    {
+        replacement.insert(field, early_envelope.value(field));
+    }
+    (*objects)[*early_tail] = std::move(replacement);
+    return write_transcript_objects(path, std::move(*objects));
+}
+
+bool merge_second_backend_session_sequence(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+
+    std::optional<std::uint64_t> first_sequence;
+    for (QJsonObject& object : *objects) {
+        if (object.value(QStringLiteral("kind")).toString() !=
+            QStringLiteral("backend.output"))
+        {
+            continue;
+        }
+        if (!first_sequence.has_value()) {
+            first_sequence = static_cast<std::uint64_t>(
+                object.value(QStringLiteral("session_sequence")).toInteger());
+            continue;
+        }
+
+        insert_u64(object, QStringLiteral("session_sequence"), *first_sequence);
+        return write_transcript_objects(path, std::move(*objects));
+    }
+    return false;
+}
+
+bool coherently_merge_second_backend_group(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+
+    std::vector<std::uint64_t> backend_sequences;
+    for (const QJsonObject& object : *objects) {
+        if (object.value(QStringLiteral("kind")).toString() !=
+            QStringLiteral("backend.output"))
+        {
+            continue;
+        }
+        const std::uint64_t sequence = static_cast<std::uint64_t>(
+            object.value(QStringLiteral("session_sequence")).toInteger());
+        if (backend_sequences.empty() || backend_sequences.back() != sequence) {
+            backend_sequences.push_back(sequence);
+        }
+    }
+    if (backend_sequences.size() < 3U ||
+        backend_sequences[1] != backend_sequences[0] + 1U)
+    {
+        return false;
+    }
+
+    const std::uint64_t first_sequence = backend_sequences[0];
+    const std::uint64_t second_sequence = backend_sequences[1];
+    bool removed_first_tail = false;
+    std::erase_if(
+        *objects,
+        [first_sequence, &removed_first_tail](const QJsonObject& object) {
+            const bool remove =
+                object.value(QStringLiteral("kind")).toString() ==
+                    QStringLiteral("snapshot") &&
+                static_cast<std::uint64_t>(
+                    object.value(QStringLiteral("session_sequence")).toInteger()) ==
+                    first_sequence;
+            removed_first_tail = removed_first_tail || remove;
+            return remove;
+        });
+    if (!removed_first_tail) {
+        return false;
+    }
+
+    for (QJsonObject& object : *objects) {
+        const QJsonValue sequence_value =
+            object.value(QStringLiteral("session_sequence"));
+        if (!sequence_value.isDouble()) {
+            continue;
+        }
+        const std::uint64_t sequence = static_cast<std::uint64_t>(
+            sequence_value.toInteger());
+        if (sequence == second_sequence) {
+            insert_u64(object, QStringLiteral("session_sequence"), first_sequence);
+        }
+        else
+        if (sequence > second_sequence) {
+            insert_u64(object, QStringLiteral("session_sequence"), sequence - 1U);
+        }
+    }
+    return write_transcript_objects(path, std::move(*objects));
+}
+
+bool rewrite_first_event_sequence(
+    const QString& path,
+    const QString& kind,
+    std::uint64_t  sequence)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+    for (QJsonObject& object : *objects) {
+        if (object.value(QStringLiteral("kind")).toString() != kind) {
+            continue;
+        }
+        insert_u64(object, QStringLiteral("session_sequence"), sequence);
+        return write_transcript_objects(path, std::move(*objects));
+    }
+    return false;
+}
+
+bool split_duplicate_snapshot_session_sequence(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+
+    std::vector<std::size_t> snapshot_indexes;
+    for (std::size_t index = 0U; index < objects->size(); ++index) {
+        if ((*objects)[index].value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            snapshot_indexes.push_back(index);
+        }
+    }
+    if (snapshot_indexes.size() < 2U) {
+        return false;
+    }
+
+    QJsonObject& split = (*objects)[snapshot_indexes[snapshot_indexes.size() - 2U]];
+    insert_u64(
+        split,
+        QStringLiteral("session_sequence"),
+        static_cast<std::uint64_t>(
+            split.value(QStringLiteral("session_sequence")).toInteger()) + 1000U);
+    return write_transcript_objects(path, std::move(*objects));
+}
+
+bool rewrite_last_snapshot_dirty_ranges(const QString& path)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+
+    for (auto it = objects->rbegin(); it != objects->rend(); ++it) {
+        if (it->value(QStringLiteral("kind")).toString() != QStringLiteral("snapshot")) {
+            continue;
+        }
+        it->insert(QStringLiteral("dirty_row_range_count"), 1);
+        it->insert(QStringLiteral("dirty_row_ranges"), QJsonArray{
+            QJsonObject{
+                {QStringLiteral("first_row"), 1},
+                {QStringLiteral("row_count"), 1},
+            },
+        });
+        return write_transcript_objects(path, std::move(*objects));
+    }
+    return false;
+}
+
+int insert_divergent_snapshots_before_last(const QString& path, int count)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value() || count <= 0) {
+        return 0;
+    }
+
+    std::optional<std::size_t> last_snapshot_index;
+    for (std::size_t index = 0U; index < objects->size(); ++index) {
+        if ((*objects)[index].value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            last_snapshot_index = index;
+        }
+    }
+    if (!last_snapshot_index.has_value()) {
+        return 0;
+    }
+
+    const QJsonObject tail = (*objects)[*last_snapshot_index];
+    std::vector<QJsonObject> inserted;
+    inserted.reserve(static_cast<std::size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        QJsonObject divergent = tail;
+        QJsonArray visible_rows = divergent.value(QStringLiteral("visible_rows")).toArray();
+        if (visible_rows.isEmpty()) {
+            return 0;
+        }
+        QJsonObject first_row = visible_rows.first().toObject();
+        const QString text = QStringLiteral("missing-checkpoint-%1").arg(index);
+        first_row.insert(QStringLiteral("text"), text);
+        first_row.insert(QStringLiteral("hash64"), text_hash64(text));
+        visible_rows.replace(0, first_row);
+        divergent.insert(QStringLiteral("visible_rows"), visible_rows);
+        inserted.push_back(std::move(divergent));
+    }
+    objects->insert(
+        objects->begin() +
+            static_cast<std::vector<QJsonObject>::difference_type>(*last_snapshot_index),
+        std::make_move_iterator(inserted.begin()),
+        std::make_move_iterator(inserted.end()));
+    return write_transcript_objects(path, std::move(*objects)) ? count : 0;
+}
+
+enum class Scroll_protocol_mutation
+{
+    REMOVE_INTENT,
+    REORDER_RESULT,
+    CORRUPT_RESULT_PAYLOAD,
+    DUPLICATE_RESULT,
+};
+
+bool mutate_scroll_protocol(const QString& path, Scroll_protocol_mutation mutation)
+{
+    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
+    if (!objects.has_value()) {
+        return false;
+    }
+
+    std::optional<std::size_t> intent_index;
+    std::optional<std::size_t> result_index;
+    for (std::size_t index = 0U; index < objects->size(); ++index) {
+        const QString kind = (*objects)[index].value(QStringLiteral("kind")).toString();
+        if (!intent_index.has_value() && kind == QStringLiteral("surface.scroll_intent")) {
+            intent_index = index;
+        }
+        if (!result_index.has_value() && kind == QStringLiteral("surface.scroll")) {
+            result_index = index;
+        }
+    }
+    if (!intent_index.has_value() || !result_index.has_value() ||
+        *intent_index >= *result_index)
+    {
+        return false;
+    }
+
+    switch (mutation) {
+        case Scroll_protocol_mutation::REMOVE_INTENT:
+            objects->erase(
+                objects->begin() +
+                static_cast<std::vector<QJsonObject>::difference_type>(*intent_index));
+            break;
+        case Scroll_protocol_mutation::REORDER_RESULT:
+            std::swap((*objects)[*intent_index], (*objects)[*result_index]);
+            break;
+        case Scroll_protocol_mutation::CORRUPT_RESULT_PAYLOAD:
+            (*objects)[*result_index].insert(
+                QStringLiteral("applied_line_delta"),
+                (*objects)[*result_index]
+                        .value(QStringLiteral("applied_line_delta"))
+                        .toInt() + 1);
+            break;
+        case Scroll_protocol_mutation::DUPLICATE_RESULT:
+            objects->insert(
+                objects->begin() +
+                    static_cast<std::vector<QJsonObject>::difference_type>(*result_index + 1U),
+                (*objects)[*result_index]);
+            break;
+    }
+    return write_transcript_objects(path, std::move(*objects));
 }
 
 bool expect_reader_failure(
@@ -1025,6 +1540,265 @@ public:
 private:
     term::Terminal_backend_callbacks m_callbacks;
 };
+
+bool capture_output_transcript(
+    const QString&                 path,
+    const std::vector<QByteArray>& outputs)
+{
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    if (recorder == nullptr) {
+        return false;
+    }
+
+    {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.transcript_recorder = recorder;
+        term::Terminal_session session(std::move(backend), config);
+
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{3, 24};
+        if (session.start(launch_config).code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return false;
+        }
+        for (const QByteArray& output : outputs) {
+            backend_ptr->emit_output(output);
+            session.process_backend_callback_events();
+        }
+    }
+    const bool failed = recorder->failed();
+    recorder.reset();
+    return !failed;
+}
+
+bool capture_budgeted_output_transcript(
+    const QString&    path,
+    const QByteArray& output)
+{
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    if (recorder == nullptr) {
+        return false;
+    }
+
+    {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.transcript_recorder = recorder;
+        config.backend_event_notifier = []() {};
+        term::Terminal_session session(std::move(backend), config);
+
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{3, 24};
+        if (session.start(launch_config).code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return false;
+        }
+
+        backend_ptr->emit_output(output);
+        for (;;) {
+            const term::Backend_callback_drain_stop stop =
+                session.process_backend_callback_events_for(
+                    std::chrono::steady_clock::duration::zero());
+            if (stop == term::Backend_callback_drain_stop::COMPLETE) {
+                break;
+            }
+        }
+    }
+    const bool failed = recorder->failed();
+    recorder.reset();
+    return !failed;
+}
+
+QByteArray large_single_group_output()
+{
+    QByteArray output;
+    output.reserve(48000);
+    for (int index = 0; index < 3200; ++index) {
+        output += QByteArrayLiteral("\x1b[Hstate-");
+        output += QByteArray::number(index);
+        output += QByteArrayLiteral("\x1b[K");
+    }
+    return output;
+}
+
+bool has_full_and_final_short_budgeted_output_slices(
+    const std::vector<term::Terminal_transcript_event>& events)
+{
+    std::vector<const term::Terminal_transcript_event*> output_events;
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.kind == QStringLiteral("backend.output")) {
+            output_events.push_back(&event);
+        }
+    }
+    if (output_events.size() < 2U) {
+        return false;
+    }
+
+    const qint64 sequence = output_events.front()->object
+        .value(QStringLiteral("session_sequence"))
+        .toInteger();
+    for (std::size_t index = 0U; index + 1U < output_events.size(); ++index) {
+        if (output_events[index]->object.value(QStringLiteral("session_sequence"))
+                .toInteger() != sequence ||
+            output_events[index]->object.value(QStringLiteral("byte_count"))
+                .toInteger() != 4096)
+        {
+            return false;
+        }
+    }
+    const term::Terminal_transcript_event& final = *output_events.back();
+    const qint64 final_byte_count =
+        final.object.value(QStringLiteral("byte_count")).toInteger();
+    return
+        final.object.value(QStringLiteral("session_sequence")).toInteger() == sequence &&
+        final_byte_count > 0 && final_byte_count < 4096;
+}
+
+bool capture_scroll_transcript(const QString& path)
+{
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    if (recorder == nullptr) {
+        return false;
+    }
+
+    bool recorded = false;
+    {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.transcript_recorder = recorder;
+        term::Terminal_session session(std::move(backend), config);
+
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{3, 24};
+        if (session.start(launch_config).code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return false;
+        }
+        backend_ptr->emit_output(
+            QByteArrayLiteral("zero\r\none\r\ntwo\r\nthree\r\nfour"));
+        session.process_backend_callback_events();
+
+        const std::optional<term::Terminal_render_snapshot> before_snapshot =
+            session.latest_render_snapshot();
+        if (!before_snapshot.has_value()) {
+            return false;
+        }
+        const term::Terminal_viewport_state viewport_before = before_snapshot->viewport;
+        const QString source = QStringLiteral("api.lines");
+        if (!recorder->record_surface_scroll_intent({
+                source,
+                1,
+                std::nullopt,
+                viewport_before,
+            }))
+        {
+            return false;
+        }
+
+        const term::Terminal_viewport_scroll_result result =
+            session.scroll_published_viewport_lines(1);
+        const std::optional<term::Terminal_render_snapshot> after_snapshot =
+            session.latest_render_snapshot();
+        if (result.action != term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
+            !after_snapshot.has_value())
+        {
+            return false;
+        }
+        recorded = recorder->record_surface_scroll({
+            source,
+            1,
+            std::nullopt,
+            result,
+            viewport_before,
+            after_snapshot->viewport,
+        });
+    }
+    const bool failed = recorder->failed();
+    recorder.reset();
+    return recorded && !failed;
+}
+
+bool capture_resize_owner_transcript(const QString& path)
+{
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    if (recorder == nullptr) {
+        return false;
+    }
+
+    bool captured = false;
+    {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.transcript_recorder = recorder;
+        term::Terminal_session session(std::move(backend), config);
+
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{3, 24};
+        if (session.start(launch_config).code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return false;
+        }
+        backend_ptr->emit_output(QByteArrayLiteral("seed"));
+        captured = session.resize(QSizeF(120.0, 40.0), {4, 24}).code ==
+            term::Terminal_session_result_code::ACCEPTED;
+    }
+    const bool failed = recorder->failed();
+    recorder.reset();
+    return captured && !failed;
+}
+
+bool capture_backend_error_owner_transcript(const QString& path)
+{
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    if (recorder == nullptr) {
+        return false;
+    }
+
+    {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.transcript_recorder = recorder;
+        term::Terminal_session session(std::move(backend), config);
+
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{3, 24};
+        if (session.start(launch_config).code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return false;
+        }
+        backend_ptr->emit_output(QByteArrayLiteral("seed"));
+        session.process_backend_callback_events();
+        backend_ptr->emit_error({
+            term::Terminal_backend_error_code::READ_FAILED,
+            QStringLiteral("read failed"),
+        });
+        session.process_backend_callback_events();
+    }
+    const bool failed = recorder->failed();
+    recorder.reset();
+    return !failed;
+}
 
 struct Replay_harness
 {
@@ -3816,7 +4590,7 @@ bool test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before
     return ok;
 }
 
-bool test_replay_tool_compares_every_snapshot_in_contiguous_run(
+bool test_replay_tool_accepts_duplicate_semantic_snapshot_in_causal_run(
     const QString& replay_tool_path)
 {
     bool ok = true;
@@ -3868,13 +4642,10 @@ bool test_replay_tool_compares_every_snapshot_in_contiguous_run(
         events.has_value() ? event_count(*events, QStringLiteral("snapshot")) : 0;
     ok &= check(recorded_snapshot_count > inserted_snapshot_events,
         "strict snapshot-run fixture leaves final snapshot unchanged");
-    const int expected_matching_snapshot_events =
-        recorded_snapshot_count - inserted_snapshot_events;
-
     const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
     ok &= check(replay.finished, "strict snapshot-run replay tool finishes");
-    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
-        "strict snapshot-run replay tool rejects final-only snapshot masking");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "strict snapshot-run replay accepts a scheduling-only duplicate snapshot");
     const std::optional<int> recorded_snapshot_events =
         replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("recorded_snapshot_events"));
     ok &= check(recorded_snapshot_events.has_value() &&
@@ -3883,35 +4654,511 @@ bool test_replay_tool_compares_every_snapshot_in_contiguous_run(
     const std::optional<int> replayed_snapshot_events =
         replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("replayed_snapshot_events"));
     ok &= check(replayed_snapshot_events.has_value() &&
-            *replayed_snapshot_events == expected_matching_snapshot_events,
+            *replayed_snapshot_events == recorded_snapshot_count - inserted_snapshot_events,
         "strict snapshot-run replay reports replayed snapshot count");
     const std::optional<int> matching_snapshot_events =
         replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("matching_snapshot_events"));
     ok &= check(matching_snapshot_events.has_value() &&
-            *matching_snapshot_events == expected_matching_snapshot_events,
-        "strict snapshot-run replay still compares unchanged snapshots");
+            *matching_snapshot_events == recorded_snapshot_count,
+        "strict snapshot-run replay accounts for every semantically matched recorded snapshot");
     const std::optional<int> divergent_snapshot_events =
         replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("divergent_snapshot_events"));
     ok &= check(divergent_snapshot_events.has_value() &&
-            *divergent_snapshot_events == inserted_snapshot_events,
-        "strict snapshot-run replay rejects final-only snapshot masking");
+            *divergent_snapshot_events == 0,
+        "strict snapshot-run replay ignores numbering and duplicate publication timing");
+    const std::optional<int> recorded_snapshot_runs =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("recorded_snapshot_runs"));
+    const std::optional<int> replayed_snapshot_runs =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("replayed_snapshot_runs"));
+    ok &= check(recorded_snapshot_runs.has_value() && replayed_snapshot_runs.has_value() &&
+            *recorded_snapshot_runs == *replayed_snapshot_runs,
+        "strict snapshot-run replay collapses the duplicate into one semantic state run");
 
     const Replay_tool_process_result default_replay =
         run_replay_tool_with_arguments(replay_tool_path, {path});
     ok &= check(default_replay.finished, "default snapshot-run replay tool finishes");
     ok &= check(
-        default_replay.exit_status == QProcess::NormalExit && default_replay.exit_code != 0,
-        "default snapshot-run replay is strict all-snapshot replay");
+        default_replay.exit_status == QProcess::NormalExit && default_replay.exit_code == 0,
+        "default snapshot-run replay uses causal semantic strictness");
     const std::optional<int> default_divergent_snapshot_events =
         replay_stdout_metric(
             default_replay.stdout_text,
             QByteArrayLiteral("divergent_snapshot_events"));
     ok &= check(default_divergent_snapshot_events.has_value() &&
-            *default_divergent_snapshot_events == inserted_snapshot_events,
-        "default snapshot-run replay compares every snapshot");
+            *default_divergent_snapshot_events == 0,
+        "default snapshot-run replay accepts only the scheduling-neutral duplicate");
     if (!ok) {
         print_replay_tool_output(replay);
         print_replay_tool_output(default_replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_accepts_replay_only_intermediate_snapshot(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "intermediate snapshot replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary intermediate snapshot directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("intermediate-snapshot.ndjson"));
+    ok &= check(
+        capture_budgeted_output_transcript(path, large_single_group_output()),
+        "intermediate snapshot fixture captures one causal output group");
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> original_events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(original_events.has_value(), "intermediate snapshot original transcript parses");
+    ok &= check(
+        original_events.has_value() &&
+            has_full_and_final_short_budgeted_output_slices(*original_events),
+        "budgeted output positive fixture retains full slices and a final short continuation");
+    const int original_snapshot_count = original_events.has_value()
+        ? event_count(*original_events, QStringLiteral("snapshot"))
+        : 0;
+    ok &= check(original_snapshot_count > 2,
+        "intermediate snapshot fixture records multiple publications in one group");
+    const int removed_snapshot_events =
+        remove_intermediate_snapshot_run_within_group(path);
+    ok &= check(removed_snapshot_events > 0,
+        "intermediate snapshot fixture removes a nonfinal semantic run");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> rewritten_events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(rewritten_events.has_value() &&
+            event_count(*rewritten_events, QStringLiteral("snapshot")) > 0,
+        "intermediate snapshot fixture keeps the causal group nonempty");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "intermediate snapshot replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "intermediate snapshot replay accepts the replay-only causal intermediate state");
+    const std::optional<int> recorded_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("recorded_snapshot_events"));
+    const std::optional<int> replayed_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("replayed_snapshot_events"));
+    const std::optional<int> divergent_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("divergent_snapshot_events"));
+    const std::optional<int> surplus_replayed_snapshot_runs = replay_stdout_metric(
+        replay.stdout_text,
+        QByteArrayLiteral("surplus_replayed_snapshot_runs"));
+    ok &= check(recorded_snapshot_events.has_value() &&
+            *recorded_snapshot_events == original_snapshot_count - removed_snapshot_events,
+        "intermediate snapshot replay reports the coalesced recorded count");
+    ok &= check(replayed_snapshot_events.has_value() && recorded_snapshot_events.has_value() &&
+            *replayed_snapshot_events > *recorded_snapshot_events,
+        "intermediate snapshot replay regenerates the intermediate publication");
+    ok &= check(divergent_snapshot_events.has_value() &&
+            *divergent_snapshot_events == 0,
+        "intermediate snapshot replay keeps semantic strictness green");
+    ok &= check(surplus_replayed_snapshot_runs.has_value() &&
+            *surplus_replayed_snapshot_runs > 0,
+        "intermediate snapshot replay reports the accepted scheduling surplus");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_rejects_one_sided_empty_snapshot_groups(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "empty-group replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary empty-group replay directory is valid")) {
+        return false;
+    }
+
+    const std::vector<QByteArray> outputs = {
+        QByteArrayLiteral("first"),
+        QByteArrayLiteral("\r\nsecond"),
+        QByteArrayLiteral("\r\nfinal"),
+    };
+
+    const QString all_nonfinal_path =
+        temp_dir.filePath(QStringLiteral("all-nonfinal-snapshots-removed.ndjson"));
+    ok &= check(capture_output_transcript(all_nonfinal_path, outputs),
+        "all-nonfinal fixture captures three causal groups");
+    ok &= check(remove_all_snapshots_except_last(all_nonfinal_path) > 0,
+        "all-nonfinal fixture removes every earlier checkpoint");
+    const Replay_tool_process_result all_nonfinal =
+        run_replay_tool(replay_tool_path, all_nonfinal_path);
+    ok &= check(all_nonfinal.finished, "all-nonfinal replay tool finishes");
+    ok &= check(
+        all_nonfinal.exit_status == QProcess::NormalExit && all_nonfinal.exit_code != 0,
+        "all-nonfinal replay rejects one-sided empty causal groups");
+
+    const QString middle_path =
+        temp_dir.filePath(QStringLiteral("middle-group-checkpoint-removed.ndjson"));
+    ok &= check(capture_output_transcript(middle_path, outputs),
+        "middle-group fixture captures three causal groups");
+    ok &= check(remove_snapshots_for_middle_backend_group(middle_path) > 0,
+        "middle-group fixture removes only the middle checkpoint");
+    const Replay_tool_process_result middle = run_replay_tool(replay_tool_path, middle_path);
+    ok &= check(middle.finished, "middle-group replay tool finishes");
+    ok &= check(middle.exit_status == QProcess::NormalExit && middle.exit_code != 0,
+        "middle-group replay rejects a missing causal checkpoint");
+
+    const QString repaired_path =
+        temp_dir.filePath(QStringLiteral("early-tail-repaired-later.ndjson"));
+    ok &= check(capture_output_transcript(repaired_path, outputs),
+        "early-tail fixture captures three causal groups");
+    ok &= check(replace_early_group_tail_with_final_snapshot(repaired_path),
+        "early-tail fixture installs a later state in the first group");
+    const Replay_tool_process_result repaired = run_replay_tool(replay_tool_path, repaired_path);
+    ok &= check(repaired.finished, "early-tail replay tool finishes");
+    ok &= check(repaired.exit_status == QProcess::NormalExit && repaired.exit_code != 0,
+        "early-tail replay rejects a wrong group tail even when the final state repairs it");
+    if (!ok) {
+        print_replay_tool_output(all_nonfinal);
+        print_replay_tool_output(middle);
+        print_replay_tool_output(repaired);
+    }
+    return ok;
+}
+
+bool test_replay_tool_rejects_session_sequence_corruption(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "session-sequence replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary session-sequence replay directory is valid")) {
+        return false;
+    }
+
+    const QString merged_path =
+        temp_dir.filePath(QStringLiteral("merged-backend-session-sequence.ndjson"));
+    ok &= check(
+        capture_output_transcript(
+            merged_path,
+            {
+                QByteArrayLiteral("first"),
+                QByteArrayLiteral("\r\nsecond"),
+                QByteArrayLiteral("\r\nfinal"),
+            }),
+        "merged session-sequence fixture captures outputs");
+    ok &= check(merge_second_backend_session_sequence(merged_path),
+        "merged session-sequence fixture merges independent backend owners");
+    const Replay_tool_process_result merged = run_replay_tool(replay_tool_path, merged_path);
+    ok &= check(merged.finished, "merged session-sequence replay tool finishes");
+    ok &= check(merged.exit_status == QProcess::NormalExit && merged.exit_code != 0,
+        "merged session-sequence replay rejects backend ownership corruption");
+    ok &= check(merged.stdout_text.contains("causal_protocol_divergences=1"),
+        "merged session-sequence replay reports a causal protocol divergence");
+
+    const QString coherent_path =
+        temp_dir.filePath(QStringLiteral("coherently-merged-backend-group.ndjson"));
+    ok &= check(
+        capture_output_transcript(
+            coherent_path,
+            {
+                QByteArrayLiteral("first"),
+                QByteArrayLiteral("\r\nsecond"),
+                QByteArrayLiteral("\r\nfinal"),
+            }),
+        "coherent merge fixture captures outputs");
+    ok &= check(coherently_merge_second_backend_group(coherent_path),
+        "coherent merge fixture merges the driver and every owned publication");
+    const Replay_tool_process_result coherent =
+        run_replay_tool(replay_tool_path, coherent_path);
+    ok &= check(coherent.finished, "coherent merge replay tool finishes");
+    ok &= check(coherent.exit_status == QProcess::NormalExit && coherent.exit_code != 0,
+        "coherent merge replay rejects dense causal ownership corruption");
+    ok &= check(coherent.stdout_text.contains("causal_protocol_divergences=1"),
+        "coherent merge replay reports a causal protocol divergence");
+
+    const QString split_path =
+        temp_dir.filePath(QStringLiteral("split-backend-session-sequence.ndjson"));
+    ok &= check(
+        capture_output_transcript(split_path, {QByteArrayLiteral("final")}),
+        "split session-sequence fixture captures output");
+    ok &= check(insert_final_snapshot_copy_before_last_snapshot(split_path) == 1,
+        "split session-sequence fixture duplicates a publication");
+    ok &= check(split_duplicate_snapshot_session_sequence(split_path),
+        "split session-sequence fixture splits one backend owner's publications");
+    const Replay_tool_process_result split = run_replay_tool(replay_tool_path, split_path);
+    ok &= check(split.finished, "split session-sequence replay tool finishes");
+    ok &= check(split.exit_status == QProcess::NormalExit && split.exit_code != 0,
+        "split session-sequence replay rejects backend ownership corruption");
+    ok &= check(split.stdout_text.contains("causal_protocol_divergences=1"),
+        "split session-sequence replay reports a causal protocol divergence");
+
+    const QString resize_path =
+        temp_dir.filePath(QStringLiteral("resize-result-unrelated-owner.ndjson"));
+    ok &= check(capture_resize_owner_transcript(resize_path),
+        "resize owner fixture captures request and result");
+    const Replay_tool_process_result valid_resize =
+        run_replay_tool(replay_tool_path, resize_path);
+    ok &= check(valid_resize.finished, "valid resize owner replay tool finishes");
+    ok &= check(
+        valid_resize.exit_status == QProcess::NormalExit && valid_resize.exit_code == 0,
+        "valid resize request/result ownership replays successfully");
+
+    const QString legacy_resize_path =
+        temp_dir.filePath(QStringLiteral("legacy-direct-resize.ndjson"));
+    ok &= check(capture_resize_owner_transcript(legacy_resize_path),
+        "legacy resize fixture captures a modern request/result pair");
+    ok &= check(remove_first_event_kind(
+            legacy_resize_path,
+            QStringLiteral("session.resize_request")),
+        "legacy resize fixture removes only the modern request marker");
+    const Replay_tool_process_result legacy_resize =
+        run_replay_tool(replay_tool_path, legacy_resize_path);
+    ok &= check(legacy_resize.finished, "legacy direct resize replay tool finishes");
+    ok &= check(
+        legacy_resize.exit_status == QProcess::NormalExit && legacy_resize.exit_code == 0,
+        "legacy direct resize normalizes to the replayed modern request/result pair");
+    ok &= check(
+        legacy_resize.stdout_text.contains("causal_driver_divergences=0") &&
+            legacy_resize.stdout_text.contains("causal_protocol_divergences=0"),
+        "legacy direct resize retains a clean normalized causal comparison");
+
+    ok &= check(rewrite_first_event_sequence(
+            resize_path,
+            QStringLiteral("session.resize"),
+            2U),
+        "resize owner fixture attaches the result to backend owner 2");
+    const Replay_tool_process_result resize = run_replay_tool(replay_tool_path, resize_path);
+    ok &= check(resize.finished, "resize owner replay tool finishes");
+    ok &= check(resize.exit_status == QProcess::NormalExit && resize.exit_code != 0,
+        "resize owner replay rejects an unrelated existing owner");
+    ok &= check(resize.stdout_text.contains("causal_protocol_divergences=1"),
+        "resize owner replay reports a causal protocol divergence");
+
+    const QString text_area_path =
+        temp_dir.filePath(QStringLiteral("text-area-request-unrelated-owner.ndjson"));
+    ok &= check(capture_output_transcript(
+            text_area_path,
+            {QByteArrayLiteral("\x1b[8;4;24t")}),
+        "text-area owner fixture captures a parser-derived request");
+    const Replay_tool_process_result valid_text_area =
+        run_replay_tool(replay_tool_path, text_area_path);
+    ok &= check(valid_text_area.finished, "valid text-area owner replay tool finishes");
+    ok &= check(
+        valid_text_area.exit_status == QProcess::NormalExit &&
+            valid_text_area.exit_code == 0,
+        "valid parser-derived text-area ownership replays successfully");
+    ok &= check(rewrite_first_event_sequence(
+            text_area_path,
+            QStringLiteral("session.text_area_resize_request"),
+            1U),
+        "text-area owner fixture attaches the request to session.start");
+    const Replay_tool_process_result text_area =
+        run_replay_tool(replay_tool_path, text_area_path);
+    ok &= check(text_area.finished, "text-area owner replay tool finishes");
+    ok &= check(text_area.exit_status == QProcess::NormalExit && text_area.exit_code != 0,
+        "text-area owner replay rejects an unrelated existing owner");
+    ok &= check(text_area.stdout_text.contains("causal_protocol_divergences=1"),
+        "text-area owner replay reports a causal protocol divergence");
+
+    const QString backend_error_path =
+        temp_dir.filePath(QStringLiteral("backend-error-standalone-owner.ndjson"));
+    ok &= check(capture_backend_error_owner_transcript(backend_error_path),
+        "backend-error owner fixture captures an independent callback group");
+    const Replay_tool_process_result valid_backend_error =
+        run_replay_tool(replay_tool_path, backend_error_path);
+    ok &= check(valid_backend_error.finished,
+        "valid backend-error owner replay tool finishes");
+    ok &= check(
+        valid_backend_error.exit_status == QProcess::NormalExit &&
+            valid_backend_error.exit_code == 0,
+        "standalone backend-error callback ownership replays successfully");
+    ok &= check(rewrite_first_event_sequence(
+            backend_error_path,
+            QStringLiteral("session.backend_error"),
+            2U),
+        "backend-error owner fixture attaches the callback to the prior output group");
+    const Replay_tool_process_result backend_error =
+        run_replay_tool(replay_tool_path, backend_error_path);
+    ok &= check(backend_error.finished, "backend-error owner replay tool finishes");
+    ok &= check(
+        backend_error.exit_status == QProcess::NormalExit && backend_error.exit_code != 0,
+        "independent replay layout rejects the recorded-only backend-error merge");
+    ok &= check(
+        backend_error.stdout_text.contains("causal_protocol_divergences=0") &&
+            backend_error.stdout_text.contains("causal_driver_divergences=1"),
+        "backend-error merge reaches independent causal group comparison");
+    if (!ok) {
+        print_replay_tool_output(merged);
+        print_replay_tool_output(coherent);
+        print_replay_tool_output(split);
+        print_replay_tool_output(valid_resize);
+        print_replay_tool_output(legacy_resize);
+        print_replay_tool_output(resize);
+        print_replay_tool_output(valid_text_area);
+        print_replay_tool_output(text_area);
+        print_replay_tool_output(valid_backend_error);
+        print_replay_tool_output(backend_error);
+    }
+    return ok;
+}
+
+bool test_replay_tool_rejects_scroll_protocol_corruption(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "scroll-protocol replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary scroll-protocol replay directory is valid")) {
+        return false;
+    }
+
+    struct Mutation_case
+    {
+        const char*              file_name;
+        const char*              label;
+        Scroll_protocol_mutation mutation;
+    };
+    const Mutation_case cases[] = {
+        {
+            "orphan-scroll-result.ndjson",
+            "orphan scroll result",
+            Scroll_protocol_mutation::REMOVE_INTENT,
+        },
+        {
+            "reordered-scroll-result.ndjson",
+            "reordered scroll result",
+            Scroll_protocol_mutation::REORDER_RESULT,
+        },
+        {
+            "corrupted-scroll-result.ndjson",
+            "corrupted scroll result payload",
+            Scroll_protocol_mutation::CORRUPT_RESULT_PAYLOAD,
+        },
+        {
+            "duplicate-scroll-result.ndjson",
+            "duplicate scroll result",
+            Scroll_protocol_mutation::DUPLICATE_RESULT,
+        },
+    };
+
+    for (const Mutation_case& mutation_case : cases) {
+        const QString path = temp_dir.filePath(QString::fromLatin1(mutation_case.file_name));
+        const std::string label = mutation_case.label;
+        ok &= check(capture_scroll_transcript(path), label + " fixture captures");
+        ok &= check(
+            mutate_scroll_protocol(path, mutation_case.mutation),
+            label + " fixture mutates");
+        const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+        ok &= check(replay.finished, label + " replay tool finishes");
+        ok &= check(
+            replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+            label + " replay is rejected");
+        ok &= check(
+            replay.stdout_text.contains("causal_protocol_divergences=1"),
+            label + " reports a causal protocol divergence");
+        if (replay.exit_code == 0 ||
+            !replay.stdout_text.contains("causal_protocol_divergences=1"))
+        {
+            print_replay_tool_output(replay);
+        }
+    }
+    return ok;
+}
+
+bool test_replay_tool_compares_duplicate_publication_dirty_diagnostics(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "duplicate-dirty replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary duplicate-dirty replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("duplicate-dirty.ndjson"));
+    ok &= check(
+        capture_output_transcript(path, {QByteArrayLiteral("alpha")}),
+        "duplicate-dirty fixture captures output");
+    ok &= check(insert_final_snapshot_copy_before_last_snapshot(path) == 1,
+        "duplicate-dirty fixture duplicates the final semantic publication");
+    ok &= check(rewrite_last_snapshot_dirty_ranges(path),
+        "duplicate-dirty fixture corrupts only the duplicate run tail diagnostics");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "duplicate-dirty replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "duplicate-dirty replay keeps diagnostic variance nonfatal");
+    ok &= check(replay.stdout_text.contains("dirty_mismatch_snapshot_events=1"),
+        "duplicate-dirty replay compares matched publications tail-to-tail");
+    ok &= check(replay.stdout_text.contains("unpaired_recorded_dirty_snapshot_events=1"),
+        "duplicate-dirty replay reports the unpaired recorded publication");
+    ok &= check(replay.stdout_text.contains("unpaired_replayed_dirty_snapshot_events=0"),
+        "duplicate-dirty replay reports no unpaired replayed publication");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_bounds_large_missing_run_comparison_work(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "bounded-work replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary bounded-work replay directory is valid")) {
+        return false;
+    }
+
+    constexpr int k_missing_run_count = 192;
+    const QString path = temp_dir.filePath(QStringLiteral("large-missing-runs.ndjson"));
+    ok &= check(
+        capture_budgeted_output_transcript(path, large_single_group_output()),
+        "bounded-work fixture captures a large replay group");
+    ok &= check(insert_divergent_snapshots_before_last(path, k_missing_run_count) ==
+            k_missing_run_count,
+        "bounded-work fixture inserts many missing recorded checkpoints");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "bounded-work replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+        "bounded-work replay rejects the divergent checkpoints");
+    const std::optional<int> recorded_runs =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("recorded_snapshot_runs"));
+    const std::optional<int> replayed_runs =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("replayed_snapshot_runs"));
+    const std::optional<int> comparison_work = replay_stdout_metric(
+        replay.stdout_text,
+        QByteArrayLiteral("snapshot_alignment_comparison_work"));
+    ok &= check(replayed_runs.has_value() && *replayed_runs > 8,
+        "bounded-work fixture exercises a large replay run");
+    ok &= check(recorded_runs.has_value() && replayed_runs.has_value() &&
+            comparison_work.has_value() &&
+            *comparison_work <= *recorded_runs + *replayed_runs + 4,
+        "bounded-work replay comparison work stays linear in recorded and replayed runs");
+    if (!ok) {
+        print_replay_tool_output(replay);
     }
     return ok;
 }
@@ -4073,8 +5320,21 @@ bool test_replay_tool_prints_diagnostics(const QString& replay_tool_path)
     ok &= check(
         replay.stdout_text.contains("selection_replay=semantic_range_from_surface_selection_drag"),
         "replay tool labels semantic selection replay");
+
+    ok &= check(rewrite_first_snapshot_dirty_ranges(path),
+        "replay tool fixture rewrites only scheduling-owned dirty diagnostics");
+    const Replay_tool_process_result dirty_replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(dirty_replay.finished,
+        "dirty-diagnostic replay tool finishes");
+    ok &= check(
+        dirty_replay.exit_status == QProcess::NormalExit && dirty_replay.exit_code == 0,
+        "dirty-diagnostic replay remains semantically successful");
+    ok &= check(dirty_replay.stdout_text.contains("dirty_mismatch_snapshot_events=1") &&
+            dirty_replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "dirty-diagnostic replay reports scheduling variance without model divergence");
     if (!ok) {
         print_replay_tool_output(replay);
+        print_replay_tool_output(dirty_replay);
     }
     return ok;
 }
@@ -4297,7 +5557,13 @@ int main(int argc, char** argv)
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
     ok &= test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
         replay_tool_path);
-    ok &= test_replay_tool_compares_every_snapshot_in_contiguous_run(replay_tool_path);
+    ok &= test_replay_tool_accepts_duplicate_semantic_snapshot_in_causal_run(replay_tool_path);
+    ok &= test_replay_tool_accepts_replay_only_intermediate_snapshot(replay_tool_path);
+    ok &= test_replay_tool_rejects_one_sided_empty_snapshot_groups(replay_tool_path);
+    ok &= test_replay_tool_rejects_session_sequence_corruption(replay_tool_path);
+    ok &= test_replay_tool_rejects_scroll_protocol_corruption(replay_tool_path);
+    ok &= test_replay_tool_compares_duplicate_publication_dirty_diagnostics(replay_tool_path);
+    ok &= test_replay_tool_bounds_large_missing_run_comparison_work(replay_tool_path);
     ok &= test_replay_tool_rejects_surplus_replayed_snapshots(replay_tool_path);
     ok &= test_replay_tool_prints_diagnostics(replay_tool_path);
     ok &= test_replay_tool_compares_invalid_range_selected_text_result(replay_tool_path);

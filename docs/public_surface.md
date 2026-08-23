@@ -321,8 +321,50 @@ When built with `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY`, the
 `[--strict-all-snapshots] <transcript.ndjson>`. Strict all-snapshot comparison is
 the default, and the named option lets corpus and test callers make that intent
 explicit. The tool compares every recorded snapshot event against replayed
-snapshot publications in order. Final-only contiguous snapshot replay is not a
+semantic state runs from the same validated causal input group. It rejects
+missing or conflicting session-sequence ownership and validates known derived
+event order. In particular, every `surface.scroll` result must follow a matching
+`surface.scroll_intent` and agree with the result of the one application of that
+intent, including request, action, applied delta, and before/after viewport; the
+tool never reapplies a mismatched result.
+
+Recorded and replayed causal layouts are derived and validated independently;
+recorded group identifiers are never imposed on replay publications. The tool
+then requires their normalized group counts, owner kinds, driver order, and
+payload signatures to agree. Deadline-driven `backend.output` fragments retain
+one logical group only when each continuation follows a full 4096-byte slice;
+the final slice may be shorter. Replay queues and drains that logical byte stream
+under one replay owner, so callback slicing cannot manufacture or conceal a
+causal group boundary. A `session.resize` result in request/result-schema
+transcripts must retain the sequence owned by its immediately applicable
+`session.resize_request`; legacy direct `session.resize` events remain accepted.
+Legacy direct results and replay-produced modern pairs compare through the same
+exact host-resize outcome signature. Modern pairs additionally require their
+request fields to agree with the result and retain exact request/result driver
+comparison, so the compatibility normalization does not admit corrupt modern
+metadata.
+Parser-produced `session.text_area_resize_request` events must retain their
+current `backend.output` transition owner.
+
+For each causal group, recorded and replayed snapshot streams must either both
+be empty or both be nonempty. Their final semantic runs are compared tail to
+tail. Earlier recorded checkpoints must then occur in order before that final
+run; replay-only runs are accepted only before or between those checkpoints.
+Snapshot sequence numbers and dirty-row ranges remain diagnostics because
+callback budgets can coalesce a publication or expose an additional
+publication without changing the model. Dirty ranges are compared tail to tail
+for every publication in a matched run, and mismatches plus unpaired recorded or
+replayed publications are counted but remain nonfatal. A transcript without
+snapshot diagnostics fails the strict gate. Final-only snapshot replay is not a
 supported mode.
+
+The summary reports recorded/replayed causal-group counts, causal-driver and
+causal-protocol divergences, semantic run and scheduling-surplus counts,
+fixed-digest object checks,
+`snapshot_alignment_comparison_work`, dirty mismatches, and both unpaired dirty
+publication counts. Alignment uses ordered per-digest positions, so ordinary
+comparison work is amortized linear in the recorded and replayed run counts;
+full `QJsonObject` equality is used only after fixed-size semantic digests match.
 
 The C++ diagnostic scroll overloads (`scroll_viewport_lines_with_diagnostics()`,
 `scroll_to_offset_from_tail_with_diagnostics()`) return a
