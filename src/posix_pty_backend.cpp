@@ -277,14 +277,6 @@ std::optional<Native_launch_data> make_native_launch_data(
     }
     data.env_ptrs.push_back(nullptr);
 
-    const std::optional<QByteArray> executable = resolved_executable(
-        data.argv_bytes.front(),
-        config.environment,
-        config.working_directory);
-    if (!executable.has_value()) {
-        return std::nullopt;
-    }
-    data.executable = *executable;
     data.working_directory = QFile::encodeName(config.working_directory);
     return data;
 }
@@ -688,15 +680,26 @@ public:
                     QStringLiteral("initial terminal size is outside the PTY range"));
         }
 
-        const std::optional<Native_launch_data> native_launch =
+        std::optional<Native_launch_data> native_launch =
             make_native_launch_data(effective_config);
         if (!native_launch.has_value()) {
             return
                 reject_start(
                     Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
-                    QStringLiteral(
-                        "launch argv/environment is invalid or executable lookup failed"));
+                    QStringLiteral("launch argv/environment is invalid"));
         }
+
+        const std::optional<QByteArray> executable = resolved_executable(
+            native_launch->argv_bytes.front(),
+            effective_config.environment,
+            effective_config.working_directory);
+        if (!executable.has_value()) {
+            return
+                reject_start(
+                    Terminal_backend_error_code::START_FAILED,
+                    QStringLiteral("executable lookup failed in the final environment"));
+        }
+        native_launch->executable = *executable;
 
         Unique_fd startup_error_read;
         Unique_fd startup_error_write;

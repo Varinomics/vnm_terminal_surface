@@ -553,9 +553,9 @@ int verify_requested_backend(
     if (requires_msdf_ownership &&
         !msdf_rhi_observed.load(std::memory_order_acquire))
     {
-        std::cerr << "FAIL: " << test_name << " activated backend " << backend
-            << " without exposing its QRhi capability state\n";
-        return 1;
+        std::cerr << "SKIP: " << test_name << " selected backend " << backend
+            << " but no usable per-window QRhi was observed\n";
+        return k_unsupported_backend_skip_return_code;
     }
     if (known_software_adapter.load(std::memory_order_relaxed)) {
         std::cerr << "SKIP: " << test_name

@@ -196,6 +196,13 @@ indeterminate result must never be retried because a child may already exist.
 Starting again after a determinately exited process resets the old session
 before launching the new one.
 
+Startup errors use a flat taxonomy. Structurally invalid or policy-invalid
+requests report `INVALID_LAUNCH_CONFIG`; a well-formed executable that cannot be
+resolved or admitted reports `START_FAILED`. Error classification is orthogonal
+to native dispatch and determinacy. Callers must use `native_dispatch_occurred`
+and `determinacy` themselves to decide whether native dispatch occurred and
+whether retry is safe.
+
 Initial rows and columns come from the item size, font metrics, and device pixel
 ratio. Hosts should size the item before launch. Later geometry, font, screen,
 or device-pixel-ratio changes refresh the grid and send ordered resize requests
@@ -399,6 +406,13 @@ sound.
 classes such as invalid launch config, unavailable working directory, start,
 write, resize, interrupt, terminate, output overflow, callback, and read
 failures.
+
+On Windows ConPTY, classification of exit code 130 is best effort when a later
+input write overlaps final child output and exit. ConPTY can acknowledge that a
+write reached its input pipe but cannot confirm that the child consumed it, so
+`process_exited()` may report either `INTERRUPTED` or `EXITED` in that narrow
+ordering. The exit code remains 130, and exit delivery and output drain are
+unchanged.
 
 `text_area_resize_requested()` is emitted for `CSI 8 ; rows ; columns t`
 xterm text-area resize requests. The terminal model applies the requested grid

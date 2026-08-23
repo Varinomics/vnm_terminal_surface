@@ -29,6 +29,12 @@ already attempted a start, or has a start in progress rejects a second start
 with `START_FAILED`. Both backends start three worker threads on success: a
 reader, a writer, and a process-wait thread.
 
+Startup errors use a flat taxonomy. A structurally invalid or policy-invalid
+request reports `INVALID_LAUNCH_CONFIG`. A well-formed executable that cannot be
+resolved or admitted reports `START_FAILED`. The dispatch and determinacy fields
+describe, independently, whether native dispatch occurred and whether the
+outcome is safe to retry; they do not refine or replace the error code.
+
 ### POSIX session and process group
 
 The POSIX child always becomes its own session and process-group leader.
@@ -183,6 +189,17 @@ pending classification. On delivery failure, the writer drops the in-flight
 override and surfaces `INTERRUPT_FAILED` while the process is still running.
 Queued interrupt entries that the writer never reaches are discarded as ordinary
 queued writes and do not affect exit-reason resolution.
+
+The code-130 classification is necessarily best effort when a later input write
+overlaps final child output and exit. ConPTY reports that `WriteFile` reached its
+input pipe but provides no acknowledgement that the child consumed the bytes. A
+successful later write and output can therefore clear the pending interrupt
+observation before the process-wait thread marks the session as stopping, even
+when the child never reads that write, and the exit is reported as `EXITED` with
+code 130. If the later write fails or the process-wait thread marks the session
+as stopping first, the same exit is reported as `INTERRUPTED` with code 130. The
+ambiguity affects the reason metadata only; exit delivery, output drain, and the
+native exit code are unchanged.
 
 ## Terminate And Escalation
 
