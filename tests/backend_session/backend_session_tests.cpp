@@ -6002,7 +6002,7 @@ bool test_selection_current_detach_after_accepted_primary_repaint_recovery()
     return ok;
 }
 
-bool test_selection_trace_records_anchored_footer_recovery()
+bool test_detached_viewport_and_selection_trace_follow_anchored_footer_recovery()
 {
     bool ok = true;
 
@@ -6061,6 +6061,22 @@ bool test_selection_trace_records_anchored_footer_recovery()
         })),
         "anchored-footer trace fixture establishes an accepted repaint episode");
 
+    const std::optional<term::Terminal_render_snapshot> tail_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(tail_snapshot.has_value() &&
+            tail_snapshot->viewport.scrollback_rows == 1 &&
+            session->scroll_published_viewport_to_offset_from_tail(
+                tail_snapshot->viewport.scrollback_rows).action ==
+                term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "anchored-footer fixture detaches from the tail after the accepted episode");
+    const std::optional<term::Terminal_render_snapshot> detached_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(detached_snapshot.has_value() &&
+            detached_snapshot->viewport.offset_from_tail == 1 &&
+            !detached_snapshot->viewport.follow_tail &&
+            snapshot_row_text(*detached_snapshot, 0) == QStringLiteral("old"),
+        "anchored-footer fixture captures an exact detached viewport anchor");
+
     session->set_selection_range({
         {12, 0},
         {12, 2},
@@ -6093,7 +6109,11 @@ bool test_selection_trace_records_anchored_footer_recovery()
         "anchored-footer trace fixture publishes the continued repaint");
     const std::optional<term::Terminal_screen_model_result> result =
         session->last_model_ingest_result();
+    const std::optional<term::Terminal_render_snapshot> recovered_snapshot =
+        session->latest_render_snapshot();
     ok &= check(result.has_value() && result->recovery_proposals.size() == 1U &&
+            result->recovery_proposals[0].status ==
+                term::Terminal_recovery_proposal_status::ACCEPTED &&
             result->recovery_proposals[0].matched_prefix_rows == 10 &&
             result->recovery_proposals[0].unmatched_tail_rows == 5 &&
             result->recovery_proposals[0].anchored_suffix_rows == 5 &&
@@ -6105,6 +6125,12 @@ bool test_selection_trace_records_anchored_footer_recovery()
                     QStringLiteral("partial-anchored-shift-match") &&
             session->selected_text().text == QStringLiteral("f1"),
         "anchored-footer trace fixture records metadata and preserves footer selection");
+    ok &= check(recovered_snapshot.has_value() &&
+            recovered_snapshot->viewport.scrollback_rows == 2 &&
+            recovered_snapshot->viewport.offset_from_tail == 2 &&
+            !recovered_snapshot->viewport.follow_tail &&
+            snapshot_row_text(*recovered_snapshot, 0) == QStringLiteral("old"),
+        "anchored-footer recovery preserves the detached viewport anchor as history grows");
 
     (void)term::set_interaction_trace_enabled(false);
     QFile trace_file(trace_path);
@@ -18691,7 +18717,7 @@ int main()
     ok &= test_selection_drag_press_provenance_composes_exact_publications();
     ok &= test_selection_drag_press_provenance_composes_synchronized_publications();
     ok &= test_selection_current_detach_after_accepted_primary_repaint_recovery();
-    ok &= test_selection_trace_records_anchored_footer_recovery();
+    ok &= test_detached_viewport_and_selection_trace_follow_anchored_footer_recovery();
     ok &= test_selection_current_repaint_recovery_detach_classification();
     ok &= test_synchronized_hold_follows_multiple_successors_in_one_publication();
     ok &= test_selection_spans_preserve_after_unchanged_synchronized_output_release();
