@@ -60,7 +60,7 @@ function(vnm_terminal_msdf_text_make_available out_var)
     else()
         message(STATUS "${_vnm_terminal_msdf_text_CONTEXT}: Fetching vnm_msdf_text")
         FetchContent_Declare(vnm_msdf_text
-            GIT_REPOSITORY https://github.com/imakris/vnm_msdf_text.git
+            GIT_REPOSITORY https://github.com/Varinomics/vnm_msdf_text.git
             # vnm_terminal intentionally tracks vnm_msdf_text master so API
             # breaks fail here instead of hiding behind stale compatibility pins.
             GIT_TAG master)

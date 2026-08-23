@@ -72,7 +72,7 @@ jobs:
       - name: Checkout chrome
         uses: actions/checkout@v4
         with:
-          repository: imakris/vnm_qml_chrome
+          repository: Varinomics/vnm_qml_chrome
           path: vnm_qml_chrome
           ref: master
           persist-credentials: false
