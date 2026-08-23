@@ -868,6 +868,22 @@ QByteArray selection_recovery_addressed_rows(
     return bytes;
 }
 
+QByteArray selection_recovery_home_rows(
+    std::initializer_list<QByteArray> rows)
+{
+    QByteArray bytes = QByteArrayLiteral("\x1b[?25l\x1b[m\x1b[H");
+    std::size_t row_index = 0U;
+    for (const QByteArray& row : rows) {
+        bytes += row;
+        bytes += QByteArrayLiteral("\x1b[K");
+        if (++row_index < rows.size()) {
+            bytes += QByteArrayLiteral("\r\n");
+        }
+    }
+    bytes += QByteArrayLiteral("\x1b[?25h");
+    return bytes;
+}
+
 QByteArray public_prefix_lines(int count)
 {
     QByteArray bytes;
@@ -5982,6 +5998,125 @@ bool test_selection_current_detach_after_accepted_primary_repaint_recovery()
             trace_tail.contains("predecessor={") &&
             trace_tail.contains("result=0"),
         "selection recovery serializes bounded continuity, proof, boundary, row, delta, and resolver evidence through the session trace channel");
+
+    return ok;
+}
+
+bool test_selection_trace_records_anchored_footer_recovery()
+{
+    bool ok = true;
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config config;
+    config.recover_scrollback_from_primary_repaints = true;
+    config.capture_last_model_ingest_result = true;
+    config.selection_trace_enabled = true;
+    std::unique_ptr<term::Terminal_session> session =
+        std::make_unique<term::Terminal_session>(
+            std::move(backend),
+            enable_test_traces(config));
+    term::Terminal_launch_config launch = valid_launch_config();
+    launch.initial_grid_size = {16, 16};
+    ok &= check(session->start(launch).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "anchored-footer trace fixture starts");
+
+    ok &= check(backend_ptr->emit_output(selection_recovery_home_rows({
+            QByteArrayLiteral("old"),
+            QByteArray(),
+            QByteArrayLiteral("b1"),
+            QByteArrayLiteral("b2"),
+            QByteArrayLiteral("b3"),
+            QByteArrayLiteral("b4"),
+            QByteArrayLiteral("b5"),
+            QByteArrayLiteral("b6"),
+            QByteArrayLiteral("b7"),
+            QByteArrayLiteral("b8"),
+            QByteArrayLiteral("b9"),
+            QByteArrayLiteral("b10"),
+            QByteArrayLiteral("f1"),
+            QByteArrayLiteral("f2"),
+            QByteArrayLiteral("f3"),
+            QByteArray(),
+        })),
+        "anchored-footer trace fixture publishes the episode seed");
+    ok &= check(backend_ptr->emit_output(selection_recovery_home_rows({
+            QByteArray(),
+            QByteArrayLiteral("b1"),
+            QByteArrayLiteral("b2"),
+            QByteArrayLiteral("b3"),
+            QByteArrayLiteral("b4"),
+            QByteArrayLiteral("b5"),
+            QByteArrayLiteral("b6"),
+            QByteArrayLiteral("b7"),
+            QByteArrayLiteral("b8"),
+            QByteArrayLiteral("b9"),
+            QByteArrayLiteral("b10"),
+            QByteArrayLiteral("f1"),
+            QByteArrayLiteral("f2"),
+            QByteArrayLiteral("f3"),
+            QByteArray(),
+            QByteArrayLiteral("f4"),
+        })),
+        "anchored-footer trace fixture establishes an accepted repaint episode");
+
+    session->set_selection_range({
+        {12, 0},
+        {12, 2},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    QString trace_error;
+    ok &= check(term::set_interaction_trace_enabled(true, &trace_error),
+        "anchored-footer trace fixture enables interaction tracing");
+    const QString trace_path = term::interaction_trace_path();
+    const qint64 trace_start = QFileInfo(trace_path).size();
+
+    ok &= check(backend_ptr->emit_output(selection_recovery_home_rows({
+            QByteArrayLiteral("b1"),
+            QByteArrayLiteral("b2"),
+            QByteArrayLiteral("b3"),
+            QByteArrayLiteral("b4"),
+            QByteArrayLiteral("b5"),
+            QByteArrayLiteral("b6"),
+            QByteArrayLiteral("b7"),
+            QByteArrayLiteral("b8"),
+            QByteArrayLiteral("b9"),
+            QByteArrayLiteral("b10"),
+            QByteArrayLiteral("new"),
+            QByteArrayLiteral("f1"),
+            QByteArrayLiteral("f2"),
+            QByteArrayLiteral("f3"),
+            QByteArray(),
+            QByteArrayLiteral("f4"),
+        })),
+        "anchored-footer trace fixture publishes the continued repaint");
+    const std::optional<term::Terminal_screen_model_result> result =
+        session->last_model_ingest_result();
+    ok &= check(result.has_value() && result->recovery_proposals.size() == 1U &&
+            result->recovery_proposals[0].matched_prefix_rows == 10 &&
+            result->recovery_proposals[0].unmatched_tail_rows == 5 &&
+            result->recovery_proposals[0].anchored_suffix_rows == 5 &&
+            result->recovery_attempts.size() == 1U &&
+            result->recovery_attempts[0].reason ==
+                term::Terminal_recovery_attempt_reason::PARTIAL_ANCHORED_SHIFT_MATCH &&
+            QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                result->recovery_attempts[0].reason)) ==
+                    QStringLiteral("partial-anchored-shift-match") &&
+            session->selected_text().text == QStringLiteral("f1"),
+        "anchored-footer trace fixture records metadata and preserves footer selection");
+
+    (void)term::set_interaction_trace_enabled(false);
+    QFile trace_file(trace_path);
+    QByteArray trace_tail;
+    if (trace_file.open(QIODevice::ReadOnly) && trace_file.seek(trace_start)) {
+        trace_tail = trace_file.readAll();
+    }
+    ok &= check(trace_tail.contains("matched_prefix=10") &&
+            trace_tail.contains("unmatched_tail=5") &&
+            trace_tail.contains("anchored_suffix=5") &&
+            trace_tail.contains("reason=partial-anchored-shift-match"),
+        "anchored-footer recovery serializes its distinct trace evidence");
 
     return ok;
 }
@@ -18556,6 +18691,7 @@ int main()
     ok &= test_selection_drag_press_provenance_composes_exact_publications();
     ok &= test_selection_drag_press_provenance_composes_synchronized_publications();
     ok &= test_selection_current_detach_after_accepted_primary_repaint_recovery();
+    ok &= test_selection_trace_records_anchored_footer_recovery();
     ok &= test_selection_current_repaint_recovery_detach_classification();
     ok &= test_synchronized_hold_follows_multiple_successors_in_one_publication();
     ok &= test_selection_spans_preserve_after_unchanged_synchronized_output_release();

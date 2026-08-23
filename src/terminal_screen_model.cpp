@@ -422,6 +422,8 @@ const char* terminal_recovery_attempt_reason_token(
             return "full-shift-match";
         case Terminal_recovery_attempt_reason::PARTIAL_SHIFT_MATCH:
             return "partial-shift-match";
+        case Terminal_recovery_attempt_reason::PARTIAL_ANCHORED_SHIFT_MATCH:
+            return "partial-anchored-shift-match";
         case Terminal_recovery_attempt_reason::NONMATCHING:
             return "nonmatching";
         case Terminal_recovery_attempt_reason::REPEATED_ROW_AMBIGUOUS:
@@ -4686,6 +4688,9 @@ void Terminal_screen_model::set_scroll_region(int top_parameter, int bottom_para
         return;
     }
 
+    if (m_scroll_top != top || m_scroll_bottom != bottom) {
+        cancel_primary_repaint_recovery_candidate();
+    }
     m_scroll_top = top;
     m_scroll_bottom = bottom;
     set_cursor_address(1, 1);
@@ -4698,6 +4703,7 @@ void Terminal_screen_model::set_origin_mode(bool enabled)
         return;
     }
 
+    cancel_primary_repaint_recovery_candidate();
     m_origin_mode = enabled;
     m_modes.origin_mode = enabled;
     set_cursor_address(1, 1);
@@ -5348,14 +5354,26 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
             --candidate.unmatched_finish_budget;
             m_primary_repaint_recovery_candidate = std::move(candidate);
         }
+        else {
+            m_primary_repaint_recovery_episode_active = false;
+        }
         return;
     }
 
+    Terminal_recovery_attempt_reason accepted_reason =
+        Terminal_recovery_attempt_reason::PARTIAL_SHIFT_MATCH;
+    if (shift.match_kind == Terminal_repaint_recovery_match_kind::FULL) {
+        accepted_reason = Terminal_recovery_attempt_reason::FULL_SHIFT_MATCH;
+    }
+    else if (shift.match_kind ==
+        Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED)
+    {
+        accepted_reason =
+            Terminal_recovery_attempt_reason::PARTIAL_ANCHORED_SHIFT_MATCH;
+    }
     record_recovery_attempt({
         Terminal_recovery_attempt_status::ACCEPTED,
-        shift.match_kind == Terminal_repaint_recovery_match_kind::FULL
-            ? Terminal_recovery_attempt_reason::FULL_SHIFT_MATCH
-            : Terminal_recovery_attempt_reason::PARTIAL_SHIFT_MATCH,
+        accepted_reason,
         static_cast<int>(candidate.rows.size()),
         shift.shifted_rows,
     });
@@ -5364,14 +5382,31 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
     terminal_selection_continuity_capability_t& continuity = selection_continuity();
     for (int row = 0; row < static_cast<int>(active_rows.size()); ++row) {
         Terminal_screen_row& target = active_rows[static_cast<std::size_t>(row)];
-        const int predecessor_row = shift.shifted_rows + row;
-        const bool matched_candidate = row < shift.matched_prefix_rows &&
+        int predecessor_row = shift.shifted_rows + row;
+        bool matched_candidate = row < shift.matched_prefix_rows &&
             predecessor_row < static_cast<int>(candidate.rows.size());
+        if (shift.match_kind ==
+            Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED)
+        {
+            const int anchored_suffix_start =
+                static_cast<int>(active_rows.size()) - shift.anchored_suffix_rows;
+            if (row >= anchored_suffix_start) {
+                predecessor_row = row;
+                matched_candidate =
+                    predecessor_row < static_cast<int>(candidate.rows.size());
+            }
+            else if (row >= shift.matched_prefix_rows) {
+                predecessor_row = -1;
+                matched_candidate = false;
+            }
+        }
 
         terminal_history_handle_t old_handle;
         Terminal_selection_survivor_proof_result proof_result =
             Terminal_selection_survivor_proof_result::UNMATCHED_TAIL;
-        if (predecessor_row < static_cast<int>(candidate.rows.size())) {
+        if (predecessor_row >= 0 &&
+            predecessor_row < static_cast<int>(candidate.rows.size()))
+        {
             const Terminal_screen_row& predecessor =
                 candidate.rows[static_cast<std::size_t>(predecessor_row)];
             old_handle = retained_history_handle_from_provenance(
@@ -5428,6 +5463,7 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
         }
     }
     mark_all_dirty();
+    m_primary_repaint_recovery_episode_active = true;
 }
 
 void Terminal_screen_model::cancel_primary_repaint_recovery_candidate(
@@ -5465,6 +5501,7 @@ void Terminal_screen_model::cancel_primary_repaint_recovery_candidate(
         mark_all_dirty();
     }
     m_primary_repaint_recovery_candidate = {};
+    m_primary_repaint_recovery_episode_active = false;
     if (had_active_candidate) {
         record_recovery_attempt({
             Terminal_recovery_attempt_status::CANCELLED,
@@ -5586,6 +5623,7 @@ Terminal_screen_model::primary_repaint_recovery_proposal(
     proposal.metadata.recovered_row_count = shift.shifted_rows;
     proposal.metadata.matched_prefix_rows = shift.matched_prefix_rows;
     proposal.metadata.unmatched_tail_rows = shift.unmatched_tail_rows;
+    proposal.metadata.anchored_suffix_rows = shift.anchored_suffix_rows;
     proposal.metadata.visible_row_identity_ambiguous =
         candidate.visible_row_identity_ambiguous;
     proposal.source_scrollback_rows = candidate.scrollback_rows;
@@ -5603,6 +5641,8 @@ Terminal_screen_model::primary_repaint_recovery_shift(
     input.line_start_clear_before_text      = candidate.line_start_clear_before_text;
     input.explicit_non_home_repaint_address =
         candidate.explicit_non_home_repaint_address;
+    input.continuing_repaint_episode =
+        m_primary_repaint_recovery_episode_active;
 
     input.candidate_rows.reserve(candidate.rows.size());
     for (const Terminal_screen_row& row : candidate.rows) {
@@ -5761,6 +5801,9 @@ void Terminal_screen_model::mark_terminal_content_changed()
         m_active_buffer_id == Terminal_buffer_id::PRIMARY)
     {
         m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous = true;
+    }
+    else {
+        m_primary_repaint_recovery_episode_active = false;
     }
 
     m_terminal_content_changed = true;

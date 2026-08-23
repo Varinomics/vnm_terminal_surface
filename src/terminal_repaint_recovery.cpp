@@ -34,6 +34,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
     constexpr int k_min_meaningful_matches                 = 2;
     constexpr int k_preferred_meaningful_matches           = 3;
     constexpr int k_min_partial_blank_rewritten_tail_rows  = 2;
+    constexpr int k_min_anchored_meaningful_matches        = 3;
 
     const int row_count = static_cast<int>(input.candidate_rows.size());
     int best_shift              = 0;
@@ -134,6 +135,91 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
             best_matched_prefix     = matched_prefix;
             best_shift              = shift;
             best_full_match         = full_surviving_suffix_matched;
+        }
+    }
+
+    // A continuing repaint can preserve a fixed footer while shifting the
+    // content above it. This is deliberately a separate, stronger exception
+    // to the bounded partial-tail policy above: it proves a dense one-row body
+    // shift, exactly one rewritten seam, and a distinct same-coordinate footer.
+    if (best_shift == 0                         &&
+        input.continuing_repaint_episode        &&
+        row_count > 1                           &&
+        input.candidate_rows.front().isEmpty())
+    {
+        int                  matched_prefix = 0;
+        int                  meaningful_matches = 0;
+        std::vector<QString> distinct_matched_texts;
+        while (matched_prefix + 1 < row_count) {
+            const QString& current_text =
+                input.current_rows[static_cast<std::size_t>(matched_prefix)];
+            const QString& candidate_text =
+                input.candidate_rows[static_cast<std::size_t>(matched_prefix + 1)];
+            if (current_text != candidate_text) {
+                break;
+            }
+            if (!candidate_text.isEmpty()) {
+                ++meaningful_matches;
+                if (std::find(
+                        distinct_matched_texts.begin(),
+                        distinct_matched_texts.end(),
+                        candidate_text) == distinct_matched_texts.end())
+                {
+                    distinct_matched_texts.push_back(candidate_text);
+                }
+            }
+            ++matched_prefix;
+        }
+
+        int                  anchored_suffix_start = row_count;
+        int                  anchored_meaningful_matches = 0;
+        std::vector<QString> distinct_anchored_texts;
+        while (anchored_suffix_start > 0) {
+            const int row = anchored_suffix_start - 1;
+            const QString& current_text =
+                input.current_rows[static_cast<std::size_t>(row)];
+            const QString& candidate_text =
+                input.candidate_rows[static_cast<std::size_t>(row)];
+            if (current_text != candidate_text) {
+                break;
+            }
+            if (!candidate_text.isEmpty()) {
+                ++anchored_meaningful_matches;
+                if (std::find(
+                        distinct_anchored_texts.begin(),
+                        distinct_anchored_texts.end(),
+                        candidate_text) == distinct_anchored_texts.end())
+                {
+                    distinct_anchored_texts.push_back(candidate_text);
+                }
+            }
+            --anchored_suffix_start;
+        }
+
+        const bool dense_shifted_prefix =
+            matched_prefix * 3 >= (row_count - 1) * 2;
+        const bool strong_shifted_prefix =
+            meaningful_matches >= k_min_anchored_meaningful_matches &&
+            static_cast<int>(distinct_matched_texts.size()) >=
+                k_min_anchored_meaningful_matches;
+        const bool strong_anchored_suffix =
+            anchored_meaningful_matches >= k_min_anchored_meaningful_matches &&
+            static_cast<int>(distinct_anchored_texts.size()) >=
+                k_min_anchored_meaningful_matches;
+        const bool exactly_one_seam =
+            anchored_suffix_start == matched_prefix + 1;
+        if (dense_shifted_prefix       &&
+            strong_shifted_prefix      &&
+            strong_anchored_suffix     &&
+            exactly_one_seam)
+        {
+            result.shifted_rows        = 1;
+            result.matched_prefix_rows = matched_prefix;
+            result.unmatched_tail_rows = row_count - 1 - matched_prefix;
+            result.anchored_suffix_rows = row_count - anchored_suffix_start;
+            result.match_kind =
+                Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED;
+            return result;
         }
     }
 

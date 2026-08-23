@@ -913,7 +913,7 @@ QString selection_trace_recovery_proposals(
         }
         text += QStringLiteral(
             "reason=%1,status=%2,source=%3,candidate_rows=%4,recovered_rows=%5,"
-            "matched_prefix=%6,unmatched_tail=%7,ambiguous=%8")
+            "matched_prefix=%6,unmatched_tail=%7,anchored_suffix=%8,ambiguous=%9")
             .arg(static_cast<int>(proposal.reason))
             .arg(static_cast<int>(proposal.status))
             .arg(static_cast<int>(proposal.provenance_source))
@@ -921,6 +921,7 @@ QString selection_trace_recovery_proposals(
             .arg(proposal.recovered_row_count)
             .arg(proposal.matched_prefix_rows)
             .arg(proposal.unmatched_tail_rows)
+            .arg(proposal.anchored_suffix_rows)
             .arg(selection_trace_bool(proposal.visible_row_identity_ambiguous));
     }
     return text;

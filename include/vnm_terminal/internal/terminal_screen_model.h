@@ -275,6 +275,7 @@ struct terminal_recovery_proposal_t
     int                                         recovered_row_count = 0;
     int                                         matched_prefix_rows = 0;
     int                                         unmatched_tail_rows = 0;
+    int                                         anchored_suffix_rows = 0;
     bool                                        visible_row_identity_ambiguous = false;
 };
 
@@ -293,6 +294,7 @@ enum class Terminal_recovery_attempt_reason
     REPEATED_ROW_AMBIGUOUS,
     RECOVERY_DISABLED,
     CANDIDATE_INVALIDATED,
+    PARTIAL_ANCHORED_SHIFT_MATCH,
 };
 
 struct terminal_recovery_attempt_t
@@ -1590,6 +1592,7 @@ private:
     ingest_publication_t            m_synchronized_selection_changes;
     int                             m_scrollback_evicted_rows = 0;
     int                             m_primary_repaint_recovery_resize_guard_remaining = 0;
+    bool                            m_primary_repaint_recovery_episode_active = false;
     primary_repaint_recovery_candidate_t
                                     m_primary_repaint_recovery_candidate;
 };

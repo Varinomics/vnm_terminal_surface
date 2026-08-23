@@ -8,6 +8,7 @@
 #include <QDateTime>
 #include <QString>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
@@ -107,6 +108,20 @@ QByteArray visible_row_write_stream(
     if (cursor_hidden) {
         stream += QByteArrayLiteral("\x1b[?25h");
     }
+    return stream;
+}
+
+QByteArray home_repaint_stream(std::span<const QByteArray> rows)
+{
+    QByteArray stream = QByteArrayLiteral("\x1b[?25l\x1b[m\x1b[H");
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        stream += rows[index];
+        stream += QByteArrayLiteral("\x1b[K");
+        if (index + 1U < rows.size()) {
+            stream += QByteArrayLiteral("\r\n");
+        }
+    }
+    stream += QByteArrayLiteral("\x1b[?25h");
     return stream;
 }
 
@@ -1105,6 +1120,134 @@ bool test_primary_repaint_recovery_accepts_distinct_shift()
         model.ingest(QByteArrayLiteral("z"));
     ok &= check(non_recovery_result.recovery_proposals.empty(),
         "recovery proposal metadata clears on later non-recovery ingest");
+
+    return ok;
+}
+
+bool test_primary_repaint_recovery_accepts_anchored_footer_continuation()
+{
+    bool ok = true;
+
+    // This normalized 28-row fixture preserves the captured blankness and row
+    // equality geometry: 14 meaningful shifted-prefix rows (13 distinct), one
+    // rewritten seam row, and four distinct meaningful rows in the anchored
+    // nine-row footer.
+    const std::array<QByteArray, 28> captured_before = {
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("running-one"),
+        QByteArrayLiteral("running-two"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("completed-one"),
+        QByteArrayLiteral("completed-two"),
+        QByteArrayLiteral("completed-three"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("summary-lines"),
+        QByteArrayLiteral("elapsed-time"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("command-one"),
+        QByteArrayLiteral("command-two"),
+        QByteArrayLiteral("command-three"),
+        QByteArrayLiteral("command-result"),
+        QByteArrayLiteral("revision"),
+        QByteArrayLiteral("summary-lines"),
+        QByteArrayLiteral("command-detail"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("active-task"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("working-status"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("prompt"),
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("model-footer"),
+    };
+
+    std::array<QByteArray, 28> episode_seed;
+    episode_seed[0] = QByteArrayLiteral("previous-output");
+    std::copy_n(captured_before.begin(), 27, episode_seed.begin() + 1);
+
+    std::array<QByteArray, 28> captured_after;
+    std::copy_n(captured_before.begin() + 1, 18, captured_after.begin());
+    captured_after[18] = QByteArrayLiteral("new-command-detail");
+    std::copy(
+        captured_before.begin() + 19,
+        captured_before.end(),
+        captured_after.begin() + 19);
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(28, 40, 64);
+    model.ingest(home_repaint_stream(episode_seed));
+
+    const term::Terminal_screen_model_result first_recovery =
+        model.ingest(home_repaint_stream(captured_before));
+    ok &= check(first_recovery.recovery_proposals.size() == 1U &&
+            first_recovery.recovery_proposals[0].status ==
+                term::Terminal_recovery_proposal_status::ACCEPTED &&
+            first_recovery.recovery_proposals[0].matched_prefix_rows == 27 &&
+            first_recovery.recovery_proposals[0].unmatched_tail_rows == 0 &&
+            model.scrollback_size() == 1,
+        "anchored-footer fixture first establishes one accepted repaint episode");
+
+    const term::Terminal_screen_model_result continued_recovery =
+        model.ingest(home_repaint_stream(captured_after));
+    ok &= check(continued_recovery.recovery_proposals.size() == 1U &&
+            continued_recovery.recovery_proposals[0].matched_prefix_rows == 18 &&
+            continued_recovery.recovery_proposals[0].unmatched_tail_rows == 9 &&
+            continued_recovery.recovery_proposals[0].anchored_suffix_rows == 9 &&
+            continued_recovery.recovery_attempts.size() == 1U &&
+            continued_recovery.recovery_attempts[0].reason ==
+                term::Terminal_recovery_attempt_reason::PARTIAL_ANCHORED_SHIFT_MATCH &&
+            QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                continued_recovery.recovery_attempts[0].reason)) ==
+                    QStringLiteral("partial-anchored-shift-match") &&
+            continued_recovery.scrollback_rows == 2 &&
+            model.scrollback_size() == 2,
+        "anchored-footer continuation records the body, seam, and footer geometry");
+
+    const std::vector<term::terminal_selection_line_successor_t> successors =
+        continuity_successors(continued_recovery);
+    const bool anchored_footer_successor = std::any_of(
+        successors.begin(),
+        successors.end(),
+        [](const term::terminal_selection_line_successor_t& successor) {
+            return successor.old_logical_row == 21 &&
+                successor.final_logical_row == 22;
+        });
+    const bool seam_has_successor = std::any_of(
+        successors.begin(),
+        successors.end(),
+        [](const term::terminal_selection_line_successor_t& successor) {
+            return successor.final_logical_row == 20;
+        });
+    ok &= check(successors.size() == 28U &&
+            anchored_footer_successor &&
+            !seam_has_successor,
+        "anchored-footer recovery maps shifted body and same-coordinate footer but not seam");
+
+    term::Terminal_screen_model content_invalidated_model =
+        make_recovery_enabled_primary_repaint_model(28, 40, 64);
+    content_invalidated_model.ingest(home_repaint_stream(episode_seed));
+    content_invalidated_model.ingest(home_repaint_stream(captured_before));
+    content_invalidated_model.ingest(QByteArrayLiteral("x"));
+    content_invalidated_model.ingest(QByteArrayLiteral(
+        "\x1b[28;1Hmodel-footer\x1b[K"));
+    const term::Terminal_screen_model_result content_invalidated_recovery =
+        content_invalidated_model.ingest(home_repaint_stream(captured_after));
+    ok &= check(content_invalidated_model.scrollback_size() == 1 &&
+            content_invalidated_recovery.recovery_proposals.empty(),
+        "ordinary content mutation ends anchored repaint episode continuity");
+
+    term::Terminal_screen_model margin_invalidated_model =
+        make_recovery_enabled_primary_repaint_model(28, 40, 64);
+    margin_invalidated_model.ingest(home_repaint_stream(episode_seed));
+    margin_invalidated_model.ingest(home_repaint_stream(captured_before));
+    margin_invalidated_model.ingest(QByteArrayLiteral("\x1b[2;28r\x1b[r"));
+    const term::Terminal_screen_model_result margin_invalidated_recovery =
+        margin_invalidated_model.ingest(home_repaint_stream(captured_after));
+    ok &= check(margin_invalidated_model.scrollback_size() == 1 &&
+            margin_invalidated_recovery.recovery_proposals.empty(),
+        "scroll-region change ends anchored repaint episode continuity");
 
     return ok;
 }
@@ -2530,6 +2673,112 @@ bool test_repaint_recovery_shift_helper_matches_policy()
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
         "recovery helper suppresses broad blank-spacer layout repaints");
+
+    const auto anchored_footer_input = []() {
+        term::terminal_repaint_recovery_shift_input_t anchored_input;
+        anchored_input.candidate_active = true;
+        anchored_input.primary_buffer_active = true;
+        anchored_input.scrollback_rows_unchanged = true;
+        anchored_input.candidate_rows.resize(28);
+        anchored_input.current_rows.resize(28);
+        for (int row = 1; row <= 18; ++row) {
+            anchored_input.candidate_rows[static_cast<std::size_t>(row)] =
+                QStringLiteral("body-%1").arg(row);
+        }
+        for (int row = 19; row < 28; ++row) {
+            anchored_input.candidate_rows[static_cast<std::size_t>(row)] =
+                QStringLiteral("footer-%1").arg(row);
+        }
+        for (int row = 0; row < 18; ++row) {
+            anchored_input.current_rows[static_cast<std::size_t>(row)] =
+                anchored_input.candidate_rows[static_cast<std::size_t>(row + 1)];
+        }
+        anchored_input.current_rows[18] = QStringLiteral("rewritten-seam");
+        std::copy(
+            anchored_input.candidate_rows.begin() + 19,
+            anchored_input.candidate_rows.end(),
+            anchored_input.current_rows.begin() + 19);
+        return anchored_input;
+    };
+
+    term::terminal_repaint_recovery_shift_input_t anchored_input =
+        anchored_footer_input();
+    ok &= check(term::primary_repaint_recovery_shift_rows(anchored_input) == 0,
+        "recovery helper requires an accepted repaint episode for anchored footer recovery");
+
+    anchored_input.continuing_repaint_episode = true;
+    const term::terminal_repaint_recovery_shift_result_t anchored_shift =
+        term::primary_repaint_recovery_shift_result(anchored_input);
+    ok &= check(anchored_shift.shifted_rows == 1 &&
+            anchored_shift.matched_prefix_rows == 18 &&
+            anchored_shift.unmatched_tail_rows == 9 &&
+            anchored_shift.anchored_suffix_rows == 9 &&
+            anchored_shift.match_kind ==
+                term::Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED,
+        "recovery helper accepts one dense shifted body, seam, and anchored footer");
+
+    term::terminal_repaint_recovery_shift_input_t two_seams =
+        anchored_footer_input();
+    two_seams.continuing_repaint_episode = true;
+    two_seams.current_rows[19] = QStringLiteral("second-rewritten-seam");
+    ok &= check(term::primary_repaint_recovery_shift_rows(two_seams) == 0,
+        "recovery helper rejects anchored footer recovery with two seams");
+
+    term::terminal_repaint_recovery_shift_input_t sparse_body =
+        anchored_footer_input();
+    sparse_body.continuing_repaint_episode = true;
+    sparse_body.current_rows[17] = QStringLiteral("early-rewritten-seam");
+    sparse_body.current_rows[18] = sparse_body.candidate_rows[18];
+    ok &= check(term::primary_repaint_recovery_shift_rows(sparse_body) == 0,
+        "recovery helper rejects an anchored footer below two-thirds body coverage");
+
+    term::terminal_repaint_recovery_shift_input_t ambiguous_body =
+        anchored_footer_input();
+    ambiguous_body.continuing_repaint_episode = true;
+    for (int row = 1; row <= 18; ++row) {
+        ambiguous_body.candidate_rows[static_cast<std::size_t>(row)] =
+            row <= 2 || row % 2 == 0
+                ? QStringLiteral("body-one")
+                : QStringLiteral("body-two");
+        ambiguous_body.current_rows[static_cast<std::size_t>(row - 1)] =
+            ambiguous_body.candidate_rows[static_cast<std::size_t>(row)];
+    }
+    ok &= check(term::primary_repaint_recovery_shift_rows(ambiguous_body) == 0,
+        "recovery helper rejects an anchored footer below three distinct body anchors");
+
+    term::terminal_repaint_recovery_shift_input_t weak_footer =
+        anchored_footer_input();
+    weak_footer.continuing_repaint_episode = true;
+    for (int row = 19; row < 28; ++row) {
+        weak_footer.candidate_rows[static_cast<std::size_t>(row)].clear();
+        weak_footer.current_rows[static_cast<std::size_t>(row)].clear();
+    }
+    weak_footer.candidate_rows[25] = weak_footer.current_rows[25] =
+        QStringLiteral("footer-one");
+    weak_footer.candidate_rows[26] = weak_footer.current_rows[26] =
+        QStringLiteral("footer-two");
+    ok &= check(term::primary_repaint_recovery_shift_rows(weak_footer) == 0,
+        "recovery helper rejects an anchored footer without three distinct anchors");
+
+    term::terminal_repaint_recovery_shift_input_t two_row_shift =
+        anchored_footer_input();
+    two_row_shift.continuing_repaint_episode = true;
+    two_row_shift.candidate_rows[1].clear();
+    for (int row = 2; row <= 19; ++row) {
+        two_row_shift.candidate_rows[static_cast<std::size_t>(row)] =
+            QStringLiteral("two-row-body-%1").arg(row);
+    }
+    for (int row = 0; row < 18; ++row) {
+        two_row_shift.current_rows[static_cast<std::size_t>(row)] =
+            two_row_shift.candidate_rows[static_cast<std::size_t>(row + 2)];
+    }
+    two_row_shift.current_rows[18] = QStringLiteral("rewritten-seam");
+    std::copy(
+        two_row_shift.candidate_rows.begin() + 19,
+        two_row_shift.candidate_rows.end(),
+        two_row_shift.current_rows.begin() + 19);
+    ok &= check(term::primary_repaint_recovery_shift_rows(two_row_shift) == 0,
+        "recovery helper does not extend anchored footer recovery beyond one-row shifts");
 
     input.candidate_rows = {
         QStringLiteral("aa"),
@@ -5130,6 +5379,7 @@ int main()
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();
     ok &= test_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_primary_repaint_recovery_accepts_anchored_footer_continuation();
     ok &= test_selection_attachment_follows_multiple_successors_in_one_ingest();
     ok &= test_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_primary_repaint_recovery_recovers_blank_separator_row();
