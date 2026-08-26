@@ -31,13 +31,22 @@ not a target build dependency. ShaderTools is not linked to
 `vnm_terminal_surface`, not part of the Qt posture link allowlist, and not an
 installed package dependency.
 
+The glyph coverage atlas is a texture array, so its OpenGL ES program requires
+GLSL ES 3.00. `atlas_glyph.vert.qsb` and
+`atlas_glyph_alpha.frag.qsb` must expose the same `300 es` target and must not
+expose a `100 es` target. GLSL ES 1.00 cannot declare or sample a
+`sampler2DArray`; including that generated variant makes Qt select source that
+cannot compile on an ES 3 device.
+
 Dual-source atlas fragment shader packages must carry OpenGL GLSL 330 targets
 and patched GLSL 150 replacements from the corresponding `.glsl150.frag`
 source files. Qt Shader Baker's generated GLSL 150 output drops the explicit
 fragment-output location while keeping `index = 1`, which some Mesa/OpenGL
-drivers reject. Regenerate those packages with explicit `--glsl
-"100 es,120,150,330"` targets, then replace `glsl,150` from the checked-in
-`.glsl150.frag` file before committing the `.qsb`.
+drivers reject. The dual-source glyph fragment is not selected on the OpenGL ES
+backend, so regenerate `atlas_glyph.frag.qsb` with explicit `--glsl
+"120,150,330"` targets. Regenerate the other dual-source packages with the ES
+targets their shader features support. Replace `glsl,150` from the checked-in
+`.glsl150.frag` file before committing each `.qsb`.
 
 The shaped glyph-atlas fallback uses alpha-blended grayscale glyph coverage.
 LCD/subpixel glyph masks are not used for the glyph-atlas fallback. Known

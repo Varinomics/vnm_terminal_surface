@@ -47,6 +47,7 @@
 #include <private/qquickitem_p.h>
 #include <private/qquickwindow_p.h>
 #include <rhi/qrhi.h>
+#include <rhi/qshader.h>
 
 #if !defined(VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED)
 #define VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED 0
@@ -7103,6 +7104,106 @@ bool source_contains_once(const QByteArray& source, const QByteArray& token)
 {
     const qsizetype first = source.indexOf(token);
     return first >= 0 && source.indexOf(token, first + token.size()) < 0;
+}
+
+bool load_shader_package(const char* path, QShader& out)
+{
+    QFile file(QString::fromLatin1(path));
+    if (!file.open(QIODevice::ReadOnly)) {
+        std::cerr << "FAIL: could not open shader package: " << path << '\n';
+        return false;
+    }
+
+    out = QShader::fromSerialized(file.readAll());
+    if (!out.isValid()) {
+        std::cerr << "FAIL: could not deserialize shader package: " << path << '\n';
+        return false;
+    }
+    return true;
+}
+
+std::set<int> glsl_es_versions(const QShader& shader)
+{
+    std::set<int> versions;
+    for (const QShaderKey& key : shader.availableShaders()) {
+        const QShaderVersion version = key.sourceVersion();
+        if (key.source() == QShader::GlslShader &&
+            version.flags().testFlag(QShaderVersion::GlslEs))
+        {
+            versions.insert(version.version());
+        }
+    }
+    return versions;
+}
+
+bool shader_has_invalid_es_array_sampler_variant(const QShader& shader)
+{
+    for (const QShaderKey& key : shader.availableShaders()) {
+        const QShaderVersion version = key.sourceVersion();
+        if (key.source() != QShader::GlslShader ||
+            !version.flags().testFlag(QShaderVersion::GlslEs) ||
+            version.version() >= 300)
+        {
+            continue;
+        }
+
+        const QByteArray source = shader.shader(key).shader();
+        if (source.contains(QByteArrayLiteral("sampler2DArray")) ||
+            source.contains(QByteArrayLiteral("texture2DArray")))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool test_shader_package_gles_contract()
+{
+    constexpr const char* k_glyph_vertex_path =
+        ":/vnm_terminal_surface/shaders/atlas_glyph.vert.qsb";
+    constexpr const char* k_glyph_fragment_path =
+        ":/vnm_terminal_surface/shaders/atlas_glyph.frag.qsb";
+    constexpr const char* k_glyph_alpha_fragment_path =
+        ":/vnm_terminal_surface/shaders/atlas_glyph_alpha.frag.qsb";
+
+    QShader glyph_vertex;
+    QShader glyph_fragment;
+    QShader glyph_alpha_fragment;
+    bool ok = true;
+    ok &= load_shader_package(k_glyph_vertex_path, glyph_vertex);
+    ok &= load_shader_package(k_glyph_fragment_path, glyph_fragment);
+    ok &= load_shader_package(k_glyph_alpha_fragment_path, glyph_alpha_fragment);
+    if (!ok) {
+        return false;
+    }
+
+    const std::set<int> expected_glyph_es_versions = {300};
+    ok &= check(
+        glsl_es_versions(glyph_vertex) == expected_glyph_es_versions,
+        "glyph vertex package has only the GLES 3.0 atlas variant");
+    ok &= check(
+        glsl_es_versions(glyph_alpha_fragment) == expected_glyph_es_versions,
+        "glyph alpha fragment package matches the GLES 3.0 vertex variant");
+    ok &= check(
+        !shader_has_invalid_es_array_sampler_variant(glyph_fragment) &&
+            !shader_has_invalid_es_array_sampler_variant(glyph_alpha_fragment),
+        "glyph fragment packages do not expose texture arrays to GLSL ES below 3.0");
+
+    const QShaderKey es_300_key(
+        QShader::GlslShader,
+        QShaderVersion(300, QShaderVersion::GlslEs));
+    const QByteArray vertex_es_300 = glyph_vertex.shader(es_300_key).shader();
+    const QByteArray fragment_es_300 =
+        glyph_alpha_fragment.shader(es_300_key).shader();
+    ok &= check(
+        vertex_es_300.startsWith(QByteArrayLiteral("#version 300 es")) &&
+            fragment_es_300.startsWith(QByteArrayLiteral("#version 300 es")),
+        "glyph GLES package keys contain matching ESSL 3.00 source");
+    ok &= check(
+        fragment_es_300.contains(QByteArrayLiteral("sampler2DArray")) &&
+            fragment_es_300.contains(QByteArrayLiteral("texture(")),
+        "glyph GLES fragment samples the texture-array coverage atlas");
+    return ok;
 }
 
 bool test_source_posture()
@@ -20383,6 +20484,7 @@ bool test_font_file_bytes_for_font()
 bool run_unit_tests()
 {
     bool ok = true;
+    ok &= test_shader_package_gles_contract();
     ok &= test_source_posture();
     ok &= test_font_file_bytes_for_font();
     ok &= test_cache_key_includes_physical_size_and_face();
