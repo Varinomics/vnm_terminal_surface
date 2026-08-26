@@ -282,6 +282,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/diagnostics/profile_text.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
+    include/vnm_terminal/terminal_canvas_export.h
     include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/backend_output_capture.cpp
@@ -464,20 +465,27 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package
 endif()
 
 install(FILES
-    include/vnm_terminal/backend_output_capture.h
-    include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
-    include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/vnm_terminal_canvas.h
-    include/vnm_terminal/vnm_terminal_surface.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
 )
 
-install(FILES
-    include/vnm_terminal/diagnostics/metrics_json.h
-    include/vnm_terminal/diagnostics/profile_text.h
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal/diagnostics"
-)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL)
+    install(FILES
+        include/vnm_terminal/backend_output_capture.h
+        include/vnm_terminal/font_metrics.h
+        include/vnm_terminal/terminal_canvas_export.h
+        include/vnm_terminal/terminal_message_submission.h
+        include/vnm_terminal/vnm_terminal_surface.h
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
+    )
+
+    install(FILES
+        include/vnm_terminal/diagnostics/metrics_json.h
+        include/vnm_terminal/diagnostics/profile_text.h
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal/diagnostics"
+    )
+endif()
 
 install(FILES
     LICENSE

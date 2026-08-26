@@ -228,7 +228,8 @@ if(NOT resolved_provider_dir STREQUAL provider_package_dir)
 endif()
 
 set(consumer_build_args
-    --build "${consumer_binary_dir}")
+    --build "${consumer_binary_dir}"
+    --parallel 1)
 if(DEFINED install_config AND NOT "${install_config}" STREQUAL "")
     list(APPEND consumer_build_args
         --config "${install_config}")

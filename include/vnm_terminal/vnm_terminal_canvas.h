@@ -45,6 +45,7 @@ signals:
     void font_family_changed();
     void font_size_changed();
     void frame_changed();
+    void cursor_blink_phase_changed(bool visible);
 
 protected:
     QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override;
@@ -53,6 +54,8 @@ protected:
 
 private:
     void refresh_render_state();
+    void refresh_cursor_blink();
+    void toggle_cursor_blink_phase();
 
     struct Private;
     std::unique_ptr<Private> m_private;

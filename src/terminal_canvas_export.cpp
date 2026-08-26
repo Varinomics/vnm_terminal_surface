@@ -1,11 +1,13 @@
-#include "vnm_terminal/terminal_canvas_frame.h"
+#include "vnm_terminal/terminal_canvas_export.h"
 
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 
+#include <QByteArray>
 #include <QThread>
+#include <cstddef>
 #include <utility>
 
 namespace term = vnm_terminal::internal;
@@ -90,14 +92,37 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         });
     }
 
+    std::size_t frame_text_utf8_bytes = 0U;
     frame->cells.reserve(snapshot->cells.size());
     for (const term::Terminal_render_cell& source_cell : snapshot->cells) {
         if (source_cell.wide_continuation) {
             continue;
         }
 
+        if (source_cell.text.code_unit_count() >
+            k_terminal_canvas_max_cell_text_utf16_code_units)
+        {
+            return {
+                Terminal_canvas_export_status::
+                    CELL_TEXT_UTF16_CODE_UNIT_LIMIT_EXCEEDED,
+                {},
+            };
+        }
+
         QString text;
         source_cell.text.append_to(text);
+        const std::size_t cell_text_utf8_bytes =
+            static_cast<std::size_t>(text.toUtf8().size());
+        if (cell_text_utf8_bytes >
+            static_cast<std::size_t>(k_terminal_canvas_max_frame_text_utf8_bytes) -
+                frame_text_utf8_bytes)
+        {
+            return {
+                Terminal_canvas_export_status::FRAME_TEXT_UTF8_BYTE_LIMIT_EXCEEDED,
+                {},
+            };
+        }
+        frame_text_utf8_bytes += cell_text_utf8_bytes;
         frame->cells.push_back({
             source_cell.position.row,
             source_cell.position.column,

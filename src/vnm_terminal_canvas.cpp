@@ -10,6 +10,7 @@
 #include <QFont>
 #include <QQuickWindow>
 #include <QThread>
+#include <QTimer>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -64,25 +65,6 @@ term::Terminal_cursor_shape internal_cursor_shape(
 std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
     const vnm_terminal::Terminal_canvas_frame& frame)
 {
-    if (frame.api_version != vnm_terminal::k_terminal_canvas_frame_api_version ||
-        frame.rows <= 0 || frame.rows > vnm_terminal::k_terminal_canvas_max_rows ||
-        frame.columns <= 0 ||
-        frame.columns > vnm_terminal::k_terminal_canvas_max_columns ||
-        frame.cells.size() > vnm_terminal::k_terminal_canvas_max_cells ||
-        frame.styles.empty() ||
-        frame.styles.size() > vnm_terminal::k_terminal_canvas_max_styles)
-    {
-        return {};
-    }
-
-    const vnm_terminal::Terminal_canvas_style& default_style = frame.styles.front();
-    if (default_style.foreground_rgba != frame.default_foreground_rgba ||
-        default_style.background_rgba != frame.default_background_rgba ||
-        default_style.attributes != 0U)
-    {
-        return {};
-    }
-
     auto snapshot = std::make_shared<term::Terminal_render_snapshot>();
     snapshot->grid_size             = {frame.rows, frame.columns};
     snapshot->viewport.visible_rows = frame.rows;
@@ -104,10 +86,6 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
     snapshot->styles.push_back(term::make_default_terminal_text_style());
     for (std::size_t index = 1U; index < frame.styles.size(); ++index) {
         const vnm_terminal::Terminal_canvas_style& style = frame.styles[index];
-        if ((style.attributes & ~k_canvas_style_attribute_mask) != 0U) {
-            return {};
-        }
-
         snapshot->styles.push_back({
             term::make_rgb_terminal_color_ref(style.foreground_rgba),
             term::make_rgb_terminal_color_ref(style.background_rgba),
@@ -117,17 +95,6 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
 
     std::size_t materialized_cell_count = 0U;
     for (const vnm_terminal::Terminal_canvas_cell& cell : frame.cells) {
-        if (cell.row < 0 || cell.row >= frame.rows ||
-            cell.column < 0 || cell.column >= frame.columns ||
-            cell.display_width <= 0 ||
-            cell.display_width > frame.columns - cell.column ||
-            static_cast<std::size_t>(cell.style_index) >= frame.styles.size() ||
-            materialized_cell_count >
-                vnm_terminal::k_terminal_canvas_max_cells -
-                    static_cast<std::size_t>(cell.display_width))
-        {
-            return {};
-        }
         materialized_cell_count += static_cast<std::size_t>(cell.display_width);
     }
 
@@ -158,12 +125,89 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
         }
     }
 
-    if (term::validate_render_snapshot(*snapshot).status !=
-        term::Terminal_render_snapshot_status::OK)
-    {
-        return {};
-    }
     return snapshot;
+}
+
+bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
+{
+    if (frame.api_version != vnm_terminal::k_terminal_canvas_frame_api_version ||
+        frame.rows <= 0 || frame.rows > vnm_terminal::k_terminal_canvas_max_rows ||
+        frame.columns <= 0 ||
+        frame.columns > vnm_terminal::k_terminal_canvas_max_columns ||
+        frame.cells.size() > vnm_terminal::k_terminal_canvas_max_cells ||
+        frame.styles.empty() ||
+        frame.styles.size() > vnm_terminal::k_terminal_canvas_max_styles)
+    {
+        return false;
+    }
+
+    const vnm_terminal::Terminal_canvas_style& default_style = frame.styles.front();
+    if (default_style.foreground_rgba != frame.default_foreground_rgba ||
+        default_style.background_rgba != frame.default_background_rgba ||
+        default_style.attributes != 0U)
+    {
+        return false;
+    }
+
+    for (std::size_t index = 1U; index < frame.styles.size(); ++index) {
+        const vnm_terminal::Terminal_canvas_style& style = frame.styles[index];
+        if ((style.attributes & ~k_canvas_style_attribute_mask) != 0U) {
+            return false;
+        }
+    }
+
+    std::size_t materialized_cell_count = 0U;
+    std::size_t frame_text_utf8_bytes   = 0U;
+    int         previous_row            = -1;
+    int         previous_end_column     = 0;
+    for (const vnm_terminal::Terminal_canvas_cell& cell : frame.cells) {
+        if (cell.row < 0 || cell.row >= frame.rows ||
+            cell.column < 0 || cell.column >= frame.columns ||
+            cell.display_width <= 0 ||
+            cell.display_width > frame.columns - cell.column ||
+            static_cast<std::size_t>(cell.style_index) >= frame.styles.size() ||
+            materialized_cell_count >
+                vnm_terminal::k_terminal_canvas_max_cells -
+                    static_cast<std::size_t>(cell.display_width))
+        {
+            return false;
+        }
+
+        if (previous_row > cell.row ||
+            (previous_row == cell.row && previous_end_column > cell.column))
+        {
+            return false;
+        }
+
+        if (cell.text.size() >
+            vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units)
+        {
+            return false;
+        }
+        const std::size_t cell_text_utf8_bytes =
+            static_cast<std::size_t>(cell.text.toUtf8().size());
+        if (cell_text_utf8_bytes >
+            static_cast<std::size_t>(
+                vnm_terminal::k_terminal_canvas_max_frame_text_utf8_bytes) -
+                frame_text_utf8_bytes)
+        {
+            return false;
+        }
+
+        materialized_cell_count += static_cast<std::size_t>(cell.display_width);
+        frame_text_utf8_bytes   += cell_text_utf8_bytes;
+        previous_row            = cell.row;
+        previous_end_column     = cell.column + cell.display_width;
+    }
+
+    if (frame.cursor.visible &&
+        (frame.cursor.row < 0 || frame.cursor.row >= frame.rows ||
+         frame.cursor.column < 0 || frame.cursor.column >= frame.columns))
+    {
+        return false;
+    }
+
+    return true;
 }
 
 term::Terminal_render_options render_options(
@@ -188,6 +232,8 @@ struct VNM_TerminalCanvas::Private
     term::terminal_cell_metrics_t                               cell_metrics;
     std::shared_ptr<term::Qsg_atlas_recorder>                   recorder =
         std::make_shared<term::Qsg_atlas_recorder>();
+    QTimer*                                                     cursor_blink_timer   = nullptr;
+    bool                                                        cursor_blink_visible = true;
     qreal                                                       device_pixel_ratio = 1.0;
     std::uint64_t                                               font_epoch          = 1U;
     std::uint64_t                                               capture_sequence    = 0U;
@@ -202,6 +248,13 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
 {
     setFlag(ItemHasContents, true);
     setClip(true);
+    m_private->cursor_blink_timer = new QTimer(this);
+    m_private->cursor_blink_timer->setInterval(500);
+    connect(
+        m_private->cursor_blink_timer,
+        &QTimer::timeout,
+        this,
+        &VNM_TerminalCanvas::toggle_cursor_blink_phase);
     refresh_render_state();
 }
 
@@ -268,21 +321,29 @@ bool VNM_TerminalCanvas::set_canvas_frame(
         }
         m_private->frame.reset();
         m_private->snapshot.reset();
+        refresh_cursor_blink();
         refresh_render_state();
         emit frame_changed();
         return true;
+    }
+
+    if (!canvas_frame_is_valid(*frame)) {
+        return false;
     }
 
     const std::shared_ptr<const vnm_terminal::Terminal_canvas_frame> owned_frame =
         std::make_shared<const vnm_terminal::Terminal_canvas_frame>(*frame);
     const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
         materialize_snapshot(*owned_frame);
-    if (snapshot == nullptr) {
+    if (term::validate_render_snapshot(*snapshot).status !=
+        term::Terminal_render_snapshot_status::OK)
+    {
         return false;
     }
 
     m_private->frame    = owned_frame;
     m_private->snapshot = snapshot;
+    refresh_cursor_blink();
     refresh_render_state();
     emit frame_changed();
     return true;
@@ -317,7 +378,7 @@ QSGNode* VNM_TerminalCanvas::updatePaintNode(
         m_private->device_pixel_ratio,
         m_private->font_epoch,
         ++m_private->capture_sequence,
-        true);
+        m_private->cursor_blink_visible);
     return term::update_qsg_atlas_node(
         old_node,
         std::move(captured),
@@ -370,5 +431,38 @@ void VNM_TerminalCanvas::refresh_render_state()
         setImplicitWidth(0.0);
         setImplicitHeight(0.0);
     }
+    update();
+}
+
+void VNM_TerminalCanvas::refresh_cursor_blink()
+{
+    const bool enabled =
+        m_private->frame != nullptr &&
+        m_private->frame->cursor.visible &&
+        m_private->frame->cursor.blink_enabled;
+    if (enabled) {
+        m_private->cursor_blink_timer->start();
+    }
+    else {
+        m_private->cursor_blink_timer->stop();
+    }
+
+    if (!m_private->cursor_blink_visible) {
+        m_private->cursor_blink_visible = true;
+        emit cursor_blink_phase_changed(true);
+    }
+}
+
+void VNM_TerminalCanvas::toggle_cursor_blink_phase()
+{
+    if (m_private->frame == nullptr ||
+        !m_private->frame->cursor.visible ||
+        !m_private->frame->cursor.blink_enabled)
+    {
+        return;
+    }
+
+    m_private->cursor_blink_visible = !m_private->cursor_blink_visible;
+    emit cursor_blink_phase_changed(m_private->cursor_blink_visible);
     update();
 }

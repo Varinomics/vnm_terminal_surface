@@ -606,6 +606,7 @@ add_test(
 
 add_executable(vnm_terminal_canvas_export
     terminal_canvas_export/public_header_compile.cpp
+    terminal_canvas_export/public_export_header_compile.cpp
     terminal_canvas_export/terminal_canvas_export_tests.cpp
 )
 
@@ -623,6 +624,32 @@ add_test(
         "${CMAKE_COMMAND}" -E env
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_canvas_export>"
+)
+
+add_executable(vnm_terminal_canvas_contract
+    terminal_canvas_renderer/terminal_canvas_contract_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_canvas_contract PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface_renderer
+)
+
+set_target_properties(vnm_terminal_canvas_contract PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_canvas_contract
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_canvas_contract>"
+)
+
+set_tests_properties(vnm_terminal_canvas_contract PROPERTIES
+    LABELS "renderer;canvas;contract"
+    TIMEOUT 30
 )
 
 add_executable(vnm_terminal_canvas_renderer
@@ -2028,6 +2055,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
     vnm_terminal_canvas_export
+    vnm_terminal_canvas_contract
     vnm_terminal_canvas_renderer
     vnm_terminal_render_frame
     vnm_terminal_qsg_atlas
@@ -2178,6 +2206,30 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package
             "Installing vnm_terminal_surface with MSDF requires packaged vnm_msdf_text"
     )
 endif()
+
+add_test(
+    NAME vnm_terminal_surface_renderer_only_package_consumer_builds
+    COMMAND
+        "${CMAKE_COMMAND}"
+        "-Dgenerator=${CMAKE_GENERATOR}"
+        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
+        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
+        "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
+        "-Dsource_dir=${PROJECT_SOURCE_DIR}"
+        "-Dproducer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_producer"
+        "-Dinstall_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_install"
+        "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke_renderer_only"
+        "-Dconsumer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_consumer"
+        "-Dqt6_dir=${Qt6_DIR}"
+        -P "${PROJECT_SOURCE_DIR}/tests/package_smoke_renderer_only/expect_consumer_builds.cmake"
+)
+
+set_tests_properties(
+    vnm_terminal_surface_renderer_only_package_consumer_builds
+    PROPERTIES
+        LABELS "package;renderer;architecture"
+        TIMEOUT 240
+)
 
 add_test(
     NAME vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch

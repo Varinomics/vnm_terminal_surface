@@ -4,10 +4,7 @@
 #include <QtGlobal>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <vector>
-
-class VNM_TerminalSurface;
 
 namespace vnm_terminal {
 
@@ -16,18 +13,12 @@ inline constexpr int           k_terminal_canvas_max_rows          = 200;
 inline constexpr int           k_terminal_canvas_max_columns       = 300;
 inline constexpr std::size_t   k_terminal_canvas_max_cells         = 32'768U;
 inline constexpr std::size_t   k_terminal_canvas_max_styles        = 256U;
-
-enum class Terminal_canvas_export_status
-{
-    OK,
-    NO_FRAME,
-    WRONG_THREAD,
-    INVALID_SOURCE_FRAME,
-    ROW_LIMIT_EXCEEDED,
-    COLUMN_LIMIT_EXCEEDED,
-    CELL_LIMIT_EXCEEDED,
-    STYLE_LIMIT_EXCEEDED,
-};
+inline constexpr qsizetype k_terminal_canvas_max_cell_text_utf16_code_units =
+    4'096;
+// The 96 KiB text budget leaves the surrounding 128 KiB wire envelope room
+// for geometry, styles, cursor state, framing, and other capability metadata.
+inline constexpr qsizetype k_terminal_canvas_max_frame_text_utf8_bytes =
+    96 * 1'024;
 
 enum class Terminal_canvas_cursor_shape
 {
@@ -92,16 +83,5 @@ struct Terminal_canvas_frame
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;
 };
-
-struct Terminal_canvas_export_result
-{
-    Terminal_canvas_export_status              status = Terminal_canvas_export_status::NO_FRAME;
-    std::shared_ptr<const Terminal_canvas_frame> frame;
-};
-
-// Call on the surface's owning thread. The returned frame owns all of its data;
-// later surface publications cannot mutate a previously returned frame.
-Terminal_canvas_export_result export_terminal_canvas_frame(
-    const VNM_TerminalSurface& surface);
 
 } // namespace vnm_terminal

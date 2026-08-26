@@ -1,5 +1,5 @@
 #include "helpers/test_check.h"
-#include "vnm_terminal/terminal_canvas_frame.h"
+#include "vnm_terminal/terminal_canvas_export.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 
 #include "vnm_terminal/internal/render_snapshot.h"
@@ -15,6 +15,7 @@
 namespace term = vnm_terminal::internal;
 
 bool terminal_canvas_public_header_contract();
+bool terminal_canvas_public_export_header_contract();
 
 namespace {
 
@@ -291,6 +292,77 @@ bool test_exact_bounds_and_one_over_fail_closed()
     return ok;
 }
 
+bool test_text_bounds_fail_closed_without_truncation()
+{
+    bool                ok = true;
+    VNM_TerminalSurface surface;
+
+    const QString exact_cell_text(
+        vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units,
+        QLatin1Char('x'));
+    auto exact_cell = make_snapshot(1, 1);
+    exact_cell->cells.push_back(make_cell(0, 0, exact_cell_text));
+    ok &= expect_status(
+        surface,
+        std::move(exact_cell),
+        vnm_terminal::Terminal_canvas_export_status::OK,
+        "exact per-cell UTF-16 code-unit limit exports");
+
+    QString excess_cell_text = exact_cell_text;
+    excess_cell_text += QLatin1Char('x');
+    auto excess_cell = make_snapshot(1, 1);
+    excess_cell->cells.push_back(make_cell(0, 0, std::move(excess_cell_text)));
+    ok &= expect_status(
+        surface,
+        std::move(excess_cell),
+        vnm_terminal::Terminal_canvas_export_status::
+            CELL_TEXT_UTF16_CODE_UNIT_LIMIT_EXCEEDED,
+        "per-cell UTF-16 code-unit limit plus one fails explicitly");
+
+    constexpr qsizetype k_multibyte_utf8_bytes_per_code_unit = 2;
+    static_assert(
+        vnm_terminal::k_terminal_canvas_max_frame_text_utf8_bytes %
+            (vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units *
+                k_multibyte_utf8_bytes_per_code_unit) == 0);
+    const qsizetype aggregate_cell_count =
+        vnm_terminal::k_terminal_canvas_max_frame_text_utf8_bytes /
+        (vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units *
+            k_multibyte_utf8_bytes_per_code_unit);
+    const QString multibyte_cell_text(
+        vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units,
+        QChar(0x00e9U));
+
+    auto exact_frame = make_snapshot(1, static_cast<int>(aggregate_cell_count));
+    for (int column = 0; column < exact_frame->grid_size.columns; ++column) {
+        exact_frame->cells.push_back(
+            make_cell(0, column, multibyte_cell_text));
+    }
+    ok &= expect_status(
+        surface,
+        std::move(exact_frame),
+        vnm_terminal::Terminal_canvas_export_status::OK,
+        "exact aggregate UTF-8 byte limit exports multibyte text");
+
+    auto excess_frame = make_snapshot(
+        1,
+        static_cast<int>(aggregate_cell_count) + 1);
+    for (int column = 0; column < aggregate_cell_count; ++column) {
+        excess_frame->cells.push_back(
+            make_cell(0, column, multibyte_cell_text));
+    }
+    excess_frame->cells.push_back(make_cell(
+        0,
+        static_cast<int>(aggregate_cell_count),
+        QStringLiteral("x")));
+    ok &= expect_status(
+        surface,
+        std::move(excess_frame),
+        vnm_terminal::Terminal_canvas_export_status::
+            FRAME_TEXT_UTF8_BYTE_LIMIT_EXCEEDED,
+        "aggregate UTF-8 byte limit plus one fails explicitly");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -299,8 +371,11 @@ int main(int argc, char** argv)
     bool            ok = true;
     ok &= check(terminal_canvas_public_header_contract(),
         "public header compiles independently and publishes exact bounds");
+    ok &= check(terminal_canvas_public_export_header_contract(),
+        "full-only exporter header compiles independently");
     ok &= test_no_frame_and_invalid_source_are_explicit();
     ok &= test_frame_preserves_canvas_authority_and_prior_immutability();
     ok &= test_exact_bounds_and_one_over_fail_closed();
+    ok &= test_text_bounds_fail_closed_without_truncation();
     return ok ? 0 : 1;
 }
