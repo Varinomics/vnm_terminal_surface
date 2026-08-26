@@ -16679,6 +16679,108 @@ bool test_keyboard_no_session_and_post_exit_semantics(QGuiApplication& app)
     return ok;
 }
 
+bool test_ordinary_exit_retains_output_interaction(QGuiApplication& app)
+{
+    bool ok = true;
+    Clipboard_text_guard clipboard_guard;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    fixture.surface.set_wheel_event_policy(
+        VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_FIRST);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    ok &= check(started, "ordinary-exit interaction surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    pump_events(app);
+    ok &= check(
+        fixture.surface.process_state() == VNM_TerminalSurface::Process_state::EXITED,
+        "ordinary-exit interaction surface is noninteractive");
+    const int offset_before_wheel = fixture.surface.viewport_offset_from_tail();
+    const std::size_t write_count = backend_ptr->writes.size();
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::NoModifier,
+        120,
+        true,
+        "ordinary-exit retained output accepts scrollback wheel input");
+    ok &= check(
+        fixture.surface.viewport_offset_from_tail() > offset_before_wheel,
+        "ordinary-exit retained output wheel changes the viewport");
+    ok &= check(backend_ptr->writes.size() == write_count,
+        "ordinary-exit retained output wheel writes no backend input");
+
+    const QPointF selection_start = point_in_grid_cell(fixture.surface, 0, 0);
+    const QPointF selection_end   = point_in_grid_cell(fixture.surface, 0, 5);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        selection_start,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "ordinary-exit retained output accepts selection press");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        selection_end,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "ordinary-exit retained output accepts selection drag");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        selection_end,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "ordinary-exit retained output accepts selection release");
+    const QString selected_text = fixture.surface.selected_text();
+    ok &= check(!selected_text.isEmpty(),
+        "ordinary-exit retained output exposes selected_text");
+    QGuiApplication::clipboard()->setText(
+        QStringLiteral("ordinary-exit-copy-sentinel"),
+        QClipboard::Clipboard);
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_C,
+        Qt::ControlModifier,
+        {},
+        "ordinary-exit retained output accepts copy shortcut");
+    ok &= check(
+        QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            selected_text,
+        "ordinary-exit retained output copy updates the clipboard");
+    ok &= check(backend_ptr->writes.size() == write_count,
+        "ordinary-exit retained output copy writes no backend input");
+
+    fixture.surface.clear_selection();
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        "ordinary-exit mapped text remains consumed by the inactive surface");
+    ok &= check(backend_ptr->writes.size() == write_count,
+        "ordinary-exit mapped text writes no backend input");
+    return ok;
+}
+
 bool test_keyboard_unhandled_key_skips_backend_drain(QGuiApplication& app)
 {
     bool ok = true;
@@ -18200,6 +18302,7 @@ int main(int argc, char** argv)
     ok &= test_keyboard_keypad_modes(app);
     ok &= test_keyboard_focus_routed_delivery(app);
     ok &= test_keyboard_no_session_and_post_exit_semantics(app);
+    ok &= test_ordinary_exit_retains_output_interaction(app);
     ok &= test_keyboard_unhandled_key_skips_backend_drain(app);
     ok &= test_worker_callback_drains_on_gui_thread(app);
     ok &= test_hover_move_does_not_drain_queued_backend_output(app);
