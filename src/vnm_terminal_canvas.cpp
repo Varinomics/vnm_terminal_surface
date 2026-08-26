@@ -221,6 +221,15 @@ term::Terminal_render_options render_options(
     return options;
 }
 
+bool canvas_cursor_blink_enabled(
+    const std::shared_ptr<const vnm_terminal::Terminal_canvas_frame>& frame)
+{
+    return
+        frame != nullptr &&
+        frame->cursor.visible &&
+        frame->cursor.blink_enabled;
+}
+
 } // namespace
 
 struct VNM_TerminalCanvas::Private
@@ -319,9 +328,11 @@ bool VNM_TerminalCanvas::set_canvas_frame(
         if (m_private->frame == nullptr) {
             return true;
         }
+        const bool cursor_blink_was_enabled =
+            canvas_cursor_blink_enabled(m_private->frame);
         m_private->frame.reset();
         m_private->snapshot.reset();
-        refresh_cursor_blink();
+        refresh_cursor_blink(cursor_blink_was_enabled);
         refresh_render_state();
         emit frame_changed();
         return true;
@@ -341,9 +352,11 @@ bool VNM_TerminalCanvas::set_canvas_frame(
         return false;
     }
 
+    const bool cursor_blink_was_enabled =
+        canvas_cursor_blink_enabled(m_private->frame);
     m_private->frame    = owned_frame;
     m_private->snapshot = snapshot;
-    refresh_cursor_blink();
+    refresh_cursor_blink(cursor_blink_was_enabled);
     refresh_render_state();
     emit frame_changed();
     return true;
@@ -434,19 +447,25 @@ void VNM_TerminalCanvas::refresh_render_state()
     update();
 }
 
-void VNM_TerminalCanvas::refresh_cursor_blink()
+void VNM_TerminalCanvas::refresh_cursor_blink(bool was_enabled)
 {
-    const bool enabled =
-        m_private->frame != nullptr &&
-        m_private->frame->cursor.visible &&
-        m_private->frame->cursor.blink_enabled;
-    if (enabled) {
-        m_private->cursor_blink_timer->start();
-    }
-    else {
-        m_private->cursor_blink_timer->stop();
+    const bool enabled = canvas_cursor_blink_enabled(m_private->frame);
+    if (enabled == was_enabled) {
+        // Active replacements preserve the established timer cadence and
+        // visible phase; the disabled state is already stopped and normalized.
+        return;
     }
 
+    if (enabled) {
+        if (!m_private->cursor_blink_visible) {
+            m_private->cursor_blink_visible = true;
+            emit cursor_blink_phase_changed(true);
+        }
+        m_private->cursor_blink_timer->start();
+        return;
+    }
+
+    m_private->cursor_blink_timer->stop();
     if (!m_private->cursor_blink_visible) {
         m_private->cursor_blink_visible = true;
         emit cursor_blink_phase_changed(true);

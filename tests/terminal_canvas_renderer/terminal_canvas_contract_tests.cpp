@@ -134,6 +134,7 @@ bool test_cursor_blink_phase_and_lifecycle()
 {
     bool             ok = true;
     QPointer<QTimer> timer_lifetime;
+    std::vector<bool> phases;
     {
         VNM_TerminalCanvas canvas;
         QTimer* const      timer = canvas.findChild<QTimer*>();
@@ -143,7 +144,6 @@ bool test_cursor_blink_phase_and_lifecycle()
             return false;
         }
 
-        std::vector<bool> phases;
         QObject::connect(
             &canvas,
             &VNM_TerminalCanvas::cursor_blink_phase_changed,
@@ -161,16 +161,46 @@ bool test_cursor_blink_phase_and_lifecycle()
             "blinking cursor frame is accepted");
         ok &= check(timer->isActive(),
             "accepted blinking cursor starts the canvas-owned timer");
+        ok &= check(timer->interval() == 500,
+            "canvas-owned blink cadence is 500 ms");
+        const int active_timer_id = timer->timerId();
+        bool      replacements_accepted = true;
+        for (std::uint64_t sequence = 21U; sequence <= 23U; ++sequence) {
+            auto replacement = make_frame(sequence);
+            replacement->cursor = blinking->cursor;
+            replacements_accepted &= canvas.set_canvas_frame(replacement);
+        }
+        ok &= check(
+            replacements_accepted && canvas.frame_sequence() == 23U,
+            "frequent blink-enabled replacements publish the latest frame");
+        ok &= check(timer->timerId() == active_timer_id && phases.empty(),
+            "blink-enabled replacements preserve cadence and visible phase");
+
         ok &= check(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection),
             "blink timer timeout can be delivered deterministically");
         ok &= check(phases.size() == 1U && !phases[0],
             "first blink phase hides the cursor");
+
+        replacements_accepted = true;
+        for (std::uint64_t sequence = 24U; sequence <= 26U; ++sequence) {
+            auto replacement = make_frame(sequence);
+            replacement->cursor = blinking->cursor;
+            replacements_accepted &= canvas.set_canvas_frame(replacement);
+        }
+        ok &= check(
+            replacements_accepted && canvas.frame_sequence() == 26U,
+            "frequent hidden-phase replacements publish the latest frame");
+        ok &= check(
+            timer->timerId() == active_timer_id &&
+            phases.size() == 1U && !phases[0],
+            "hidden phase and original timer cadence survive frame replacement");
+
         ok &= check(QMetaObject::invokeMethod(timer, "timeout", Qt::DirectConnection),
             "second blink timer timeout can be delivered deterministically");
         ok &= check(phases.size() == 2U && phases[1],
             "second blink phase restores the cursor");
 
-        auto steady = make_frame(21U);
+        auto steady = make_frame(27U);
         steady->cursor.visible       = true;
         steady->cursor.blink_enabled = false;
         ok &= check(canvas.set_canvas_frame(steady),
@@ -183,7 +213,9 @@ bool test_cursor_blink_phase_and_lifecycle()
         ok &= check(phases.size() == phase_count,
             "stopped timer cannot advance a non-blinking cursor phase");
 
-        ok &= check(canvas.set_canvas_frame(blinking),
+        auto restarted = make_frame(28U);
+        restarted->cursor = blinking->cursor;
+        ok &= check(canvas.set_canvas_frame(restarted),
             "blinking cursor can restart after a steady frame");
         ok &= check(timer->isActive(), "restarted blink timer is active");
         ok &= check(canvas.set_canvas_frame({}), "clearing a blinking frame succeeds");

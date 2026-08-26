@@ -54,7 +54,7 @@ protected:
 
 private:
     void refresh_render_state();
-    void refresh_cursor_blink();
+    void refresh_cursor_blink(bool was_enabled);
     void toggle_cursor_blink_phase();
 
     struct Private;
