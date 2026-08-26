@@ -604,6 +604,27 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_render_snapshot>"
 )
 
+add_executable(vnm_terminal_canvas_export
+    terminal_canvas_export/public_header_compile.cpp
+    terminal_canvas_export/terminal_canvas_export_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_canvas_export PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_canvas_export PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_canvas_export
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_canvas_export>"
+)
+
 add_executable(vnm_terminal_render_frame
     render_frame/render_frame_tests.cpp
 )
@@ -1957,6 +1978,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_diagnostics_schema_sync
     vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
+    vnm_terminal_canvas_export
     vnm_terminal_render_frame
     vnm_terminal_qsg_atlas
     vnm_terminal_shaping_contract
