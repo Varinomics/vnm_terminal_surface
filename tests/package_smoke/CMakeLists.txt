@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(vnm_terminal_surface CONFIG REQUIRED)
 
+if(NOT TARGET vnm_terminal_surface::vnm_terminal_surface_renderer)
+    message(FATAL_ERROR
+        "vnm_terminal_surface package must export its renderer-only target")
+endif()
+
 if(NOT TARGET Qt6::GuiPrivate)
     message(FATAL_ERROR
         "vnm_terminal_surface package must find Qt6::GuiPrivate for exported private Qt API use")
@@ -41,6 +46,16 @@ if(NOT vnm_terminal_surface_interface MATCHES "Qt6::GuiPrivate")
         "vnm_terminal_surface package must export the Qt6::GuiPrivate private link dependency")
 endif()
 
+get_target_property(vnm_terminal_renderer_interface
+    vnm_terminal_surface::vnm_terminal_surface_renderer
+    INTERFACE_LINK_LIBRARIES)
+if(vnm_terminal_renderer_interface MATCHES
+    "vnm_qt_dispatch|terminal_session|terminal_history|terminal_input|pty")
+    message(FATAL_ERROR
+        "renderer-only package target exports a forbidden backend dependency: "
+        "${vnm_terminal_renderer_interface}")
+endif()
+
 if(vnm_terminal_surface_interface MATCHES "ShaderTools")
     message(FATAL_ERROR
         "vnm_terminal_surface package must not export Qt6::ShaderTools")
@@ -50,7 +65,8 @@ if(VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED)
         message(FATAL_ERROR
             "vnm_terminal_surface package must find vnm_msdf_text when MSDF is enabled")
     endif()
-    if(NOT vnm_terminal_surface_interface MATCHES "vnm_msdf_text::vnm_msdf_text")
+    if(NOT vnm_terminal_surface_interface MATCHES "vnm_msdf_text::vnm_msdf_text" AND
+        NOT vnm_terminal_renderer_interface MATCHES "vnm_msdf_text::vnm_msdf_text")
         message(FATAL_ERROR
             "vnm_terminal_surface package must export the vnm_msdf_text link dependency")
     endif()

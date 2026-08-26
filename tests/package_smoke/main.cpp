@@ -1,6 +1,8 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "vnm_terminal/diagnostics/metrics_json.h"
 #include "vnm_terminal/font_metrics.h"
+#include "vnm_terminal/terminal_canvas_frame.h"
+#include "vnm_terminal/vnm_terminal_canvas.h"
 
 #include <optional>
 #include <utility>
@@ -59,13 +61,16 @@ int main()
         &vnm_terminal::cell_metrics_valid;
     const auto standalone_boundary = &invoke_standalone_boundary;
     const auto worker_boundary = &invoke_worker_boundary;
+    bool (VNM_TerminalCanvas::*set_canvas_frame)(
+        std::shared_ptr<const vnm_terminal::Terminal_canvas_frame>) =
+            &VNM_TerminalCanvas::set_canvas_frame;
 
     return (append_atlas != nullptr &&
             append_render_invalidation != nullptr &&
             append_backend_drain != nullptr &&
             default_family != nullptr && metrics_for_font != nullptr &&
             metrics_valid != nullptr && standalone_boundary != nullptr &&
-            worker_boundary != nullptr)
+            worker_boundary != nullptr && set_canvas_frame != nullptr)
         ? 0
         : 1;
 }

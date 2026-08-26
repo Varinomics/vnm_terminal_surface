@@ -32,6 +32,9 @@ endif()
 option(VNM_TERMINAL_SURFACE_BUILD_TESTING
     "Build vnm_terminal_surface tests"
     ${vnm_terminal_surface_build_testing_default})
+option(VNM_TERMINAL_SURFACE_BUILD_FULL
+    "Build the process/session/input-owning vnm_terminal_surface target"
+    ON)
 option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readiness validation gates" OFF)
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
@@ -67,7 +70,8 @@ if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_ENABLE_PROFILING)
 endif()
 
 set(vnm_terminal_surface_testing_enabled OFF)
-if(BUILD_TESTING AND VNM_TERMINAL_SURFACE_BUILD_TESTING)
+if(BUILD_TESTING AND VNM_TERMINAL_SURFACE_BUILD_TESTING AND
+    VNM_TERMINAL_SURFACE_BUILD_FULL)
     set(vnm_terminal_surface_testing_enabled ON)
 endif()
 
@@ -88,7 +92,8 @@ set(vnm_terminal_qt_components
 find_package(Qt6 6.11 REQUIRED COMPONENTS ${vnm_terminal_qt_components})
 include(cmake/vnm_terminal_qt_posture.cmake)
 
-if(NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND
+    NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
     if(VNM_QT_DISPATCH_SOURCE_DIR)
         if(NOT EXISTS "${VNM_QT_DISPATCH_SOURCE_DIR}/CMakeLists.txt")
             message(FATAL_ERROR
@@ -112,7 +117,8 @@ if(NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
     FetchContent_MakeAvailable(vnm_terminal_surface_qt_dispatch)
 endif()
 
-if(NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND
+    NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
     message(FATAL_ERROR
         "vnm_qt_dispatch target is unavailable after dependency discovery.")
 endif()
@@ -129,6 +135,111 @@ vnm_terminal_validate_qt_posture(DIRECT_TARGETS
 
 set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR "${Qt6_VERSION_MAJOR}")
 set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
+set(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE
+    "${VNM_TERMINAL_SURFACE_BUILD_FULL}")
+
+set(vnm_terminal_surface_renderer_sources
+    include/vnm_terminal/internal/cell_stable_shaping.h
+    include/vnm_terminal/internal/hierarchical_profiler.h
+    include/vnm_terminal/internal/ime_contract.h
+    include/vnm_terminal/internal/metrics_contract.h
+    include/vnm_terminal/internal/qsg_atlas_font_bytes.h
+    include/vnm_terminal/internal/qsg_atlas_renderer.h
+    include/vnm_terminal/internal/qsg_atlas_warm_set.h
+    include/vnm_terminal/internal/qsg_terminal_render_frame.h
+    include/vnm_terminal/internal/qsg_terminal_renderer.h
+    include/vnm_terminal/internal/qt_grid_metrics_provider.h
+    include/vnm_terminal/internal/render_snapshot.h
+    include/vnm_terminal/internal/selection_contract.h
+    include/vnm_terminal/internal/terminal_graphic_geometry.h
+    include/vnm_terminal/internal/terminal_hyperlink.h
+    include/vnm_terminal/internal/terminal_render_cell_text.h
+    include/vnm_terminal/internal/terminal_style.h
+    include/vnm_terminal/internal/unicode_width.h
+    include/vnm_terminal/internal/unicode_width_tables.h
+    include/vnm_terminal/internal/vnm_terminal_font.h
+    include/vnm_terminal/internal/viewport_contract.h
+    include/vnm_terminal/terminal_canvas_frame.h
+    include/vnm_terminal/vnm_terminal_canvas.h
+    src/qsg_atlas_font_bytes.cpp
+    src/qsg_atlas_renderer.cpp
+    src/qsg_terminal_renderer.cpp
+    src/qt_grid_metrics_provider.cpp
+    src/metrics_contract.cpp
+    src/unicode_width_tables.cpp
+    src/vnm_terminal_font.cpp
+    src/vnm_terminal_canvas.cpp
+)
+
+add_library(vnm_terminal_surface_renderer STATIC
+    ${vnm_terminal_surface_renderer_sources}
+)
+
+qt_add_resources(vnm_terminal_surface_renderer_resource_sources
+    resources/vnm_terminal_surface.qrc
+)
+
+target_sources(vnm_terminal_surface_renderer PRIVATE
+    ${vnm_terminal_surface_renderer_resource_sources}
+)
+
+target_include_directories(vnm_terminal_surface_renderer PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+)
+
+target_link_libraries(vnm_terminal_surface_renderer PUBLIC
+    ${vnm_terminal_qt_targets}
+)
+
+target_link_libraries(vnm_terminal_surface_renderer PRIVATE
+    Qt6::GuiPrivate
+    Qt6::QuickPrivate
+)
+
+target_compile_definitions(vnm_terminal_surface_renderer PUBLIC
+    VNM_TERMINAL_PROFILING_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_PROFILING}>
+)
+
+target_compile_definitions(vnm_terminal_surface_renderer PRIVATE
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER}>
+)
+
+if(WIN32)
+    target_link_libraries(vnm_terminal_surface_renderer PRIVATE
+        dwrite
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(vnm_terminal_surface_renderer PRIVATE
+        /FS
+    )
+endif()
+
+if(VNM_TERMINAL_SANITIZE_ADDRESS)
+    if(MSVC)
+        target_compile_options(vnm_terminal_surface_renderer PRIVATE /fsanitize=address)
+        target_compile_definitions(vnm_terminal_surface_renderer PRIVATE
+            _DISABLE_VECTOR_ANNOTATION
+            _DISABLE_STRING_ANNOTATION
+        )
+    else()
+        target_compile_options(vnm_terminal_surface_renderer PRIVATE -fsanitize=address)
+        target_link_options(vnm_terminal_surface_renderer PUBLIC -fsanitize=address)
+    endif()
+endif()
+
+cmake_language(DEFER CALL
+    vnm_terminal_validate_qt_link_interface
+    vnm_terminal_surface_renderer)
+
+add_library(
+    vnm_terminal_surface::vnm_terminal_surface_renderer
+    ALIAS
+    vnm_terminal_surface_renderer)
+
+if(VNM_TERMINAL_SURFACE_BUILD_FULL)
 
 add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/backend_output_capture.h
@@ -141,10 +252,6 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/metrics_json_writers.h
     include/vnm_terminal/internal/parser_action.h
     include/vnm_terminal/internal/profile_text_writers.h
-    include/vnm_terminal/internal/qsg_atlas_renderer.h
-    include/vnm_terminal/internal/qsg_terminal_render_frame.h
-    include/vnm_terminal/internal/qsg_terminal_renderer.h
-    include/vnm_terminal/internal/qt_grid_metrics_provider.h
     include/vnm_terminal/internal/render_snapshot.h
     include/vnm_terminal/internal/selection_contract.h
     include/vnm_terminal/internal/session_contract.h
@@ -166,7 +273,6 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/utf8_scan.h
     include/vnm_terminal/internal/unicode_width.h
     include/vnm_terminal/internal/unicode_width_tables.h
-    include/vnm_terminal/internal/vnm_terminal_font.h
     include/vnm_terminal/internal/viewport_contract.h
     include/vnm_terminal/internal/wheel_gesture.h
     include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h
@@ -198,27 +304,12 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_screen_model.cpp
     src/terminal_screen_model_snapshot.cpp
     src/terminal_search.cpp
-    src/metrics_contract.cpp
     src/native_backend_io_core.cpp
-    src/qsg_atlas_font_bytes.cpp
-    src/qsg_atlas_renderer.cpp
-    src/qsg_terminal_renderer.cpp
-    src/qt_grid_metrics_provider.cpp
     src/selection_contract.cpp
     src/session_contract.cpp
-    src/unicode_width_tables.cpp
     src/viewport_contract.cpp
-    src/vnm_terminal_font.cpp
     src/vnm_terminal_surface.cpp
     src/wheel_gesture.cpp
-)
-
-qt_add_resources(vnm_terminal_surface_resource_sources
-    resources/vnm_terminal_surface.qrc
-)
-
-target_sources(vnm_terminal_surface PRIVATE
-    ${vnm_terminal_surface_resource_sources}
 )
 
 if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
@@ -256,6 +347,7 @@ target_include_directories(vnm_terminal_surface PUBLIC
 
 target_link_libraries(vnm_terminal_surface PUBLIC
     ${vnm_terminal_qt_targets}
+    vnm_terminal_surface::vnm_terminal_surface_renderer
 )
 
 target_link_libraries(vnm_terminal_surface PRIVATE
@@ -273,6 +365,8 @@ target_compile_definitions(vnm_terminal_surface PRIVATE
     VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
 )
 
+endif()
+
 if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
     vnm_terminal_msdf_text_make_available(
@@ -286,23 +380,23 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER)
         vnm_msdf_text::vnm_msdf_text
         IMPORTED)
     if(vnm_terminal_msdf_text_package_dependency)
-        target_link_libraries(vnm_terminal_surface PRIVATE
+        target_link_libraries(vnm_terminal_surface_renderer PRIVATE
             vnm_msdf_text::vnm_msdf_text
         )
     else()
-        target_link_libraries(vnm_terminal_surface PRIVATE
+        target_link_libraries(vnm_terminal_surface_renderer PRIVATE
             "$<BUILD_INTERFACE:vnm_msdf_text::vnm_msdf_text>"
         )
     endif()
 endif()
 
-if(MSVC)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND MSVC)
     target_compile_options(vnm_terminal_surface PRIVATE
         /FS
     )
 endif()
 
-if(VNM_TERMINAL_SANITIZE_ADDRESS)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND VNM_TERMINAL_SANITIZE_ADDRESS)
     if(MSVC)
         target_compile_options(vnm_terminal_surface PRIVATE /fsanitize=address)
         # Only our code is instrumented (Qt and the FetchContent deps are not), so
@@ -317,7 +411,8 @@ if(VNM_TERMINAL_SANITIZE_ADDRESS)
     endif()
 endif()
 
-if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND
+    CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     find_library(VNM_TERMINAL_PTY_UTIL_LIBRARY util)
     if(VNM_TERMINAL_PTY_UTIL_LIBRARY)
         target_link_libraries(vnm_terminal_surface PRIVATE
@@ -326,9 +421,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     endif()
 endif()
 
-cmake_language(DEFER CALL vnm_terminal_validate_qt_link_interface vnm_terminal_surface)
-
-add_library(vnm_terminal_surface::vnm_terminal_surface ALIAS vnm_terminal_surface)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL)
+    cmake_language(DEFER CALL vnm_terminal_validate_qt_link_interface vnm_terminal_surface)
+    add_library(vnm_terminal_surface::vnm_terminal_surface ALIAS vnm_terminal_surface)
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # FreeType is statically linked into consumers through vnm_msdf_text/msdfgen.
@@ -337,11 +433,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # X11/Wayland), corrupting Qt glyph loading (FT_Load_Glyph err=7) and breaking
     # glyph rasterization. Exclude static-archive symbols from consumers' dynamic
     # exports so Qt keeps using its own FreeType.
-    target_link_options(vnm_terminal_surface INTERFACE "-Wl,--exclude-libs,ALL")
+    target_link_options(vnm_terminal_surface_renderer INTERFACE "-Wl,--exclude-libs,ALL")
+endif()
+
+set(vnm_terminal_surface_install_targets
+    vnm_terminal_surface_renderer
+)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL)
+    list(APPEND vnm_terminal_surface_install_targets
+        vnm_terminal_surface
+    )
 endif()
 
 install(TARGETS
-    vnm_terminal_surface
+    ${vnm_terminal_surface_install_targets}
     EXPORT vnm_terminal_surfaceTargets
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
@@ -363,6 +468,7 @@ install(FILES
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_message_submission.h
+    include/vnm_terminal/vnm_terminal_canvas.h
     include/vnm_terminal/vnm_terminal_surface.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
 )

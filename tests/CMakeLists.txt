@@ -625,6 +625,55 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_canvas_export>"
 )
 
+add_executable(vnm_terminal_canvas_renderer
+    terminal_canvas_renderer/terminal_canvas_renderer_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_canvas_renderer PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface_renderer
+)
+
+set_target_properties(vnm_terminal_canvas_renderer PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_canvas_renderer
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_readback_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_canvas_renderer>"
+)
+
+set_tests_properties(vnm_terminal_canvas_renderer PROPERTIES
+    LABELS "renderer;canvas;host"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 60
+)
+
+set(vnm_terminal_renderer_inventory_file
+    "${CMAKE_CURRENT_BINARY_DIR}/renderer_target_inventory_$<CONFIG>.txt")
+file(GENERATE
+    OUTPUT "${vnm_terminal_renderer_inventory_file}"
+    CONTENT "sources=$<JOIN:$<TARGET_PROPERTY:vnm_terminal_surface_renderer,SOURCES>,|>\nlinks=$<JOIN:$<TARGET_PROPERTY:vnm_terminal_surface_renderer,LINK_LIBRARIES>,|>\ninterface_links=$<JOIN:$<TARGET_PROPERTY:vnm_terminal_surface_renderer,INTERFACE_LINK_LIBRARIES>,|>\n"
+)
+
+add_test(
+    NAME vnm_terminal_renderer_source_inventory
+    COMMAND
+        "${CMAKE_COMMAND}"
+        "-Dinventory_file=${vnm_terminal_renderer_inventory_file}"
+        "-Dsource_root=${PROJECT_SOURCE_DIR}"
+        -P "${PROJECT_SOURCE_DIR}/tests/renderer_source_inventory/renderer_source_inventory_tests.cmake"
+)
+
+set_tests_properties(vnm_terminal_renderer_source_inventory PROPERTIES
+    LABELS "renderer;architecture;inventory"
+    TIMEOUT 30
+)
+
 add_executable(vnm_terminal_render_frame
     render_frame/render_frame_tests.cpp
 )
@@ -1979,6 +2028,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
     vnm_terminal_canvas_export
+    vnm_terminal_canvas_renderer
     vnm_terminal_render_frame
     vnm_terminal_qsg_atlas
     vnm_terminal_shaping_contract
