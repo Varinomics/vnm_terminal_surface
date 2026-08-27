@@ -595,12 +595,19 @@ repository and uses this surface as its terminal engine.
 Headers under `include/vnm_terminal/internal/` are implementation detail, not
 consumer API. They are never installed: the package smoke test
 (`tests/package_smoke`) hard-fails if any `vnm_terminal/internal` header reaches
-the install tree, and the public install interface exposes only
-`vnm_terminal/vnm_terminal_surface.h`, `vnm_terminal/font_metrics.h`, and the
-`vnm_terminal/diagnostics/` subtree. Embedders that consume the installed
-package therefore cannot include internal headers and must rely on the public
-surface, the public `diagnostics/` serializers, and the public font/metrics API.
-Renderer diagnostics are exposed through the public `qsg_atlas` serializer.
+the install tree. Every build installs the bounded immutable canvas contract
+(`vnm_terminal/terminal_canvas_frame.h`) and the backend-free Qt Quick canvas
+(`vnm_terminal/vnm_terminal_canvas.h`) through
+`vnm_terminal_surface::vnm_terminal_surface_renderer`. A full build additionally
+installs `vnm_terminal/backend_output_capture.h`,
+`vnm_terminal/font_metrics.h`, `vnm_terminal/terminal_canvas_export.h`,
+`vnm_terminal/terminal_message_submission.h`,
+`vnm_terminal/vnm_terminal_surface.h`, and the `vnm_terminal/diagnostics/`
+subtree through
+`vnm_terminal_surface::vnm_terminal_surface`. Embedders that consume the
+installed package therefore cannot include internal headers and must rely on
+these public targets and headers. Renderer diagnostics are exposed through the
+public `qsg_atlas` serializer.
 Internal headers carry no source- or binary-stability guarantee and may change
 without notice.
 

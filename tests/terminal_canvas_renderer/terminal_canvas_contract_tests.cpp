@@ -83,6 +83,14 @@ bool test_frame_contract_and_text_bounds()
     ok &= check(canvas.frame_sequence() == 11U,
         "rejected frame preserves the prior accepted canvas");
 
+    auto invalid_cursor = make_frame(12U);
+    invalid_cursor->cursor.shape =
+        static_cast<vnm_terminal::Terminal_canvas_cursor_shape>(0xffU);
+    ok &= check(!canvas.set_canvas_frame(invalid_cursor),
+        "unknown cursor shape is rejected");
+    ok &= check(canvas.frame_sequence() == 11U,
+        "cursor-shape rejection preserves the prior accepted canvas");
+
     const QString exact_cell_text(
         vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units,
         QLatin1Char('x'));

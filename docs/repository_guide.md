@@ -50,6 +50,10 @@ surface; source-tree consumers rebuild the surface against their own Qt.
   `ON` when the surface is the top-level project and `OFF` when it is included
   as a subproject. Test executables are configured only when both this option
   and `BUILD_TESTING` are `ON`.
+- `VNM_TERMINAL_SURFACE_BUILD_FULL` is `ON` by default. Turning it off omits
+  the full surface library and packages only the backend-free terminal canvas
+  renderer, without the terminal session, parser, native PTY/ConPTY backend,
+  input, or dispatch dependency.
 - `VNM_TERMINAL_BUILD_BENCHMARKS` is `OFF` by default. It adds benchmark
   targets and benchmark CTest validation tests when both test gates are
   enabled.
@@ -94,8 +98,11 @@ native backend reports an unavailable-backend error for process launch.
 
 The root CMake project builds:
 
+- `vnm_terminal_surface_renderer`, the backend-free Qt Quick canvas renderer,
+  with alias `vnm_terminal_surface::vnm_terminal_surface_renderer`;
 - `vnm_terminal_surface`, the static library, with alias
-  `vnm_terminal_surface::vnm_terminal_surface`;
+  `vnm_terminal_surface::vnm_terminal_surface`, when
+  `VNM_TERMINAL_SURFACE_BUILD_FULL=ON`;
 - `vnm_terminal_canvas_fixture`, the scripted child process used by backend,
   surface, and conformance tests;
 - `vnm_terminal_transcript_replay`, only when
@@ -383,6 +390,17 @@ target_link_libraries(my_terminal PRIVATE
     vnm_terminal_surface::vnm_terminal_surface)
 ```
 
+For a backend-free canvas consumer, configure the dependency with
+`VNM_TERMINAL_SURFACE_BUILD_FULL=OFF` and link only the renderer target:
+
+```cmake
+set(VNM_TERMINAL_SURFACE_BUILD_FULL OFF CACHE BOOL "" FORCE)
+set(VNM_TERMINAL_SURFACE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+add_subdirectory("../vnm_terminal_surface" "${CMAKE_BINARY_DIR}/_deps/vnm_terminal_surface")
+target_link_libraries(my_canvas PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface_renderer)
+```
+
 Installed consumers can use the exported package:
 
 ```cmake
@@ -391,8 +409,16 @@ target_link_libraries(my_terminal PRIVATE
     vnm_terminal_surface::vnm_terminal_surface)
 ```
 
-The installed package exports the public host header
-`include/vnm_terminal/vnm_terminal_surface.h`. Source-tree headers under
+Every installed package exports
+`vnm_terminal_surface::vnm_terminal_surface_renderer` with
+`vnm_terminal/terminal_canvas_frame.h` and
+`vnm_terminal/vnm_terminal_canvas.h`. A full package also exports
+`vnm_terminal_surface::vnm_terminal_surface` with
+`vnm_terminal/backend_output_capture.h`, `vnm_terminal/font_metrics.h`,
+`vnm_terminal/terminal_canvas_export.h`,
+`vnm_terminal/terminal_message_submission.h`,
+`vnm_terminal/vnm_terminal_surface.h`, and the public diagnostics headers.
+Source-tree headers under
 `include/vnm_terminal/internal` are implementation and test contracts, not
 installed consumer API.
 

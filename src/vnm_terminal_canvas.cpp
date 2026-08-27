@@ -62,6 +62,19 @@ term::Terminal_cursor_shape internal_cursor_shape(
     return term::Terminal_cursor_shape::BLOCK;
 }
 
+bool canvas_cursor_shape_is_valid(
+    vnm_terminal::Terminal_canvas_cursor_shape shape)
+{
+    switch (shape) {
+        case vnm_terminal::Terminal_canvas_cursor_shape::BLOCK:
+        case vnm_terminal::Terminal_canvas_cursor_shape::BAR:
+        case vnm_terminal::Terminal_canvas_cursor_shape::UNDERLINE:
+            return true;
+    }
+
+    return false;
+}
+
 std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
     const vnm_terminal::Terminal_canvas_frame& frame)
 {
@@ -136,7 +149,8 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
         frame.columns > vnm_terminal::k_terminal_canvas_max_columns ||
         frame.cells.size() > vnm_terminal::k_terminal_canvas_max_cells ||
         frame.styles.empty() ||
-        frame.styles.size() > vnm_terminal::k_terminal_canvas_max_styles)
+        frame.styles.size() > vnm_terminal::k_terminal_canvas_max_styles ||
+        !canvas_cursor_shape_is_valid(frame.cursor.shape))
     {
         return false;
     }
