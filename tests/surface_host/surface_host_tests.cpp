@@ -17116,16 +17116,24 @@ bool test_after_frame_callback_update_latch_falls_back_on_window_destroy(
     const QString tail_text = QStringLiteral("after-frame-detach-tail");
     backend_ptr->emit_output(epoch_catchup_budget_probe_payload(tail_text.toUtf8()));
 
+    // Keep the frame-owner wake queued while the zero-budget polish creates
+    // the incomplete slice. Dispatching it afterward starts the watchdog only
+    // after the potentially slow polish, so this fixture measures detach
+    // fallback rather than watchdog fallback.
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(*surface);
+    ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            *surface) > 0U,
+        "after-frame detach fallback leaves callback work behind the frame wait");
+
     QCoreApplication::sendPostedEvents(surface, QEvent::MetaCall);
     const term::Terminal_surface_render_invalidation_stats_t scheduled_stats =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(*surface);
     ok &= check(scheduled_stats.pending_update,
         "after-frame detach fallback starts with frame work pending");
-
-    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(*surface);
-    ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
-            *surface) > 0U,
-        "after-frame detach fallback leaves callback work behind the frame wait");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            backend_callback_after_frame_wait_active_for_testing(*surface),
+        "after-frame detach fallback owns pending callbacks through the frame");
     ok &= check(!term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
             *surface),
         "after-frame detach fallback does not use posted drains while frame is viable");
