@@ -1244,22 +1244,23 @@ private:
         const qsizetype bytes_size = bytes.size();
         deliver_or_buffer_native_backend_output(
             m_mutex,
+            m_output_cv,
             m_callbacks,
             m_paused_output,
             m_output_paused,
             m_paused_output_delivery_in_progress,
             std::move(bytes),
             [this, bytes_size] {
-                // This backend admits a chunk only while the buffer stays at or under the
-                // high watermark, so the pause buffer never exceeds it. The POSIX backend
-                // admits while the buffer is below the watermark instead, and refuses to
-                // buffer at all once stopping. The two policies are not interchangeable
-                // and neither is the shared default.
                 return
-                    m_output_delivery_limits.delivery_chunk_bytes > 0  &&
+                    m_output_delivery_limits.delivery_chunk_bytes > 0 &&
+                    m_paused_output.size() <=
+                        m_output_delivery_limits.high_watermark_bytes &&
                     bytes_size <=
                         m_output_delivery_limits.high_watermark_bytes -
                             m_paused_output.size();
+            },
+            [this] {
+                return m_shutdown_started;
             });
     }
 

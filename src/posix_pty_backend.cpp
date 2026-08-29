@@ -1401,24 +1401,26 @@ private:
 
     void deliver_or_buffer_output(QByteArray bytes)
     {
+        const qsizetype bytes_size = bytes.size();
         deliver_or_buffer_native_backend_output(
             m_mutex,
+            m_output_cv,
             m_callbacks,
             m_paused_output,
             m_output_paused,
             m_paused_output_delivery_in_progress,
             std::move(bytes),
-            [this] {
-                // This backend stops buffering once stopping and admits a chunk while the
-                // buffer is still below the high watermark, so a chunk may carry it past
-                // the watermark. The Windows backend admits only while the buffer stays at
-                // or under the watermark, and keeps buffering while stopping. The two
-                // policies are not interchangeable and neither is the shared default.
+            [this, bytes_size] {
                 return
-                    !m_stopping                                      &&
-                    m_paused_output_limits.delivery_chunk_bytes > 0  &&
-                    m_paused_output.size() <
-                        m_paused_output_limits.high_watermark_bytes;
+                    m_paused_output_limits.delivery_chunk_bytes > 0 &&
+                    m_paused_output.size() <=
+                        m_paused_output_limits.high_watermark_bytes &&
+                    bytes_size <=
+                        m_paused_output_limits.high_watermark_bytes -
+                            m_paused_output.size();
+            },
+            [this] {
+                return m_stopping;
             });
     }
 

@@ -390,58 +390,52 @@ void deliver_native_backend_output_with_snapshot(
 
 // Appends `bytes` to the paused-output FIFO, or delivers them when nothing is pending.
 //
-// The FIFO is never bypassed. `can_buffer_paused_output` is an admission bound the
-// caller's reader must keep satisfiable, not an overflow relief valve: the else branch
-// emits `bytes` immediately, so taking it while the FIFO is non-empty would put newer
-// bytes ahead of older ones and corrupt the VT stream the session parses. Both backends
-// uphold that by parking their read loop on the output condition variable once the paused
-// buffer reaches the high watermark, which is why the else branch is normally reached only
-// with an empty FIFO. Windows also clamps every read to the room left under the watermark,
-// because only its predicate weighs the incoming chunk size; the POSIX predicate weighs
-// the buffered size alone, so there the clamp only bounds the overshoot. Both backends fix
-// these limits in `start()` before the reader thread exists, so a read is always clamped
-// against the same numbers the predicate later tests.
+// The FIFO is never bypassed. A reader may pass its pre-read admission check and then
+// observe a pause or an in-progress replay after the blocking native read returns. When
+// neither direct delivery nor bounded FIFO admission remains possible, this boundary
+// parks that backend reader on `output_cv`; the GUI/owner thread never calls it. Resume,
+// replay completion, exit and teardown all wake the same condition variable. A teardown
+// stop discards the already-read bytes only after the backend has cleared its callbacks.
 //
-// The one clause that can refuse with bytes still buffered is the POSIX `m_stopping`
-// clause, and both of its shapes are safe. The two shutdown paths clear the callbacks
-// under the same lock that sets the flag, so the else branch snapshots an empty
-// `output_received` and emits nothing. The exit-report path leaves the callbacks live, but
-// it runs only after the reader thread has finished and the pending buffer has been
-// drained, so no reader is left to take the else branch against a non-empty FIFO.
-//
-// A reader that reads more than its own predicate admits reintroduces the reordering.
-template <typename Can_buffer_paused_output_fn>
+// Both backends clamp each read to their fixed delivery budget before the reader exists,
+// so admission here keeps the native FIFO and both downstream queues bounded.
+template <typename Can_buffer_paused_output_fn, typename Stop_requested_fn>
 void deliver_or_buffer_native_backend_output(
     std::mutex&                        mutex,
+    std::condition_variable&           output_cv,
     Terminal_backend_callbacks&        callbacks,
     QByteArray&                        paused_output,
     bool&                              output_paused,
     bool&                              paused_output_delivery_in_progress,
     QByteArray                         bytes,
-    Can_buffer_paused_output_fn&&      can_buffer_paused_output)
+    Can_buffer_paused_output_fn&&      can_buffer_paused_output,
+    Stop_requested_fn&&                stop_requested)
 {
-    bool should_deliver = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if ((output_paused ||
-             paused_output_delivery_in_progress ||
-             !paused_output.isEmpty()) &&
-            can_buffer_paused_output())
-        {
-            append_native_backend_paused_output(paused_output, std::move(bytes));
-        }
-        else {
-            should_deliver = true;
-        }
-    }
-
-    if (!should_deliver) {
-        return;
-    }
-
     Terminal_backend_callbacks callback_snapshot;
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
+        output_cv.wait(lock, [&] {
+            const bool delivery_pending =
+                output_paused ||
+                paused_output_delivery_in_progress ||
+                !paused_output.isEmpty();
+            return
+                stop_requested() ||
+                !delivery_pending ||
+                can_buffer_paused_output();
+        });
+        if (stop_requested()) {
+            return;
+        }
+
+        if (output_paused ||
+            paused_output_delivery_in_progress ||
+            !paused_output.isEmpty())
+        {
+            append_native_backend_paused_output(paused_output, std::move(bytes));
+            return;
+        }
+
         callback_snapshot = callbacks;
     }
 

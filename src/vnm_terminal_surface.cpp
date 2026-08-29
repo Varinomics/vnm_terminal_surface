@@ -3126,6 +3126,7 @@ VNM_TerminalSurface::~VNM_TerminalSurface()
     if (m_private->session != nullptr &&
         is_live_process_state(m_private->session->process_state()))
     {
+        emit termination_requested(Termination_initiator::SURFACE_DESTRUCTION);
         (void)m_private->session->terminate();
     }
     reset_session();
@@ -4786,6 +4787,11 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
             scroll_result,
             viewport_before,
             viewport_after);
+        if (diagnostic.visible_scroll_applied &&
+            !m_private->shutting_down.load())
+        {
+            emit viewport_interaction_applied();
+        }
         return diagnostic;
     }
 
@@ -4917,6 +4923,11 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
             scroll_result,
             viewport_before,
             viewport_after);
+        if (diagnostic.visible_scroll_applied &&
+            !m_private->shutting_down.load())
+        {
+            emit viewport_interaction_applied();
+        }
         return diagnostic;
     }
 
@@ -5045,6 +5056,7 @@ bool VNM_TerminalSurface::terminate_process()
         return false;
     }
 
+    emit termination_requested(Termination_initiator::PUBLIC_REQUEST);
     const term::Terminal_session_result result =
         m_private->session->terminate();
     sync_from_session();
@@ -7003,6 +7015,9 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 local_scroll_applied &&
                 (!render_publication_blocked_after_scroll || public_projection_scroll_visible);
             trace_visible_scroll_applied = visible_scroll_applied;
+            if (visible_scroll_applied && !m_private->shutting_down.load()) {
+                emit viewport_interaction_applied();
+            }
             const QString outcome =
                 deferred_intent_recorded
                     ? QStringLiteral("public_projection_deferred_intent_recorded")

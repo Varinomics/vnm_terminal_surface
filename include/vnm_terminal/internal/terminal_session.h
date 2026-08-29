@@ -937,6 +937,8 @@ private:
     bool queue_high_water_reached(
         Queue_category             category) const;
 
+    bool output_backpressure_required() const;
+
     void set_output_backpressure_active(
         bool                       active,
         std::uint64_t              sequence);
@@ -944,9 +946,6 @@ private:
     Terminal_session_result handle_output_overflow(
         std::uint64_t              sequence,
         QString                    message);
-
-    void terminate_after_output_overflow(
-        std::uint64_t              sequence);
 
     bool should_ignore_backend_output_after_stop(
         std::uint64_t              sequence) const;

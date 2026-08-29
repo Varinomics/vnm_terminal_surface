@@ -147,6 +147,23 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
         frame.rows <= 0 || frame.rows > vnm_terminal::k_terminal_canvas_max_rows ||
         frame.columns <= 0 ||
         frame.columns > vnm_terminal::k_terminal_canvas_max_columns ||
+        !std::isfinite(frame.font_size) || frame.font_size < 1.0 ||
+        frame.font_size > vnm_terminal::k_terminal_canvas_max_font_pixel_size ||
+        !std::isfinite(frame.cell_width) || frame.cell_width <= 0.0 ||
+        !std::isfinite(frame.cell_height) || frame.cell_height <= 0.0 ||
+        !std::isfinite(frame.content_width) || frame.content_width <= 0.0 ||
+        !std::isfinite(frame.content_height) || frame.content_height <= 0.0 ||
+        std::max(
+            1,
+            static_cast<int>(frame.content_width / frame.cell_width)) !=
+            frame.columns ||
+        std::max(
+            1,
+            static_cast<int>(frame.content_height / frame.cell_height)) !=
+            frame.rows ||
+        !vnm_terminal::terminal_canvas_grid_fits_cell_budget(
+            frame.rows,
+            frame.columns) ||
         frame.cells.size() > vnm_terminal::k_terminal_canvas_max_cells ||
         frame.styles.empty() ||
         frame.styles.size() > vnm_terminal::k_terminal_canvas_max_styles ||
@@ -256,6 +273,8 @@ struct VNM_TerminalCanvas::Private
     std::shared_ptr<term::Qsg_atlas_recorder>                   recorder =
         std::make_shared<term::Qsg_atlas_recorder>();
     QTimer*                                                     cursor_blink_timer   = nullptr;
+    QTimer*                                                     render_status_timer  = nullptr;
+    QString                                                     render_error;
     bool                                                        cursor_blink_visible = true;
     qreal                                                       device_pixel_ratio = 1.0;
     std::uint64_t                                               font_epoch          = 1U;
@@ -278,6 +297,14 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
         &QTimer::timeout,
         this,
         &VNM_TerminalCanvas::toggle_cursor_blink_phase);
+    m_private->render_status_timer = new QTimer(this);
+    m_private->render_status_timer->setInterval(100);
+    connect(
+        m_private->render_status_timer,
+        &QTimer::timeout,
+        this,
+        &VNM_TerminalCanvas::refresh_render_status);
+    m_private->render_status_timer->start();
     refresh_render_state();
 }
 
@@ -316,6 +343,21 @@ void VNM_TerminalCanvas::set_font_size(qreal font_size)
     refresh_render_state();
 }
 
+bool VNM_TerminalCanvas::authoritative_cell_metrics_enabled() const
+{
+    return m_authoritative_cell_metrics_enabled;
+}
+
+void VNM_TerminalCanvas::set_authoritative_cell_metrics_enabled(bool enabled)
+{
+    if (m_authoritative_cell_metrics_enabled == enabled) {
+        return;
+    }
+    m_authoritative_cell_metrics_enabled = enabled;
+    emit authoritative_cell_metrics_enabled_changed();
+    refresh_render_state();
+}
+
 int VNM_TerminalCanvas::rows() const
 {
     return m_private->frame != nullptr ? m_private->frame->rows : 0;
@@ -329,6 +371,11 @@ int VNM_TerminalCanvas::columns() const
 qulonglong VNM_TerminalCanvas::frame_sequence() const
 {
     return m_private->frame != nullptr ? m_private->frame->sequence : 0U;
+}
+
+QString VNM_TerminalCanvas::render_error() const
+{
+    return m_private->render_error;
 }
 
 bool VNM_TerminalCanvas::set_canvas_frame(
@@ -346,6 +393,11 @@ bool VNM_TerminalCanvas::set_canvas_frame(
             canvas_cursor_blink_enabled(m_private->frame);
         m_private->frame.reset();
         m_private->snapshot.reset();
+        m_private->recorder->reset();
+        if (!m_private->render_error.isEmpty()) {
+            m_private->render_error.clear();
+            emit render_error_changed();
+        }
         refresh_cursor_blink(cursor_blink_was_enabled);
         refresh_render_state();
         emit frame_changed();
@@ -444,21 +496,94 @@ void VNM_TerminalCanvas::refresh_render_state()
         m_private->device_pixel_ratio);
     m_private->cell_metrics = m_private->metrics_provider.cell_metrics();
 
+    if (m_authoritative_cell_metrics_enabled && m_private->frame != nullptr &&
+        term::is_valid_cell_metrics(m_private->cell_metrics))
+    {
+        const qreal vertical_scale =
+            m_private->frame->cell_height / m_private->cell_metrics.height;
+        m_private->cell_metrics.width = m_private->frame->cell_width;
+        m_private->cell_metrics.height = m_private->frame->cell_height;
+        m_private->cell_metrics.ascent *= vertical_scale;
+        m_private->cell_metrics.descent *= vertical_scale;
+    }
+
     if (m_private->frame != nullptr &&
         term::is_valid_cell_metrics(m_private->cell_metrics))
     {
-        setImplicitWidth(
-            static_cast<qreal>(m_private->frame->columns) *
-                m_private->cell_metrics.width);
-        setImplicitHeight(
-            static_cast<qreal>(m_private->frame->rows) *
-                m_private->cell_metrics.height);
+        setImplicitWidth(m_authoritative_cell_metrics_enabled
+            ? m_private->frame->content_width
+            : static_cast<qreal>(m_private->frame->columns) *
+                  m_private->cell_metrics.width);
+        setImplicitHeight(m_authoritative_cell_metrics_enabled
+            ? m_private->frame->content_height
+            : static_cast<qreal>(m_private->frame->rows) *
+                  m_private->cell_metrics.height);
     }
     else {
         setImplicitWidth(0.0);
         setImplicitHeight(0.0);
     }
     update();
+}
+
+void VNM_TerminalCanvas::refresh_render_status()
+{
+    const term::Qsg_atlas_frame_report report = m_private->recorder->snapshot();
+    QString error;
+    const bool glyph_generation_failed =
+        report.frame_build.glyph_missed_instances > 0 ||
+        report.frame_build.glyph_coverage_failures > 0 ||
+        report.frame_build.glyph_atlas_insert_failures > 0;
+    const bool resource_generation_failed =
+        report.command_buffer_non_null &&
+        report.render_target_non_null &&
+        report.rhi_non_null &&
+        !report.prepared_generation_committed;
+    if (m_private->frame != nullptr && report.prepare_count > 0U &&
+        (glyph_generation_failed || resource_generation_failed))
+    {
+        const term::Qsg_atlas_frame_build_summary& build = report.frame_build;
+        if (build.glyph_missed_instances > 0) {
+            const term::Qsg_atlas_glyph_miss_diagnostic& miss =
+                build.first_glyph_miss;
+            if (miss.cause ==
+                term::Qsg_atlas_glyph_miss_cause::ATLAS_INSERT_FAILED)
+            {
+                error = QStringLiteral(
+                    "Terminal rendering paused: %1 glyph instances exceeded "
+                    "the bounded atlas (%2 x %3 pixels, %4/%5 pages, %6 MiB "
+                    "maximum). The last complete canvas is retained; reduce "
+                    "zoom to resume.")
+                    .arg(build.glyph_missed_instances)
+                    .arg(report.cache.page_size.width())
+                    .arg(report.cache.page_size.height())
+                    .arg(report.cache.page_count)
+                    .arg(report.cache.page_budget)
+                    .arg(report.cache.budget_bytes / (1024U * 1024U));
+            }
+            else {
+                error = QStringLiteral(
+                    "Terminal rendering paused because %1 glyph instances "
+                    "could not be rasterized (%2). The last complete canvas "
+                    "is retained.")
+                    .arg(build.glyph_missed_instances)
+                    .arg(QString::fromLatin1(
+                        term::qsg_atlas_glyph_miss_cause_name(miss.cause)));
+            }
+        }
+        else {
+            error = QStringLiteral(
+                "Terminal rendering paused because the graphics resources for "
+                "the new canvas could not be prepared. The last complete "
+                "canvas is retained.");
+        }
+    }
+
+    if (m_private->render_error == error) {
+        return;
+    }
+    m_private->render_error = std::move(error);
+    emit render_error_changed();
 }
 
 void VNM_TerminalCanvas::refresh_cursor_blink(bool was_enabled)

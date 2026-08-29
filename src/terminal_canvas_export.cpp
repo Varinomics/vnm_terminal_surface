@@ -1,12 +1,14 @@
 #include "vnm_terminal/terminal_canvas_export.h"
 
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 
 #include <QByteArray>
 #include <QThread>
+#include <cmath>
 #include <cstddef>
 #include <utility>
 
@@ -54,7 +56,11 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     if (snapshot->grid_size.columns > k_terminal_canvas_max_columns) {
         return {Terminal_canvas_export_status::COLUMN_LIMIT_EXCEEDED, {}};
     }
-    if (snapshot->cells.size() > k_terminal_canvas_max_cells) {
+    if (!terminal_canvas_grid_fits_cell_budget(
+            snapshot->grid_size.rows,
+            snapshot->grid_size.columns) ||
+        snapshot->cells.size() > k_terminal_canvas_max_cells)
+    {
         return {Terminal_canvas_export_status::CELL_LIMIT_EXCEEDED, {}};
     }
     if (snapshot->styles.size() > k_terminal_canvas_max_styles) {
@@ -62,8 +68,29 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     }
 
     auto frame = std::make_shared<Terminal_canvas_frame>();
+    const term::terminal_cell_metrics_t cell_metrics =
+        term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
+    if (!term::is_valid_cell_metrics(cell_metrics) ||
+        !std::isfinite(surface.width()) || surface.width() <= 0.0 ||
+        !std::isfinite(surface.height()) || surface.height() <= 0.0)
+    {
+        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
+    }
+    const term::Terminal_metrics_result authoritative_grid =
+        term::grid_size_for_geometry(surface.size(), cell_metrics);
+    if (authoritative_grid.status != term::Terminal_metrics_status::OK ||
+        authoritative_grid.grid_size.rows != snapshot->grid_size.rows ||
+        authoritative_grid.grid_size.columns != snapshot->grid_size.columns)
+    {
+        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
+    }
     frame->rows                        = snapshot->grid_size.rows;
     frame->columns                     = snapshot->grid_size.columns;
+    frame->font_size                   = surface.font_size();
+    frame->cell_width                  = cell_metrics.width;
+    frame->cell_height                 = cell_metrics.height;
+    frame->content_width               = surface.width();
+    frame->content_height              = surface.height();
     frame->sequence                    = snapshot->metadata.sequence;
     frame->publication_generation      = snapshot->metadata.publication_generation;
     frame->row_origin_generation       = snapshot->metadata.row_origin_generation;

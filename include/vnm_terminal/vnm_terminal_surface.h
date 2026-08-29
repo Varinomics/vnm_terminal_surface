@@ -301,6 +301,13 @@ public:
     };
     Q_ENUM(Exit_reason)
 
+    enum class Termination_initiator
+    {
+        PUBLIC_REQUEST,
+        SURFACE_DESTRUCTION,
+    };
+    Q_ENUM(Termination_initiator)
+
     enum class Backend_error_code
     {
         INVALID_LAUNCH_CONFIG,
@@ -762,11 +769,13 @@ signals:
     void grid_geometry_changed();
     void geometry_sync_changed();
     void viewport_changed();
+    void viewport_interaction_applied();
     void selection_changed();
     void search_changed();
 
     void process_started();
     void process_exited(Exit_reason reason, int exit_code);
+    void termination_requested(Termination_initiator initiator);
     void backend_error(Backend_error_code code, QString message);
     void output_activity();
     void output_backpressure_changed(bool active);

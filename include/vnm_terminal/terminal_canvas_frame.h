@@ -4,14 +4,27 @@
 #include <QtGlobal>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace vnm_terminal {
 
-inline constexpr std::uint32_t k_terminal_canvas_frame_api_version = 1U;
-inline constexpr int           k_terminal_canvas_max_rows          = 200;
-inline constexpr int           k_terminal_canvas_max_columns       = 300;
+inline constexpr std::uint32_t k_terminal_canvas_frame_api_version = 3U;
+inline constexpr qreal k_terminal_canvas_max_font_pixel_size = 1'024.0;
 inline constexpr std::size_t   k_terminal_canvas_max_cells         = 32'768U;
+// A canvas axis is bounded by the same allocation budget as the complete
+// grid. The compact worker wire uses unsigned 16-bit row/gap fields, and the
+// cell budget is the tighter bound. Requiring the grid area to fit below
+// prevents either axis from becoming an independent, lower presentation cap.
+inline constexpr int k_terminal_canvas_wire_axis_max =
+    static_cast<int>(std::numeric_limits<std::uint16_t>::max());
+inline constexpr int k_terminal_canvas_axis_max =
+    k_terminal_canvas_max_cells <
+            static_cast<std::size_t>(k_terminal_canvas_wire_axis_max)
+        ? static_cast<int>(k_terminal_canvas_max_cells)
+        : k_terminal_canvas_wire_axis_max;
+inline constexpr int k_terminal_canvas_max_rows = k_terminal_canvas_axis_max;
+inline constexpr int k_terminal_canvas_max_columns = k_terminal_canvas_axis_max;
 inline constexpr std::size_t   k_terminal_canvas_max_styles        = 256U;
 inline constexpr qsizetype k_terminal_canvas_max_cell_text_utf16_code_units =
     4'096;
@@ -19,6 +32,15 @@ inline constexpr qsizetype k_terminal_canvas_max_cell_text_utf16_code_units =
 // for geometry, styles, cursor state, framing, and other capability metadata.
 inline constexpr qsizetype k_terminal_canvas_max_frame_text_utf8_bytes =
     96 * 1'024;
+
+inline constexpr bool terminal_canvas_grid_fits_cell_budget(
+    int rows,
+    int columns)
+{
+    return rows > 0 && columns > 0 &&
+        static_cast<std::size_t>(rows) <=
+            k_terminal_canvas_max_cells / static_cast<std::size_t>(columns);
+}
 
 enum class Terminal_canvas_cursor_shape
 {
@@ -72,6 +94,11 @@ struct Terminal_canvas_frame
     std::uint32_t                    api_version = k_terminal_canvas_frame_api_version;
     int                              rows        = 0;
     int                              columns     = 0;
+    qreal                            font_size   = 13.0;
+    qreal                            cell_width  = 0.0;
+    qreal                            cell_height = 0.0;
+    qreal                            content_width  = 0.0;
+    qreal                            content_height = 0.0;
     std::uint64_t                    sequence               = 0U;
     std::uint64_t                    publication_generation = 0U;
     std::uint64_t                    row_origin_generation  = 0U;

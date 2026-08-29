@@ -620,6 +620,7 @@ class Glyph_atlas_cache final
 public:
     explicit Glyph_atlas_cache(QSize page_size = QSize(256, 256));
 
+    bool configure(QSize page_size, int page_budget);
     void set_epoch(std::uint64_t epoch);
     void reset();
 
@@ -743,6 +744,7 @@ struct Qsg_atlas_frame_report
     bool          coverage_upload_recorded        = false;
     bool          raw_font_rasterized             = false;
     bool          raw_font_rasterized_in_prepare  = false;
+    bool          prepared_generation_committed   = false;
     int           rasterized_glyphs               = 0;
     int           atlas_page_count                = 0;
     QRect         viewport_rect;
@@ -784,7 +786,8 @@ public:
         const Qsg_atlas_frame_build_summary& frame_build,
         const Qsg_atlas_render_summary& render_summary,
         const Qsg_atlas_producer_summary& producer_summary,
-        const Qsg_atlas_warm_lazy_summary& warm_lazy_summary);
+        const Qsg_atlas_warm_lazy_summary& warm_lazy_summary,
+        bool prepared_generation_committed = false);
     void record_render(
         const Captured_atlas_frame& frame,
         std::uint64_t               render_elapsed_ns,
