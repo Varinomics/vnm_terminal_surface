@@ -1,5 +1,7 @@
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 
+#include "vnm_terminal/font_metrics.h"
+
 #include <QFontDatabase>
 #include <QResource>
 #include <QStringList>
@@ -76,6 +78,15 @@ QFont vnm_terminal_font(QString family, qreal pixel_size)
         font.setPixelSize(std::max(1, static_cast<int>(std::round(bounded_pixel_size))));
     }
     return font;
+}
+
+}
+
+namespace vnm_terminal {
+
+QString default_monospace_font_family()
+{
+    return internal::vnm_terminal_default_monospace_font_family();
 }
 
 }

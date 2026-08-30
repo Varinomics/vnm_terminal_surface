@@ -276,9 +276,16 @@ struct VNM_TerminalCanvas::Private
     QTimer*                                                     render_status_timer  = nullptr;
     QString                                                     render_error;
     bool                                                        cursor_blink_visible = true;
+    bool                                                        render_ready         = false;
     qreal                                                       device_pixel_ratio = 1.0;
     std::uint64_t                                               font_epoch          = 1U;
     std::uint64_t                                               capture_sequence    = 0U;
+    std::uint64_t                                               ownership_generation = 1U;
+    std::uint64_t                                               synchronized_ownership_generation = 0U;
+    std::uint64_t                                               canvas_frame_generation = 0U;
+    std::uint64_t                                               rendered_canvas_frame_generation = 0U;
+    std::uint64_t                                               rendered_frame_sequence = 0U;
+    std::uint64_t                                               rendered_publication_generation = 0U;
 };
 
 VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
@@ -322,6 +329,52 @@ void VNM_TerminalCanvas::set_font_family(const QString& font_family)
     }
     m_font_family = font_family;
     emit font_family_changed();
+    refresh_render_state();
+}
+
+QString VNM_TerminalCanvas::font_style() const
+{
+    return m_font_style;
+}
+
+void VNM_TerminalCanvas::set_font_style(const QString& font_style)
+{
+    if (m_font_style == font_style) {
+        return;
+    }
+    m_font_style = font_style;
+    emit font_style_changed();
+    refresh_render_state();
+}
+
+int VNM_TerminalCanvas::font_weight() const
+{
+    return m_font_weight;
+}
+
+void VNM_TerminalCanvas::set_font_weight(int font_weight)
+{
+    const int normalized = std::clamp(font_weight, 1, 1000);
+    if (m_font_weight == normalized) {
+        return;
+    }
+    m_font_weight = normalized;
+    emit font_weight_changed();
+    refresh_render_state();
+}
+
+bool VNM_TerminalCanvas::font_italic() const
+{
+    return m_font_italic;
+}
+
+void VNM_TerminalCanvas::set_font_italic(bool font_italic)
+{
+    if (m_font_italic == font_italic) {
+        return;
+    }
+    m_font_italic = font_italic;
+    emit font_italic_changed();
     refresh_render_state();
 }
 
@@ -373,6 +426,31 @@ qulonglong VNM_TerminalCanvas::frame_sequence() const
     return m_private->frame != nullptr ? m_private->frame->sequence : 0U;
 }
 
+qulonglong VNM_TerminalCanvas::frame_generation() const
+{
+    return m_private->canvas_frame_generation;
+}
+
+bool VNM_TerminalCanvas::render_ready() const
+{
+    return m_private->render_ready;
+}
+
+qulonglong VNM_TerminalCanvas::rendered_frame_generation() const
+{
+    return m_private->rendered_canvas_frame_generation;
+}
+
+qulonglong VNM_TerminalCanvas::rendered_frame_sequence() const
+{
+    return m_private->rendered_frame_sequence;
+}
+
+qulonglong VNM_TerminalCanvas::rendered_publication_generation() const
+{
+    return m_private->rendered_publication_generation;
+}
+
 QString VNM_TerminalCanvas::render_error() const
 {
     return m_private->render_error;
@@ -386,21 +464,39 @@ bool VNM_TerminalCanvas::set_canvas_frame(
     }
 
     if (frame == nullptr) {
-        if (m_private->frame == nullptr) {
-            return true;
-        }
+        const bool had_frame = m_private->frame != nullptr;
         const bool cursor_blink_was_enabled =
             canvas_cursor_blink_enabled(m_private->frame);
+        ++m_private->ownership_generation;
+        if (m_private->ownership_generation == 0U) {
+            m_private->ownership_generation = 1U;
+        }
         m_private->frame.reset();
         m_private->snapshot.reset();
         m_private->recorder->reset();
-        if (!m_private->render_error.isEmpty()) {
-            m_private->render_error.clear();
-            emit render_error_changed();
-        }
+        const bool error_changed = !m_private->render_error.isEmpty();
+        const bool status_changed =
+            m_private->render_ready ||
+            m_private->rendered_canvas_frame_generation != 0U ||
+            m_private->rendered_frame_sequence != 0U ||
+            m_private->rendered_publication_generation != 0U ||
+            error_changed;
+        m_private->render_ready = false;
+        m_private->rendered_canvas_frame_generation = 0U;
+        m_private->rendered_frame_sequence = 0U;
+        m_private->rendered_publication_generation = 0U;
+        m_private->render_error.clear();
         refresh_cursor_blink(cursor_blink_was_enabled);
         refresh_render_state();
-        emit frame_changed();
+        if (had_frame) {
+            emit frame_changed();
+        }
+        if (error_changed) {
+            emit render_error_changed();
+        }
+        if (status_changed) {
+            emit render_status_changed();
+        }
         return true;
     }
 
@@ -420,11 +516,21 @@ bool VNM_TerminalCanvas::set_canvas_frame(
 
     const bool cursor_blink_was_enabled =
         canvas_cursor_blink_enabled(m_private->frame);
+    ++m_private->canvas_frame_generation;
+    if (m_private->canvas_frame_generation == 0U) {
+        m_private->canvas_frame_generation = 1U;
+    }
     m_private->frame    = owned_frame;
     m_private->snapshot = snapshot;
+    const bool error_changed = !m_private->render_error.isEmpty();
+    m_private->render_error.clear();
     refresh_cursor_blink(cursor_blink_was_enabled);
     refresh_render_state();
     emit frame_changed();
+    if (error_changed) {
+        emit render_error_changed();
+        emit render_status_changed();
+    }
     return true;
 }
 
@@ -438,6 +544,14 @@ QSGNode* VNM_TerminalCanvas::updatePaintNode(
     QSGNode*             old_node,
     UpdatePaintNodeData*)
 {
+    if (m_private->synchronized_ownership_generation !=
+        m_private->ownership_generation)
+    {
+        delete old_node;
+        old_node = nullptr;
+        m_private->synchronized_ownership_generation =
+            m_private->ownership_generation;
+    }
     if (m_private->snapshot == nullptr ||
         !term::is_valid_cell_metrics(m_private->cell_metrics) ||
         width() <= 0.0 || height() <= 0.0)
@@ -457,7 +571,9 @@ QSGNode* VNM_TerminalCanvas::updatePaintNode(
         m_private->device_pixel_ratio,
         m_private->font_epoch,
         ++m_private->capture_sequence,
-        m_private->cursor_blink_visible);
+        m_private->cursor_blink_visible,
+        m_private->ownership_generation,
+        m_private->canvas_frame_generation);
     return term::update_qsg_atlas_node(
         old_node,
         std::move(captured),
@@ -483,6 +599,12 @@ void VNM_TerminalCanvas::refresh_render_state()
     const QFont previous_font  = m_private->render_font;
     m_private->device_pixel_ratio = device_pixel_ratio(window());
     m_private->render_font = term::vnm_terminal_font(m_font_family, m_font_size);
+    if (!m_font_style.isEmpty()) {
+        m_private->render_font.setStyleName(m_font_style);
+    }
+    m_private->render_font.setWeight(
+        static_cast<QFont::Weight>(m_font_weight));
+    m_private->render_font.setItalic(m_font_italic);
     if (previous_ratio != m_private->device_pixel_ratio ||
         previous_font != m_private->render_font)
     {
@@ -529,6 +651,33 @@ void VNM_TerminalCanvas::refresh_render_state()
 void VNM_TerminalCanvas::refresh_render_status()
 {
     const term::Qsg_atlas_frame_report report = m_private->recorder->snapshot();
+    const bool prepared_current_ownership =
+        report.prepared_ownership_generation ==
+            m_private->ownership_generation;
+    const bool rendered_prepared_generation =
+        report.prepared_generation_committed &&
+        report.render_count > 0U &&
+        report.render_capture_sequence == report.prepared_capture_sequence &&
+        report.render_ownership_generation ==
+            report.prepared_ownership_generation &&
+        report.render_canvas_frame_generation ==
+            report.prepared_canvas_frame_generation;
+    bool next_render_ready = m_private->render_ready;
+    std::uint64_t next_rendered_canvas_frame_generation =
+        m_private->rendered_canvas_frame_generation;
+    std::uint64_t next_rendered_frame_sequence =
+        m_private->rendered_frame_sequence;
+    std::uint64_t next_rendered_publication_generation =
+        m_private->rendered_publication_generation;
+    if (prepared_current_ownership && rendered_prepared_generation) {
+        next_render_ready = true;
+        next_rendered_canvas_frame_generation =
+            report.prepared_canvas_frame_generation;
+        next_rendered_frame_sequence = report.prepared_snapshot_sequence;
+        next_rendered_publication_generation =
+            report.prepared_publication_generation;
+    }
+
     QString error;
     const bool glyph_generation_failed =
         report.frame_build.glyph_missed_instances > 0 ||
@@ -539,7 +688,15 @@ void VNM_TerminalCanvas::refresh_render_status()
         report.render_target_non_null &&
         report.rhi_non_null &&
         !report.prepared_generation_committed;
-    if (m_private->frame != nullptr && report.prepare_count > 0U &&
+    const bool prepared_current_frame =
+        prepared_current_ownership &&
+        m_private->frame != nullptr &&
+        report.prepared_canvas_frame_generation ==
+            m_private->canvas_frame_generation &&
+        report.prepared_snapshot_sequence == m_private->frame->sequence &&
+        report.prepared_publication_generation ==
+            m_private->frame->publication_generation;
+    if (prepared_current_frame && report.prepare_count > 0U &&
         (glyph_generation_failed || resource_generation_failed))
     {
         const term::Qsg_atlas_frame_build_summary& build = report.frame_build;
@@ -579,11 +736,29 @@ void VNM_TerminalCanvas::refresh_render_status()
         }
     }
 
-    if (m_private->render_error == error) {
+    const bool error_changed = m_private->render_error != error;
+    const bool status_changed =
+        m_private->render_ready != next_render_ready ||
+        m_private->rendered_canvas_frame_generation !=
+            next_rendered_canvas_frame_generation ||
+        m_private->rendered_frame_sequence != next_rendered_frame_sequence ||
+        m_private->rendered_publication_generation !=
+            next_rendered_publication_generation ||
+        error_changed;
+    if (!status_changed) {
         return;
     }
+    m_private->render_ready = next_render_ready;
+    m_private->rendered_canvas_frame_generation =
+        next_rendered_canvas_frame_generation;
+    m_private->rendered_frame_sequence = next_rendered_frame_sequence;
+    m_private->rendered_publication_generation =
+        next_rendered_publication_generation;
     m_private->render_error = std::move(error);
-    emit render_error_changed();
+    if (error_changed) {
+        emit render_error_changed();
+    }
+    emit render_status_changed();
 }
 
 void VNM_TerminalCanvas::refresh_cursor_blink(bool was_enabled)

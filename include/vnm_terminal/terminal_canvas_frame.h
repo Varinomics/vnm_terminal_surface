@@ -9,7 +9,7 @@
 
 namespace vnm_terminal {
 
-inline constexpr std::uint32_t k_terminal_canvas_frame_api_version = 3U;
+inline constexpr std::uint32_t k_terminal_canvas_frame_api_version = 4U;
 inline constexpr qreal k_terminal_canvas_max_font_pixel_size = 1'024.0;
 inline constexpr std::size_t   k_terminal_canvas_max_cells         = 32'768U;
 // A canvas axis is bounded by the same allocation budget as the complete
@@ -95,6 +95,10 @@ struct Terminal_canvas_frame
     int                              rows        = 0;
     int                              columns     = 0;
     qreal                            font_size   = 13.0;
+    QString                          font_family;
+    QString                          font_style;
+    int                              font_weight = 400;
+    bool                             font_italic = false;
     qreal                            cell_width  = 0.0;
     qreal                            cell_height = 0.0;
     qreal                            content_width  = 0.0;

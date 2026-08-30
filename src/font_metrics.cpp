@@ -6,11 +6,6 @@
 
 namespace vnm_terminal {
 
-QString default_monospace_font_family()
-{
-    return internal::vnm_terminal_default_monospace_font_family();
-}
-
 Cell_metrics cell_metrics_for_font(
     const QString& family,
     qreal          pixel_size,

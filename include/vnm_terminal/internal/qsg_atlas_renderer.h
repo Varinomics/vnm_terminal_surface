@@ -666,6 +666,8 @@ struct Captured_atlas_frame
     std::uint64_t                    font_epoch          = 0U;
     std::uint64_t                    capture_sequence    = 0U;
     std::uint64_t                    publication_generation = 0U;
+    std::uint64_t                    ownership_generation = 1U;
+    std::uint64_t                    canvas_frame_generation = 0U;
     bool                             cursor_blink_visible = true;
 };
 
@@ -680,6 +682,13 @@ struct Qsg_atlas_frame_report
     std::uint64_t captured_snapshot_sequence      = 0U;
     std::uint64_t captured_publication_generation = 0U;
     std::uint64_t captured_font_epoch             = 0U;
+    std::uint64_t captured_ownership_generation   = 0U;
+    std::uint64_t captured_canvas_frame_generation = 0U;
+    std::uint64_t prepared_capture_sequence       = 0U;
+    std::uint64_t prepared_snapshot_sequence      = 0U;
+    std::uint64_t prepared_publication_generation = 0U;
+    std::uint64_t prepared_ownership_generation   = 0U;
+    std::uint64_t prepared_canvas_frame_generation = 0U;
     std::uint64_t first_render_capture_sequence   = 0U;
     std::uint64_t first_captured_snapshot_sequence = 0U;
     std::uint64_t first_captured_publication_generation = 0U;
@@ -691,10 +700,8 @@ struct Qsg_atlas_frame_report
     std::uint64_t render_snapshot_sequence        = 0U;
     std::uint64_t render_publication_generation   = 0U;
     std::uint64_t render_font_epoch               = 0U;
-    QColor        captured_diagnostic_color;
-    QColor        first_captured_diagnostic_color;
-    QColor        first_render_diagnostic_color;
-    QColor        render_diagnostic_color;
+    std::uint64_t render_ownership_generation     = 0U;
+    std::uint64_t render_canvas_frame_generation  = 0U;
     bool          captured_light_options          = false;
     bool          first_captured_light_options    = false;
     bool          first_render_light_options      = false;
@@ -907,9 +914,9 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     qreal                         device_pixel_ratio,
     std::uint64_t                 font_epoch,
     std::uint64_t                 capture_sequence,
-    bool                          cursor_blink_visible);
-
-QColor qsg_atlas_diagnostic_color(const Captured_atlas_frame& frame);
+    bool                          cursor_blink_visible,
+    std::uint64_t                 ownership_generation = 1U,
+    std::uint64_t                 canvas_frame_generation = 0U);
 
 QSGNode* update_qsg_atlas_node(
     QSGNode*                                      old_node,

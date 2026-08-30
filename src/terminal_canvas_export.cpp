@@ -3,10 +3,12 @@
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/terminal_style.h"
+#include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 
 #include <QByteArray>
+#include <QFontInfo>
 #include <QThread>
 #include <cmath>
 #include <cstddef>
@@ -87,6 +89,13 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     frame->rows                        = snapshot->grid_size.rows;
     frame->columns                     = snapshot->grid_size.columns;
     frame->font_size                   = surface.font_size();
+    const QFontInfo active_font(term::vnm_terminal_font(
+        surface.font_family(),
+        surface.font_size()));
+    frame->font_family                 = active_font.family();
+    frame->font_style                  = active_font.styleName();
+    frame->font_weight                 = active_font.weight();
+    frame->font_italic                 = active_font.italic();
     frame->cell_width                  = cell_metrics.width;
     frame->cell_height                 = cell_metrics.height;
     frame->content_width               = surface.width();

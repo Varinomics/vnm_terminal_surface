@@ -2117,6 +2117,11 @@ public:
         }
     }
 
+    std::uint64_t ownership_generation() const
+    {
+        return m_pending_frame.ownership_generation;
+    }
+
     StateFlags changedStates() const override
     {
         return ViewportState | ScissorState;
@@ -7653,14 +7658,12 @@ void Qsg_atlas_recorder::record_capture(const Captured_atlas_frame& frame)
     const std::lock_guard<std::mutex> lock(m_mutex);
     const std::uint64_t frame_snapshot_sequence = snapshot_sequence(frame);
     const std::uint64_t frame_publication_generation = publication_generation(frame);
-    const QColor frame_diagnostic_color = qsg_atlas_diagnostic_color(frame);
     const bool frame_light_options = captured_options_are_light(frame);
     if (m_report.capture_count == 0U) {
         m_report.first_captured_snapshot_sequence = frame_snapshot_sequence;
         m_report.first_captured_publication_generation =
             frame_publication_generation;
         m_report.first_captured_font_epoch        = frame.font_epoch;
-        m_report.first_captured_diagnostic_color       = frame_diagnostic_color;
         m_report.first_captured_light_options     = frame_light_options;
     }
     ++m_report.capture_count;
@@ -7668,7 +7671,9 @@ void Qsg_atlas_recorder::record_capture(const Captured_atlas_frame& frame)
     m_report.captured_snapshot_sequence      = frame_snapshot_sequence;
     m_report.captured_publication_generation = frame_publication_generation;
     m_report.captured_font_epoch             = frame.font_epoch;
-    m_report.captured_diagnostic_color       = frame_diagnostic_color;
+    m_report.captured_ownership_generation   = frame.ownership_generation;
+    m_report.captured_canvas_frame_generation =
+        frame.canvas_frame_generation;
     m_report.captured_light_options     = frame_light_options;
     m_report.captured_snapshot_cursor   = captured_snapshot_cursor_report(frame);
     m_report.captured_render_cursor     = captured_render_cursor_report(frame);
@@ -7694,8 +7699,6 @@ void Qsg_atlas_recorder::record_prepare(
     const Qsg_atlas_warm_lazy_summary&   warm_lazy_summary,
     bool                                 prepared_generation_committed)
 {
-    (void)frame;
-
     const std::lock_guard<std::mutex> lock(m_mutex);
     ++m_report.prepare_count;
     m_report.prepare_elapsed_ns            += prepare_elapsed_ns;
@@ -7758,6 +7761,12 @@ void Qsg_atlas_recorder::record_prepare(
     m_report.raw_font_rasterized_in_prepare = raw_font_rasterized_in_prepare;
     m_report.prepared_generation_committed  =
         prepared_generation_committed;
+    m_report.prepared_capture_sequence       = frame.capture_sequence;
+    m_report.prepared_snapshot_sequence      = snapshot_sequence(frame);
+    m_report.prepared_publication_generation = publication_generation(frame);
+    m_report.prepared_ownership_generation   = frame.ownership_generation;
+    m_report.prepared_canvas_frame_generation =
+        frame.canvas_frame_generation;
     m_report.rasterized_glyphs              = rasterized_glyphs;
     m_report.prepare_thread_id              = prepare_thread_id;
     m_report.raw_font_raster_thread_id      = raw_font_raster_thread_id;
@@ -7782,7 +7791,8 @@ void Qsg_atlas_recorder::record_render(
     m_report.render_snapshot_sequence       = snapshot_sequence(frame);
     m_report.render_publication_generation  = publication_generation(frame);
     m_report.render_font_epoch              = frame.font_epoch;
-    m_report.render_diagnostic_color        = qsg_atlas_diagnostic_color(frame);
+    m_report.render_ownership_generation    = frame.ownership_generation;
+    m_report.render_canvas_frame_generation = frame.canvas_frame_generation;
     m_report.render_light_options           = captured_options_are_light(frame);
     m_report.viewport_rect                  = viewport_rect;
     m_report.drew                           = drew;
@@ -7792,7 +7802,6 @@ void Qsg_atlas_recorder::record_render(
         m_report.first_render_publication_generation =
             m_report.render_publication_generation;
         m_report.first_render_font_epoch        = frame.font_epoch;
-        m_report.first_render_diagnostic_color  = m_report.render_diagnostic_color;
         m_report.first_render_light_options     = captured_options_are_light(frame);
     }
 }
@@ -8641,7 +8650,9 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     qreal                         device_pixel_ratio,
     std::uint64_t                 font_epoch,
     std::uint64_t                 capture_sequence,
-    bool                          cursor_blink_visible)
+    bool                          cursor_blink_visible,
+    std::uint64_t                 ownership_generation,
+    std::uint64_t                 canvas_frame_generation)
 {
     Captured_atlas_frame frame;
     frame.snapshot             = std::move(snapshot);
@@ -8655,16 +8666,12 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     frame.font_epoch           = font_epoch;
     frame.capture_sequence     = capture_sequence;
     frame.publication_generation = publication_generation(frame);
+    frame.ownership_generation = std::max<std::uint64_t>(
+        1U,
+        ownership_generation);
+    frame.canvas_frame_generation = canvas_frame_generation;
     frame.cursor_blink_visible = cursor_blink_visible;
     return frame;
-}
-
-QColor qsg_atlas_diagnostic_color(const Captured_atlas_frame& frame)
-{
-    const int sequence_component = 32 + static_cast<int>(snapshot_sequence(frame) % 160U);
-    const int options_component  = captured_options_are_light(frame) ? 214 : 72;
-    const int epoch_component    = 32 + static_cast<int>(frame.font_epoch % 160U);
-    return QColor(sequence_component, options_component, epoch_component, 255);
 }
 
 QSGNode* update_qsg_atlas_node(
@@ -8675,6 +8682,13 @@ QSGNode* update_qsg_atlas_node(
 {
     Qsg_atlas_render_node* node =
         dynamic_cast<Qsg_atlas_render_node*>(old_node);
+    if (node != nullptr &&
+        node->ownership_generation() != frame.ownership_generation)
+    {
+        delete node;
+        node = nullptr;
+        old_node = nullptr;
+    }
     if (node == nullptr) {
         delete old_node;
         node = new Qsg_atlas_render_node(recorder);
