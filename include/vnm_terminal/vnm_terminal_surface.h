@@ -936,12 +936,12 @@ private:
                                result);
 
     void reset_session();
-    enum class Empty_selection_copy_policy
+    enum class Selection_copy_policy
     {
         COPY,
-        SKIP_EMPTY_SELECTION,
+        SKIP_EMPTY_OR_SINGLE_SPACE,
     };
-    bool copy_selected_text_to_clipboard(Empty_selection_copy_policy policy);
+    bool copy_selected_text_to_clipboard(Selection_copy_policy policy);
     std::optional<QString> read_clipboard_text_for_paste();
     void set_selection_state(Selection_state state);
     void set_search_state(

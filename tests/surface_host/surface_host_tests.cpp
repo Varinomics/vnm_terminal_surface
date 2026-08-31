@@ -5137,7 +5137,7 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
         pump_events(app);
 
         auto backend = std::make_unique<Scripted_backend>();
-        backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta")};
+        backend->outputs_during_start = {QByteArrayLiteral("alpha beta\r\nbeta")};
 
         bool started = false;
         Scripted_backend* backend_ptr = start_surface_with_backend(
@@ -5239,6 +5239,100 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             "Ctrl+C with selection copies selected text to clipboard");
 
         fixture.surface.clear_selection();
+        const int last_column = std::max(0, fixture.surface.columns() - 1);
+        ok &= check(last_column > 5,
+            "copy shortcut one-cell fixtures have enough columns");
+        const QPointF single_space_point      = point_in_grid_cell(fixture.surface, 0, 5);
+        const QPointF single_space_drag_point = single_space_point + QPointF(0.25, 0.0);
+        QGuiApplication::clipboard()->setText(
+            QStringLiteral("copy-on-select-single-space-sentinel"),
+            QClipboard::Clipboard);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            single_space_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "copy on select single-space selection press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            single_space_drag_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "copy on select single-space selection drag is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            single_space_drag_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "copy on select single-space selection release is accepted");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral(" "),
+            "copy on select single-space fixture selects one space");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("copy-on-select-single-space-sentinel"),
+            "copy on select ignores a single-space selection");
+
+        const std::size_t single_space_selection_write_count = backend_ptr->writes.size();
+        ok &= send_key(
+            fixture.surface,
+            Qt::Key_C,
+            Qt::ControlModifier,
+            {},
+            "Ctrl+C with a single-space selection is accepted by copy policy");
+        ok &= check(backend_ptr->writes.size() == single_space_selection_write_count,
+            "Ctrl+C with a single-space selection writes no ETX");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral(" "),
+            "Ctrl+C explicitly copies a single-space selection");
+
+        fixture.surface.clear_selection();
+        const QPointF single_character_point      = point_in_grid_cell(fixture.surface, 0, 4);
+        const QPointF single_character_drag_point = single_character_point + QPointF(0.25, 0.0);
+        QGuiApplication::clipboard()->setText(
+            QStringLiteral("copy-on-select-single-character-sentinel"),
+            QClipboard::Clipboard);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            single_character_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "copy on select single-character selection press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            single_character_drag_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "copy on select single-character selection drag is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            single_character_drag_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "copy on select single-character selection release is accepted");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("a"),
+            "copy on select single-character fixture selects one character");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("a"),
+            "copy on select copies a single non-space character");
+
+        fixture.surface.clear_selection();
         QGuiApplication::clipboard()->setText(QStringLiteral("copy-fallback"),
             QClipboard::Clipboard);
         ok &= send_key_and_expect_write(
@@ -5249,11 +5343,8 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             QStringLiteral("copy-fallback"),
             "Ctrl+C fallback leaves clipboard unchanged");
 
-        const int last_column = std::max(0, fixture.surface.columns() - 1);
-        ok &= check(last_column > 5,
-            "copy shortcut empty-selection fixture has enough columns");
-        const QPointF empty_start = point_in_grid_cell(fixture.surface, 0, 5);
-        const QPointF empty_end   = point_in_grid_cell(fixture.surface, 0, last_column);
+        const QPointF empty_start = point_in_grid_cell(fixture.surface, 1, 4);
+        const QPointF empty_end   = point_in_grid_cell(fixture.surface, 1, last_column);
         QGuiApplication::clipboard()->setText(
             QStringLiteral("copy-on-select-empty-sentinel"),
             QClipboard::Clipboard);
