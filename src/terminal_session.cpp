@@ -446,14 +446,14 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
         }
     }
 
-    if (snapshot.cursor.visible) {
-        const int cursor_public_row =
-            first_public_row_for_viewport(projection.viewport()) + snapshot.cursor.position.row;
-        snapshot.cursor.position.row = cursor_public_row - first_public_row;
-        snapshot.cursor.visible =
-            snapshot.cursor.position.row >= 0 &&
-            snapshot.cursor.position.row <  snapshot.grid_size.rows;
-    }
+    const bool cursor_was_visible = snapshot.cursor.visible;
+    const int cursor_public_row =
+        first_public_row_for_viewport(projection.viewport()) + snapshot.cursor.position.row;
+    snapshot.cursor.position.row = cursor_public_row - first_public_row;
+    snapshot.cursor.visible =
+        cursor_was_visible &&
+        snapshot.cursor.position.row >= 0 &&
+        snapshot.cursor.position.row < snapshot.grid_size.rows;
 
     append_public_projection_selection_spans(snapshot, projection, first_public_row);
 
@@ -1253,12 +1253,10 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     snapshot.metadata.backend_geometry_in_sync     = backend_geometry_in_sync;
     snapshot.metadata.visual_bell_active           = false;
     snapshot.metadata.mouse_reporting_mode_changed = false;
-    if (snapshot.cursor.visible) {
-        snapshot.cursor.position.row =
-            std::clamp(snapshot.cursor.position.row, 0, grid_size.rows - 1);
-        snapshot.cursor.position.column =
-            std::clamp(snapshot.cursor.position.column, 0, grid_size.columns - 1);
-    }
+    snapshot.cursor.position.row =
+        std::clamp(snapshot.cursor.position.row, 0, grid_size.rows - 1);
+    snapshot.cursor.position.column =
+        std::clamp(snapshot.cursor.position.column, 0, grid_size.columns - 1);
     return snapshot;
 }
 

@@ -75,6 +75,69 @@ bool canvas_cursor_shape_is_valid(
     return false;
 }
 
+const vnm_terminal::terminal_canvas_content_extent_t* supported_content_extent(
+    const vnm_terminal::Terminal_canvas_frame* frame)
+{
+    if (frame == nullptr ||
+        !frame->content_extent.has_value() ||
+        frame->content_extent->record_version !=
+            vnm_terminal::k_terminal_canvas_content_extent_version)
+    {
+        return nullptr;
+    }
+
+    return &*frame->content_extent;
+}
+
+int semantic_content_bottom_row_exclusive(
+    const vnm_terminal::Terminal_canvas_frame& frame)
+{
+    const int occupied_bottom = frame.cells.empty()
+        ? 0
+        : frame.cells.back().row + 1;
+    const int cursor_bottom =
+        frame.cursor.row >= 0 && frame.cursor.row < frame.rows
+        ? frame.cursor.row + 1
+        : 0;
+    return std::clamp(
+        std::max({1, occupied_bottom, cursor_bottom}),
+        1,
+        frame.rows);
+}
+
+bool supported_content_extent_is_valid(
+    const vnm_terminal::Terminal_canvas_frame& frame)
+{
+    const vnm_terminal::terminal_canvas_content_extent_t* const extent =
+        supported_content_extent(&frame);
+    if (extent == nullptr) {
+        return true;
+    }
+
+    switch (extent->active_buffer) {
+        case vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER:
+            break;
+        case vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER:
+            if (extent->scrollback_rows != 0 || extent->offset_from_tail != 0) {
+                return false;
+            }
+            break;
+        default:
+            return false;
+    }
+
+    return
+        extent->content_bottom_row_exclusive >= 1 &&
+        extent->content_bottom_row_exclusive <= frame.rows &&
+        extent->scrollback_rows >= 0 &&
+        extent->scrollback_rows <=
+            std::numeric_limits<int>::max() - (frame.rows - 1) &&
+        extent->offset_from_tail >= 0 &&
+        extent->offset_from_tail <= extent->scrollback_rows &&
+        extent->content_bottom_row_exclusive ==
+            semantic_content_bottom_row_exclusive(frame);
+}
+
 std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
     const vnm_terminal::Terminal_canvas_frame& frame)
 {
@@ -82,6 +145,18 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
     snapshot->grid_size             = {frame.rows, frame.columns};
     snapshot->viewport.visible_rows = frame.rows;
     snapshot->viewport.follow_tail  = true;
+    if (const vnm_terminal::terminal_canvas_content_extent_t* const extent =
+            supported_content_extent(&frame))
+    {
+        snapshot->viewport.active_buffer =
+            extent->active_buffer ==
+                vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER
+            ? term::Terminal_buffer_id::ALTERNATE
+            : term::Terminal_buffer_id::PRIMARY;
+        snapshot->viewport.scrollback_rows  = extent->scrollback_rows;
+        snapshot->viewport.offset_from_tail = extent->offset_from_tail;
+        snapshot->viewport.follow_tail      = extent->offset_from_tail == 0;
+    }
     snapshot->color_state.default_foreground_rgba = frame.default_foreground_rgba;
     snapshot->color_state.default_background_rgba = frame.default_background_rgba;
     snapshot->color_state.cursor_rgba             = frame.cursor_rgba;
@@ -238,7 +313,7 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
         return false;
     }
 
-    return true;
+    return supported_content_extent_is_valid(frame);
 }
 
 term::Terminal_render_options render_options(
@@ -419,6 +494,47 @@ int VNM_TerminalCanvas::rows() const
 int VNM_TerminalCanvas::columns() const
 {
     return m_private->frame != nullptr ? m_private->frame->columns : 0;
+}
+
+qreal VNM_TerminalCanvas::cell_height() const
+{
+    return m_private->frame != nullptr ? m_private->frame->cell_height : 0.0;
+}
+
+bool VNM_TerminalCanvas::content_extent_available() const
+{
+    return supported_content_extent(m_private->frame.get()) != nullptr;
+}
+
+int VNM_TerminalCanvas::content_bottom_row_exclusive() const
+{
+    const vnm_terminal::terminal_canvas_content_extent_t* const extent =
+        supported_content_extent(m_private->frame.get());
+    return extent != nullptr ? extent->content_bottom_row_exclusive : 0;
+}
+
+int VNM_TerminalCanvas::scrollback_rows() const
+{
+    const vnm_terminal::terminal_canvas_content_extent_t* const extent =
+        supported_content_extent(m_private->frame.get());
+    return extent != nullptr ? extent->scrollback_rows : 0;
+}
+
+int VNM_TerminalCanvas::viewport_offset_from_tail() const
+{
+    const vnm_terminal::terminal_canvas_content_extent_t* const extent =
+        supported_content_extent(m_private->frame.get());
+    return extent != nullptr ? extent->offset_from_tail : 0;
+}
+
+bool VNM_TerminalCanvas::alternate_screen() const
+{
+    const vnm_terminal::terminal_canvas_content_extent_t* const extent =
+        supported_content_extent(m_private->frame.get());
+    return
+        extent != nullptr &&
+        extent->active_buffer ==
+            vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER;
 }
 
 qulonglong VNM_TerminalCanvas::frame_sequence() const

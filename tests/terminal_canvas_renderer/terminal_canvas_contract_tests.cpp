@@ -7,6 +7,7 @@
 #include <QPointer>
 #include <QTimer>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -20,6 +21,10 @@ std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_frame(
     auto frame = std::make_shared<vnm_terminal::Terminal_canvas_frame>();
     frame->rows                    = 2;
     frame->columns                 = 12;
+    frame->cell_width              = 10.0;
+    frame->cell_height             = 20.0;
+    frame->content_width           = 120.0;
+    frame->content_height          = 40.0;
     frame->sequence                = sequence;
     frame->default_foreground_rgba = 0xffffffffU;
     frame->default_background_rgba = 0xff091018U;
@@ -29,6 +34,7 @@ std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_frame(
         0U,
     });
     frame->cells.push_back({0, 0, 1, 0U, QStringLiteral("A")});
+    frame->content_extent.emplace();
     return frame;
 }
 
@@ -39,6 +45,8 @@ std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_text_frame(
     auto frame = make_frame(sequence);
     frame->rows    = 1;
     frame->columns = static_cast<int>(cell_text.size());
+    frame->content_width  = frame->cell_width * frame->columns;
+    frame->content_height = frame->cell_height;
     frame->cells.clear();
     for (std::size_t index = 0U; index < cell_text.size(); ++index) {
         frame->cells.push_back({
@@ -135,6 +143,225 @@ bool test_frame_contract_and_text_bounds()
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");
     ok &= check(canvas.rows() == 0 && canvas.columns() == 0,
         "clear releases published canvas geometry");
+    return ok;
+}
+
+bool test_content_extent_properties_and_atomic_lifecycle()
+{
+    bool               ok = true;
+    VNM_TerminalCanvas canvas;
+    int                frame_change_count = 0;
+    QObject::connect(
+        &canvas,
+        &VNM_TerminalCanvas::frame_changed,
+        [&frame_change_count]() { ++frame_change_count; });
+
+    ok &= check(
+        canvas.cell_height() == 0.0 &&
+        !canvas.content_extent_available() &&
+        canvas.content_bottom_row_exclusive() == 0 &&
+        canvas.scrollback_rows() == 0 &&
+        canvas.viewport_offset_from_tail() == 0 &&
+        !canvas.alternate_screen(),
+        "canvas exposes neutral semantic properties without an accepted frame");
+
+    auto accepted = make_frame(100U);
+    accepted->content_extent->scrollback_rows  = 7;
+    accepted->content_extent->offset_from_tail = 3;
+    ok &= check(canvas.set_canvas_frame(accepted),
+        "known coherent semantic extent is accepted");
+    ok &= check(
+        frame_change_count == 1 &&
+        canvas.cell_height() == 20.0 &&
+        canvas.content_extent_available() &&
+        canvas.content_bottom_row_exclusive() == 1 &&
+        canvas.scrollback_rows() == 7 &&
+        canvas.viewport_offset_from_tail() == 3 &&
+        !canvas.alternate_screen(),
+        "accepted frame publishes all semantic properties in one transaction");
+
+    accepted->cell_height = 99.0;
+    accepted->content_extent->content_bottom_row_exclusive = 2;
+    accepted->content_extent->scrollback_rows               = 99;
+    accepted->content_extent->offset_from_tail               = 98;
+    accepted->content_extent->active_buffer =
+        vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER;
+    ok &= check(
+        canvas.cell_height() == 20.0 &&
+        canvas.content_bottom_row_exclusive() == 1 &&
+        canvas.scrollback_rows() == 7 &&
+        canvas.viewport_offset_from_tail() == 3 &&
+        !canvas.alternate_screen(),
+        "semantic getters read the installed immutable frame copy");
+
+    const auto expect_rejected =
+        [&canvas, &frame_change_count](
+            std::shared_ptr<vnm_terminal::Terminal_canvas_frame> candidate,
+            const char*                                         message)
+        {
+            const bool rejected = !canvas.set_canvas_frame(std::move(candidate));
+            return check(
+                rejected &&
+                frame_change_count == 1 &&
+                canvas.frame_sequence() == 100U &&
+                canvas.content_extent_available() &&
+                canvas.content_bottom_row_exclusive() == 1 &&
+                canvas.scrollback_rows() == 7 &&
+                canvas.viewport_offset_from_tail() == 3 &&
+                !canvas.alternate_screen(),
+                message);
+        };
+
+    auto invalid_bottom_low = make_frame(101U);
+    invalid_bottom_low->content_extent->content_bottom_row_exclusive = 0;
+    ok &= expect_rejected(
+        std::move(invalid_bottom_low),
+        "bottom below one rejects without changing accepted properties");
+
+    auto invalid_bottom_high = make_frame(102U);
+    invalid_bottom_high->content_extent->content_bottom_row_exclusive = 3;
+    ok &= expect_rejected(
+        std::move(invalid_bottom_high),
+        "bottom beyond frame rows rejects without changing accepted properties");
+
+    auto incoherent_bottom = make_frame(103U);
+    incoherent_bottom->content_extent->content_bottom_row_exclusive = 2;
+    ok &= expect_rejected(
+        std::move(incoherent_bottom),
+        "plausible but snapshot-incoherent bottom is rejected exactly");
+
+    auto invalid_scrollback = make_frame(104U);
+    invalid_scrollback->content_extent->scrollback_rows = -1;
+    ok &= expect_rejected(
+        std::move(invalid_scrollback),
+        "negative scrollback rejects without changing accepted properties");
+
+    auto excessive_scrollback = make_frame(105U);
+    const int maximum_safe_scrollback =
+        std::numeric_limits<int>::max() - (excessive_scrollback->rows - 1);
+    excessive_scrollback->content_extent->scrollback_rows =
+        maximum_safe_scrollback + 1;
+    ok &= expect_rejected(
+        std::move(excessive_scrollback),
+        "scrollback that can overflow a viewport logical row is rejected");
+
+    auto invalid_offset_low = make_frame(106U);
+    invalid_offset_low->content_extent->offset_from_tail = -1;
+    ok &= expect_rejected(
+        std::move(invalid_offset_low),
+        "negative offset rejects without changing accepted properties");
+
+    auto invalid_offset_high = make_frame(107U);
+    invalid_offset_high->content_extent->scrollback_rows  = 2;
+    invalid_offset_high->content_extent->offset_from_tail = 3;
+    ok &= expect_rejected(
+        std::move(invalid_offset_high),
+        "offset beyond scrollback rejects without changing accepted properties");
+
+    auto invalid_alternate_scrollback = make_frame(108U);
+    invalid_alternate_scrollback->content_extent->active_buffer =
+        vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER;
+    invalid_alternate_scrollback->content_extent->scrollback_rows = 1;
+    ok &= expect_rejected(
+        std::move(invalid_alternate_scrollback),
+        "alternate scrollback rejects without changing accepted properties");
+
+    auto invalid_alternate_offset = make_frame(109U);
+    invalid_alternate_offset->content_extent->active_buffer =
+        vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER;
+    invalid_alternate_offset->content_extent->scrollback_rows  = 1;
+    invalid_alternate_offset->content_extent->offset_from_tail = 1;
+    ok &= expect_rejected(
+        std::move(invalid_alternate_offset),
+        "alternate offset rejects without changing accepted properties");
+
+    auto invalid_buffer = make_frame(110U);
+    invalid_buffer->content_extent->active_buffer =
+        static_cast<vnm_terminal::Terminal_canvas_buffer>(0xffU);
+    ok &= expect_rejected(
+        std::move(invalid_buffer),
+        "unknown known-record buffer rejects without changing accepted properties");
+
+    auto maximum_scrollback = make_frame(111U);
+    maximum_scrollback->content_extent->scrollback_rows = maximum_safe_scrollback;
+    ok &= check(
+        canvas.set_canvas_frame(maximum_scrollback) &&
+            canvas.scrollback_rows() == maximum_safe_scrollback,
+        "largest scrollback with safe viewport logical rows is accepted");
+
+    auto hidden_cursor = make_frame(112U);
+    hidden_cursor->cursor.row     = 1;
+    hidden_cursor->cursor.column  = 11;
+    hidden_cursor->cursor.visible = false;
+    hidden_cursor->content_extent->content_bottom_row_exclusive = 2;
+    ok &= check(canvas.set_canvas_frame(hidden_cursor) &&
+            canvas.content_bottom_row_exclusive() == 2,
+        "hidden in-range semantic cursor participates in exact coherence");
+
+    auto unknown_record = make_frame(113U);
+    unknown_record->content_extent->record_version =
+        vnm_terminal::k_terminal_canvas_content_extent_version + 1U;
+    unknown_record->content_extent->content_bottom_row_exclusive = -4;
+    unknown_record->content_extent->scrollback_rows               = -5;
+    unknown_record->content_extent->offset_from_tail               = 99;
+    unknown_record->content_extent->active_buffer =
+        static_cast<vnm_terminal::Terminal_canvas_buffer>(0xffU);
+    ok &= check(canvas.set_canvas_frame(unknown_record),
+        "unknown semantic record version leaves the base canvas renderable");
+    const std::shared_ptr<const vnm_terminal::Terminal_canvas_frame>
+        stored_unknown_record = canvas.canvas_frame();
+    ok &= check(
+        stored_unknown_record != nullptr &&
+            stored_unknown_record->content_extent.has_value() &&
+            stored_unknown_record->content_extent->record_version ==
+                vnm_terminal::k_terminal_canvas_content_extent_version + 1U &&
+            stored_unknown_record->content_extent->content_bottom_row_exclusive == -4 &&
+            stored_unknown_record->content_extent->scrollback_rows == -5 &&
+            stored_unknown_record->content_extent->offset_from_tail == 99 &&
+            stored_unknown_record->content_extent->active_buffer ==
+                static_cast<vnm_terminal::Terminal_canvas_buffer>(0xffU),
+        "unknown semantic record is preserved in the installed immutable frame");
+    ok &= check(
+        canvas.cell_height() == 20.0 &&
+        !canvas.content_extent_available() &&
+        canvas.content_bottom_row_exclusive() == 0 &&
+        canvas.scrollback_rows() == 0 &&
+        canvas.viewport_offset_from_tail() == 0 &&
+        !canvas.alternate_screen(),
+        "unknown semantic record exposes only neutral capability values");
+
+    auto absent_record = make_frame(114U);
+    absent_record->content_extent.reset();
+    ok &= check(canvas.set_canvas_frame(absent_record),
+        "absent semantic record leaves the base canvas renderable");
+    ok &= check(
+        canvas.cell_height() == 20.0 &&
+        !canvas.content_extent_available() &&
+        canvas.content_bottom_row_exclusive() == 0 &&
+        canvas.scrollback_rows() == 0 &&
+        canvas.viewport_offset_from_tail() == 0 &&
+        !canvas.alternate_screen(),
+        "absent semantic record exposes only neutral capability values");
+
+    auto alternate = make_frame(115U);
+    alternate->content_extent->active_buffer =
+        vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER;
+    ok &= check(canvas.set_canvas_frame(alternate) && canvas.alternate_screen(),
+        "coherent alternate extent materializes and exposes its buffer");
+
+    const int changes_before_clear = frame_change_count;
+    ok &= check(canvas.set_canvas_frame({}), "explicit null clears accepted extent");
+    ok &= check(
+        frame_change_count == changes_before_clear + 1 &&
+        canvas.rows() == 0 &&
+        canvas.columns() == 0 &&
+        canvas.cell_height() == 0.0 &&
+        !canvas.content_extent_available() &&
+        canvas.content_bottom_row_exclusive() == 0 &&
+        canvas.scrollback_rows() == 0 &&
+        canvas.viewport_offset_from_tail() == 0 &&
+        !canvas.alternate_screen(),
+        "one clear transaction resets geometry and all semantic properties");
     return ok;
 }
 
@@ -242,6 +469,7 @@ int main(int argc, char** argv)
     QGuiApplication application(argc, argv);
     bool            ok = true;
     ok &= test_frame_contract_and_text_bounds();
+    ok &= test_content_extent_properties_and_atomic_lifecycle();
     ok &= test_cursor_blink_phase_and_lifecycle();
     return ok ? 0 : 1;
 }

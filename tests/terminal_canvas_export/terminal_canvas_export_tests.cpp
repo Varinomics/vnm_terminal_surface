@@ -68,10 +68,36 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot(
     VNM_TerminalSurface&                              surface,
     std::shared_ptr<term::Terminal_render_snapshot> snapshot)
 {
+    const term::terminal_cell_metrics_t cell_metrics =
+        term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
+    surface.setWidth(snapshot->grid_size.columns * cell_metrics.width);
+    surface.setHeight(snapshot->grid_size.rows * cell_metrics.height);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         std::move(snapshot));
     return vnm_terminal::export_terminal_canvas_frame(surface);
+}
+
+bool expect_content_extent(
+    const vnm_terminal::Terminal_canvas_export_result& result,
+    int                                                 content_bottom,
+    int                                                 scrollback_rows,
+    int                                                 offset_from_tail,
+    vnm_terminal::Terminal_canvas_buffer                active_buffer,
+    const char*                                         message)
+{
+    return check(
+        result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
+        result.frame != nullptr &&
+        result.frame->content_extent.has_value() &&
+        result.frame->content_extent->record_version ==
+            vnm_terminal::k_terminal_canvas_content_extent_version &&
+        result.frame->content_extent->content_bottom_row_exclusive ==
+            content_bottom &&
+        result.frame->content_extent->scrollback_rows == scrollback_rows &&
+        result.frame->content_extent->offset_from_tail == offset_from_tail &&
+        result.frame->content_extent->active_buffer == active_buffer,
+        message);
 }
 
 bool test_no_frame_and_invalid_source_are_explicit()
@@ -185,6 +211,13 @@ bool test_frame_preserves_canvas_authority_and_prior_immutability()
             vnm_terminal::Terminal_canvas_cursor_shape::UNDERLINE &&
         first.frame->cursor.visible && first.frame->cursor.blink_enabled,
         "cursor authority survives export");
+    ok &= expect_content_extent(
+        first,
+        2,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "canvas extent is derived from the same immutable snapshot");
 
     auto replacement = make_snapshot(1, 1);
     replacement->metadata.sequence = 42U;
@@ -195,8 +228,139 @@ bool test_frame_preserves_canvas_authority_and_prior_immutability()
     ok &= check(
         first.frame->sequence == 41U &&
         first.frame->rows == 2 &&
-        first.frame->cells.size() == 3U,
+        first.frame->cells.size() == 3U &&
+        first.frame->content_extent.has_value() &&
+        first.frame->content_extent->content_bottom_row_exclusive == 2,
         "prior frame remains immutable after a later surface publication");
+    return ok;
+}
+
+bool test_content_extent_uses_semantic_cells_cursor_and_viewport()
+{
+    bool                ok = true;
+    VNM_TerminalSurface surface;
+
+    ok &= expect_content_extent(
+        export_snapshot(surface, make_snapshot(5, 8)),
+        1,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "empty primary snapshot retains the one-row semantic minimum");
+
+    auto occupied = make_snapshot(5, 8);
+    occupied->cells.push_back(make_cell(3, 0, QStringLiteral("x")));
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(occupied)),
+        4,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "last occupied snapshot row determines semantic bottom in O(1)");
+
+    auto hidden_cursor = make_snapshot(5, 8);
+    hidden_cursor->cursor.position = {4, 7};
+    hidden_cursor->cursor.visible  = false;
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(hidden_cursor)),
+        5,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "hidden in-range semantic cursor contributes to bottom");
+
+    auto off_frame_cursor = make_snapshot(5, 8);
+    off_frame_cursor->cursor.position = {9, 7};
+    off_frame_cursor->cursor.visible  = false;
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(off_frame_cursor)),
+        1,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "hidden off-frame cursor does not force a detached frame to full height");
+
+    auto negative_cursor = make_snapshot(5, 8);
+    negative_cursor->cursor.position = {-1, 0};
+    negative_cursor->cursor.visible  = false;
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(negative_cursor)),
+        1,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "negative hidden cursor does not contribute to semantic bottom");
+
+    auto styled_blank = make_snapshot(5, 8);
+    term::Terminal_text_style styled = term::make_default_terminal_text_style();
+    styled.attributes =
+        term::terminal_style_attribute_mask(term::Terminal_style_attribute::BOLD);
+    styled_blank->styles.push_back(styled);
+    styled_blank->cells.push_back(make_cell(3, 0, QStringLiteral(" "), 1, 1U));
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(styled_blank)),
+        4,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "occupied styled blank contributes while sparse erasure remains absent");
+
+    auto detached = make_snapshot(5, 8);
+    detached->viewport.scrollback_rows  = 12;
+    detached->viewport.offset_from_tail = 4;
+    detached->viewport.follow_tail      = false;
+    detached->cells.push_back(make_cell(1, 0, QStringLiteral("d")));
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(detached)),
+        2,
+        12,
+        4,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "primary extent copies shared history and offset exactly");
+
+    auto alternate = make_snapshot(5, 8);
+    alternate->viewport.active_buffer = term::Terminal_buffer_id::ALTERNATE;
+    alternate->cells.push_back(make_cell(2, 0, QStringLiteral("a")));
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(alternate)),
+        3,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER,
+        "alternate extent retains honest bottom and zero shared history");
+
+    auto public_projection = make_snapshot(5, 8);
+    public_projection->basis = term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    public_projection->purpose = term::Terminal_render_snapshot_purpose::SCROLL;
+    public_projection->viewport.scrollback_rows  = 9;
+    public_projection->viewport.offset_from_tail = 3;
+    public_projection->viewport.follow_tail      = false;
+    public_projection->dirty_row_ranges          = {{0, 5}};
+    public_projection->cells.push_back(make_cell(2, 0, QStringLiteral("p")));
+    public_projection->cursor.position = {4, 0};
+    public_projection->cursor.visible  = false;
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(public_projection)),
+        5,
+        9,
+        3,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "public-projection extent uses only its safe copied snapshot basis");
+
+    auto geometry_derived = make_snapshot(5, 8);
+    geometry_derived->purpose =
+        term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
+    geometry_derived->cells.push_back(make_cell(1, 0, QStringLiteral("g")));
+    geometry_derived->cursor.position = {2, 0};
+    geometry_derived->cursor.visible  = false;
+    ok &= expect_content_extent(
+        export_snapshot(surface, std::move(geometry_derived)),
+        3,
+        0,
+        0,
+        vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+        "geometry-derived extent uses only its normalized safe snapshot basis");
+
     return ok;
 }
 
@@ -256,14 +420,14 @@ bool test_exact_bounds_and_one_over_fail_closed()
         vnm_terminal::Terminal_canvas_export_status::COLUMN_LIMIT_EXCEEDED,
         "column bound plus one fails explicitly");
 
-    auto exact_cells = make_snapshot(110, 300);
+    auto exact_cells = make_snapshot(128, 256);
     fill_cells(*exact_cells, vnm_terminal::k_terminal_canvas_max_cells);
     ok &= expect_status(
         surface,
         std::move(exact_cells),
         vnm_terminal::Terminal_canvas_export_status::OK,
         "exact materialized-cell bound exports");
-    auto excess_cells = make_snapshot(110, 300);
+    auto excess_cells = make_snapshot(128, 257);
     fill_cells(*excess_cells, vnm_terminal::k_terminal_canvas_max_cells + 1U);
     ok &= expect_status(
         surface,
@@ -375,6 +539,7 @@ int main(int argc, char** argv)
         "full-only exporter header compiles independently");
     ok &= test_no_frame_and_invalid_source_are_explicit();
     ok &= test_frame_preserves_canvas_authority_and_prior_immutability();
+    ok &= test_content_extent_uses_semantic_cells_cursor_and_viewport();
     ok &= test_exact_bounds_and_one_over_fail_closed();
     ok &= test_text_bounds_fail_closed_without_truncation();
     return ok ? 0 : 1;

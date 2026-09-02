@@ -10,6 +10,7 @@
 #include <QByteArray>
 #include <QFontInfo>
 #include <QThread>
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <utility>
@@ -129,6 +130,7 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     }
 
     std::size_t frame_text_utf8_bytes = 0U;
+    int         occupied_bottom       = 0;
     frame->cells.reserve(snapshot->cells.size());
     for (const term::Terminal_render_cell& source_cell : snapshot->cells) {
         if (source_cell.wide_continuation) {
@@ -159,6 +161,7 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
             };
         }
         frame_text_utf8_bytes += cell_text_utf8_bytes;
+        occupied_bottom = source_cell.position.row + 1;
         frame->cells.push_back({
             source_cell.position.row,
             source_cell.position.column,
@@ -167,6 +170,24 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
             std::move(text),
         });
     }
+
+    const int cursor_bottom =
+        snapshot->cursor.position.row >= 0 &&
+            snapshot->cursor.position.row < snapshot->grid_size.rows
+        ? snapshot->cursor.position.row + 1
+        : 0;
+    terminal_canvas_content_extent_t content_extent;
+    content_extent.content_bottom_row_exclusive = std::clamp(
+        std::max({1, occupied_bottom, cursor_bottom}),
+        1,
+        snapshot->grid_size.rows);
+    content_extent.scrollback_rows = snapshot->viewport.scrollback_rows;
+    content_extent.offset_from_tail = snapshot->viewport.offset_from_tail;
+    content_extent.active_buffer =
+        snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE
+        ? Terminal_canvas_buffer::ALTERNATE_BUFFER
+        : Terminal_canvas_buffer::PRIMARY_BUFFER;
+    frame->content_extent = content_extent;
 
     return {
         Terminal_canvas_export_status::OK,

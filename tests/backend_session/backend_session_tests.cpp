@@ -4270,6 +4270,57 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     return ok;
 }
 
+bool test_hidden_safe_cursor_is_clamped_in_geometry_snapshot()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 0;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 12};
+    ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "hidden-cursor geometry fixture starts");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("SAFE\x1b[4;12H\x1b[?25l")),
+        "hidden-cursor geometry fixture publishes a hidden safe cursor");
+    const std::optional<term::Terminal_render_snapshot> safe_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(safe_snapshot.has_value() &&
+            !safe_snapshot->cursor.visible &&
+            safe_snapshot->cursor.position.row == 3 &&
+            safe_snapshot->cursor.position.column == 11,
+        "hidden-cursor geometry fixture captures the safe cursor at the old edge");
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026h\x1b[1;1HHIDDEN")),
+        "hidden-cursor geometry fixture mutates live content inside the hold");
+    const term::Terminal_session_result resize_result =
+        session->resize(QSizeF(50.0, 40.0), {2, 5});
+    const std::optional<term::Terminal_render_snapshot> derived_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED &&
+            derived_snapshot.has_value() &&
+            derived_snapshot->basis ==
+                term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+            derived_snapshot->purpose ==
+                term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
+            derived_snapshot->grid_size.rows == 2 &&
+            derived_snapshot->grid_size.columns == 5 &&
+            !derived_snapshot->cursor.visible &&
+            derived_snapshot->cursor.position.row == 1 &&
+            derived_snapshot->cursor.position.column == 4 &&
+            snapshot_contains_text(*derived_snapshot, QStringLiteral("SAFE")) &&
+            !snapshot_contains_text(*derived_snapshot, QStringLiteral("HIDDEN")),
+        "geometry derivation clamps hidden safe cursor without exposing held live state");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "hidden-cursor geometry fixture releases synchronized output");
+    return ok;
+}
+
 term::terminal_selection_visual_lease_t make_selection_lease(
     term::Terminal_selection_range range)
 {
@@ -9930,6 +9981,68 @@ bool test_public_projection_geometry_invalidation_composes_with_prior_invalidati
             "composed geometry invalidation cannot release an exact anchor after resize away and back");
     }
 
+    return ok;
+}
+
+bool test_public_projection_rebases_hidden_safe_cursor()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 20;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 16};
+    ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            backend->emit_output(
+                numbered_scroll_lines(8) + QByteArrayLiteral("\x1b[?25l")),
+        "hidden-cursor public projection fixture publishes retained rows");
+    const std::optional<term::Terminal_render_snapshot> safe_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(safe_snapshot.has_value() &&
+            safe_snapshot->viewport.offset_from_tail == 0 &&
+            safe_snapshot->viewport.scrollback_rows > 0 &&
+            !safe_snapshot->cursor.visible,
+        "hidden-cursor public projection fixture captures a hidden safe cursor");
+    if (!safe_snapshot.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026h\x1b[1;1HHIDDEN")),
+        "hidden-cursor public projection fixture mutates live state inside the hold");
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines_from_published_state(
+            1,
+            safe_snapshot->viewport);
+    const std::optional<term::Terminal_render_snapshot> public_snapshot =
+        session->latest_render_snapshot();
+    const int expected_cursor_row =
+        safe_snapshot->cursor.position.row +
+        first_public_row_for_viewport(safe_snapshot->viewport) -
+        (public_snapshot.has_value()
+            ? first_public_row_for_viewport(public_snapshot->viewport)
+            : 0);
+    ok &= check(scroll_result.action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+            public_snapshot.has_value() &&
+            public_snapshot->basis ==
+                term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            public_snapshot->purpose ==
+                term::Terminal_render_snapshot_purpose::SCROLL &&
+            !public_snapshot->cursor.visible &&
+            public_snapshot->cursor.position.row == expected_cursor_row &&
+            public_snapshot->cursor.position.column ==
+                safe_snapshot->cursor.position.column &&
+            !snapshot_contains_text(*public_snapshot, QStringLiteral("HIDDEN")),
+        "public projection rebases hidden cursor in the safe copied basis");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "hidden-cursor public projection fixture releases synchronized output");
     return ok;
 }
 
@@ -18703,6 +18816,7 @@ int main()
     ok &= test_selection_snapshot_and_visible_text();
     ok &= test_selection_snapshot_during_blocked_publication();
     ok &= test_blocked_detach_resize_snapshot_metadata_coherence();
+    ok &= test_hidden_safe_cursor_is_clamped_in_geometry_snapshot();
     ok &= test_selection_internal_state_and_lease();
     ok &= test_selection_replacement_empty_cancel_and_payload_detach();
     ok &= test_selection_model_semantic_flags();
@@ -18749,6 +18863,7 @@ int main()
     ok &= test_public_projection_entry_and_release_boundaries();
     ok &= test_public_projection_release_reconciliation();
     ok &= test_public_projection_geometry_invalidation_composes_with_prior_invalidation();
+    ok &= test_public_projection_rebases_hidden_safe_cursor();
     ok &= test_public_projection_publishes_natural_full_row_scroll();
     ok &= test_public_projection_natural_wrapped_capture_fragment_ordinals();
     ok &= test_public_projection_wrapped_fragment_release_reconciles_fragment_index();

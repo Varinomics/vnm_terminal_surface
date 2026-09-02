@@ -5,11 +5,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace vnm_terminal {
 
 inline constexpr std::uint32_t k_terminal_canvas_frame_api_version = 4U;
+inline constexpr std::uint16_t k_terminal_canvas_content_extent_version = 1U;
 inline constexpr qreal k_terminal_canvas_max_font_pixel_size = 1'024.0;
 inline constexpr std::size_t   k_terminal_canvas_max_cells         = 32'768U;
 // A canvas axis is bounded by the same allocation budget as the complete
@@ -47,6 +49,37 @@ enum class Terminal_canvas_cursor_shape
     BLOCK,
     BAR,
     UNDERLINE,
+};
+
+enum class Terminal_canvas_buffer : std::uint8_t
+{
+    PRIMARY_BUFFER,
+    ALTERNATE_BUFFER,
+};
+
+// Semantic extent for one enclosing frame. Interpret fields only when
+// record_version is known; an unknown version leaves only this capability
+// unavailable and does not invalidate the base frame. Incoherent fields in a
+// known record version invalidate the complete enclosing frame.
+//
+// In version 1, content_bottom_row_exclusive is a frame-relative exclusive row,
+// never a global logical row. It is exactly the maximum of one row, the last
+// exported semantic cell row plus one, and an in-range cursor row plus one.
+// Cursor paint visibility is irrelevant, and an out-of-range cursor contributes
+// nothing. The bottom is in [1, frame.rows], scrollback_rows is in
+// [0, INT_MAX - (frame.rows - 1)], and offset_from_tail is in
+// [0, scrollback_rows]. PRIMARY_BUFFER carries that shared viewport state.
+// ALTERNATE_BUFFER requires zero scrollback and offset; it retains the honestly
+// derived bottom even though presentation anchors the full frame grid.
+struct terminal_canvas_content_extent_t
+{
+    std::uint16_t         record_version =
+        k_terminal_canvas_content_extent_version;
+    int                   content_bottom_row_exclusive = 1;
+    int                   scrollback_rows = 0;
+    int                   offset_from_tail = 0;
+    Terminal_canvas_buffer active_buffer =
+        Terminal_canvas_buffer::PRIMARY_BUFFER;
 };
 
 enum class Terminal_canvas_style_attribute : std::uint16_t
@@ -110,6 +143,10 @@ struct Terminal_canvas_frame
     quint32                          default_background_rgba = 0xff000000U;
     quint32                          cursor_rgba             = 0xffffffffU;
     bool                             reverse_video           = false;
+    // This record, cells, and cursor share the frame's sequence and generations
+    // and must be installed, replaced, or cleared atomically. Absence makes only
+    // the semantic-extent capability unavailable.
+    std::optional<terminal_canvas_content_extent_t> content_extent;
     std::vector<Terminal_canvas_style> styles;
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;

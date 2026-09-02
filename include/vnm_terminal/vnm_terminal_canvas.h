@@ -25,6 +25,15 @@ class VNM_TerminalCanvas : public QQuickItem
         NOTIFY authoritative_cell_metrics_enabled_changed)
     Q_PROPERTY(int rows READ rows NOTIFY frame_changed)
     Q_PROPERTY(int columns READ columns NOTIFY frame_changed)
+    Q_PROPERTY(qreal cellHeight READ cell_height NOTIFY frame_changed)
+    Q_PROPERTY(bool contentExtentAvailable
+        READ content_extent_available NOTIFY frame_changed)
+    Q_PROPERTY(int contentBottomRowExclusive
+        READ content_bottom_row_exclusive NOTIFY frame_changed)
+    Q_PROPERTY(int scrollbackRows READ scrollback_rows NOTIFY frame_changed)
+    Q_PROPERTY(int viewportOffsetFromTail
+        READ viewport_offset_from_tail NOTIFY frame_changed)
+    Q_PROPERTY(bool alternateScreen READ alternate_screen NOTIFY frame_changed)
     Q_PROPERTY(qulonglong frameSequence READ frame_sequence NOTIFY frame_changed)
     Q_PROPERTY(qulonglong frameGeneration
         READ frame_generation NOTIFY frame_changed)
@@ -64,6 +73,14 @@ public:
 
     int rows() const;
     int columns() const;
+    qreal cell_height() const;
+    bool content_extent_available() const;
+    // Extent value accessors are meaningful only while availability is true;
+    // otherwise they return neutral values.
+    int content_bottom_row_exclusive() const;
+    int scrollback_rows() const;
+    int viewport_offset_from_tail() const;
+    bool alternate_screen() const;
     qulonglong frame_sequence() const;
     qulonglong frame_generation() const;
     bool render_ready() const;

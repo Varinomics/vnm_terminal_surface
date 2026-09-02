@@ -24,6 +24,10 @@ std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_frame(
     auto frame = std::make_shared<vnm_terminal::Terminal_canvas_frame>();
     frame->rows                        = 2;
     frame->columns                     = 12;
+    frame->cell_width                  = 10.0;
+    frame->cell_height                 = 20.0;
+    frame->content_width               = 120.0;
+    frame->content_height              = 40.0;
     frame->sequence                    = sequence;
     frame->publication_generation      = 3U;
     frame->row_origin_generation       = 2U;
@@ -80,6 +84,22 @@ bool image_has_canvas_pixels(const QImage& image)
     return dark_pixels > image.width() * image.height() / 2 && colored_pixels > 2;
 }
 
+bool renderer_is_software_or_headless(QQuickWindow& window)
+{
+    QSGRendererInterface* const renderer_interface = window.rendererInterface();
+    if (renderer_interface == nullptr) {
+        return true;
+    }
+
+    const QSGRendererInterface::GraphicsApi graphics_api =
+        renderer_interface->graphicsApi();
+    return
+        QGuiApplication::platformName() == QLatin1String("offscreen") ||
+        graphics_api == QSGRendererInterface::Unknown ||
+        graphics_api == QSGRendererInterface::Software ||
+        graphics_api == QSGRendererInterface::Null;
+}
+
 bool pump_until_rendered(
     QGuiApplication&  application,
     QQuickWindow&     window,
@@ -128,8 +148,7 @@ int main(int argc, char** argv)
 
     QImage rendered;
     if (!pump_until_rendered(application, window, canvas, rendered)) {
-        const QSGRendererInterface* renderer = window.rendererInterface();
-        if (renderer == nullptr || rendered.isNull()) {
+        if (renderer_is_software_or_headless(window)) {
             return ok ? 77 : 1;
         }
         ok &= check(false, "host window renders public canvas pixels");
