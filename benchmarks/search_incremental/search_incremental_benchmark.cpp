@@ -41,8 +41,10 @@ constexpr int k_default_columns          = 80;
 constexpr int k_default_scrollback_limit = 10000;
 constexpr int k_default_published_lines  = 200;
 constexpr int k_default_match_stride     = 97;
-constexpr int k_schema_version           = 1;
+constexpr int k_schema_version           = 3;
 constexpr const char* k_benchmark_name = "vnm_terminal_search_incremental_benchmark";
+constexpr const char* k_dense_query = ".";
+constexpr const char* k_dense_edited_query = "..";
 
 struct App_options
 {
@@ -75,24 +77,49 @@ struct line_cost_t
     qint64 iqr_ns    = 0;
 };
 
+struct dense_result_probe_t
+{
+    qint64 query_submission_ns          = 0;
+    qint64 query_completion_tail_ns     = 0;
+    qint64 query_completion_total_ns    = 0;
+    int    match_count                  = 0;
+    qint64 search_next_ns               = 0;
+    qint64 search_previous_ns           = 0;
+    qint64 query_edit_submission_ns     = 0;
+    qint64 query_edit_completion_tail_ns = 0;
+    qint64 query_edit_completion_total_ns = 0;
+    int    edited_match_count           = 0;
+    qint64 clear_submission_ns          = 0;
+    qint64 clear_disposal_tail_ns       = 0;
+    qint64 clear_completion_total_ns    = 0;
+};
+
 struct Attempt_result
 {
-    bool          ok                      = false;
+    bool          ok                                      = false;
     QString       error;
-    qint64        seed_ns                 = 0;
-    int           seed_scrollback_rows    = 0;
-    std::uint64_t prefix_plain_ascii_rows = 0U;
-    line_cost_t   baseline;
-    line_cost_t   active;
-    qint64        search_overhead_ns_per_line      = 0;
-    qint64        query_activation_ns              = 0;
-    int           match_count                      = 0;
-    int           viewport_offset_after_activation = -1;
-    qint64        reflow_widen_ns                  = 0;
-    qint64        reflow_narrow_ns                 = 0;
-    std::optional<qint64> rss_before_query_bytes;
-    std::optional<qint64> rss_after_index_bytes;
-    std::optional<qint64> rss_after_lines_bytes;
+    qint64        no_query_seed_submission_ns             = 0;
+    qint64        no_query_preseed_to_postseed_ns         = 0;
+    int           seed_scrollback_rows                    = 0;
+    std::uint64_t prefix_plain_ascii_rows                 = 0U;
+    line_cost_t   no_query_publication_submission;
+    qint64        no_query_publication_maintenance_catchup_ns = 0;
+    qint64        no_query_publication_batch_completion_ns = 0;
+    line_cost_t   active_query_publication_submission;
+    qint64        active_query_publication_submission_overhead_ns_per_line = 0;
+    qint64        query_submission_ns                     = 0;
+    qint64        query_completion_ns                     = 0;
+    qint64        active_search_catchup_ns                = 0;
+    int           match_count                             = 0;
+    int           viewport_offset_after_activation        = -1;
+    qint64        reflow_widen_ns                         = 0;
+    qint64        reflow_narrow_ns                        = 0;
+    std::optional<dense_result_probe_t> dense_result;
+    std::optional<qint64> rss_pre_seed_bytes;
+    std::optional<qint64> rss_post_seed_bytes;
+    std::optional<qint64> rss_post_no_query_publications_bytes;
+    std::optional<qint64> rss_post_query_completion_bytes;
+    std::optional<qint64> rss_post_active_query_publications_bytes;
 };
 
 class Benchmark_backend final : public term::Terminal_backend
@@ -320,12 +347,21 @@ Attempt_result run_attempt(const App_options& options)
         return result;
     }
 
+    result.rss_pre_seed_bytes = process_resident_memory_bytes();
     const steady_clock_t::time_point seed_start = steady_clock_t::now();
     if (!backend->emit_output(make_seed_output(options))) {
         result.error = QStringLiteral("seed output was rejected");
         return result;
     }
-    result.seed_ns = elapsed_nanoseconds(seed_start, steady_clock_t::now());
+    result.no_query_seed_submission_ns =
+        elapsed_nanoseconds(seed_start, steady_clock_t::now());
+    if (!session.wait_for_search_idle_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("seed search-source maintenance did not complete");
+        return result;
+    }
+    result.no_query_preseed_to_postseed_ns =
+        elapsed_nanoseconds(seed_start, steady_clock_t::now());
+    result.rss_post_seed_bytes = process_resident_memory_bytes();
 
     const std::optional<term::Terminal_render_snapshot> seeded =
         session.latest_render_snapshot();
@@ -336,23 +372,53 @@ Attempt_result run_attempt(const App_options& options)
     result.seed_scrollback_rows    = seeded->viewport.scrollback_rows;
     result.prefix_plain_ascii_rows =
         session.retained_history_diagnostics().payload_kind_prefix_plain_ascii_rows;
-    result.rss_before_query_bytes  = process_resident_memory_bytes();
 
-    const int line_index_base = options.scrollback_limit + options.rows;
+    int line_index_base = options.scrollback_limit + options.rows;
+    const int last_control_line = line_index_base + options.published_lines - 1;
+    line_index_base +=
+        (options.match_stride - last_control_line % options.match_stride) %
+        options.match_stride;
+    const steady_clock_t::time_point no_query_publication_start =
+        steady_clock_t::now();
     std::vector<qint64> baseline_samples =
         emit_line_burst(*backend, options, line_index_base);
     if (baseline_samples.empty()) {
         result.error = QStringLiteral("control leg output was rejected");
         return result;
     }
-    result.baseline = line_cost_from_samples(std::move(baseline_samples));
+    result.no_query_publication_submission =
+        line_cost_from_samples(std::move(baseline_samples));
+    const steady_clock_t::time_point no_query_submission_end =
+        steady_clock_t::now();
+    if (!session.wait_for_search_idle_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral(
+            "no-query search-source maintenance did not complete");
+        return result;
+    }
+    result.no_query_publication_maintenance_catchup_ns =
+        elapsed_nanoseconds(no_query_submission_end, steady_clock_t::now());
+    result.no_query_publication_batch_completion_ns =
+        elapsed_nanoseconds(no_query_publication_start, steady_clock_t::now());
+    result.rss_post_no_query_publications_bytes = process_resident_memory_bytes();
 
     const steady_clock_t::time_point activation_start = steady_clock_t::now();
     session.set_search_query(options.query);
-    result.query_activation_ns =
+    result.query_submission_ns =
         elapsed_nanoseconds(activation_start, steady_clock_t::now());
-    result.match_count           = session.search_result_state().match_count;
-    result.rss_after_index_bytes = process_resident_memory_bytes();
+    if (session.search_result_state().status !=
+            term::Terminal_search_result_status::SEARCHING)
+    {
+        result.error = QStringLiteral("query submission did not report SEARCHING");
+        return result;
+    }
+    if (!session.wait_for_search_completion_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("query evaluation did not complete");
+        return result;
+    }
+    result.query_completion_ns =
+        elapsed_nanoseconds(activation_start, steady_clock_t::now());
+    result.match_count = session.search_result_state().match_count;
+    result.rss_post_query_completion_bytes = process_resident_memory_bytes();
 
     const std::optional<term::Terminal_render_snapshot> activated =
         session.latest_render_snapshot();
@@ -368,10 +434,20 @@ Attempt_result run_attempt(const App_options& options)
         result.error = QStringLiteral("search leg output was rejected");
         return result;
     }
-    result.active = line_cost_from_samples(std::move(active_samples));
-    result.search_overhead_ns_per_line =
-        result.active.median_ns - result.baseline.median_ns;
-    result.rss_after_lines_bytes = process_resident_memory_bytes();
+    const steady_clock_t::time_point catchup_start = steady_clock_t::now();
+    if (!session.wait_for_search_completion_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("search leg evaluation did not complete");
+        return result;
+    }
+    result.active_search_catchup_ns =
+        elapsed_nanoseconds(catchup_start, steady_clock_t::now());
+    result.active_query_publication_submission =
+        line_cost_from_samples(std::move(active_samples));
+    result.active_query_publication_submission_overhead_ns_per_line =
+        result.active_query_publication_submission.median_ns -
+        result.no_query_publication_submission.median_ns;
+    result.rss_post_active_query_publications_bytes =
+        process_resident_memory_bytes();
 
     const term::terminal_grid_size_t widened{options.rows, options.columns * 2};
     const term::terminal_grid_size_t narrowed{options.rows, options.columns};
@@ -379,14 +455,121 @@ Attempt_result run_attempt(const App_options& options)
     (void)session.resize(
         QSizeF(static_cast<qreal>(widened.columns) * 8.0, static_cast<qreal>(widened.rows) * 16.0),
         widened);
+    if (!session.wait_for_search_completion_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("widened reflow search did not complete");
+        return result;
+    }
     result.reflow_widen_ns = elapsed_nanoseconds(widen_start, steady_clock_t::now());
     const steady_clock_t::time_point narrow_start = steady_clock_t::now();
     (void)session.resize(
         QSizeF(static_cast<qreal>(narrowed.columns) * 8.0, static_cast<qreal>(narrowed.rows) * 16.0),
         narrowed);
+    if (!session.wait_for_search_completion_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("narrowed reflow search did not complete");
+        return result;
+    }
     result.reflow_narrow_ns = elapsed_nanoseconds(narrow_start, steady_clock_t::now());
 
+    if (session.search_query() == QString::fromLatin1(k_dense_query)) {
+        session.clear_search();
+        if (!session.wait_for_search_idle_for_testing(std::chrono::seconds(30))) {
+            result.error = QStringLiteral("dense-query setup clear did not complete");
+            return result;
+        }
+    }
+    result.dense_result.emplace();
+    dense_result_probe_t& dense = *result.dense_result;
+    const steady_clock_t::time_point dense_query_start = steady_clock_t::now();
+    session.set_search_query(QString::fromLatin1(k_dense_query));
+    const steady_clock_t::time_point dense_query_submission_end =
+        steady_clock_t::now();
+    dense.query_submission_ns =
+        elapsed_nanoseconds(dense_query_start, dense_query_submission_end);
+    if (session.search_result_state().status !=
+            term::Terminal_search_result_status::SEARCHING)
+    {
+        result.error = QStringLiteral("dense query submission did not report SEARCHING");
+        return result;
+    }
+    if (!session.wait_for_search_completion_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("dense query evaluation did not complete");
+        return result;
+    }
+    const steady_clock_t::time_point dense_query_completion = steady_clock_t::now();
+    dense.query_completion_tail_ns =
+        elapsed_nanoseconds(dense_query_submission_end, dense_query_completion);
+    dense.query_completion_total_ns =
+        elapsed_nanoseconds(dense_query_start, dense_query_completion);
+    dense.match_count = session.search_result_state().match_count;
+    if (dense.match_count <= 0) {
+        result.error = QStringLiteral("dense query produced no matches");
+        return result;
+    }
+
+    const steady_clock_t::time_point search_next_start = steady_clock_t::now();
+    if (!session.search_next()) {
+        result.error = QStringLiteral("dense search-next navigation failed");
+        return result;
+    }
+    dense.search_next_ns =
+        elapsed_nanoseconds(search_next_start, steady_clock_t::now());
+
+    const steady_clock_t::time_point search_previous_start = steady_clock_t::now();
+    if (!session.search_previous()) {
+        result.error = QStringLiteral("dense search-previous navigation failed");
+        return result;
+    }
+    dense.search_previous_ns =
+        elapsed_nanoseconds(search_previous_start, steady_clock_t::now());
+
+    const steady_clock_t::time_point query_edit_start = steady_clock_t::now();
+    session.set_search_query(QString::fromLatin1(k_dense_edited_query));
+    const steady_clock_t::time_point query_edit_submission_end =
+        steady_clock_t::now();
+    dense.query_edit_submission_ns =
+        elapsed_nanoseconds(query_edit_start, query_edit_submission_end);
+    if (session.search_result_state().status !=
+            term::Terminal_search_result_status::SEARCHING)
+    {
+        result.error = QStringLiteral("dense query edit did not report SEARCHING");
+        return result;
+    }
+    if (!session.wait_for_search_completion_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("dense query edit did not complete");
+        return result;
+    }
+    const steady_clock_t::time_point query_edit_completion = steady_clock_t::now();
+    dense.query_edit_completion_tail_ns =
+        elapsed_nanoseconds(query_edit_submission_end, query_edit_completion);
+    dense.query_edit_completion_total_ns =
+        elapsed_nanoseconds(query_edit_start, query_edit_completion);
+    dense.edited_match_count = session.search_result_state().match_count;
+    if (dense.edited_match_count <= 0) {
+        result.error = QStringLiteral("dense edited query produced no matches");
+        return result;
+    }
+
+    const steady_clock_t::time_point dense_clear_start = steady_clock_t::now();
     session.clear_search();
+    const steady_clock_t::time_point dense_clear_submission_end =
+        steady_clock_t::now();
+    dense.clear_submission_ns =
+        elapsed_nanoseconds(dense_clear_start, dense_clear_submission_end);
+    if (session.search_result_state().status !=
+            term::Terminal_search_result_status::INACTIVE)
+    {
+        result.error = QStringLiteral("dense clear submission did not report INACTIVE");
+        return result;
+    }
+    if (!session.wait_for_search_idle_for_testing(std::chrono::seconds(30))) {
+        result.error = QStringLiteral("dense result disposal did not complete");
+        return result;
+    }
+    const steady_clock_t::time_point dense_clear_completion = steady_clock_t::now();
+    dense.clear_disposal_tail_ns =
+        elapsed_nanoseconds(dense_clear_submission_end, dense_clear_completion);
+    dense.clear_completion_total_ns =
+        elapsed_nanoseconds(dense_clear_start, dense_clear_completion);
     result.ok = true;
     return result;
 }
@@ -567,6 +750,41 @@ void insert_optional_bytes(
     object.insert(key, value.has_value() ? QJsonValue(*value) : QJsonValue());
 }
 
+std::optional<qint64> optional_growth(
+    const std::optional<qint64>& before,
+    const std::optional<qint64>& after)
+{
+    return before.has_value() && after.has_value()
+        ? std::optional<qint64>(*after - *before)
+        : std::nullopt;
+}
+
+QJsonObject dense_result_probe_json(const dense_result_probe_t& probe)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("query_submission_ns"), probe.query_submission_ns);
+    object.insert(QStringLiteral("query_completion_tail_ns"),
+        probe.query_completion_tail_ns);
+    object.insert(QStringLiteral("query_completion_total_ns"),
+        probe.query_completion_total_ns);
+    object.insert(QStringLiteral("match_count"), probe.match_count);
+    object.insert(QStringLiteral("search_next_ns"), probe.search_next_ns);
+    object.insert(QStringLiteral("search_previous_ns"), probe.search_previous_ns);
+    object.insert(QStringLiteral("query_edit_submission_ns"),
+        probe.query_edit_submission_ns);
+    object.insert(QStringLiteral("query_edit_completion_tail_ns"),
+        probe.query_edit_completion_tail_ns);
+    object.insert(QStringLiteral("query_edit_completion_total_ns"),
+        probe.query_edit_completion_total_ns);
+    object.insert(QStringLiteral("edited_match_count"), probe.edited_match_count);
+    object.insert(QStringLiteral("clear_submission_ns"), probe.clear_submission_ns);
+    object.insert(QStringLiteral("clear_disposal_tail_ns"),
+        probe.clear_disposal_tail_ns);
+    object.insert(QStringLiteral("clear_completion_total_ns"),
+        probe.clear_completion_total_ns);
+    return object;
+}
+
 QJsonObject attempt_json(const Attempt_result& attempt)
 {
     QJsonObject object;
@@ -575,28 +793,77 @@ QJsonObject attempt_json(const Attempt_result& attempt)
     if (!attempt.error.isEmpty()) {
         object.insert(QStringLiteral("error"), attempt.error);
     }
-    object.insert(QStringLiteral("seed_ns"), attempt.seed_ns);
+    object.insert(QStringLiteral("no_query_seed_submission_ns"),
+        attempt.no_query_seed_submission_ns);
+    object.insert(QStringLiteral("no_query_preseed_to_postseed_ns"),
+        attempt.no_query_preseed_to_postseed_ns);
     object.insert(QStringLiteral("seed_scrollback_rows"), attempt.seed_scrollback_rows);
     object.insert(QStringLiteral("prefix_plain_ascii_rows"),
         static_cast<qint64>(attempt.prefix_plain_ascii_rows));
-    object.insert(QStringLiteral("baseline_ns_per_line"), attempt.baseline.median_ns);
-    object.insert(QStringLiteral("baseline_iqr_ns"), attempt.baseline.iqr_ns);
-    object.insert(QStringLiteral("active_ns_per_line"), attempt.active.median_ns);
-    object.insert(QStringLiteral("active_iqr_ns"), attempt.active.iqr_ns);
-    object.insert(QStringLiteral("search_overhead_ns_per_line"),
-        attempt.search_overhead_ns_per_line);
-    object.insert(QStringLiteral("query_activation_ns"), attempt.query_activation_ns);
+    object.insert(QStringLiteral("no_query_publication_submission_ns_per_line"),
+        attempt.no_query_publication_submission.median_ns);
+    object.insert(QStringLiteral("no_query_publication_submission_iqr_ns"),
+        attempt.no_query_publication_submission.iqr_ns);
+    object.insert(QStringLiteral("no_query_publication_maintenance_catchup_ns"),
+        attempt.no_query_publication_maintenance_catchup_ns);
+    object.insert(QStringLiteral("no_query_publication_batch_completion_ns"),
+        attempt.no_query_publication_batch_completion_ns);
+    object.insert(QStringLiteral("active_query_publication_submission_ns_per_line"),
+        attempt.active_query_publication_submission.median_ns);
+    object.insert(QStringLiteral("active_query_publication_submission_iqr_ns"),
+        attempt.active_query_publication_submission.iqr_ns);
+    object.insert(
+        QStringLiteral(
+            "active_query_publication_submission_overhead_ns_per_line"),
+        attempt.active_query_publication_submission_overhead_ns_per_line);
+    object.insert(QStringLiteral("query_submission_ns"), attempt.query_submission_ns);
+    object.insert(QStringLiteral("query_completion_ns"), attempt.query_completion_ns);
+    object.insert(QStringLiteral("active_search_catchup_ns"),
+        attempt.active_search_catchup_ns);
     object.insert(QStringLiteral("match_count"), attempt.match_count);
     object.insert(QStringLiteral("viewport_offset_after_activation"),
         attempt.viewport_offset_after_activation);
     object.insert(QStringLiteral("reflow_widen_ns"), attempt.reflow_widen_ns);
     object.insert(QStringLiteral("reflow_narrow_ns"), attempt.reflow_narrow_ns);
-    insert_optional_bytes(object, QStringLiteral("rss_before_query_bytes"),
-        attempt.rss_before_query_bytes);
-    insert_optional_bytes(object, QStringLiteral("rss_after_index_bytes"),
-        attempt.rss_after_index_bytes);
-    insert_optional_bytes(object, QStringLiteral("rss_after_lines_bytes"),
-        attempt.rss_after_lines_bytes);
+    if (attempt.dense_result.has_value()) {
+        object.insert(
+            QStringLiteral("dense_result"),
+            dense_result_probe_json(*attempt.dense_result));
+    }
+    insert_optional_bytes(object, QStringLiteral("rss_pre_seed_bytes"),
+        attempt.rss_pre_seed_bytes);
+    insert_optional_bytes(object, QStringLiteral("rss_post_seed_bytes"),
+        attempt.rss_post_seed_bytes);
+    insert_optional_bytes(object, QStringLiteral("rss_post_no_query_publications_bytes"),
+        attempt.rss_post_no_query_publications_bytes);
+    insert_optional_bytes(object, QStringLiteral("rss_post_query_completion_bytes"),
+        attempt.rss_post_query_completion_bytes);
+    insert_optional_bytes(
+        object,
+        QStringLiteral("rss_post_active_query_publications_bytes"),
+        attempt.rss_post_active_query_publications_bytes);
+    insert_optional_bytes(
+        object,
+        QStringLiteral("rss_preseed_to_postseed_growth_bytes"),
+        optional_growth(attempt.rss_pre_seed_bytes, attempt.rss_post_seed_bytes));
+    insert_optional_bytes(
+        object,
+        QStringLiteral("rss_preseed_to_post_no_query_publications_growth_bytes"),
+        optional_growth(
+            attempt.rss_pre_seed_bytes,
+            attempt.rss_post_no_query_publications_bytes));
+    insert_optional_bytes(
+        object,
+        QStringLiteral("rss_prequery_to_postcompletion_growth_bytes"),
+        optional_growth(
+            attempt.rss_post_no_query_publications_bytes,
+            attempt.rss_post_query_completion_bytes));
+    insert_optional_bytes(
+        object,
+        QStringLiteral("rss_active_query_publications_growth_bytes"),
+        optional_growth(
+            attempt.rss_post_query_completion_bytes,
+            attempt.rss_post_active_query_publications_bytes));
     return object;
 }
 
@@ -612,23 +879,111 @@ qint64 median_of(std::vector<qint64> values)
 
 QJsonObject make_summary_json(const std::vector<Attempt_result>& attempts)
 {
-    std::vector<qint64> baseline;
-    std::vector<qint64> active;
-    std::vector<qint64> overhead;
-    std::vector<qint64> activation;
+    std::vector<qint64> seed;
+    std::vector<qint64> seed_submission;
+    std::vector<qint64> no_query_publication_submission;
+    std::vector<qint64> no_query_publication_maintenance_catchup;
+    std::vector<qint64> no_query_publication_batch_completion;
+    std::vector<qint64> active_query_publication_submission;
+    std::vector<qint64> active_query_publication_submission_overhead;
+    std::vector<qint64> submission;
+    std::vector<qint64> completion;
+    std::vector<qint64> catchup;
+    std::vector<qint64> dense_query_submission;
+    std::vector<qint64> dense_query_completion_tail;
+    std::vector<qint64> dense_query_completion_total;
+    std::vector<qint64> dense_search_next;
+    std::vector<qint64> dense_search_previous;
+    std::vector<qint64> dense_query_edit_submission;
+    std::vector<qint64> dense_query_edit_completion_tail;
+    std::vector<qint64> dense_query_edit_completion_total;
+    std::vector<qint64> dense_clear_submission;
+    std::vector<qint64> dense_clear_disposal_tail;
+    std::vector<qint64> dense_clear_completion_total;
     for (const Attempt_result& attempt : attempts) {
-        baseline.push_back(attempt.baseline.median_ns);
-        active.push_back(attempt.active.median_ns);
-        overhead.push_back(attempt.search_overhead_ns_per_line);
-        activation.push_back(attempt.query_activation_ns);
+        seed.push_back(attempt.no_query_preseed_to_postseed_ns);
+        seed_submission.push_back(attempt.no_query_seed_submission_ns);
+        no_query_publication_submission.push_back(
+            attempt.no_query_publication_submission.median_ns);
+        no_query_publication_maintenance_catchup.push_back(
+            attempt.no_query_publication_maintenance_catchup_ns);
+        no_query_publication_batch_completion.push_back(
+            attempt.no_query_publication_batch_completion_ns);
+        active_query_publication_submission.push_back(
+            attempt.active_query_publication_submission.median_ns);
+        active_query_publication_submission_overhead.push_back(
+            attempt.active_query_publication_submission_overhead_ns_per_line);
+        submission.push_back(attempt.query_submission_ns);
+        completion.push_back(attempt.query_completion_ns);
+        catchup.push_back(attempt.active_search_catchup_ns);
+        if (attempt.dense_result.has_value()) {
+            const dense_result_probe_t& dense = *attempt.dense_result;
+            dense_query_submission.push_back(dense.query_submission_ns);
+            dense_query_completion_tail.push_back(dense.query_completion_tail_ns);
+            dense_query_completion_total.push_back(dense.query_completion_total_ns);
+            dense_search_next.push_back(dense.search_next_ns);
+            dense_search_previous.push_back(dense.search_previous_ns);
+            dense_query_edit_submission.push_back(dense.query_edit_submission_ns);
+            dense_query_edit_completion_tail.push_back(
+                dense.query_edit_completion_tail_ns);
+            dense_query_edit_completion_total.push_back(
+                dense.query_edit_completion_total_ns);
+            dense_clear_submission.push_back(dense.clear_submission_ns);
+            dense_clear_disposal_tail.push_back(dense.clear_disposal_tail_ns);
+            dense_clear_completion_total.push_back(dense.clear_completion_total_ns);
+        }
     }
 
     QJsonObject summary;
-    summary.insert(QStringLiteral("median_baseline_ns_per_line"), median_of(baseline));
-    summary.insert(QStringLiteral("median_active_ns_per_line"), median_of(active));
-    summary.insert(QStringLiteral("median_search_overhead_ns_per_line"),
-        median_of(overhead));
-    summary.insert(QStringLiteral("median_query_activation_ns"), median_of(activation));
+    summary.insert(QStringLiteral("median_no_query_seed_submission_ns"),
+        median_of(seed_submission));
+    summary.insert(QStringLiteral("median_no_query_preseed_to_postseed_ns"),
+        median_of(seed));
+    summary.insert(
+        QStringLiteral("median_no_query_publication_submission_ns_per_line"),
+        median_of(no_query_publication_submission));
+    summary.insert(
+        QStringLiteral("median_no_query_publication_maintenance_catchup_ns"),
+        median_of(no_query_publication_maintenance_catchup));
+    summary.insert(
+        QStringLiteral("median_no_query_publication_batch_completion_ns"),
+        median_of(no_query_publication_batch_completion));
+    summary.insert(
+        QStringLiteral("median_active_query_publication_submission_ns_per_line"),
+        median_of(active_query_publication_submission));
+    summary.insert(
+        QStringLiteral(
+            "median_active_query_publication_submission_overhead_ns_per_line"),
+        median_of(active_query_publication_submission_overhead));
+    summary.insert(QStringLiteral("median_query_submission_ns"), median_of(submission));
+    summary.insert(QStringLiteral("median_query_completion_ns"), median_of(completion));
+    summary.insert(QStringLiteral("median_active_search_catchup_ns"), median_of(catchup));
+    if (!dense_query_submission.empty()) {
+        QJsonObject dense;
+        dense.insert(QStringLiteral("median_query_submission_ns"),
+            median_of(dense_query_submission));
+        dense.insert(QStringLiteral("median_query_completion_tail_ns"),
+            median_of(dense_query_completion_tail));
+        dense.insert(QStringLiteral("median_query_completion_total_ns"),
+            median_of(dense_query_completion_total));
+        dense.insert(QStringLiteral("median_search_next_ns"),
+            median_of(dense_search_next));
+        dense.insert(QStringLiteral("median_search_previous_ns"),
+            median_of(dense_search_previous));
+        dense.insert(QStringLiteral("median_query_edit_submission_ns"),
+            median_of(dense_query_edit_submission));
+        dense.insert(QStringLiteral("median_query_edit_completion_tail_ns"),
+            median_of(dense_query_edit_completion_tail));
+        dense.insert(QStringLiteral("median_query_edit_completion_total_ns"),
+            median_of(dense_query_edit_completion_total));
+        dense.insert(QStringLiteral("median_clear_submission_ns"),
+            median_of(dense_clear_submission));
+        dense.insert(QStringLiteral("median_clear_disposal_tail_ns"),
+            median_of(dense_clear_disposal_tail));
+        dense.insert(QStringLiteral("median_clear_completion_total_ns"),
+            median_of(dense_clear_completion_total));
+        summary.insert(QStringLiteral("dense_result"), dense);
+    }
     return summary;
 }
 
@@ -669,15 +1024,88 @@ QJsonObject make_root_json(
     root.insert(QStringLiteral("profiling_compiled"), false);
 #endif
     root.insert(QStringLiteral("options"), make_options_json(options));
+    QJsonObject comparison_contract;
+    comparison_contract.insert(
+        QStringLiteral("pairing_option_fields"),
+        QJsonArray{
+            QStringLiteral("rows"),
+            QStringLiteral("columns"),
+            QStringLiteral("scrollback_limit"),
+            QStringLiteral("published_lines"),
+            QStringLiteral("match_stride"),
+            QStringLiteral("query"),
+        });
+    comparison_contract.insert(
+        QStringLiteral("revision_comparison_fields"),
+        QJsonArray{
+            QStringLiteral("no_query_seed_submission_ns"),
+            QStringLiteral("no_query_preseed_to_postseed_ns"),
+            QStringLiteral("no_query_publication_submission_ns_per_line"),
+            QStringLiteral("no_query_publication_maintenance_catchup_ns"),
+            QStringLiteral("no_query_publication_batch_completion_ns"),
+            QStringLiteral("rss_post_seed_bytes"),
+            QStringLiteral("rss_preseed_to_postseed_growth_bytes"),
+            QStringLiteral(
+                "rss_preseed_to_post_no_query_publications_growth_bytes"),
+            QStringLiteral("query_submission_ns"),
+            QStringLiteral("query_completion_ns"),
+            QStringLiteral("rss_post_query_completion_bytes"),
+            QStringLiteral("rss_prequery_to_postcompletion_growth_bytes"),
+        });
+    comparison_contract.insert(
+        QStringLiteral("prior_schema_1_field_mapping"),
+        QJsonObject{
+            {QStringLiteral("no_query_seed_submission_ns"),
+                QStringLiteral("seed_ns")},
+            {QStringLiteral("no_query_publication_submission_ns_per_line"),
+                QStringLiteral("baseline_ns_per_line")},
+            {QStringLiteral("rss_post_seed_bytes"),
+                QStringLiteral("rss_before_query_bytes")},
+            {QStringLiteral("query_completion_ns"),
+                QStringLiteral("query_activation_ns")},
+            {QStringLiteral("rss_post_query_completion_bytes"),
+                QStringLiteral("rss_after_index_bytes")},
+        });
+    root.insert(QStringLiteral("comparison_contract"), comparison_contract);
+    root.insert(
+        QStringLiteral("capability_measurements"),
+        QJsonObject{
+            {
+                QStringLiteral("dense_result"),
+                QJsonObject{
+                    {QStringLiteral("attempt_field"), QStringLiteral("dense_result")},
+                    {QStringLiteral("query"), QString::fromLatin1(k_dense_query)},
+                    {QStringLiteral("edited_query"),
+                        QString::fromLatin1(k_dense_edited_query)},
+                },
+            },
+        });
     root.insert(
         QStringLiteral("measurement_semantics"),
         QStringLiteral(
-            "seed timing covers ingest of the whole retained history with no query set; "
-            "the control leg emits single lines with no query and the search leg emits the "
-            "same lines with the query active, both at the retention target and with the "
-            "viewport at the tail; per-line cost is a median with an interquartile range "
-            "over the leg; activation times one set_search_query on the seeded session; "
-            "memory is best-effort process RSS"));
+            "no_query_seed_submission_ns covers synchronous ingest and publication of the "
+            "whole retained history while no query is set; "
+            "no_query_preseed_to_postseed_ns additionally waits until asynchronous "
+            "search-source maintenance is idle; no_query_publication_submission_ns_per_line "
+            "measures synchronous no-query publication one line at a time at the retention "
+            "target, while maintenance_catchup and batch_completion report the asynchronous "
+            "tail and total wall time for the whole leg; active "
+            "query publication submission excludes asynchronous catchup, which is reported "
+            "separately; query submission times only set_search_query while query completion "
+            "also waits for the accepted asynchronous result; the optional dense_result "
+            "capability record uses a fixed one-byte query that repeatedly matches seeded "
+            "padding, measures next and previous navigation, then edits to a two-byte query; "
+            "every dense-result completion_total_ns starts before the corresponding public "
+            "call, while completion_tail_ns or disposal_tail_ns starts after that call "
+            "returns; clear_submission_ns times only clear_search and its bounded overlay "
+            "publication, while clear_completion_total_ns additionally waits until "
+            "worker-side result disposal is idle; "
+            "RSS checkpoints are absolute "
+            "best-effort process working sets and every growth field names its exact before "
+            "and after checkpoints, so prequery-to-postcompletion growth is not total search "
+            "memory; pair reports from two revisions only when every pairing_option_field "
+            "matches and compare the named revision_comparison_fields; the schema-1 map "
+            "identifies equivalent historical checkpoints, not aliases for total memory"));
     root.insert(QStringLiteral("warmup_status"),
         warmup_ok ? QStringLiteral("ok") : QStringLiteral("failed"));
     root.insert(QStringLiteral("attempts"), attempt_array);
@@ -705,6 +1133,39 @@ bool validate_json_output(
         root.value(QStringLiteral("status")).toString() != QStringLiteral("ok"))
     {
         *out_error = QStringLiteral("benchmark root metadata changed or status failed");
+        return false;
+    }
+
+    const QJsonObject comparison_contract =
+        root.value(QStringLiteral("comparison_contract")).toObject();
+    if (comparison_contract.value(QStringLiteral("pairing_option_fields"))
+            .toArray().isEmpty() ||
+        comparison_contract.value(QStringLiteral("revision_comparison_fields"))
+            .toArray().isEmpty() ||
+        comparison_contract.value(QStringLiteral("prior_schema_1_field_mapping"))
+            .toObject().isEmpty())
+    {
+        *out_error = QStringLiteral("benchmark comparison contract is missing");
+        return false;
+    }
+    const QJsonObject dense_capability =
+        root.value(QStringLiteral("capability_measurements"))
+            .toObject()
+            .value(QStringLiteral("dense_result"))
+            .toObject();
+    if (dense_capability.value(QStringLiteral("attempt_field")).toString() !=
+            QStringLiteral("dense_result") ||
+        dense_capability.value(QStringLiteral("query")).toString() !=
+            QString::fromLatin1(k_dense_query) ||
+        dense_capability.value(QStringLiteral("edited_query")).toString() !=
+            QString::fromLatin1(k_dense_edited_query) ||
+        root.value(QStringLiteral("summary"))
+            .toObject()
+            .value(QStringLiteral("dense_result"))
+            .toObject()
+            .isEmpty())
+    {
+        *out_error = QStringLiteral("dense-result capability metadata is missing");
         return false;
     }
 
@@ -739,10 +1200,122 @@ bool validate_json_output(
             return false;
         }
 
-        if (attempt.value(QStringLiteral("baseline_ns_per_line")).toInteger() <= 0 ||
-            attempt.value(QStringLiteral("active_ns_per_line")).toInteger() <= 0)
+        if (attempt.value(QStringLiteral("no_query_seed_submission_ns"))
+                    .toInteger() <= 0 ||
+            attempt.value(QStringLiteral("no_query_preseed_to_postseed_ns"))
+                    .toInteger() <= 0 ||
+            attempt.value(QStringLiteral(
+                "no_query_publication_submission_ns_per_line"))
+                    .toInteger() <= 0 ||
+            attempt.value(QStringLiteral(
+                "no_query_publication_maintenance_catchup_ns"))
+                    .toInteger() < 0 ||
+            attempt.value(QStringLiteral(
+                "no_query_publication_batch_completion_ns"))
+                    .toInteger() <= 0 ||
+            attempt.value(QStringLiteral(
+                "active_query_publication_submission_ns_per_line"))
+                    .toInteger() <= 0 ||
+            attempt.value(QStringLiteral("query_submission_ns")).toInteger() <= 0 ||
+            attempt.value(QStringLiteral("query_completion_ns")).toInteger() <= 0)
         {
-            *out_error = QStringLiteral("benchmark attempt %1 recorded no per-line cost")
+            *out_error = QStringLiteral("benchmark attempt %1 recorded an incomplete timing")
+                .arg(index);
+            return false;
+        }
+        if (attempt.value(QStringLiteral("no_query_preseed_to_postseed_ns"))
+                    .toInteger() <
+                attempt.value(QStringLiteral("no_query_seed_submission_ns"))
+                    .toInteger() ||
+            attempt.value(QStringLiteral(
+                "no_query_publication_batch_completion_ns"))
+                    .toInteger() <
+                attempt.value(QStringLiteral(
+                    "no_query_publication_maintenance_catchup_ns"))
+                    .toInteger() ||
+            attempt.value(QStringLiteral("query_completion_ns")).toInteger() <
+                attempt.value(QStringLiteral("query_submission_ns")).toInteger())
+        {
+            *out_error = QStringLiteral(
+                "benchmark attempt %1 recorded inconsistent async timing boundaries")
+                .arg(index);
+            return false;
+        }
+
+        const QJsonObject dense =
+            attempt.value(QStringLiteral("dense_result")).toObject();
+        if (dense.isEmpty() ||
+            dense.value(QStringLiteral("match_count")).toInt() <= 0 ||
+            dense.value(QStringLiteral("edited_match_count")).toInt() <= 0 ||
+            dense.value(QStringLiteral("query_submission_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("query_completion_tail_ns")).toInteger() < 0 ||
+            dense.value(QStringLiteral("query_completion_total_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("search_next_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("search_previous_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("query_edit_submission_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("query_edit_completion_tail_ns")).toInteger() < 0 ||
+            dense.value(QStringLiteral("query_edit_completion_total_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("clear_submission_ns")).toInteger() <= 0 ||
+            dense.value(QStringLiteral("clear_disposal_tail_ns")).toInteger() < 0 ||
+            dense.value(QStringLiteral("clear_completion_total_ns")).toInteger() <= 0)
+        {
+            *out_error = QStringLiteral(
+                "benchmark attempt %1 recorded an incomplete dense-result probe")
+                .arg(index);
+            return false;
+        }
+        if (dense.value(QStringLiteral("query_completion_total_ns")).toInteger() <
+                dense.value(QStringLiteral("query_submission_ns")).toInteger() ||
+            dense.value(QStringLiteral("query_completion_total_ns")).toInteger() <
+                dense.value(QStringLiteral("query_completion_tail_ns")).toInteger() ||
+            dense.value(QStringLiteral("query_edit_completion_total_ns")).toInteger() <
+                dense.value(QStringLiteral("query_edit_submission_ns")).toInteger() ||
+            dense.value(QStringLiteral("query_edit_completion_total_ns")).toInteger() <
+                dense.value(QStringLiteral("query_edit_completion_tail_ns")).toInteger() ||
+            dense.value(QStringLiteral("clear_completion_total_ns")).toInteger() <
+                dense.value(QStringLiteral("clear_submission_ns")).toInteger() ||
+            dense.value(QStringLiteral("clear_completion_total_ns")).toInteger() <
+                dense.value(QStringLiteral("clear_disposal_tail_ns")).toInteger())
+        {
+            *out_error = QStringLiteral(
+                "benchmark attempt %1 recorded inconsistent dense-result timing boundaries")
+                .arg(index);
+            return false;
+        }
+
+        const auto rss_growth_is_consistent = [&attempt](
+            const QString& before_key,
+            const QString& after_key,
+            const QString& growth_key) {
+            const QJsonValue before = attempt.value(before_key);
+            const QJsonValue after  = attempt.value(after_key);
+            const QJsonValue growth = attempt.value(growth_key);
+            if (before.isNull() || after.isNull()) {
+                return growth.isNull();
+            }
+            return before.isDouble() && after.isDouble() && growth.isDouble() &&
+                growth.toInteger() == after.toInteger() - before.toInteger();
+        };
+        if (!rss_growth_is_consistent(
+                QStringLiteral("rss_pre_seed_bytes"),
+                QStringLiteral("rss_post_seed_bytes"),
+                QStringLiteral("rss_preseed_to_postseed_growth_bytes")) ||
+            !rss_growth_is_consistent(
+                QStringLiteral("rss_pre_seed_bytes"),
+                QStringLiteral("rss_post_no_query_publications_bytes"),
+                QStringLiteral(
+                    "rss_preseed_to_post_no_query_publications_growth_bytes")) ||
+            !rss_growth_is_consistent(
+                QStringLiteral("rss_post_no_query_publications_bytes"),
+                QStringLiteral("rss_post_query_completion_bytes"),
+                QStringLiteral("rss_prequery_to_postcompletion_growth_bytes")) ||
+            !rss_growth_is_consistent(
+                QStringLiteral("rss_post_query_completion_bytes"),
+                QStringLiteral("rss_post_active_query_publications_bytes"),
+                QStringLiteral("rss_active_query_publications_growth_bytes")))
+        {
+            *out_error = QStringLiteral(
+                "benchmark attempt %1 recorded inconsistent RSS checkpoints")
                 .arg(index);
             return false;
         }

@@ -183,6 +183,9 @@ public:
     void clear() noexcept;
 
     Terminal_history_ring_read_scope read_record(std::uint64_t byte_sequence);
+    Terminal_history_ring_read_scope read_record_at_live_index(
+        std::size_t   live_index,
+        std::uint64_t expected_byte_sequence);
 
     void fail_next_record_descriptor_allocation_for_testing()
     {

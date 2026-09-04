@@ -254,6 +254,11 @@ public:
     bool search_previous();
     QString search_query() const;
     terminal_search_result_state_t search_result_state() const;
+    bool process_search_events();
+    bool wait_for_search_idle_for_testing(
+        std::chrono::milliseconds timeout);
+    bool wait_for_search_completion_for_testing(
+        std::chrono::milliseconds timeout);
 
     std::vector<Terminal_session_command> processed_commands() const;
     std::vector<Terminal_session_notification> notifications() const;
@@ -857,17 +862,26 @@ private:
     void latch_synchronized_output_scroll_policy_for_new_hold();
     void reset_synchronized_output_policy_lifecycle();
     bool capture_public_projection_from_latest_content_basis();
-    bool capture_search_projection_from_safe_basis(
+    void update_search_source_from_published_model(
         const Terminal_render_snapshot&            safe_basis,
-        terminal_selection_content_basis_t         content_basis);
-    bool refresh_search_from_current_public_source();
+        const Terminal_screen_model_result&        model_result);
     void apply_search_matches_to_snapshot(
         Terminal_render_snapshot&                  snapshot,
         std::uint64_t                              active_buffer_epoch) const;
+    void cancel_pending_search_reveal();
+    bool publish_completed_search_result(QString message);
     bool reveal_current_search_match(QString message);
+    bool publish_bounded_safe_search_viewport(
+        const terminal_search_match_t& match,
+        QString                        message);
     bool publish_search_overlay_from_latest_public_snapshot(QString message);
+    bool publish_search_overlay_from_snapshot(
+        const Terminal_render_snapshot& safe_basis,
+        QString                         message);
+    bool install_search_derived_snapshot(
+        Terminal_render_snapshot snapshot,
+        QString                  message);
     bool publish_search_derived_snapshot(QString message);
-    void invalidate_search_projection();
     std::optional<Terminal_public_scroll_diagnostics> reconcile_public_projection_release(
         const Terminal_public_release_intent& release_intent,
         Terminal_viewport_state               live_viewport_before_on_release);
@@ -991,7 +1005,6 @@ private:
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_content_render_snapshot;
     terminal_selection_content_basis_t                     m_latest_content_render_snapshot_content_basis;
     std::optional<Terminal_public_projection>              m_public_projection;
-    std::optional<Terminal_public_projection>              m_search_projection;
     Terminal_public_viewport_controller                    m_public_viewport_controller;
     std::optional<Terminal_screen_model_result>            m_last_model_ingest_result;
     std::optional<Terminal_screen_model_result>            m_render_snapshot_model_result;
@@ -1017,7 +1030,13 @@ private:
     std::optional<std::uint64_t>                           m_drain_synchronized_release_publication_generation;
     std::optional<std::uint64_t>                           m_drain_latest_live_content_publication_generation;
     std::uint64_t                                          m_next_public_projection_generation = 1U;
-    std::uint64_t                                          m_next_search_projection_generation = 1U;
+    std::optional<terminal_retained_history_ordinal_range_t>
+                                                           m_queued_search_retained_range;
+    std::optional<terminal_search_source_identity_t>
+                                                           m_queued_search_source_identity;
+    std::uint64_t                                          m_search_source_revision = 0U;
+    bool                                                   m_search_retained_reset_pending = false;
+    bool                                                   m_search_reveal_pending = false;
     std::shared_ptr<const Terminal_render_snapshot>        m_unrendered_render_snapshot_dirty_basis;
     std::optional<Terminal_synchronized_output_scroll_policy>
                                                            m_synchronized_output_hold_policy;

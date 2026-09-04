@@ -184,6 +184,11 @@ public:
             VNM_TerminalSurface&       surface,
             std::function<void()>      handler);
 
+    // Set before starting the session; the hook runs on its search worker.
+    static void set_before_search_completion_dispatch_handler_for_testing(
+        VNM_TerminalSurface& surface,
+        std::function<void()> handler);
+
     static void set_pending_published_mouse_report_block_count_for_testing(
         VNM_TerminalSurface&       surface,
         int                        count);

@@ -27,6 +27,7 @@
 #include <QQuickWindow>
 #include <QScreen>
 #include <QThread>
+#include <QThreadPool>
 #include <QTemporaryDir>
 #include <QVariant>
 #include <QWheelEvent>
@@ -43,6 +44,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <semaphore>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -18109,9 +18111,19 @@ bool test_public_search_api_persists_query_and_navigates(QGuiApplication& app)
         std::move(backend),
         {QStringLiteral("scripted-terminal")},
         &started);
-    pump_events(app);
 
     ok &= check(started, "public search API fixture starts");
+    ok &= check(
+        fixture.surface.search_result_state() ==
+            VNM_TerminalSurface::Search_result_state::SEARCHING &&
+        fixture.surface.search_match_count() == 0 &&
+        fixture.surface.current_search_match() == 0,
+        "public search API exposes pending evaluation without stale matches");
+    ok &= check(pump_until(app, [&fixture] {
+            return fixture.surface.search_result_state() ==
+                VNM_TerminalSurface::Search_result_state::MATCH;
+        }),
+        "public search completion returns to the GUI owner thread");
     ok &= check(
         fixture.surface.search_result_state() ==
             VNM_TerminalSurface::Search_result_state::MATCH &&
@@ -18143,6 +18155,118 @@ bool test_public_search_api_persists_query_and_navigates(QGuiApplication& app)
         "public clear search removes result state and disables navigation");
     ok &= check(search_change_count >= 4,
         "public search state changes notify host property observers");
+    return ok;
+}
+
+class Search_completion_dispatch_pause
+{
+public:
+    void pause()
+    {
+        if (m_claimed.exchange(true)) {
+            return;
+        }
+        m_entered.release();
+        m_resume.acquire();
+    }
+
+    bool wait_until_paused()
+    {
+        return m_entered.try_acquire_for(std::chrono::seconds(5));
+    }
+
+    void resume() { m_resume.release(); }
+
+private:
+    std::atomic_bool      m_claimed = false;
+    std::binary_semaphore m_entered{0};
+    std::binary_semaphore m_resume{0};
+};
+
+bool test_search_completion_during_surface_destruction(QGuiApplication& app)
+{
+    auto surface = std::make_unique<VNM_TerminalSurface>();
+    surface->setSize(QSizeF(520.0, 240.0));
+    pump_events(app);
+
+    auto pause = std::make_shared<Search_completion_dispatch_pause>();
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_search_completion_dispatch_handler_for_testing(
+            *surface, [pause] { pause->pause(); });
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("completion-needle")};
+    bool started = false;
+    (void)start_surface_with_backend(
+        *surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+    surface->set_search_query(QStringLiteral("completion-needle"));
+
+    bool ok = check(started, "search completion destruction fixture starts");
+    ok &= check(pause->wait_until_paused(),
+        "search worker reaches the copied completion notifier before dispatch");
+    // QObject lifetime, not query contents, is the oracle: copied worker work
+    // must survive GUI destruction without accessing the destroyed item.
+    surface.reset();
+    pause->resume();
+    ok &= check(QThreadPool::globalInstance()->waitForDone(5000),
+        "copied search notifier finishes after surface destruction");
+    pump_events(app);
+    return ok;
+}
+
+bool test_search_completion_after_session_restart(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto pause = std::make_shared<Search_completion_dispatch_pause>();
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_search_completion_dispatch_handler_for_testing(
+            fixture.surface, [pause] { pause->pause(); });
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("session-needle session-needle")};
+    bool started = false;
+    (void)start_surface_with_backend(
+        fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+    fixture.surface.set_search_query(QStringLiteral("session-needle"));
+
+    bool ok = check(started, "search completion restart fixture starts");
+    ok &= check(pause->wait_until_paused(),
+        "previous session completion is held before dispatch");
+    ok &= check(fixture.surface.terminate_process(), "previous search session terminates");
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_search_completion_dispatch_handler_for_testing(fixture.surface, {});
+    auto restarted_backend = std::make_unique<Scripted_backend>();
+    restarted_backend->outputs_during_start = {QByteArrayLiteral("session-needle")};
+    bool restarted = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(restarted_backend),
+        {QStringLiteral("scripted-terminal")},
+        &restarted);
+    ok &= check(restarted, "replacement search session starts");
+    ok &= check(pump_until(app, [&fixture] {
+            return fixture.surface.search_result_state() ==
+                VNM_TerminalSurface::Search_result_state::MATCH;
+        }),
+        "replacement session publishes its own search completion");
+    const auto snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    int stale_search_changes = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::search_changed,
+        &fixture.surface,
+        [&stale_search_changes] { ++stale_search_changes; });
+    pause->resume();
+    ok &= check(QThreadPool::globalInstance()->waitForDone(5000),
+        "previous session notifier finishes after replacement completes");
+    pump_events(app);
+    ok &= check(
+        fixture.surface.search_match_count() == 1 &&
+        fixture.surface.current_search_match() == 1 &&
+        stale_search_changes == 0 &&
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface) == snapshot,
+        "previous session completion leaves replacement results and snapshot unchanged");
     return ok;
 }
 
@@ -18275,6 +18399,12 @@ bool test_indeterminate_dispatched_start_is_reported_once(QGuiApplication& app)
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
+
+    if (app.arguments().contains(QStringLiteral("--search-completion-lifetime-only"))) {
+        bool ok = test_search_completion_during_surface_destruction(app);
+        ok &= test_search_completion_after_session_restart(app);
+        return ok ? 0 : 1;
+    }
 
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
@@ -18416,6 +18546,8 @@ int main(int argc, char** argv)
     ok &= test_notification_burst_uses_durable_channel(app);
     ok &= test_surface_overflow_reports_error_and_exit(app);
     ok &= test_public_search_api_persists_query_and_navigates(app);
+    ok &= test_search_completion_during_surface_destruction(app);
+    ok &= test_search_completion_after_session_restart(app);
     ok &= test_invalid_argv_reports_backend_error(app);
     ok &= test_indeterminate_dispatched_start_is_reported_once(app);
     return ok ? 0 : 1;

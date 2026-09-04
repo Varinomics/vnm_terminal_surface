@@ -390,6 +390,7 @@ public:
         SOURCE_UNAVAILABLE,
         NO_MATCH,
         MATCH,
+        SEARCHING,
     };
     Q_ENUM(Search_result_state)
 

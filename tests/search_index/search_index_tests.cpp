@@ -71,6 +71,28 @@ bool check_row_parity(
     return false;
 }
 
+bool test_identity_spans_stay_implicit_until_needed()
+{
+    term::Terminal_search_row_text text;
+    text.append_cell_text(QStringView(u"a"), 0, 1);
+    text.append_cell_text(QStringView(u"b"), 1, 2);
+    text.append_cell_text(QStringView(u"c"), 2, 3);
+    bool ok = true;
+    ok &= check(
+        text.identity_spans && text.spans.empty() && text.view() == QStringView(u"abc"),
+        "ordinary single-width search text keeps identity spans implicit");
+
+    text.append_cell_text(QStringView(u"xy"), 3, 5);
+    ok &= check(
+        !text.identity_spans && text.spans.size() == text.units.size() &&
+            text.spans[0] == term::terminal_search_column_span_t{0, 1} &&
+            text.spans[2] == term::terminal_search_column_span_t{2, 3} &&
+            text.spans[3] == term::terminal_search_column_span_t{3, 5} &&
+            text.spans[4] == term::terminal_search_column_span_t{3, 5},
+        "the first non-identity cell backfills exact spans for preceding text");
+    return ok;
+}
+
 // Walks every viewport position of the primary buffer, so every retained row is
 // compared against the snapshot that publishes it.
 bool check_primary_parity_over_history(
@@ -302,6 +324,7 @@ bool test_retained_history_ordinal_range_tracks_appends_and_evictions()
 int main()
 {
     bool ok = true;
+    ok &= test_identity_spans_stay_implicit_until_needed();
     ok &= test_search_row_text_matches_published_snapshot_rows();
     ok &= test_retained_history_ordinal_range_tracks_appends_and_evictions();
 

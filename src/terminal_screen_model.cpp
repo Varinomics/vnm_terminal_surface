@@ -2884,7 +2884,7 @@ Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_reco
     const terminal_history_handle_t handle =
         retained_history.index[index].history_handle;
     const Terminal_history_ring_read_scope read =
-        retained_history.ring->read_record(handle.byte_sequence);
+        retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
     const Terminal_history_row_record_decode_result decoded =
         decode_terminal_history_row_record(read, handle);
     if (decoded.status != Terminal_history_row_record_codec_status::OK) {
@@ -7221,6 +7221,23 @@ bool Terminal_screen_model::search_row_text(
     int                       logical_row,
     Terminal_search_row_text& out_text) const
 {
+    return search_row_text_impl(buffer_id, logical_row, true, out_text);
+}
+
+bool Terminal_screen_model::search_source_row_text(
+    Terminal_buffer_id        buffer_id,
+    int                       logical_row,
+    Terminal_search_row_text& out_text) const
+{
+    return search_row_text_impl(buffer_id, logical_row, false, out_text);
+}
+
+bool Terminal_screen_model::search_row_text_impl(
+    Terminal_buffer_id        buffer_id,
+    int                       logical_row,
+    bool                      current_geometry,
+    Terminal_search_row_text& out_text) const
+{
     out_text.clear();
     if (logical_row < 0) {
         return false;
@@ -7259,13 +7276,13 @@ bool Terminal_screen_model::search_row_text(
             static_cast<std::size_t>(active_row->value)].cells;
     }
 
-    // The geometry rule is the snapshot builder's own, so the emitted columns
-    // cannot drift from the published row.
     out_text.source_width = static_cast<std::int32_t>(source_cells->size());
-    std::vector<Cell>        visual_projection;
-    const std::vector<Cell>& visual_row =
-        row_cells_for_current_geometry(*source_cells, visual_projection);
-    const int column_count = m_config.grid_size.columns;
+    out_text.units.reserve(source_cells->size());
+    std::vector<Cell> visual_projection;
+    const std::vector<Cell>& visual_row = current_geometry
+        ? row_cells_for_current_geometry(*source_cells, visual_projection)
+        : *source_cells;
+    const int column_count = static_cast<int>(visual_row.size());
     int       next_column  = 0;
     for (int column = 0; column < column_count; ++column) {
         const Cell& cell = visual_row[static_cast<std::size_t>(column)];

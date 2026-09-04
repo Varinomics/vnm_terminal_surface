@@ -524,6 +524,37 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_record(std::uint64_
     return Terminal_history_ring_read_scope(descriptor, std::move(bytes));
 }
 
+Terminal_history_ring_read_scope Terminal_history_ring::read_record_at_live_index(
+    std::size_t   live_index,
+    std::uint64_t expected_byte_sequence)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::read_record_at_live_index");
+
+    if (!ok()) {
+        return Terminal_history_ring_read_scope(m_status);
+    }
+    if (live_index >= m_records.size()) {
+        return Terminal_history_ring_read_scope(
+            Terminal_history_ring_status::OUT_OF_LIVE_RANGE);
+    }
+
+    const terminal_history_ring_record_descriptor_t expected = m_records[live_index];
+    if (expected.byte_sequence != expected_byte_sequence) {
+        return Terminal_history_ring_read_scope(
+            Terminal_history_ring_status::NOT_RECORD_BOUNDARY);
+    }
+
+    std::vector<std::byte> bytes =
+        copy_record_bytes(expected.byte_sequence, expected.record_bytes);
+    terminal_history_ring_record_descriptor_t descriptor;
+    const Terminal_history_ring_status validation_status =
+        validate_record_bytes(bytes, expected_byte_sequence, &descriptor);
+    if (validation_status != Terminal_history_ring_status::OK) {
+        return Terminal_history_ring_read_scope(validation_status);
+    }
+    return Terminal_history_ring_read_scope(descriptor, std::move(bytes));
+}
+
 void Terminal_history_ring::release_reservation() noexcept
 {
     m_reservation_open = false;

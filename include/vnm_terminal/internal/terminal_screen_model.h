@@ -642,6 +642,13 @@ public:
         Terminal_buffer_id             buffer_id,
         int                            logical_row,
         Terminal_search_row_text&      out_text) const;
+    // Emits the row in its stored geometry. Retained rows preserve this compact
+    // source so capability-owned consumers can project later geometry without
+    // revisiting the full model.
+    bool search_source_row_text(
+        Terminal_buffer_id             buffer_id,
+        int                            logical_row,
+        Terminal_search_row_text&      out_text) const;
     void discard_retained_lookup_cache_for_testing() const;
     bool retained_history_storage_allocated_for_testing() const;
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
@@ -1437,6 +1444,12 @@ private:
         const std::vector<Cell>&       row,
         int                            first_column,
         int                            end_column) const;
+
+    bool search_row_text_impl(
+        Terminal_buffer_id             buffer_id,
+        int                            logical_row,
+        bool                           current_geometry,
+        Terminal_search_row_text&      out_text) const;
 
     std::optional<std::vector<Cell>> logical_row_cells(
         Terminal_buffer_id             buffer_id,

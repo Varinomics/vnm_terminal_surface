@@ -246,6 +246,35 @@ bool test_explicit_discard_advances_live_bounds()
     return ok;
 }
 
+bool test_live_index_read_validates_lockstep_identity()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    const term::terminal_history_ring_commit_result_t first =
+        append_record(ring, "first");
+    const term::terminal_history_ring_commit_result_t second =
+        append_record(ring, "second");
+    const term::terminal_history_ring_commit_result_t third =
+        append_record(ring, "third");
+    (void)ring.discard_oldest_records(1U);
+
+    const term::Terminal_history_ring_read_scope second_read =
+        ring.read_record_at_live_index(0U, second.byte_sequence);
+    ok &= check(second_read.ok() && payload_equal(second_read, "second"),
+        "live-index read follows the post-discard record order");
+    ok &= check(
+        ring.read_record_at_live_index(0U, first.byte_sequence).status() ==
+            term::Terminal_history_ring_status::NOT_RECORD_BOUNDARY,
+        "live-index read rejects a mismatched expected byte sequence");
+    ok &= check(
+        ring.read_record_at_live_index(2U, third.byte_sequence).status() ==
+            term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+        "live-index read rejects an index outside the live descriptor range");
+
+    return ok;
+}
+
 bool test_clear_preserves_capacity_and_sequence()
 {
     bool ok = true;
@@ -352,6 +381,7 @@ int main()
     ok &= test_wrap_traversal_tail_boundaries();
     ok &= test_read_scope_boundaries();
     ok &= test_explicit_discard_advances_live_bounds();
+    ok &= test_live_index_read_validates_lockstep_identity();
     ok &= test_clear_preserves_capacity_and_sequence();
     ok &= test_descriptor_allocation_failure_does_not_start_commit();
     return ok ? 0 : 1;

@@ -19,10 +19,11 @@ struct terminal_search_column_span_t
         const terminal_search_column_span_t&) = default;
 };
 
-// Searchable text of one physical row, in the geometry the live grid uses.
-// spans carries exactly one entry per code unit. identity_spans stays true while
-// every entry is {index, index + 1}, the ordinary single-width single-code-unit
-// case, which lets a store keep no spans at all for that row.
+// Searchable text of one physical row. source_width records its geometry so a
+// consumer can bound stored rows to the live grid. Non-identity spans carry
+// exactly one entry per code unit. identity_spans stays true while every entry
+// would be {index, index + 1}, the ordinary single-width single-code-unit case,
+// so those rows keep no explicit spans.
 struct Terminal_search_row_text
 {
     std::vector<char16_t>                      units;
@@ -54,10 +55,19 @@ struct Terminal_search_row_text
         const terminal_search_column_span_t span{first_column, end_column};
         for (QChar code_unit : text) {
             const std::int32_t index = static_cast<std::int32_t>(units.size());
-            identity_spans = identity_spans &&
-                span == terminal_search_column_span_t{index, index + 1};
+            if (identity_spans &&
+                span != terminal_search_column_span_t{index, index + 1})
+            {
+                identity_spans = false;
+                spans.reserve(units.size() + static_cast<std::size_t>(text.size()));
+                for (std::int32_t prior = 0; prior < index; ++prior) {
+                    spans.push_back({prior, prior + 1});
+                }
+            }
+            if (!identity_spans) {
+                spans.push_back(span);
+            }
             units.push_back(code_unit.unicode());
-            spans.push_back(span);
         }
     }
 

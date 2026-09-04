@@ -280,6 +280,9 @@ struct Terminal_session_config
     // without reading or mutating GUI-thread state.
     std::function<void(std::uint64_t, bool)>
                                     backend_event_epoch_notifier;
+    // Runs after a search worker has committed a generation-checked result.
+    // The owner must process search events on its state-owning thread.
+    std::function<void()>           search_event_notifier;
     std::size_t                     trace_command_limit                      = 0U;
     std::size_t                     trace_notification_limit                 = 0U;
     std::size_t                     trace_result_limit                       = 0U;

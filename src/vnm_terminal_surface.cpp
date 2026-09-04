@@ -34,6 +34,7 @@
 #include <QKeyEvent>
 #include <QMetaObject>
 #include <QMouseEvent>
+#include <QObject>
 #include <QPointer>
 #include <QProcessEnvironment>
 #include <QThreadPool>
@@ -295,6 +296,43 @@ struct Msdf_availability_completion
 
     unsigned long long generation = 0;
     std::atomic<int>   dispatch_result{k_dispatch_pending};
+};
+
+class Search_completion_dispatch final : public QObject
+{
+public:
+    explicit Search_completion_dispatch(std::function<void()> handler)
+    :
+        m_handler(std::move(handler))
+    {}
+
+    void notify()
+    {
+        bool expected = false;
+        if (!m_queued.compare_exchange_strong(expected, true)) {
+            return;
+        }
+
+        const auto result = vnm::qt::post(this, [
+                this
+            ]()
+            {
+                // Clear before reading completion state so a concurrent completion
+                // is either consumed by this wake or schedules another one.
+                m_queued.store(false);
+                m_handler();
+            });
+        if (result != vnm::qt::Post_result::QUEUED) {
+            m_queued.store(false);
+            qWarning(
+                "VNM_TerminalSurface: search completion dispatch failed (result %d).",
+                (int)result);
+        }
+    }
+
+private:
+    const std::function<void()> m_handler;
+    std::atomic_bool            m_queued = false;
 };
 
 void play_platform_bell()
@@ -591,6 +629,8 @@ VNM_TerminalSurface::Search_result_state surface_search_result_state(
             return Public::NO_MATCH;
         case term::Terminal_search_result_status::MATCH:
             return Public::MATCH;
+        case term::Terminal_search_result_status::SEARCHING:
+            return Public::SEARCHING;
     }
 
     return Public::SOURCE_UNAVAILABLE;
@@ -2919,6 +2959,7 @@ struct VNM_TerminalSurface::Private
     std::uint64_t                                          last_backend_error_signal_sequence    = 0U;
     std::uint64_t                                          next_clipboard_write_request_id       = 1U;
     bool                                                   dirty_row_stats_enabled               = false;
+    std::function<void()>                                  before_search_completion_dispatch_handler_for_testing;
     // These atomics are read by backend callback threads through the notifier.
     // reset_session() must close the session before Private storage is destroyed.
     std::atomic_bool                                       session_drain_queued                  = false;
@@ -4405,7 +4446,6 @@ void VNM_TerminalSurface::set_search_query(QString query)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
-    drain_backend_callback_events();
     if (m_private->session == nullptr) {
         const Search_result_state state = query.isEmpty()
             ? Search_result_state::INACTIVE
@@ -7535,10 +7575,43 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
             m_private->schedule_backend_callback_frame_or_posted_drain(*this);
         }
     };
+    const std::uint64_t started_session_generation =
+        m_private->session_generation + 1U;
+    const QPointer<VNM_TerminalSurface> surface(this);
+    // Copied worker notifiers pin their own GUI receiver through submission.
+    // Only GUI delivery reads the surface guard, and last-owner release may
+    // occur on the worker, so receiver deletion must follow Qt affinity.
+    const auto completion_dispatch = std::shared_ptr<Search_completion_dispatch>(
+        new Search_completion_dispatch([
+                surface,
+                started_session_generation
+            ]()
+            {
+                if (surface != nullptr &&
+                    !surface->m_private->shutting_down.load() &&
+                    surface->m_private->session != nullptr &&
+                    surface->m_private->session_generation == started_session_generation)
+                {
+                    (void)surface->m_private->session->process_search_events();
+                    surface->sync_from_session();
+                }
+            }),
+        [](Search_completion_dispatch* receiver) { receiver->deleteLater(); });
+    session_config.search_event_notifier = [
+            completion_dispatch,
+            before_dispatch =
+                m_private->before_search_completion_dispatch_handler_for_testing
+        ]()
+        {
+            if (before_dispatch) {
+                before_dispatch();
+            }
+            completion_dispatch->notify();
+        };
 
     m_private->session =
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
-    ++m_private->session_generation;
+    m_private->session_generation = started_session_generation;
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
@@ -8895,6 +8968,16 @@ set_pending_published_mouse_report_block_count_for_testing(
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->pending_published_mouse_report_block_count_for_testing =
         std::max(0, count);
+}
+
+void term::VNM_TerminalSurface_render_bridge::
+set_before_search_completion_dispatch_handler_for_testing(
+    VNM_TerminalSurface& surface,
+    std::function<void()> handler)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->before_search_completion_dispatch_handler_for_testing =
+        std::move(handler);
 }
 
 void term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
