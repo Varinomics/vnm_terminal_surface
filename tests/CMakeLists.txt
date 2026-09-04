@@ -211,6 +211,32 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_profiler>"
 )
 
+add_executable(vnm_terminal_lcd_subpixel_policy_tests
+    lcd_subpixel_policy/lcd_subpixel_policy_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_lcd_subpixel_policy_tests PRIVATE
+    Qt6::GuiPrivate
+    vnm_terminal_surface::vnm_terminal_lcd_subpixel_policy
+)
+
+set_target_properties(vnm_terminal_lcd_subpixel_policy_tests PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_lcd_subpixel_policy_tests
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_lcd_subpixel_policy_tests>"
+)
+
+set_tests_properties(vnm_terminal_lcd_subpixel_policy_tests PROPERTIES
+    LABELS "renderer;policy;platform"
+    TIMEOUT 30
+)
+
 add_executable(vnm_terminal_parser_ir
     parser_ir/parser_ir_tests.cpp
 )
@@ -2037,6 +2063,7 @@ endif()
 
 set(vnm_terminal_test_process_targets
     vnm_terminal_canvas_fixture
+    vnm_terminal_lcd_subpixel_policy_tests
     vnm_terminal_profiler
     vnm_terminal_parser_ir
     vnm_terminal_unicode_width

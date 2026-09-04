@@ -853,6 +853,8 @@ private:
     void bind_screen_signals(
         QScreen*               screen);
 
+    void refresh_lcd_subpixel_policy();
+
     void handle_scene_graph_invalidated(
         std::uint64_t          window_binding_generation);
 

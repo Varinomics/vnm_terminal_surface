@@ -138,6 +138,62 @@ set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 set(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE
     "${VNM_TERMINAL_SURFACE_BUILD_FULL}")
 
+add_library(vnm_terminal_lcd_subpixel_policy STATIC
+    include/vnm_terminal/internal/lcd_subpixel_policy_platform.h
+    include/vnm_terminal/lcd_subpixel_policy.h
+    src/lcd_subpixel_policy.cpp
+)
+
+target_include_directories(vnm_terminal_lcd_subpixel_policy PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+)
+
+target_link_libraries(vnm_terminal_lcd_subpixel_policy PUBLIC
+    Qt6::Gui
+)
+
+target_link_libraries(vnm_terminal_lcd_subpixel_policy PRIVATE
+    Qt6::GuiPrivate
+)
+
+if(WIN32)
+    target_link_libraries(vnm_terminal_lcd_subpixel_policy PRIVATE
+        user32
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(vnm_terminal_lcd_subpixel_policy PRIVATE
+        /FS
+    )
+endif()
+
+if(VNM_TERMINAL_SANITIZE_ADDRESS)
+    if(MSVC)
+        target_compile_options(vnm_terminal_lcd_subpixel_policy PRIVATE
+            /fsanitize=address)
+        target_compile_definitions(vnm_terminal_lcd_subpixel_policy PRIVATE
+            _DISABLE_VECTOR_ANNOTATION
+            _DISABLE_STRING_ANNOTATION
+        )
+    else()
+        target_compile_options(vnm_terminal_lcd_subpixel_policy PRIVATE
+            -fsanitize=address)
+        target_link_options(vnm_terminal_lcd_subpixel_policy PUBLIC
+            -fsanitize=address)
+    endif()
+endif()
+
+cmake_language(DEFER CALL
+    vnm_terminal_validate_qt_link_interface
+    vnm_terminal_lcd_subpixel_policy)
+
+add_library(
+    vnm_terminal_surface::vnm_terminal_lcd_subpixel_policy
+    ALIAS
+    vnm_terminal_lcd_subpixel_policy)
+
 set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/cell_stable_shaping.h
     include/vnm_terminal/internal/hierarchical_profiler.h
@@ -354,6 +410,7 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 target_link_libraries(vnm_terminal_surface PRIVATE
     Qt6::GuiPrivate
     Qt6::QuickPrivate
+    vnm_terminal_surface::vnm_terminal_lcd_subpixel_policy
     vnm_qt_dispatch::vnm_qt_dispatch
 )
 
@@ -438,6 +495,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 set(vnm_terminal_surface_install_targets
+    vnm_terminal_lcd_subpixel_policy
     vnm_terminal_surface_renderer
 )
 if(VNM_TERMINAL_SURFACE_BUILD_FULL)
@@ -465,6 +523,7 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package
 endif()
 
 install(FILES
+    include/vnm_terminal/lcd_subpixel_policy.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/vnm_terminal_canvas.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"

@@ -1,5 +1,6 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 
+#include "vnm_terminal/lcd_subpixel_policy.h"
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/interaction_trace.h"
@@ -48,7 +49,6 @@
 #include <QWheelEvent>
 #include <QWindow>
 #include <QtGlobal>
-#include <qpa/qplatformscreen.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -71,11 +71,6 @@
 namespace term = vnm_terminal::internal;
 
 #if defined(_WIN32)
-extern "C" __declspec(dllimport) int __stdcall SystemParametersInfoW(
-    unsigned int action,
-    unsigned int parameter,
-    void*        value,
-    unsigned int update_flags);
 extern "C" __declspec(dllimport) long __stdcall OleFlushClipboard();
 extern "C" __declspec(dllimport) int __stdcall MessageBeep(unsigned int type);
 #endif
@@ -301,15 +296,6 @@ struct Msdf_availability_completion
     unsigned long long generation = 0;
     std::atomic<int>   dispatch_result{k_dispatch_pending};
 };
-
-#if defined(_WIN32)
-constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
-constexpr unsigned int k_win_spi_get_font_smoothing_type        = 0x200AU;
-constexpr unsigned int k_win_spi_get_font_smoothing_orientation = 0x2012U;
-constexpr unsigned int k_win_font_smoothing_cleartype           = 0x0002U;
-constexpr unsigned int k_win_font_smoothing_orientation_bgr     = 0x0000U;
-constexpr unsigned int k_win_font_smoothing_orientation_rgb     = 0x0001U;
-#endif
 
 void play_platform_bell()
 {
@@ -1195,116 +1181,44 @@ term::Terminal_text_renderer_policy terminal_text_renderer_policy(
     return term::Terminal_text_renderer_policy::AUTO;
 }
 
-term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order_from_qt(
-    QQuickWindow* window)
-{
-    if (window == nullptr) {
-        return term::Terminal_lcd_subpixel_order::NONE;
-    }
-
-    const QPlatformScreen* const platform_screen =
-        QPlatformScreen::platformScreenForWindow(window);
-    if (platform_screen == nullptr) {
-        return term::Terminal_lcd_subpixel_order::NONE;
-    }
-
-    switch (platform_screen->subpixelAntialiasingTypeHint()) {
-        case QPlatformScreen::Subpixel_RGB:
-            return term::Terminal_lcd_subpixel_order::RGB;
-        case QPlatformScreen::Subpixel_BGR:
-            return term::Terminal_lcd_subpixel_order::BGR;
-        case QPlatformScreen::Subpixel_VRGB:
-            return term::Terminal_lcd_subpixel_order::VRGB;
-        case QPlatformScreen::Subpixel_VBGR:
-            return term::Terminal_lcd_subpixel_order::VBGR;
-        case QPlatformScreen::Subpixel_None:
-            return term::Terminal_lcd_subpixel_order::NONE;
-    }
-
-    return term::Terminal_lcd_subpixel_order::NONE;
-}
-
-term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order_from_windows()
-{
-#if defined(_WIN32)
-    int font_smoothing_enabled = 0;
-    if (SystemParametersInfoW(
-            k_win_spi_get_font_smoothing,
-            0U,
-            &font_smoothing_enabled,
-            0U) == 0 ||
-        font_smoothing_enabled == 0)
-    {
-        return term::Terminal_lcd_subpixel_order::NONE;
-    }
-
-    unsigned int font_smoothing_type = 0U;
-    if (SystemParametersInfoW(
-            k_win_spi_get_font_smoothing_type,
-            0U,
-            &font_smoothing_type,
-            0U) == 0 ||
-        font_smoothing_type != k_win_font_smoothing_cleartype)
-    {
-        return term::Terminal_lcd_subpixel_order::NONE;
-    }
-
-    unsigned int font_smoothing_orientation = 0U;
-    if (SystemParametersInfoW(
-            k_win_spi_get_font_smoothing_orientation,
-            0U,
-            &font_smoothing_orientation,
-            0U) == 0)
-    {
-        return term::Terminal_lcd_subpixel_order::NONE;
-    }
-
-    switch (font_smoothing_orientation) {
-        case k_win_font_smoothing_orientation_rgb:
-            return term::Terminal_lcd_subpixel_order::RGB;
-        case k_win_font_smoothing_orientation_bgr:
-            return term::Terminal_lcd_subpixel_order::BGR;
-    }
-#endif
-
-    return term::Terminal_lcd_subpixel_order::NONE;
-}
-
-term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order_from_mode(
+vnm_terminal::Lcd_subpixel_order_policy lcd_subpixel_order_policy(
     VNM_TerminalSurface::Lcd_subpixel_order order)
 {
     switch (order) {
         case VNM_TerminalSurface::Lcd_subpixel_order::AUTO:
+            return vnm_terminal::Lcd_subpixel_order_policy::AUTO;
         case VNM_TerminalSurface::Lcd_subpixel_order::NONE:
-            return term::Terminal_lcd_subpixel_order::NONE;
+            return vnm_terminal::Lcd_subpixel_order_policy::NONE;
         case VNM_TerminalSurface::Lcd_subpixel_order::RGB:
-            return term::Terminal_lcd_subpixel_order::RGB;
+            return vnm_terminal::Lcd_subpixel_order_policy::RGB;
         case VNM_TerminalSurface::Lcd_subpixel_order::BGR:
-            return term::Terminal_lcd_subpixel_order::BGR;
+            return vnm_terminal::Lcd_subpixel_order_policy::BGR;
         case VNM_TerminalSurface::Lcd_subpixel_order::VRGB:
-            return term::Terminal_lcd_subpixel_order::VRGB;
+            return vnm_terminal::Lcd_subpixel_order_policy::VRGB;
         case VNM_TerminalSurface::Lcd_subpixel_order::VBGR:
+            return vnm_terminal::Lcd_subpixel_order_policy::VBGR;
+    }
+
+    return vnm_terminal::Lcd_subpixel_order_policy::NONE;
+}
+
+term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order(
+    vnm_terminal::Resolved_lcd_subpixel_order order)
+{
+    switch (order) {
+        case vnm_terminal::Resolved_lcd_subpixel_order::NONE:
+            return term::Terminal_lcd_subpixel_order::NONE;
+        case vnm_terminal::Resolved_lcd_subpixel_order::RGB:
+            return term::Terminal_lcd_subpixel_order::RGB;
+        case vnm_terminal::Resolved_lcd_subpixel_order::BGR:
+            return term::Terminal_lcd_subpixel_order::BGR;
+        case vnm_terminal::Resolved_lcd_subpixel_order::VRGB:
+            return term::Terminal_lcd_subpixel_order::VRGB;
+        case vnm_terminal::Resolved_lcd_subpixel_order::VBGR:
             return term::Terminal_lcd_subpixel_order::VBGR;
     }
 
     return term::Terminal_lcd_subpixel_order::NONE;
-}
-
-term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order(
-    VNM_TerminalSurface::Lcd_subpixel_order order,
-    QQuickWindow*                           window)
-{
-    if (order != VNM_TerminalSurface::Lcd_subpixel_order::AUTO) {
-        return terminal_lcd_subpixel_order_from_mode(order);
-    }
-
-    const term::Terminal_lcd_subpixel_order qt_order =
-        terminal_lcd_subpixel_order_from_qt(window);
-    if (qt_order != term::Terminal_lcd_subpixel_order::NONE) {
-        return qt_order;
-    }
-
-    return terminal_lcd_subpixel_order_from_windows();
 }
 
 term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurface& surface)
@@ -1335,10 +1249,12 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
         surface.visual_bell_policy() == VNM_TerminalSurface::Bell_policy::ENABLED;
     options.text_renderer_policy =
         terminal_text_renderer_policy(surface.text_renderer_mode());
+    QQuickWindow* const window = surface.window();
     options.msdf_lcd_subpixel_order =
         terminal_lcd_subpixel_order(
-            surface.lcd_subpixel_order(),
-            surface.window());
+            vnm_terminal::resolve_lcd_subpixel_order(
+                lcd_subpixel_order_policy(surface.lcd_subpixel_order()),
+                window != nullptr ? window->screen() : nullptr));
     return options;
 }
 
@@ -2991,6 +2907,8 @@ struct VNM_TerminalSurface::Private
     QMetaObject::Connection                                window_scene_graph_invalidated_connection;
     QMetaObject::Connection                                screen_dpi_changed_connection;
     QMetaObject::Connection                                screen_physical_dpi_changed_connection;
+    QMetaObject::Connection                                screen_orientation_changed_connection;
+    QMetaObject::Connection                                screen_primary_orientation_changed_connection;
     QPointer<QQuickWindow>                                 bound_window;
     std::unique_ptr<term::Terminal_session>                session;
     std::uint64_t                                          session_generation = 0U;
@@ -3101,6 +3019,15 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
         [this] {
             handle_msdf_availability_completion_timeout();
         });
+    QObject::connect(
+        qGuiApp,
+        &QGuiApplication::applicationStateChanged,
+        this,
+        [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive) {
+                refresh_lcd_subpixel_policy();
+            }
+        });
     refresh_grid_metrics();
 }
 
@@ -3116,6 +3043,9 @@ VNM_TerminalSurface::~VNM_TerminalSurface()
     QObject::disconnect(m_private->window_screen_changed_connection);
     QObject::disconnect(m_private->screen_dpi_changed_connection);
     QObject::disconnect(m_private->screen_physical_dpi_changed_connection);
+    QObject::disconnect(m_private->screen_orientation_changed_connection);
+    QObject::disconnect(
+        m_private->screen_primary_orientation_changed_connection);
     m_private->shutting_down.store(true);
     if (auto lifecycle_recorder = m_private->lifecycle_recorder();
         lifecycle_recorder != nullptr)
@@ -7449,6 +7379,9 @@ void VNM_TerminalSurface::bind_screen_signals(QScreen* screen)
 {
     QObject::disconnect(m_private->screen_dpi_changed_connection);
     QObject::disconnect(m_private->screen_physical_dpi_changed_connection);
+    QObject::disconnect(m_private->screen_orientation_changed_connection);
+    QObject::disconnect(
+        m_private->screen_primary_orientation_changed_connection);
 
     if (screen == nullptr) {
         return;
@@ -7468,6 +7401,27 @@ void VNM_TerminalSurface::bind_screen_signals(QScreen* screen)
         [this](qreal) {
             refresh_grid_metrics();
         });
+    m_private->screen_orientation_changed_connection = QObject::connect(
+        screen,
+        &QScreen::orientationChanged,
+        this,
+        [this](Qt::ScreenOrientation) {
+            refresh_lcd_subpixel_policy();
+        });
+    m_private->screen_primary_orientation_changed_connection = QObject::connect(
+        screen,
+        &QScreen::primaryOrientationChanged,
+        this,
+        [this](Qt::ScreenOrientation) {
+            refresh_lcd_subpixel_policy();
+        });
+}
+
+void VNM_TerminalSurface::refresh_lcd_subpixel_policy()
+{
+    if (m_lcd_subpixel_order == Lcd_subpixel_order::AUTO) {
+        m_private->request_render_update(*this);
+    }
 }
 
 Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(

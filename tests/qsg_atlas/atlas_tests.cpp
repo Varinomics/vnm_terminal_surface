@@ -34,6 +34,7 @@
 #include <QMetaObject>
 #include <QPainter>
 #include <QSaveFile>
+#include <QScreen>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QQuickItem>
@@ -8864,6 +8865,65 @@ bool test_epoch_invalidation()
             invalidated_stats.invalidations == 1U &&
             invalidated_stats.page_count == 0,
         "changed font epoch invalidates atlas cache pages and keys");
+    return ok;
+}
+
+bool test_lcd_policy_platform_changes_invalidate_auto_surface()
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+
+    QScreen* const screen = window.screen();
+    if (screen == nullptr) {
+        return check(false, "test window has no screen");
+    }
+
+    const auto request_count = [&surface] {
+        return term::VNM_TerminalSurface_render_bridge::
+            invalidation_stats(surface).update_requests;
+    };
+    std::uint64_t before = request_count();
+    bool ok = true;
+    ok &= check(
+        QMetaObject::invokeMethod(
+            screen,
+            "orientationChanged",
+            Qt::DirectConnection,
+            Q_ARG(Qt::ScreenOrientation, screen->orientation())) &&
+            request_count() == before + 1,
+        "screen orientation changes invalidate AUTO LCD policy rendering");
+
+    before = request_count();
+    ok &= check(
+        QMetaObject::invokeMethod(
+            screen,
+            "primaryOrientationChanged",
+            Qt::DirectConnection,
+            Q_ARG(Qt::ScreenOrientation, screen->primaryOrientation())) &&
+            request_count() == before + 1,
+        "primary orientation changes invalidate AUTO LCD policy rendering");
+
+    before = request_count();
+    ok &= check(
+        QMetaObject::invokeMethod(
+            qGuiApp,
+            "applicationStateChanged",
+            Qt::DirectConnection,
+            Q_ARG(Qt::ApplicationState, Qt::ApplicationActive)) &&
+            request_count() == before + 1,
+        "application reactivation refreshes AUTO LCD platform settings");
+
+    surface.set_lcd_subpixel_order(VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+    before = request_count();
+    ok &= check(
+        QMetaObject::invokeMethod(
+            screen,
+            "orientationChanged",
+            Qt::DirectConnection,
+            Q_ARG(Qt::ScreenOrientation, screen->orientation())) &&
+            request_count() == before,
+        "fixed LCD policy ignores platform layout changes");
     return ok;
 }
 
@@ -20498,6 +20558,7 @@ bool run_unit_tests()
     ok &= test_cell_stable_ascii_layout_font();
     ok &= test_shaped_glyph_records();
     ok &= test_epoch_invalidation();
+    ok &= test_lcd_policy_platform_changes_invalidate_auto_surface();
     ok &= test_atlas_rotating_buffer_planner();
     ok &= test_atlas_row_stable_glyph_planner();
     ok &= test_atlas_non_dirty_and_full_reupload_planner();
