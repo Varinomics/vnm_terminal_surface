@@ -13587,6 +13587,98 @@ bool atlas_failed_prepare_has_no_buffer_upload(
         atlas_buffer_has_no_accepted_upload(report.render.msdf_text_buffer);
 }
 
+bool test_atlas_failed_first_text_prepare_retries_glyph_resolutions(
+    QGuiApplication& app)
+{
+    const std::array text_cases{QStringLiteral("X"), QStringLiteral("e\u0301")};
+    bool ok = true;
+    for (std::size_t index = 0; index < text_cases.size(); ++index) {
+        const std::string prefix = index == 0
+            ? "atlas simple text rollback "
+            : "atlas shaped text rollback ";
+        QQuickWindow window;
+        VNM_TerminalSurface surface;
+        configure_atlas_prepare_transaction_surface(window, surface);
+
+        term::Terminal_render_snapshot blank =
+            make_pixel_base_snapshot({2, 8}, 19850U + index * 2U);
+        blank.metadata.publication_generation = 1U;
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            surface,
+            std::make_shared<const term::Terminal_render_snapshot>(blank));
+        window.show();
+        const bool blank_rendered = pump_until(app, window, surface,
+            [&](const term::Qsg_atlas_frame_report& report) {
+                return atlas_report_render_state_ready(report) &&
+                    report.prepared_generation_committed &&
+                    report.render_snapshot_sequence == blank.metadata.sequence &&
+                    report.cache.page_count == 0;
+            });
+        if (!check(blank_rendered, prefix + "starts from a committed empty atlas")) {
+            return false;
+        }
+        const QImage blank_image = window.grabWindow();
+
+        term::Terminal_render_snapshot text = blank;
+        ++text.metadata.sequence;
+        text.metadata.publication_generation = 2U;
+        text.cells.push_back(make_pixel_cell(
+            0, 0, text_cases[index], 1, term::k_default_terminal_style_id));
+        term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
+            text.metadata.sequence);
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            surface,
+            std::make_shared<const term::Terminal_render_snapshot>(text));
+        const bool failed_prepared = pump_until(app, window, surface,
+            [&](const term::Qsg_atlas_frame_report& report) {
+                return report.prepared_snapshot_sequence == text.metadata.sequence &&
+                    !report.prepared_generation_committed;
+            });
+        const auto failed_report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+
+        ok &= check(failed_prepared &&
+                failed_report.render_snapshot_sequence == blank.metadata.sequence &&
+                failed_report.render_publication_generation == 1U,
+            prefix + "keeps the committed frame while preparation fails");
+        ok &= check(index == 0
+                ? failed_report.producer.simple_path_used > 0
+                : failed_report.producer.shape_cache_lookups > 0,
+            prefix + "exercises its cached glyph resolution path");
+
+        const bool recovered = pump_until(app, window, surface,
+            [&](const term::Qsg_atlas_frame_report& report) {
+                return atlas_report_render_state_ready(report) &&
+                    report.prepared_generation_committed &&
+                    report.render_snapshot_sequence == text.metadata.sequence &&
+                    report.render_publication_generation == 2U &&
+                    report.cache.page_count > 0 &&
+                    report.render.glyph_buffer.active_instance_count > 0;
+            });
+        const QImage recovered_image = window.grabWindow();
+        int changed_pixels = 0;
+        if (!blank_image.isNull() && !recovered_image.isNull() &&
+            blank_image.size() == recovered_image.size())
+        {
+            for (int y = 0; y < blank_image.height(); ++y) {
+                for (int x = 0; x < blank_image.width(); ++x) {
+                    if (pixel_delta(blank_image.pixelColor(x, y),
+                            recovered_image.pixelColor(x, y)) > 8)
+                    {
+                        ++changed_pixels;
+                    }
+                }
+            }
+        }
+        ok &= check(recovered,
+            prefix + "retries the same text with backed atlas pages");
+        ok &= check(changed_pixels > 4,
+            prefix + "renders glyph pixels after the failure is cleared");
+    }
+    return ok;
+}
+
 bool test_atlas_failed_prepare_forces_next_sparse_full_upload(
     QGuiApplication& app)
 {
@@ -20278,6 +20370,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_promoted(app);
     ok &= test_atlas_prepared_text_reuse(app);
+    ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
     ok &= test_atlas_failed_prepare_forces_next_sparse_full_upload(app);
     ok &= test_atlas_failed_prepare_preserves_font_epoch_basis(app);
     ok &= test_atlas_failed_prepare_preserves_cursor_layer_basis(app);

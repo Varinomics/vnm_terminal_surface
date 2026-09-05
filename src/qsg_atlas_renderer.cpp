@@ -2261,6 +2261,7 @@ public:
                 retried_msdf_text_fallback = true;
                 discard_pending_glyph_resources();
                 restore_prepare_layout_state(prepare_layout_state);
+                discard_prepared_glyph_resolutions();
                 prepare_result = prepare_atlas_instances(rhi);
                 prepared_generation_complete =
                     prepare_result.frame_build.glyph_missed_instances == 0 &&
@@ -2352,6 +2353,7 @@ public:
         else {
             restore_draw_pass_state(committed_draw_pass_state);
             restore_prepare_layout_state(prepare_layout_state);
+            discard_prepared_glyph_resolutions();
             m_cache.reset();
             m_force_next_render_full_upload = true;
         }
@@ -5090,6 +5092,15 @@ private:
             run,
             record.owner_column,
             normalized_device_pixel_ratio);
+    }
+
+    void discard_prepared_glyph_resolutions()
+    {
+        // These slots may refer to pages from the atlas transaction being discarded.
+        for (auto& glyph : m_simple_text_cache.glyphs) {
+            glyph.slot = {};
+        }
+        m_prepared_text_cache.clear();
     }
 
     void begin_prepared_text_cache_frame(bool font_epoch_changed)
