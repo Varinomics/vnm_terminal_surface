@@ -96,7 +96,7 @@ int semantic_content_bottom_row_exclusive(
         ? 0
         : frame.cells.back().row + 1;
     const int cursor_bottom =
-        frame.cursor.row >= 0 && frame.cursor.row < frame.rows
+        frame.cursor.visible && frame.cursor.row >= 0 && frame.cursor.row < frame.rows
         ? frame.cursor.row + 1
         : 0;
     return std::clamp(

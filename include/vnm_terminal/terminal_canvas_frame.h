@@ -11,7 +11,7 @@
 namespace vnm_terminal {
 
 inline constexpr std::uint32_t k_terminal_canvas_frame_api_version = 4U;
-inline constexpr std::uint16_t k_terminal_canvas_content_extent_version = 1U;
+inline constexpr std::uint16_t k_terminal_canvas_content_extent_version = 2U;
 inline constexpr qreal k_terminal_canvas_max_font_pixel_size = 1'024.0;
 inline constexpr std::size_t   k_terminal_canvas_max_cells         = 32'768U;
 // A canvas axis is bounded by the same allocation budget as the complete
@@ -62,11 +62,13 @@ enum class Terminal_canvas_buffer : std::uint8_t
 // unavailable and does not invalidate the base frame. Incoherent fields in a
 // known record version invalidate the complete enclosing frame.
 //
-// In version 1, content_bottom_row_exclusive is a frame-relative exclusive row,
+// In version 2, content_bottom_row_exclusive is a frame-relative exclusive row,
 // never a global logical row. It is exactly the maximum of one row, the last
-// exported semantic cell row plus one, and an in-range cursor row plus one.
-// Cursor paint visibility is irrelevant, and an out-of-range cursor contributes
-// nothing. The bottom is in [1, frame.rows], scrollback_rows is in
+// exported semantic cell row plus one, and a visible in-range cursor row plus one.
+// Visibility is the terminal cursor mode, never the blinking paint phase: hidden
+// cursors must not add blank rows, and blinking must not move the content anchor.
+// An out-of-range cursor contributes nothing. The bottom is in [1, frame.rows],
+// scrollback_rows is in
 // [0, INT_MAX - (frame.rows - 1)], and offset_from_tail is in
 // [0, scrollback_rows]. PRIMARY_BUFFER carries that shared viewport state.
 // ALTERNATE_BUFFER requires zero scrollback and offset; it retains the honestly

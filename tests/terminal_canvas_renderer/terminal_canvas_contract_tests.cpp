@@ -293,10 +293,20 @@ bool test_content_extent_properties_and_atomic_lifecycle()
     hidden_cursor->cursor.row     = 1;
     hidden_cursor->cursor.column  = 11;
     hidden_cursor->cursor.visible = false;
-    hidden_cursor->content_extent->content_bottom_row_exclusive = 2;
+    hidden_cursor->content_extent->content_bottom_row_exclusive = 1;
     ok &= check(canvas.set_canvas_frame(hidden_cursor) &&
+            canvas.content_bottom_row_exclusive() == 1,
+        "hidden in-range cursor preserves the extent of exported cells");
+
+    auto visible_cursor = make_frame(113U);
+    visible_cursor->cursor.row           = 1;
+    visible_cursor->cursor.column        = 11;
+    visible_cursor->cursor.visible       = true;
+    visible_cursor->cursor.blink_enabled = true;
+    visible_cursor->content_extent->content_bottom_row_exclusive = 2;
+    ok &= check(canvas.set_canvas_frame(visible_cursor) &&
             canvas.content_bottom_row_exclusive() == 2,
-        "hidden in-range semantic cursor participates in exact coherence");
+        "visible blinking cursor participates in exact coherence");
 
     auto unknown_record = make_frame(113U);
     unknown_record->content_extent->record_version =

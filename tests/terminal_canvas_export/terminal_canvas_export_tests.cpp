@@ -263,11 +263,38 @@ bool test_content_extent_uses_semantic_cells_cursor_and_viewport()
     hidden_cursor->cursor.visible  = false;
     ok &= expect_content_extent(
         export_snapshot(surface, std::move(hidden_cursor)),
-        5,
+        1,
         0,
         0,
         vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
-        "hidden in-range semantic cursor contributes to bottom");
+        "hidden in-range cursor leaves the one-row semantic minimum");
+
+    // The confirmed mobile update-prompt failure had text through row 10 and
+    // a hidden cursor at row 44. Moving that cursor must not move the anchor.
+    for (const int cursor_row : {44, 8}) {
+        auto update_prompt = make_snapshot(45, 8);
+        update_prompt->cells.push_back(make_cell(10, 0, QStringLiteral("Update")));
+        update_prompt->cursor.position = {cursor_row, 0};
+        update_prompt->cursor.visible  = false;
+        ok &= expect_content_extent(
+            export_snapshot(surface, std::move(update_prompt)),
+            11, 0, 0,
+            vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+            "hidden cursor movement preserves the visible update-prompt extent");
+    }
+
+    for (const bool blink_enabled : {false, true}) {
+        auto visible_cursor = make_snapshot(45, 8);
+        visible_cursor->cells.push_back(make_cell(10, 0, QStringLiteral("Update")));
+        visible_cursor->cursor.position      = {44, 0};
+        visible_cursor->cursor.visible       = true;
+        visible_cursor->cursor.blink_enabled = blink_enabled;
+        ok &= expect_content_extent(
+            export_snapshot(surface, std::move(visible_cursor)),
+            45, 0, 0,
+            vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
+            "visible cursor contributes independently of blinking");
+    }
 
     auto off_frame_cursor = make_snapshot(5, 8);
     off_frame_cursor->cursor.position = {9, 7};
@@ -341,7 +368,7 @@ bool test_content_extent_uses_semantic_cells_cursor_and_viewport()
     public_projection->cursor.visible  = false;
     ok &= expect_content_extent(
         export_snapshot(surface, std::move(public_projection)),
-        5,
+        3,
         9,
         3,
         vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,
@@ -355,7 +382,7 @@ bool test_content_extent_uses_semantic_cells_cursor_and_viewport()
     geometry_derived->cursor.visible  = false;
     ok &= expect_content_extent(
         export_snapshot(surface, std::move(geometry_derived)),
-        3,
+        2,
         0,
         0,
         vnm_terminal::Terminal_canvas_buffer::PRIMARY_BUFFER,

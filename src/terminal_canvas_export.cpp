@@ -172,7 +172,7 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     }
 
     const int cursor_bottom =
-        snapshot->cursor.position.row >= 0 &&
+        snapshot->cursor.visible && snapshot->cursor.position.row >= 0 &&
             snapshot->cursor.position.row < snapshot->grid_size.rows
         ? snapshot->cursor.position.row + 1
         : 0;

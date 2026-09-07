@@ -16,7 +16,7 @@ bool terminal_canvas_public_header_contract()
     const vnm_terminal::terminal_canvas_content_extent_t extent;
     return
         vnm_terminal::k_terminal_canvas_frame_api_version == 4U &&
-        vnm_terminal::k_terminal_canvas_content_extent_version == 1U &&
+        vnm_terminal::k_terminal_canvas_content_extent_version == 2U &&
         extent.record_version ==
             vnm_terminal::k_terminal_canvas_content_extent_version &&
         extent.active_buffer ==
