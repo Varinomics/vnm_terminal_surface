@@ -132,9 +132,7 @@ endif()
 # applies at load time is what keeps an installed Ubuntu Mono - Bront from
 # merging with the embedded one. It is added by several dependency paths in one
 # configure, so it guards its own repeated inclusion.
-if(NOT TARGET vnm_fonts)
-    set(VNM_FONTS_INSTALL_LIBRARY ON CACHE BOOL
-        "Install the shared font library and CMake package")
+if(NOT TARGET vnm::fonts)
     if(VNM_FONTS_SOURCE_DIR)
         if(NOT EXISTS "${VNM_FONTS_SOURCE_DIR}/CMakeLists.txt")
             message(FATAL_ERROR
@@ -155,17 +153,25 @@ if(NOT TARGET vnm_fonts)
     FetchContent_MakeAvailable(vnm_terminal_surface_fonts)
 endif()
 
-if(NOT TARGET vnm_fonts)
+if(NOT TARGET vnm::fonts)
     message(FATAL_ERROR
         "vnm_fonts target is unavailable after dependency discovery. It "
         "defines vnm::fonts only where Qt6 Core and Gui are found, which this "
         "project has already required above.")
 endif()
 
+if(COMMAND vnm_fonts_install_package)
+    vnm_fonts_install_package()
+endif()
+
 # The nested package smoke configures this project again from its own source
 # tree. Hand it the checkout this configure resolved so it neither refetches
 # vnm_fonts nor needs the network.
-get_target_property(vnm_terminal_surface_fonts_source_dir vnm_fonts SOURCE_DIR)
+set(vnm_terminal_surface_fonts_source_dir "")
+get_target_property(vnm_terminal_surface_fonts_imported vnm::fonts IMPORTED)
+if(NOT vnm_terminal_surface_fonts_imported)
+    get_target_property(vnm_terminal_surface_fonts_source_dir vnm::fonts SOURCE_DIR)
+endif()
 
 set(vnm_terminal_qt_targets
     Qt6::Core

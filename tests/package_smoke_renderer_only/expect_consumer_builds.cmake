@@ -68,7 +68,6 @@ execute_process(
     COMMAND
         "${CMAKE_COMMAND}"
         --build "${producer_binary_dir}"
-        --target vnm_terminal_surface_renderer
         --parallel 1
     RESULT_VARIABLE producer_build_result
     OUTPUT_VARIABLE producer_build_stdout
