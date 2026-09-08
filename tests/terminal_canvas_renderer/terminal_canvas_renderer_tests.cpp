@@ -4,11 +4,14 @@
 
 #include <QColor>
 #include <QEventLoop>
+#include <QFont>
+#include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QImage>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QThread>
+#include <QtMath>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -119,6 +122,66 @@ bool pump_until_rendered(
     return false;
 }
 
+bool authoritative_grid_glyph_positions(
+    QGuiApplication& application,
+    QQuickWindow& window,
+    VNM_TerminalCanvas& canvas)
+{
+    const qreal dpr = window.devicePixelRatio();
+    QFont font(canvas.font_family());
+    font.setPixelSize(qRound(canvas.font_size()));
+    const qreal physical_width = std::ceil(
+        QFontMetricsF(font).horizontalAdvance(QLatin1Char('H')) * dpr) + 2.0;
+    bool ok = true;
+    for (const qreal fraction : {0.0, 0.4, 0.6}) {
+        auto frame = make_frame(12U);
+        frame->rows           = 3;
+        frame->columns        = 48;
+        frame->cell_width     = (physical_width + fraction) / dpr;
+        frame->content_width  = frame->columns * frame->cell_width;
+        frame->content_height = frame->rows * frame->cell_height;
+        frame->cursor.visible = false;
+        frame->cells.clear();
+        for (int row = 0; row < frame->rows; ++row) {
+            frame->cells.push_back({row, 2 + row * 20, 1, 0U, QStringLiteral("H")});
+        }
+        canvas.set_authoritative_cell_metrics_enabled(true);
+        ok &= check(canvas.set_canvas_frame(frame), "fractional authoritative grid is accepted");
+        window.resize(qCeil(frame->content_width), qCeil(frame->content_height));
+        canvas.setSize(QSizeF(window.width(), window.height()));
+        QImage image;
+        ok &= check(pump_until_rendered(application, window, canvas, image),
+            "fractional authoritative grid renders");
+        if (image.isNull()) {
+            return false;
+        }
+        int first_ink = -1;
+        for (int row = 0; row < frame->rows; ++row) {
+            int left = image.width();
+            const int top    = qRound(row * frame->cell_height * dpr);
+            const int bottom = std::min(image.height(), qRound((row + 1) * frame->cell_height * dpr));
+            for (int y = top; y < bottom; ++y) {
+                for (int x = 0; x < left; ++x) {
+                    const QColor color = image.pixelColor(x, y);
+                    if (color.red() > 160 && color.green() > 160 && color.blue() > 160) {
+                        left = x;
+                    }
+                }
+            }
+            ok &= check(left < image.width(), "each grid probe row contains its glyph");
+            if (row == 0) {
+                first_ink = left;
+            }
+            const int expected_offset =
+                qRound((2 + row * 20) * frame->cell_width * dpr) -
+                qRound(2 * frame->cell_width * dpr);
+            ok &= check(std::abs(left - first_ink - expected_offset) <= 1,
+                "distant glyph origins follow authoritative cell positions without accumulated rounding");
+        }
+    }
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -152,6 +215,10 @@ int main(int argc, char** argv)
             return ok ? 77 : 1;
         }
         ok &= check(false, "host window renders public canvas pixels");
+    }
+
+    if (!rendered.isNull()) {
+        ok &= authoritative_grid_glyph_positions(application, window, canvas);
     }
 
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");

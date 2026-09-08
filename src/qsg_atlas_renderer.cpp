@@ -5056,26 +5056,14 @@ private:
         const qreal logical_grid_left =
             run.rect.left() -
             static_cast<qreal>(run.column) * m_frame.cell_metrics.width;
-        const qreal physical_grid_left = static_cast<qreal>(
-            atlas_snapped_physical_int(
-                logical_grid_left,
-                normalized_device_pixel_ratio));
-        const qreal physical_baseline_y = static_cast<qreal>(
-            atlas_snapped_physical_int(
-                run.baseline_origin.y(),
-                normalized_device_pixel_ratio));
-        const qreal physical_cell_advance = std::max<qreal>(
-            1.0,
-            std::round(
-                m_frame.cell_metrics.width *
-                normalized_device_pixel_ratio));
-        const qreal physical_origin_x =
-            physical_grid_left +
-            static_cast<qreal>(owner_column) * physical_cell_advance;
-
-        return QPointF(
-            physical_origin_x / normalized_device_pixel_ratio,
-            physical_baseline_y / normalized_device_pixel_ratio);
+        // Published grid metrics can be fractional on the receiving display.
+        // Snap each cell position, so rounding cannot accumulate across columns.
+        const qreal logical_origin_x =
+            logical_grid_left +
+            static_cast<qreal>(owner_column) * m_frame.cell_metrics.width;
+        return qsg_atlas_snapped_physical_point(
+            QPointF(logical_origin_x, run.baseline_origin.y()),
+            normalized_device_pixel_ratio);
     }
 
     QPointF snapped_terminal_cell_glyph_origin(
@@ -5744,23 +5732,6 @@ private:
 
         const qreal normalized_device_pixel_ratio =
             atlas_normalized_device_pixel_ratio(m_frame.device_pixel_ratio);
-        const qreal logical_grid_left =
-            run.rect.left() -
-            static_cast<qreal>(run.column) * m_frame.cell_metrics.width;
-        const qreal physical_grid_left = static_cast<qreal>(
-            atlas_snapped_physical_int(
-                logical_grid_left,
-                normalized_device_pixel_ratio));
-        const qreal physical_baseline_y = static_cast<qreal>(
-            atlas_snapped_physical_int(
-                run.baseline_origin.y(),
-                normalized_device_pixel_ratio));
-        const qreal physical_cell_advance = std::max<qreal>(
-            1.0,
-            std::round(
-                m_frame.cell_metrics.width *
-                normalized_device_pixel_ratio));
-
         const std::size_t instance_count_before = m_msdf_text_instances.size();
         for (qsizetype source = 0; source < run.text.size(); ++source) {
             const char32_t codepoint =
@@ -5781,12 +5752,10 @@ private:
             }
             append_msdf_text_instance(
                 scaled->second,
-                QPointF(
-                    physical_grid_left +
-                        static_cast<qreal>(
-                            run.column + static_cast<int>(source)) *
-                            physical_cell_advance,
-                    physical_baseline_y),
+                terminal_cell_glyph_origin(
+                    run,
+                    run.column + static_cast<int>(source),
+                    normalized_device_pixel_ratio) * normalized_device_pixel_ratio,
                 run,
                 color,
                 background_color,
