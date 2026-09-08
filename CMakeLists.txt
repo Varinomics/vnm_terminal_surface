@@ -133,6 +133,8 @@ endif()
 # merging with the embedded one. It is added by several dependency paths in one
 # configure, so it guards its own repeated inclusion.
 if(NOT TARGET vnm_fonts)
+    set(VNM_FONTS_INSTALL_LIBRARY ON CACHE BOOL
+        "Install the shared font library and CMake package")
     if(VNM_FONTS_SOURCE_DIR)
         if(NOT EXISTS "${VNM_FONTS_SOURCE_DIR}/CMakeLists.txt")
             message(FATAL_ERROR
@@ -290,12 +292,10 @@ target_link_libraries(vnm_terminal_surface_renderer PUBLIC
     ${vnm_terminal_qt_targets}
 )
 
-# vnm_fonts is consumed from source and installs nothing of its own, so it can
-# only be named inside the build tree; the same shape vnm_msdf_text uses below.
 target_link_libraries(vnm_terminal_surface_renderer PRIVATE
     Qt6::GuiPrivate
     Qt6::QuickPrivate
-    "$<BUILD_INTERFACE:vnm::fonts>"
+    vnm::fonts
 )
 
 target_compile_definitions(vnm_terminal_surface_renderer PUBLIC
