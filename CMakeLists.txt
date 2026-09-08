@@ -245,6 +245,9 @@ add_library(
     vnm_terminal_lcd_subpixel_policy)
 
 set(vnm_terminal_surface_renderer_sources
+    include/vnm_terminal/terminal_canvas_appearance.h
+    src/terminal_canvas_appearance.cpp
+    src/terminal_color_scheme.cpp
     include/vnm_terminal/internal/cell_stable_shaping.h
     include/vnm_terminal/internal/hierarchical_profiler.h
     include/vnm_terminal/internal/ime_contract.h
@@ -408,7 +411,6 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_session.cpp
     src/terminal_byte_stream_parser.cpp
     src/terminal_canvas_export.cpp
-    src/terminal_color_scheme.cpp
     src/terminal_screen_model.cpp
     src/terminal_screen_model_snapshot.cpp
     src/terminal_search.cpp
@@ -574,6 +576,7 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package
 endif()
 
 install(FILES
+    include/vnm_terminal/terminal_canvas_appearance.h
     include/vnm_terminal/lcd_subpixel_policy.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/vnm_terminal_canvas.h

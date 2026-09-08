@@ -106,6 +106,33 @@ struct Terminal_canvas_style
     std::uint16_t attributes      = 0U;
 };
 
+inline constexpr std::uint16_t k_terminal_canvas_color_references_version = 1U;
+inline constexpr std::uint16_t k_terminal_canvas_color_default = 256U;
+inline constexpr std::uint16_t k_terminal_canvas_color_rgba = 257U;
+
+struct terminal_canvas_style_color_refs_t
+{
+    std::uint16_t foreground = k_terminal_canvas_color_default;
+    std::uint16_t background = k_terminal_canvas_color_default;
+
+    bool operator==(const terminal_canvas_style_color_refs_t&) const = default;
+};
+
+// Entries share the enclosing frame's style indices. Selectors 0..255 refer
+// to palette slots; RGBA preserves the corresponding resolved style color.
+// The first entry is the reserved default style and uses DEFAULT for both
+// channels. Known records cover every style; invalid records invalidate the
+// enclosing frame. The record shares the frame's publication identity and is
+// installed or cleared with it. Unknown versions leave only local color-scheme
+// selection unavailable.
+struct Terminal_canvas_color_references
+{
+    std::uint16_t record_version = k_terminal_canvas_color_references_version;
+    std::vector<terminal_canvas_style_color_refs_t> styles;
+
+    bool operator==(const Terminal_canvas_color_references&) const = default;
+};
+
 struct Terminal_canvas_cell
 {
     int           row           = 0;
@@ -149,6 +176,7 @@ struct Terminal_canvas_frame
     // and must be installed, replaced, or cleared atomically. Absence makes only
     // the semantic-extent capability unavailable.
     std::optional<terminal_canvas_content_extent_t> content_extent;
+    std::optional<Terminal_canvas_color_references> color_references;
     std::vector<Terminal_canvas_style> styles;
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;

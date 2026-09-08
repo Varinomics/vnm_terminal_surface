@@ -1,5 +1,6 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/terminal_canvas_export.h"
+#include "vnm_terminal/terminal_canvas_appearance.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 
 #include "vnm_terminal/internal/render_snapshot.h"
@@ -189,6 +190,40 @@ bool test_frame_preserves_canvas_authority_and_prior_immutability()
         first.frame->styles[1].background_rgba == 0xff654321U &&
         first.frame->styles[1].attributes == styled.attributes,
         "palette/truecolor resolution and source attributes survive export");
+    ok &= check(
+        vnm_terminal::terminal_canvas_color_scheme_available(*first.frame) &&
+        first.frame->color_references->styles[0].foreground ==
+            vnm_terminal::k_terminal_canvas_color_default &&
+        first.frame->color_references->styles[1].foreground == 12U &&
+        first.frame->color_references->styles[1].background ==
+            vnm_terminal::k_terminal_canvas_color_rgba,
+        "export preserves default, indexed, and explicit RGB source semantics");
+    auto local_frame = *first.frame;
+    const QString local_scheme = vnm_terminal::terminal_canvas_default_color_scheme_name();
+    ok &= check(vnm_terminal::apply_terminal_canvas_color_scheme(local_frame, local_scheme),
+        "supported source references permit local color scheme selection");
+    ok &= check(
+        local_frame.styles[1].background_rgba == first.frame->styles[1].background_rgba &&
+        local_frame.styles[1].attributes == first.frame->styles[1].attributes &&
+        local_frame.reverse_video == first.frame->reverse_video,
+        "local scheme retains explicit RGB and leaves presentation attributes unapplied");
+    auto changed_desktop = *first.frame;
+    changed_desktop.default_foreground_rgba = 0xff556677U;
+    changed_desktop.default_background_rgba = 0xff223344U;
+    changed_desktop.styles[0].foreground_rgba = changed_desktop.default_foreground_rgba;
+    changed_desktop.styles[0].background_rgba = changed_desktop.default_background_rgba;
+    changed_desktop.styles[1].foreground_rgba = 0xff8899aaU;
+    ok &= check(vnm_terminal::apply_terminal_canvas_color_scheme(changed_desktop, local_scheme) &&
+        changed_desktop.styles[0].foreground_rgba == local_frame.styles[0].foreground_rgba &&
+        changed_desktop.styles[0].background_rgba == local_frame.styles[0].background_rgba &&
+        changed_desktop.styles[1].foreground_rgba == local_frame.styles[1].foreground_rgba &&
+        changed_desktop.styles[1].background_rgba == local_frame.styles[1].background_rgba,
+        "desktop palette changes cannot change a companion's selected local scheme");
+    auto unknown_colors = *first.frame;
+    unknown_colors.color_references->record_version += 1U;
+    ok &= check(!vnm_terminal::apply_terminal_canvas_color_scheme(unknown_colors, local_scheme) &&
+        unknown_colors.default_background_rgba == first.frame->default_background_rgba,
+        "unknown color records leave local scheme selection explicitly unavailable");
     ok &= check(first.frame->cells.size() == 3U,
         "wide continuation is represented only by its base cell");
     ok &= check(

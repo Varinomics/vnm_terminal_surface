@@ -1,5 +1,7 @@
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
+#include "vnm_terminal/terminal_canvas_appearance.h"
+
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/render_snapshot.h"
@@ -313,6 +315,15 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
         return false;
     }
 
+    if (frame.color_references &&
+        (frame.color_references->record_version == 0 ||
+            frame.color_references->styles.size() > vnm_terminal::k_terminal_canvas_max_styles ||
+            (frame.color_references->record_version ==
+                    vnm_terminal::k_terminal_canvas_color_references_version &&
+                !vnm_terminal::terminal_canvas_color_scheme_available(frame))))
+    {
+        return false;
+    }
     return supported_content_extent_is_valid(frame);
 }
 

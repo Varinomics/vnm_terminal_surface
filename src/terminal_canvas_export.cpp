@@ -19,6 +19,19 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
+std::uint16_t canvas_color_reference(const term::Terminal_color_ref& color)
+{
+    switch (color.kind) {
+        case term::Terminal_color_ref_kind::DEFAULT:
+            return vnm_terminal::k_terminal_canvas_color_default;
+        case term::Terminal_color_ref_kind::PALETTE_INDEX:
+            return color.palette_index;
+        case term::Terminal_color_ref_kind::RGB:
+        default:
+            return vnm_terminal::k_terminal_canvas_color_rgba;
+    }
+}
+
 vnm_terminal::Terminal_canvas_cursor_shape canvas_cursor_shape(
     term::Terminal_cursor_shape shape)
 {
@@ -115,7 +128,13 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     frame->cursor.blink_enabled         = snapshot->cursor.blink_enabled;
 
     frame->styles.reserve(snapshot->styles.size());
+    frame->color_references.emplace();
+    frame->color_references->styles.reserve(snapshot->styles.size());
     for (const term::Terminal_text_style& source_style : snapshot->styles) {
+        frame->color_references->styles.push_back({
+            canvas_color_reference(source_style.foreground),
+            canvas_color_reference(source_style.background),
+        });
         frame->styles.push_back({
             term::resolve_terminal_color_ref(
                 source_style.foreground,
