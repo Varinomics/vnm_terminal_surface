@@ -50,6 +50,8 @@ set(VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR "" CACHE PATH
     "Optional vnm_msdf_text source checkout used by the MSDF text renderer.")
 set(VNM_QT_DISPATCH_SOURCE_DIR "" CACHE PATH
     "Optional path to a local vnm_qt_dispatch source checkout.")
+set(VNM_FONTS_SOURCE_DIR "" CACHE PATH
+    "Optional path to a local vnm_fonts source checkout.")
 mark_as_advanced(
     VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
     VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS
@@ -122,6 +124,46 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL AND
     message(FATAL_ERROR
         "vnm_qt_dispatch target is unavailable after dependency discovery.")
 endif()
+
+# The renderer's default monospace face comes from vnm_fonts, which registers
+# it under a family name unique to the process. Two font files declaring one
+# family name merge into a single font-database entry, after which glyph lookup
+# and rasterisation can be served from different files; the marking vnm_fonts
+# applies at load time is what keeps an installed Ubuntu Mono - Bront from
+# merging with the embedded one. It is added by several dependency paths in one
+# configure, so it guards its own repeated inclusion.
+if(NOT TARGET vnm_fonts)
+    if(VNM_FONTS_SOURCE_DIR)
+        if(NOT EXISTS "${VNM_FONTS_SOURCE_DIR}/CMakeLists.txt")
+            message(FATAL_ERROR
+                "VNM_FONTS_SOURCE_DIR does not contain a "
+                "vnm_fonts CMakeLists.txt:\n"
+                "  ${VNM_FONTS_SOURCE_DIR}")
+        endif()
+        FetchContent_Declare(vnm_terminal_surface_fonts
+            SOURCE_DIR "${VNM_FONTS_SOURCE_DIR}"
+            BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/vnm_fonts-build")
+    else()
+        FetchContent_Declare(vnm_terminal_surface_fonts
+            GIT_REPOSITORY "https://github.com/Varinomics/vnm_fonts.git"
+            GIT_TAG master
+            GIT_SHALLOW FALSE
+            BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/vnm_fonts-build")
+    endif()
+    FetchContent_MakeAvailable(vnm_terminal_surface_fonts)
+endif()
+
+if(NOT TARGET vnm_fonts)
+    message(FATAL_ERROR
+        "vnm_fonts target is unavailable after dependency discovery. It "
+        "defines vnm::fonts only where Qt6 Core and Gui are found, which this "
+        "project has already required above.")
+endif()
+
+# The nested package smoke configures this project again from its own source
+# tree. Hand it the checkout this configure resolved so it neither refetches
+# vnm_fonts nor needs the network.
+get_target_property(vnm_terminal_surface_fonts_source_dir vnm_fonts SOURCE_DIR)
 
 set(vnm_terminal_qt_targets
     Qt6::Core
@@ -248,9 +290,12 @@ target_link_libraries(vnm_terminal_surface_renderer PUBLIC
     ${vnm_terminal_qt_targets}
 )
 
+# vnm_fonts is consumed from source and installs nothing of its own, so it can
+# only be named inside the build tree; the same shape vnm_msdf_text uses below.
 target_link_libraries(vnm_terminal_surface_renderer PRIVATE
     Qt6::GuiPrivate
     Qt6::QuickPrivate
+    "$<BUILD_INTERFACE:vnm::fonts>"
 )
 
 target_compile_definitions(vnm_terminal_surface_renderer PUBLIC
@@ -548,7 +593,6 @@ endif()
 
 install(FILES
     LICENSE
-    LICENSES/Ubuntu-Font-Licence-1.0.txt
     THIRD_PARTY_NOTICES.md
     DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/vnm_terminal_surface"
 )

@@ -496,6 +496,7 @@ add_executable(vnm_terminal_qt_metrics
 
 target_link_libraries(vnm_terminal_qt_metrics PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
+    vnm::fonts
 )
 
 set_target_properties(vnm_terminal_qt_metrics PROPERTIES
@@ -838,6 +839,7 @@ add_executable(vnm_terminal_qsg_atlas
 target_link_libraries(vnm_terminal_qsg_atlas PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
     vnm_qt_dispatch::vnm_qt_dispatch
+    vnm::fonts
     Qt6::QuickPrivate
 )
 
@@ -2248,6 +2250,7 @@ add_test(
         "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke_renderer_only"
         "-Dconsumer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_consumer"
         "-Dqt6_dir=${Qt6_DIR}"
+        "-Dvnm_fonts_source_dir=${vnm_terminal_surface_fonts_source_dir}"
         -P "${PROJECT_SOURCE_DIR}/tests/package_smoke_renderer_only/expect_consumer_builds.cmake"
 )
 

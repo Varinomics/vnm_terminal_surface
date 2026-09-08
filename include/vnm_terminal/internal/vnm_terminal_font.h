@@ -20,4 +20,12 @@ QString vnm_terminal_default_monospace_font_family();
 bool vnm_terminal_default_monospace_font_loaded();
 QFont vnm_terminal_font(QString family, qreal pixel_size);
 
+// Answers a family name a host stored in an earlier release with the family the
+// shipped monospace face registers under now, and returns every other family
+// unchanged. The face itself never changed - the same Bront outlines under
+// successive family names - so a stored name from an earlier release means "the
+// shipped face", and taking it literally would silently move the terminal onto
+// whatever the host substitutes for a family that no longer exists.
+QString vnm_terminal_migrated_font_family(QString family);
+
 }

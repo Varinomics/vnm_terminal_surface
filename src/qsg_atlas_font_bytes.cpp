@@ -2,6 +2,8 @@
 
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 
+#include <vnm_font_namespace.h>
+
 #include <QFile>
 #include <QFont>
 #include <QString>
@@ -24,11 +26,17 @@ namespace vnm_terminal::internal {
 
 namespace {
 
+// The verbatim upstream file, not the marked bytes the font database holds.
+// Marking rewrites the name table, which no atlas ever reads, and msdfgen bakes
+// outlines that both copies share; reading the shipped file is the path
+// vnm_fonts documents for a consumer that needs a file rather than a family.
 constexpr const char* k_bundled_monospace_font_resource =
-    ":/vnm_terminal_surface/fonts/UbuntuMonoDerivativeBront-Regular.ttf";
+    ":/vnm_fonts/UbuntuMono-Bront.ttf";
 
 std::optional<QByteArray> bundled_font_bytes()
 {
+    vnm_fonts::initialize_resources();
+
     QFile font_file(QString::fromLatin1(k_bundled_monospace_font_resource));
     if (!font_file.open(QIODevice::ReadOnly)) {
         return std::nullopt;

@@ -3129,11 +3129,17 @@ QString VNM_TerminalSurface::font_family() const
 
 void VNM_TerminalSurface::set_font_family(const QString& font_family)
 {
-    if (m_font_family == font_family) {
+    // A host that restores a persisted family hands back the name the shipped
+    // face carried when the user chose it. Answer with the name it carries now,
+    // so the terminal keeps the typeface it had and the host re-persists the
+    // current family rather than the one that no longer resolves.
+    const QString migrated_font_family =
+        term::vnm_terminal_migrated_font_family(font_family);
+    if (m_font_family == migrated_font_family) {
         return;
     }
 
-    m_font_family = font_family;
+    m_font_family = migrated_font_family;
     emit font_family_changed();
     refresh_grid_metrics();
     start_msdf_availability_check();

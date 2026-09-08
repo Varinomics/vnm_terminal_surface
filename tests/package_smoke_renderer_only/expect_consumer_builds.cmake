@@ -33,10 +33,20 @@ if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
     list(APPEND configure_args "-DQt6_DIR=${qt6_dir}")
 endif()
 
+# The producer configure below is a second, independent configure of this
+# project. Hand it the vnm_fonts checkout the outer configure already resolved
+# so the smoke neither refetches it nor needs the network.
+set(producer_configure_args)
+if(DEFINED vnm_fonts_source_dir AND NOT "${vnm_fonts_source_dir}" STREQUAL "")
+    list(APPEND producer_configure_args
+        "-DVNM_FONTS_SOURCE_DIR=${vnm_fonts_source_dir}")
+endif()
+
 execute_process(
     COMMAND
         "${CMAKE_COMMAND}"
         ${configure_args}
+        ${producer_configure_args}
         -S "${source_dir}"
         -B "${producer_binary_dir}"
         -DBUILD_TESTING=OFF

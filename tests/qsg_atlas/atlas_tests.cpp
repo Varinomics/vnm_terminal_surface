@@ -9,6 +9,7 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
+#include <vnm_font_namespace.h>
 #include <vnm_qt_dispatch/vnm_qt_dispatch.h>
 
 #include <QByteArray>
@@ -198,7 +199,7 @@ constexpr float k_msdf_single_w_atlas_px_range = 10.0f;
 constexpr float k_msdf_single_w_sharpness_bias = 2.5f;
 constexpr char32_t k_msdf_single_w_codepoint = U'W';
 constexpr const char* k_terminal_monospace_font_resource =
-    ":/vnm_terminal_surface/fonts/UbuntuMonoDerivativeBront-Regular.ttf";
+    ":/vnm_fonts/UbuntuMono-Bront.ttf";
 #endif
 
 } // namespace
@@ -5184,6 +5185,8 @@ msdf::options_t msdf_single_w_options()
 
 QByteArray read_msdf_terminal_font_data(QString& error)
 {
+    vnm_fonts::initialize_resources();
+
     QFile font_file(QString::fromLatin1(k_terminal_monospace_font_resource));
     if (!font_file.open(QIODevice::ReadOnly)) {
         error = QStringLiteral("failed to open terminal embedded monospace font: %1")

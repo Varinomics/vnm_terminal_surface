@@ -2,9 +2,10 @@
 
 #include "vnm_terminal/font_metrics.h"
 
-#include <QFontDatabase>
-#include <QResource>
-#include <QStringList>
+#include <vnm_font_namespace.h>
+
+#include <QtGlobal>
+
 #include <algorithm>
 #include <cmath>
 
@@ -17,38 +18,50 @@ namespace vnm_terminal::internal {
 
 namespace {
 
-constexpr const char* k_vnm_framework_monospace_resource =
-    ":/vnm_terminal_surface/fonts/UbuntuMonoDerivativeBront-Regular.ttf";
-
 struct Default_monospace_font
 {
     QString family;
     bool    embedded_resource_loaded = false;
 };
 
-Default_monospace_font load_vnm_framework_monospace_font()
+// The family is whatever vnm_fonts registered, never a name spelled here: the
+// library marks the family at load time so an installed Ubuntu Mono - Bront
+// cannot merge with the shipped one, and a literal copied into this file would
+// drift from that mark the moment it changed.
+Default_monospace_font load_shipped_monospace_font()
 {
     init_vnm_terminal_resources();
 
-    const int font_id =
-        QFontDatabase::addApplicationFont(QString::fromLatin1(k_vnm_framework_monospace_resource));
-    if (font_id < 0) {
+    const vnm_fonts::Registered_font shipped_font =
+        vnm_fonts::register_shipped_font(vnm_fonts::Shipped_font::UBUNTU_MONO_BRONT);
+    if (!shipped_font.is_valid()) {
         return {QStringLiteral("monospace"), false};
     }
 
-    const QStringList families = QFontDatabase::applicationFontFamilies(font_id);
-    if (families.isEmpty()) {
-        return {QStringLiteral("monospace"), false};
-    }
-
-    return {families.front(), true};
+    return {shipped_font.family, true};
 }
 
 const Default_monospace_font& default_monospace_font()
 {
-    static const Default_monospace_font font = load_vnm_framework_monospace_font();
+    static const Default_monospace_font font = load_shipped_monospace_font();
     return font;
 }
+
+// Family names the shipped monospace face carried in earlier releases. Both
+// entries are load-bearing and neither is dead: the terminal shipped the
+// verbatim upstream file, whose own family is "Ubuntu Mono - Bront", until
+// August 2026, and a renamed derivative, "Ubuntu Mono derivative Bront", from
+// then until the face moved to vnm_fonts. A user who last chose a font under
+// either release has that exact string in their settings.
+//
+// The upstream name is here even though an installed copy can still declare it.
+// Answering it with the shipped family is the point rather than a side effect:
+// an unmarked family name is precisely the ambiguity vnm_fonts removes, because
+// two files claiming one name merge into a single font-database entry.
+constexpr const char* k_superseded_monospace_font_families[] = {
+    "Ubuntu Mono - Bront",
+    "Ubuntu Mono derivative Bront",
+};
 
 }
 
@@ -60,6 +73,18 @@ QString vnm_terminal_default_monospace_font_family()
 bool vnm_terminal_default_monospace_font_loaded()
 {
     return default_monospace_font().embedded_resource_loaded;
+}
+
+QString vnm_terminal_migrated_font_family(QString family)
+{
+    const QString trimmed = family.trimmed();
+    for (const char* superseded : k_superseded_monospace_font_families) {
+        if (trimmed == QLatin1String(superseded)) {
+            return vnm_terminal_default_monospace_font_family();
+        }
+    }
+
+    return family;
 }
 
 QFont vnm_terminal_font(QString family, qreal pixel_size)
