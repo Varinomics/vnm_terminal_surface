@@ -8948,17 +8948,15 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
     int       requested_count     = 0;
     int       dismissed_count     = 0;
     int       enabled_change_count = 0;
-    qreal     requested_x         = -1.0;
-    qreal     requested_y         = -1.0;
+    QRectF    requested_row_rect;
     QDateTime requested_timestamp;
     QObject::connect(
         &fixture.surface,
         &VNM_TerminalSurface::row_timestamp_tooltip_requested,
         &fixture.surface,
-        [&](qreal x, qreal y, const QDateTime& timestamp) {
+        [&](const QRectF& row_rect, const QDateTime& timestamp) {
             ++requested_count;
-            requested_x         = x;
-            requested_y         = y;
+            requested_row_rect  = row_rect;
             requested_timestamp = timestamp;
         });
     QObject::connect(
@@ -8998,10 +8996,14 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
     const qint64 after_request_ms = QDateTime::currentMSecsSinceEpoch();
     ok &= check(dismissed_count == 0,
         "tooltip request alone emits no dismissal");
+    const term::terminal_cell_metrics_t stamped_metrics =
+        current_cell_metrics(fixture.surface);
     ok &= check(
-        nearly_equal(requested_x, stamped_point.x()) &&
-        nearly_equal(requested_y, stamped_point.y()),
-        "tooltip request reports the resting pointer position");
+        nearly_equal(requested_row_rect.x(),      0.0)                     &&
+        nearly_equal(requested_row_rect.y(),      0.0)                     &&
+        nearly_equal(requested_row_rect.width(),  fixture.surface.width()) &&
+        nearly_equal(requested_row_rect.height(), stamped_metrics.height),
+        "tooltip request reports the hovered row's full-width rectangle");
     ok &= check(
         requested_timestamp.isValid()                              &&
         requested_timestamp.toMSecsSinceEpoch() >= before_output_ms &&

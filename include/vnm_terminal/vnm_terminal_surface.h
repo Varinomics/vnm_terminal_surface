@@ -6,6 +6,7 @@
 #include <QQuickItem>
 #include <QByteArray>
 #include <QDateTime>
+#include <QRectF>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -802,11 +803,11 @@ signals:
     // on the first subsequent pointer activity, viewport scroll, or disable.
     // The timestamp is the wall-clock time the row's content last changed,
     // not when the line first appeared; never-written rows request nothing.
-    // x and y are the pointer position in item coordinates so the host can
-    // place the tooltip.
+    // row_rect is the hovered row's rectangle in item coordinates, spanning
+    // the item's full width at one cell height, so the host can anchor the
+    // tooltip to the row itself rather than to the pointer.
     void row_timestamp_tooltip_requested(
-        qreal                  x,
-        qreal                  y,
+        QRectF                 row_rect,
         QDateTime              timestamp);
     void row_timestamp_tooltip_dismissed();
 

@@ -4078,9 +4078,13 @@ void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
     }
 
     m_private->row_timestamp_tooltip_request_active = true;
+    const term::terminal_cell_metrics_t metrics = m_private->cell_metrics;
     emit row_timestamp_tooltip_requested(
-        pointer_position.x(),
-        pointer_position.y(),
+        QRectF(
+            0.0,
+            position->row * metrics.height,
+            width(),
+            metrics.height),
         QDateTime::fromMSecsSinceEpoch(stamp_ms));
 }
 
