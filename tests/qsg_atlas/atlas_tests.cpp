@@ -10157,7 +10157,7 @@ bool atlas_report_matches_sequence(
 {
     return
         report.captured_snapshot_sequence == sequence &&
-        report.render_snapshot_sequence == sequence;
+        report.prepared_snapshot_sequence == sequence;
 }
 
 bool pump_next_atlas_report_for_sequence(
@@ -13285,27 +13285,35 @@ bool test_atlas_prepared_text_reuse(QGuiApplication& app)
         dirty_report);
 
     term::Qsg_atlas_frame_report pruned_report;
-    term::Terminal_render_snapshot pruned =
-        make_atlas_prepared_text_reuse_snapshot(
-            983U,
-            QStringLiteral("\u00ea"),
-            2U,
-            {{2, 1}});
-    pruned.cells.erase(
-        std::remove_if(
-            pruned.cells.begin(),
-            pruned.cells.end(),
-            [](const term::Terminal_render_cell& cell) {
-                return cell.position.row == 2;
-            }),
-        pruned.cells.end());
-    const bool prune_prepared = pump_prepared_text_reuse_report(
-        app,
-        window,
-        surface,
-        pruned,
-        dirty_report.prepare_count,
-        pruned_report);
+    std::uint64_t pruned_previous_prepare_count = dirty_report.prepare_count;
+    bool prune_prepared = true;
+    for (std::uint64_t sequence = 983U;
+        sequence < 993U && pruned_report.producer.shape_cache_pruned == 0;
+        ++sequence)
+    {
+        term::Terminal_render_snapshot pruned =
+            make_atlas_prepared_text_reuse_snapshot(
+                sequence,
+                QStringLiteral("\u00ea"),
+                2U,
+                {{2, 1}});
+        pruned.cells.erase(
+            std::remove_if(
+                pruned.cells.begin(),
+                pruned.cells.end(),
+                [](const term::Terminal_render_cell& cell) {
+                    return cell.position.row == 2;
+                }),
+            pruned.cells.end());
+        prune_prepared &= pump_prepared_text_reuse_report(
+            app,
+            window,
+            surface,
+            pruned,
+            pruned_previous_prepare_count,
+            pruned_report);
+        pruned_previous_prepare_count = pruned_report.prepare_count;
+    }
 
     const term::Qsg_atlas_producer_summary& unchanged_producer =
         unchanged_report.producer;
@@ -13950,7 +13958,9 @@ bool test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(
     ok &= check(failed_prepared,
         "atlas forced MSDF prepare-resource failure reports the failed sequence");
     ok &= check(failed_prepared &&
-            !atlas_report_render_state_ready(failed_report),
+            !failed_report.prepared_generation_committed &&
+            failed_report.render_snapshot_sequence ==
+                baseline_report.render_snapshot_sequence,
         "atlas forced MSDF prepare-resource failure does not render ready");
     ok &= check(failed_prepared &&
             atlas_failed_prepare_has_no_buffer_upload(failed_report),
@@ -14001,7 +14011,9 @@ bool test_atlas_forced_msdf_buffer_failure_does_not_commit(
     ok &= check(failed_prepared,
         "atlas forced MSDF instance-buffer failure reports the failed sequence");
     ok &= check(failed_prepared &&
-            !atlas_report_render_state_ready(failed_report),
+            !failed_report.prepared_generation_committed &&
+            failed_report.render_snapshot_sequence ==
+                baseline_report.render_snapshot_sequence,
         "atlas forced MSDF instance-buffer failure does not render ready");
     ok &= check(failed_prepared &&
             atlas_failed_prepare_has_no_buffer_upload(failed_report),

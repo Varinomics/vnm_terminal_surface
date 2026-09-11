@@ -33,6 +33,39 @@ if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
     list(APPEND configure_args "-DQt6_DIR=${qt6_dir}")
 endif()
 
+set(smoke_config Debug)
+if(DEFINED install_config AND NOT "${install_config}" STREQUAL "")
+    set(smoke_config "${install_config}")
+endif()
+
+set(single_config_generator ON)
+if(DEFINED generator AND
+    "${generator}" MATCHES "Visual Studio|Xcode|Multi-Config")
+    set(single_config_generator OFF)
+endif()
+
+set(build_type_args)
+if(single_config_generator)
+    list(APPEND build_type_args "-DCMAKE_BUILD_TYPE=${smoke_config}")
+endif()
+
+set(producer_build_args
+    --build "${producer_binary_dir}"
+    --parallel 1)
+set(producer_install_args
+    --install "${producer_binary_dir}")
+set(consumer_build_args
+    --build "${consumer_binary_dir}"
+    --parallel 1)
+if(DEFINED install_config AND NOT "${install_config}" STREQUAL "")
+    list(APPEND producer_build_args
+        --config "${install_config}")
+    list(APPEND producer_install_args
+        --config "${install_config}")
+    list(APPEND consumer_build_args
+        --config "${install_config}")
+endif()
+
 # The producer configure below is a second, independent configure of this
 # project. Hand it the vnm_fonts checkout the outer configure already resolved
 # so the smoke neither refetches it nor needs the network.
@@ -53,7 +86,7 @@ execute_process(
         -DVNM_TERMINAL_SURFACE_BUILD_TESTING=OFF
         -DVNM_TERMINAL_SURFACE_BUILD_FULL=OFF
         -DVNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER=OFF
-        -DCMAKE_BUILD_TYPE=Debug
+        ${build_type_args}
         "-DCMAKE_INSTALL_PREFIX=${install_dir}"
     RESULT_VARIABLE producer_configure_result
     OUTPUT_VARIABLE producer_configure_stdout
@@ -67,8 +100,7 @@ endif()
 execute_process(
     COMMAND
         "${CMAKE_COMMAND}"
-        --build "${producer_binary_dir}"
-        --parallel 1
+        ${producer_build_args}
     RESULT_VARIABLE producer_build_result
     OUTPUT_VARIABLE producer_build_stdout
     ERROR_VARIABLE producer_build_stderr)
@@ -81,7 +113,7 @@ endif()
 execute_process(
     COMMAND
         "${CMAKE_COMMAND}"
-        --install "${producer_binary_dir}"
+        ${producer_install_args}
     RESULT_VARIABLE install_result
     OUTPUT_VARIABLE install_stdout
     ERROR_VARIABLE install_stderr)
@@ -120,7 +152,7 @@ execute_process(
         ${configure_args}
         -S "${consumer_source_dir}"
         -B "${consumer_binary_dir}"
-        -DCMAKE_BUILD_TYPE=Debug
+        ${build_type_args}
         "-DCMAKE_PREFIX_PATH=${install_dir}"
         -DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE
         -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE
@@ -138,8 +170,7 @@ endif()
 execute_process(
     COMMAND
         "${CMAKE_COMMAND}"
-        --build "${consumer_binary_dir}"
-        --parallel 1
+        ${consumer_build_args}
     RESULT_VARIABLE consumer_build_result
     OUTPUT_VARIABLE consumer_build_stdout
     ERROR_VARIABLE consumer_build_stderr)

@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_atlas_font_bytes.h"
+#include "vnm_terminal/internal/qsg_atlas_warm_set.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
@@ -4111,6 +4112,8 @@ private:
             : QString();
         m_warm_lazy = {};
         m_warm_lazy.warm_epoch = m_frame.font_epoch;
+        m_warm_lazy.warm_seed_strings =
+            static_cast<int>(k_qsg_atlas_warm_seed_strings.size());
         m_warm_lazy.warm_broad_seed_skipped = true;
         Terminal_render_frame_build_options frame_build_options;
         frame_build_options.build_row_descriptors           = false;

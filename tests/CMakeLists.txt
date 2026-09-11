@@ -2251,6 +2251,7 @@ add_test(
         "-Dconsumer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_consumer"
         "-Dqt6_dir=${Qt6_DIR}"
         "-Dvnm_fonts_source_dir=${vnm_terminal_surface_fonts_source_dir}"
+        "-Dinstall_config=$<CONFIG>"
         -P "${PROJECT_SOURCE_DIR}/tests/package_smoke_renderer_only/expect_consumer_builds.cmake"
 )
 
