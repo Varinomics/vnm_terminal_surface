@@ -1503,6 +1503,24 @@ bool qsg_atlas_text_has_emoji_presentation(
     return text_has_emoji_presentation(text);
 }
 
+static int qsg_atlas_text_run_cell_span(
+    const Terminal_render_text_run& run,
+    terminal_cell_metrics_t         cell_metrics)
+{
+    if (std::isfinite(cell_metrics.width) &&
+        cell_metrics.width > 0.0          &&
+        run.rect.isValid())
+    {
+        const int rect_span = static_cast<int>(
+            std::round(run.rect.width() / cell_metrics.width));
+        if (rect_span > 0) {
+            return rect_span;
+        }
+    }
+
+    return std::max(1, measure_utf8_width(run.text.toUtf8()).cells);
+}
+
 QByteArray prepared_text_cache_key(
     const Terminal_render_text_run& run,
     const QFont&                    font,
@@ -1512,10 +1530,18 @@ QByteArray prepared_text_cache_key(
     bool                            cursor_text_run)
 {
     QByteArray key;
-    append_key_uint64(key, run.retained_line_id);
-    append_key_uint64(key, run.content_generation);
+    // Shaping depends on the text and font/layout metrics, not on the cell
+    // position, identity, or generation of the retained row.  The latter
+    // change on every repaint in
+    // the resize burst even when the same text is drawn again; append-prepared
+    // updates those diagnostic fields on the cached records.
     append_key_string(key, run.text);
-    append_key_int(key, run.column);
+    // This cache stores terminal ownership and placement records as well as
+    // shaping. Their interpretation depends on the run's cell span and on
+    // whether its rectangle is usable, even when text/font are unchanged.
+    append_key_bool(key, run.rect.isValid());
+    append_key_int(key, qsg_atlas_text_run_cell_span(run, cell_metrics));
+    append_key_qreal(key, run.rect.left() - run.baseline_origin.x());
     append_key_bool(key, cursor_text_run);
     append_key_uint64(key, font_epoch);
     append_key_string(key, font.toString());
@@ -4966,19 +4992,23 @@ private:
         qreal                          inverse_page_width,
         qreal                          inverse_page_height,
         Qsg_atlas_frame_build_summary& frame_build,
-        int*                           out_appended_instances)
+        int*                           out_appended_instances,
+        bool                            origin_is_already_snapped = false,
+        bool                            clip_is_known_absent      = false)
     {
         const qreal normalized_device_pixel_ratio =
             atlas_normalized_device_pixel_ratio(device_pixel_ratio);
-        if (!atlas_physical_origin_is_snapped(
+        if (!origin_is_already_snapped &&
+            !atlas_physical_origin_is_snapped(
                 glyph_origin,
                 normalized_device_pixel_ratio))
         {
             ++frame_build.snapped_origin_failures;
         }
 
-        const QPointF snapped_glyph_origin =
-            qsg_atlas_snapped_physical_point(
+        const QPointF snapped_glyph_origin = origin_is_already_snapped
+            ? glyph_origin
+            : qsg_atlas_snapped_physical_point(
                 glyph_origin,
                 normalized_device_pixel_ratio);
 
@@ -4986,13 +5016,14 @@ private:
             snapped_glyph_origin,
             slot.physical_offset,
             slot.rect.size(),
-            normalized_device_pixel_ratio);
+            normalized_device_pixel_ratio,
+            /*origin_is_already_snapped=*/true);
         QRectF uv_rect(
             static_cast<qreal>(slot.rect.x())      * inverse_page_width,
             static_cast<qreal>(slot.rect.y())      * inverse_page_height,
             static_cast<qreal>(slot.rect.width())  * inverse_page_width,
             static_cast<qreal>(slot.rect.height()) * inverse_page_height);
-        if (run.clip_rect.isValid() &&
+        if (!clip_is_known_absent && run.clip_rect.isValid() &&
             !clip_glyph_instance(
                 glyph_rect, uv_rect, run.clip_rect, /*v_flipped=*/false))
         {
@@ -5101,10 +5132,15 @@ private:
 
     void prune_prepared_text_cache(Qsg_atlas_producer_summary& producer)
     {
+        constexpr std::uint64_t k_prepared_text_cache_max_age = 8U;
         for (auto it = m_prepared_text_cache.begin();
             it != m_prepared_text_cache.end();)
         {
-            if (it->second.last_seen_frame == m_prepared_text_cache_frame) {
+            const std::uint64_t age =
+                m_prepared_text_cache_frame >= it->second.last_seen_frame
+                    ? m_prepared_text_cache_frame - it->second.last_seen_frame
+                    : 0U;
+            if (age <= k_prepared_text_cache_max_age) {
                 ++it;
                 continue;
             }
@@ -5783,6 +5819,8 @@ private:
         int                             text_run_index,
         bool                            cursor_text_run)
     {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "Qsg_atlas_render_node::append_simple_text_run");
         if (!ensure_simple_text_cache(result)) {
             return false;
         }
@@ -5797,6 +5835,8 @@ private:
         const std::array<float, 4> color =
             atlas_glyph_color_components(run.foreground, opacity);
 
+        std::array<unsigned char, k_atlas_printable_ascii_count>
+            recorded_face_indices = {};
         int reused_glyph_records = 0;
         for (qsizetype source = 0; source < run.text.size(); ++source) {
             const int index = qsg_atlas_printable_ascii_index(run.text.at(source));
@@ -5810,6 +5850,33 @@ private:
                 continue;
             }
 
+            const int owner_column =
+                run.column + static_cast<int>(source);
+            if (glyph.slot.is_valid()) {
+                if (recorded_face_indices[static_cast<std::size_t>(index)] == 0U) {
+                    record_glyph_face(glyph.record.fallback_face_id, result);
+                    recorded_face_indices[static_cast<std::size_t>(index)] = 1U;
+                }
+                append_glyph_instance(
+                    glyph.slot,
+                    terminal_cell_glyph_origin(
+                        run,
+                        owner_column,
+                        device_pixel_ratio),
+                    run,
+                    color,
+                    device_pixel_ratio,
+                    inverse_page_width,
+                    inverse_page_height,
+                    result.frame_build,
+                    nullptr,
+                    /*origin_is_already_snapped=*/true,
+                    /*clip_is_known_absent=*/true);
+                ++result.producer.slot_resolutions_reused;
+                ++reused_glyph_records;
+                continue;
+            }
+
             Qsg_atlas_shaped_glyph_record record = glyph.record;
             record.text_run_index     = text_run_index;
             record.cursor_text_run    = cursor_text_run;
@@ -5818,8 +5885,7 @@ private:
             record.retained_line_id   = run.retained_line_id;
             record.content_generation = run.content_generation;
             record.run_column         = run.column;
-            record.owner_column       =
-                run.column + static_cast<int>(source);
+            record.owner_column       = owner_column;
             record.owner_cell_span    = 1;
             record.source_string_start = source;
             record.source_string_end   = source + 1;
@@ -5846,9 +5912,6 @@ private:
                     continue;
                 }
             }
-            else {
-                ++result.producer.slot_resolutions_reused;
-            }
             append_glyph_instance(
                 glyph.slot,
                 draw_origin,
@@ -5858,7 +5921,9 @@ private:
                 inverse_page_width,
                 inverse_page_height,
                 result.frame_build,
-                nullptr);
+                nullptr,
+                /*origin_is_already_snapped=*/true,
+                /*clip_is_known_absent=*/true);
             ++reused_glyph_records;
         }
 
@@ -5904,6 +5969,11 @@ private:
             record.logical_row        = run.logical_row;
             record.retained_line_id   = run.retained_line_id;
             record.content_generation = run.content_generation;
+            // The cached owner is absolute in the source occurrence. Rebase
+            // it before replacing the source run column; otherwise a cache
+            // hit at another column keeps stale terminal ownership.
+            record.owner_column       = run.column +
+                (record.owner_column - record.run_column);
             record.run_column         = run.column;
             record.glyph_origin      += origin_delta;
             const QPointF draw_origin = snapped_terminal_cell_glyph_origin(
@@ -8307,12 +8377,14 @@ QRectF qsg_atlas_snapped_glyph_draw_rect(
     QPointF glyph_origin,
     QPoint  glyph_physical_offset,
     QSize   glyph_physical_size,
-    qreal   device_pixel_ratio)
+    qreal   device_pixel_ratio,
+    bool    origin_is_already_snapped)
 {
     const qreal normalized_device_pixel_ratio =
         atlas_normalized_device_pixel_ratio(device_pixel_ratio);
-    const QPointF snapped_origin =
-        qsg_atlas_snapped_physical_point(
+    const QPointF snapped_origin = origin_is_already_snapped
+        ? glyph_origin
+        : qsg_atlas_snapped_physical_point(
             glyph_origin,
             normalized_device_pixel_ratio);
     const int physical_origin_x = atlas_snapped_physical_int(
@@ -8353,24 +8425,6 @@ Glyph_atlas_cache_key qsg_atlas_cache_key(
         normalized_lcd_order,
         subpixel_bucket,
     };
-}
-
-static int qsg_atlas_text_run_cell_span(
-    const Terminal_render_text_run& run,
-    terminal_cell_metrics_t         cell_metrics)
-{
-    if (std::isfinite(cell_metrics.width) &&
-        cell_metrics.width > 0.0          &&
-        run.rect.isValid())
-    {
-        const int rect_span = static_cast<int>(
-            std::round(run.rect.width() / cell_metrics.width));
-        if (rect_span > 0) {
-            return rect_span;
-        }
-    }
-
-    return std::max(1, measure_utf8_width(run.text.toUtf8()).cells);
 }
 
 static bool qsg_atlas_text_run_source_offsets_map_to_cells(

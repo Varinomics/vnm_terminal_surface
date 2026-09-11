@@ -18,6 +18,7 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/wheel_gesture.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
+#include "vnm_terminal/diagnostics/diagnostic_sink.h"
 
 #include <vnm_qt_dispatch/vnm_qt_dispatch.h>
 
@@ -324,9 +325,11 @@ public:
             });
         if (result != vnm::qt::Post_result::QUEUED) {
             m_queued.store(false);
-            qWarning(
-                "VNM_TerminalSurface: search completion dispatch failed (result %d).",
-                (int)result);
+            vnm_terminal::diagnostics::write(
+                vnm_terminal::diagnostics::Level::WARNING,
+                QStringLiteral(
+                    "VNM_TerminalSurface: search completion dispatch failed (result %1).")
+                    .arg(static_cast<int>(result)));
         }
     }
 
@@ -351,10 +354,16 @@ bool flush_clipboard_after_terminal_write()
 #if defined(_WIN32)
     const long result = OleFlushClipboard();
     if (result != 0L) {
-        qWarning(
-            "VNM_TerminalSurface: OleFlushClipboard failed after clipboard write; "
-            "data may not outlive the process: 0x%08lx",
-            static_cast<unsigned long>(result));
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral(
+                "VNM_TerminalSurface: OleFlushClipboard failed after clipboard write; "
+                "data may not outlive the process: 0x%1")
+                .arg(
+                    static_cast<qulonglong>(result),
+                    8,
+                    16,
+                    QLatin1Char('0')));
         return false;
     }
 #endif
@@ -380,12 +389,13 @@ std::chrono::steady_clock::duration configured_backend_callback_frame_catchup_bu
     const int budget_ms = budget_text.toInt(&ok);
     if (!ok || budget_ms < 0) {
         const QByteArray budget_bytes = budget_text.toLocal8Bit();
-        qWarning(
-            "VNM_TerminalSurface: ignoring invalid %s=%s; using %lldms",
-            k_backend_callback_frame_catchup_budget_env,
-            budget_bytes.constData(),
-            static_cast<long long>(
-                k_backend_callback_frame_catchup_budget_default.count()));
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral("VNM_TerminalSurface: ignoring invalid %1=%2; using %3ms")
+                .arg(QString::fromLatin1(k_backend_callback_frame_catchup_budget_env))
+                .arg(QString::fromLocal8Bit(budget_bytes))
+                .arg(static_cast<qlonglong>(
+                    k_backend_callback_frame_catchup_budget_default.count())));
         return k_backend_callback_frame_catchup_budget_default;
     }
 
@@ -396,7 +406,9 @@ bool set_terminal_clipboard_text(const QString& text)
 {
     QClipboard* clipboard = QGuiApplication::clipboard();
     if (clipboard == nullptr) {
-        qWarning("VNM_TerminalSurface: no application clipboard is available");
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral("VNM_TerminalSurface: no application clipboard is available"));
         return false;
     }
 
@@ -3224,14 +3236,18 @@ void VNM_TerminalSurface::handle_msdf_availability_completion_timeout()
     }
 
     if (dispatch_rejected) {
-        qWarning(
-            "VNM_TerminalSurface: MSDF availability dispatch admission "
-            "failed (result %d).",
-            dispatch_result);
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral(
+                "VNM_TerminalSurface: MSDF availability dispatch admission "
+                "failed (result %1).")
+                .arg(dispatch_result));
     }
     else {
-        qWarning(
-            "VNM_TerminalSurface: MSDF availability completion timed out.");
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral(
+                "VNM_TerminalSurface: MSDF availability completion timed out."));
     }
 }
 
@@ -3281,9 +3297,10 @@ void VNM_TerminalSurface::set_color_scheme(const QString& color_scheme)
 {
     const term::Terminal_color_scheme* scheme = term::find_color_scheme(color_scheme);
     if (scheme == nullptr) {
-        qWarning(
-            "VNM_TerminalSurface: ignoring unknown color scheme \"%s\"",
-            qPrintable(color_scheme));
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral("VNM_TerminalSurface: ignoring unknown color scheme \"%1\"")
+                .arg(color_scheme));
         return;
     }
     if (m_color_scheme == scheme->name) {
@@ -3413,15 +3430,18 @@ void VNM_TerminalSurface::set_retained_history_capacity_bytes(
     if (capacity_bytes < minimum_retained_history_capacity_bytes() ||
         capacity_bytes > maximum_retained_history_capacity_bytes())
     {
-        qWarning(
-            "retained-history capacity must be between %zu and %zu bytes",
-            minimum_retained_history_capacity_bytes(),
-            maximum_retained_history_capacity_bytes());
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral("retained-history capacity must be between %1 and %2 bytes")
+                .arg(static_cast<qulonglong>(minimum_retained_history_capacity_bytes()))
+                .arg(static_cast<qulonglong>(maximum_retained_history_capacity_bytes())));
         return;
     }
 
     if (m_private->session != nullptr) {
-        qWarning("retained-history capacity must be set before starting a session");
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            QStringLiteral("retained-history capacity must be set before starting a session"));
         return;
     }
 
@@ -3446,7 +3466,9 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
         m_interaction_diagnostics_error =
             QStringLiteral("interaction diagnostics are already enabled by another terminal surface");
         emit interaction_diagnostics_error_changed();
-        qWarning().noquote() << m_interaction_diagnostics_error;
+        vnm_terminal::diagnostics::write(
+            vnm_terminal::diagnostics::Level::WARNING,
+            m_interaction_diagnostics_error);
         return;
     }
 
@@ -3472,10 +3494,12 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
                         emit surface->interaction_diagnostics_enabled_changed();
                     });
                 if (post_result != vnm::qt::Post_result::QUEUED) {
-                    qWarning(
-                        "VNM_TerminalSurface: interaction-trace failure "
-                        "dispatch admission failed (result %d).",
-                        static_cast<int>(post_result));
+                    vnm_terminal::diagnostics::write(
+                        vnm_terminal::diagnostics::Level::WARNING,
+                        QStringLiteral(
+                            "VNM_TerminalSurface: interaction-trace failure "
+                            "dispatch admission failed (result %1).")
+                            .arg(static_cast<int>(post_result)));
                 }
             });
     }
@@ -3485,7 +3509,7 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
         }
         m_interaction_diagnostics_error = error;
         emit interaction_diagnostics_error_changed();
-        qWarning().noquote() << error;
+        vnm_terminal::diagnostics::write(vnm_terminal::diagnostics::Level::WARNING, error);
         return;
     }
 
@@ -5069,6 +5093,14 @@ void VNM_TerminalSurface::geometryChange(
     const QRectF&  old_geometry)
 {
     QQuickItem::geometryChange(new_geometry, old_geometry);
+    if (new_geometry.size() == old_geometry.size()) {
+        // Moving a pane does not resize its PTY or alter font/cell metrics.
+        // Keep local interaction feedback current without draining backend
+        // output or asking the renderer to rebuild terminal contents.
+        refresh_hyperlink_hover_feedback();
+        updateInputMethod(Qt::ImCursorRectangle);
+        return;
+    }
     refresh_grid_metrics();
 }
 
@@ -7229,7 +7261,7 @@ void VNM_TerminalSurface::refresh_grid_metrics()
     m_private->cell_metrics = m_private->grid_metrics_provider.cell_metrics();
     refresh_hyperlink_hover_feedback();
     const term::Terminal_metrics_result grid_result =
-        m_private->grid_metrics_provider.grid_size_for_item_geometry(boundingRect().size());
+        term::grid_size_for_geometry(boundingRect().size(), m_private->cell_metrics);
     if (m_private->session != nullptr) {
         refresh_active_session_geometry();
     }

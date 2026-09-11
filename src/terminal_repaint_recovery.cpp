@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
 
 #include <algorithm>
+#include <array>
 
 namespace vnm_terminal::internal {
 
@@ -10,6 +11,33 @@ bool row_has_visible_text(const QString& row)
 {
     return !row.isEmpty();
 }
+
+// All callers only distinguish fewer than two, two, and at least three
+// distinct texts. Saturate at three without allocating or copying QStrings.
+// The input rows stay alive and immutable for the duration of the match.
+struct distinct_row_texts_t
+{
+    std::array<const QString*, 3> texts = {};
+    std::size_t                   count = 0U;
+
+    void insert(const QString& text)
+    {
+        if (count == texts.size()) {
+            return;
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            if (*texts[index] == text) {
+                return;
+            }
+        }
+        texts[count++] = &text;
+    }
+
+    std::size_t size() const
+    {
+        return count;
+    }
+};
 
 }
 
@@ -43,21 +71,16 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
     bool best_full_match         = false;
     bool repeated_row_ambiguity  = false;
 
+    int available_meaningful_matches = static_cast<int>(std::count_if(
+        input.candidate_rows.begin(),
+        input.candidate_rows.end(),
+        row_has_visible_text));
+    bool displaced_has_text = false;
     for (int shift = 1; shift < row_count; ++shift) {
-        bool displaced_has_text = false;
-        for (int row = 0; row < shift; ++row) {
-            displaced_has_text = displaced_has_text ||
-                row_has_visible_text(input.candidate_rows[static_cast<std::size_t>(row)]);
-        }
-
-        int available_meaningful_matches = 0;
-        for (int row = 0; row + shift < row_count; ++row) {
-            if (row_has_visible_text(
-                    input.candidate_rows[static_cast<std::size_t>(row + shift)]))
-            {
-                ++available_meaningful_matches;
-            }
-        }
+        const bool newly_displaced_has_text = row_has_visible_text(
+            input.candidate_rows[static_cast<std::size_t>(shift - 1)]);
+        displaced_has_text = displaced_has_text || newly_displaced_has_text;
+        available_meaningful_matches -= newly_displaced_has_text ? 1 : 0;
         const int required_meaningful_matches = std::min(
             k_preferred_meaningful_matches,
             available_meaningful_matches);
@@ -67,7 +90,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
 
         int                  matched_prefix     = 0;
         int                  meaningful_matches = 0;
-        std::vector<QString> distinct_matched_texts;
+        distinct_row_texts_t distinct_matched_texts;
         while (matched_prefix + shift < row_count) {
             const QString& current_text =
                 input.current_rows[static_cast<std::size_t>(matched_prefix)];
@@ -79,13 +102,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
 
             if (!candidate_text.isEmpty()) {
                 ++meaningful_matches;
-                if (std::find(
-                        distinct_matched_texts.begin(),
-                        distinct_matched_texts.end(),
-                        candidate_text) == distinct_matched_texts.end())
-                {
-                    distinct_matched_texts.push_back(candidate_text);
-                }
+                distinct_matched_texts.insert(candidate_text);
             }
             ++matched_prefix;
         }
@@ -149,7 +166,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
     {
         int                  matched_prefix = 0;
         int                  meaningful_matches = 0;
-        std::vector<QString> distinct_matched_texts;
+        distinct_row_texts_t distinct_matched_texts;
         while (matched_prefix + 1 < row_count) {
             const QString& current_text =
                 input.current_rows[static_cast<std::size_t>(matched_prefix)];
@@ -160,20 +177,14 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
             }
             if (!candidate_text.isEmpty()) {
                 ++meaningful_matches;
-                if (std::find(
-                        distinct_matched_texts.begin(),
-                        distinct_matched_texts.end(),
-                        candidate_text) == distinct_matched_texts.end())
-                {
-                    distinct_matched_texts.push_back(candidate_text);
-                }
+                distinct_matched_texts.insert(candidate_text);
             }
             ++matched_prefix;
         }
 
         int                  anchored_suffix_start = row_count;
         int                  anchored_meaningful_matches = 0;
-        std::vector<QString> distinct_anchored_texts;
+        distinct_row_texts_t distinct_anchored_texts;
         while (anchored_suffix_start > 0) {
             const int row = anchored_suffix_start - 1;
             const QString& current_text =
@@ -185,13 +196,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
             }
             if (!candidate_text.isEmpty()) {
                 ++anchored_meaningful_matches;
-                if (std::find(
-                        distinct_anchored_texts.begin(),
-                        distinct_anchored_texts.end(),
-                        candidate_text) == distinct_anchored_texts.end())
-                {
-                    distinct_anchored_texts.push_back(candidate_text);
-                }
+                distinct_anchored_texts.insert(candidate_text);
             }
             --anchored_suffix_start;
         }

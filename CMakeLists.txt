@@ -390,6 +390,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/windows_conpty_backend.h
     include/vnm_terminal/diagnostics/metrics_json.h
     include/vnm_terminal/diagnostics/profile_text.h
+    include/vnm_terminal/diagnostics/diagnostic_sink.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_canvas_export.h
@@ -399,6 +400,7 @@ add_library(vnm_terminal_surface STATIC
     src/diagnostics/metric_descriptor.h
     src/diagnostics/atlas_metric_descriptors.h
     src/diagnostics/metrics_json.cpp
+    src/diagnostics/diagnostic_sink.cpp
     src/diagnostics/profile_text.cpp
     src/font_metrics.cpp
     src/interaction_trace.cpp
@@ -594,6 +596,7 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL)
     )
 
     install(FILES
+        include/vnm_terminal/diagnostics/diagnostic_sink.h
         include/vnm_terminal/diagnostics/metrics_json.h
         include/vnm_terminal/diagnostics/profile_text.h
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal/diagnostics"

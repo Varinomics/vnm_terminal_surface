@@ -438,6 +438,11 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              max_printable_ascii_span_characters      = 0U;
     std::uint64_t              printable_ascii_local_cells_inspected     = 0U;
     std::uint64_t              scalar_span_local_cells_inspected         = 0U;
+    std::uint64_t              erase_row_range_calls                     = 0U;
+    std::uint64_t              erase_row_cells_visited                   = 0U;
+    std::uint64_t              erase_row_cells_replaced                  = 0U;
+    std::uint64_t              erase_row_cells_already_erased             = 0U;
+    std::uint64_t              erase_row_wide_span_cells                  = 0U;
     std::uint64_t              row_content_generation_comparisons       = 0U;
     std::uint64_t              row_content_generation_comparison_cells  = 0U;
     std::uint64_t              row_content_generation_advances          = 0U;
@@ -933,6 +938,12 @@ private:
     struct primary_repaint_recovery_candidate_t
     {
         std::vector<Terminal_screen_row> rows;
+        // The candidate rows are compared repeatedly while a repaint episode
+        // is being reconstructed. Keep the current-geometry text projection
+        // beside the captured cells so those retries do not rebuild the same
+        // QStrings on every attempt.
+        std::vector<QString>              text_rows;
+        int                              text_row_columns = 0;
         std::map<Terminal_hyperlink_id, QByteArray>
                                      hyperlink_identity_keys;
         int                              scrollback_rows                 = 0;
@@ -954,7 +965,6 @@ private:
     };
 
     screen_buffer_state_t make_empty_buffer_state();
-    screen_buffer_state_t capture_current_buffer_state() const;
     void restore_buffer_state(const screen_buffer_state_t& state);
     void save_active_buffer_state();
     screen_buffer_state_t& active_buffer_state();
@@ -1529,7 +1539,13 @@ private:
                                     m_hyperlink_table_stats;
     Primary_backing_buffer          m_primary_backing;
     Alternate_active_grid           m_alternate_grid;
-    std::set<int>                   m_dirty_rows;
+    // Dirty rows are marked repeatedly while one parser action is applied,
+    // but the active grid is bounded to the configured row count.  Keep the
+    // row list in reusable storage and use flags for O(1) duplicate checks;
+    // publication still inserts the list into its ordered set at the API
+    // boundary.
+    std::vector<int>                m_dirty_rows;
+    std::vector<unsigned char>      m_dirty_row_flags;
     std::vector<terminal_backing_delta_t>
                                     m_backing_deltas;
     std::vector<terminal_recovery_proposal_t>
@@ -1607,7 +1623,7 @@ private:
     int                             m_primary_repaint_recovery_resize_guard_remaining = 0;
     bool                            m_primary_repaint_recovery_episode_active = false;
     primary_repaint_recovery_candidate_t
-                                    m_primary_repaint_recovery_candidate;
+                                     m_primary_repaint_recovery_candidate;
 };
 
 }

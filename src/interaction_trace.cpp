@@ -1,8 +1,8 @@
 #include "vnm_terminal/internal/interaction_trace.h"
+#include "vnm_terminal/diagnostics/diagnostic_sink.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
-#include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -316,7 +316,7 @@ void record_interaction_trace(
     if (!failure.isEmpty()) {
         const std::function<void(QString)> handler = state.failure_handler;
         lock.unlock();
-        qWarning().noquote() << failure;
+        diagnostics::write(diagnostics::Level::WARNING, failure);
         if (handler) {
             handler(failure);
         }

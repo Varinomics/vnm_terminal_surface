@@ -4362,8 +4362,13 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             // stays held until the final continuation completes.
             Q_ASSERT(m_result_capture_sequence == 0U);
             Terminal_session_command remainder = command;
-            remainder.bytes = command.bytes.sliced(k_backend_output_drain_slice_bytes);
-            command.bytes.truncate(k_backend_output_drain_slice_bytes);
+            // Copy only the consumed prefix, then release command's reference
+            // to the backing store before removing it from the remainder.
+            // A uniquely owned Qt 6 QByteArray can drop a prefix without
+            // copying the tail. An external trace reference detaches once.
+            command.bytes = QByteArray(
+                remainder.bytes.constData(), k_backend_output_drain_slice_bytes);
+            remainder.bytes.remove(0, k_backend_output_drain_slice_bytes);
             m_pending_commands.push_front(std::move(remainder));
             m_budgeted_backend_output_sequence = command.sequence;
         }

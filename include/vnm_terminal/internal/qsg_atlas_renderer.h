@@ -881,7 +881,8 @@ QRectF qsg_atlas_snapped_glyph_draw_rect(
     QPointF glyph_origin,
     QPoint  glyph_physical_offset,
     QSize   glyph_physical_size,
-    qreal   device_pixel_ratio);
+    qreal   device_pixel_ratio,
+    bool    origin_is_already_snapped = false);
 
 Glyph_atlas_cache_key qsg_atlas_cache_key(
     quint32              glyph_index,

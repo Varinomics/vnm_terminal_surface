@@ -229,6 +229,14 @@ void append_model_profile_stats_section(
         stream,
         "scalar_span_local_cells_inspected",
         stats.scalar_span_local_cells_inspected);
+    append_profile_counter(stream, "erase_row_range_calls", stats.erase_row_range_calls);
+    append_profile_counter(stream, "erase_row_cells_visited", stats.erase_row_cells_visited);
+    append_profile_counter(stream, "erase_row_cells_replaced", stats.erase_row_cells_replaced);
+    append_profile_counter(
+        stream,
+        "erase_row_cells_already_erased",
+        stats.erase_row_cells_already_erased);
+    append_profile_counter(stream, "erase_row_wide_span_cells", stats.erase_row_wide_span_cells);
     append_profile_counter(
         stream,
         "row_content_generation_comparisons",
