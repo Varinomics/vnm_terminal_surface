@@ -4392,6 +4392,7 @@ private:
                 ? static_cast<int>(*options.cursor_shape_override)
                 : 0);
         append_key_bool(key, options.cursor_blink_enabled_override.has_value());
+        append_key_bool(key, options.cursor_presentation_suppressed);
         append_key_bool(
             key,
             options.cursor_blink_enabled_override.has_value() &&

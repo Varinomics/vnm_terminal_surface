@@ -1369,6 +1369,42 @@ bool test_wide_search_match_uses_highest_cell_state()
     return ok;
 }
 
+bool test_cursor_presentation_mask()
+{
+    auto snapshot = empty_snapshot({2, 4});
+    snapshot.cursor = {{0, 0}, term::Terminal_cursor_shape::BLOCK, true, false};
+    snapshot.cells.push_back({{0, 0}, QStringLiteral("A"), 0U, 1, false, 0U});
+    auto render_options = options();
+    bool ok = check(!render_options.cursor_presentation_suppressed,
+        "cursor presentation mask defaults to disabled");
+    render_options.cursor_presentation_suppressed = true;
+    const auto masked = build(snapshot, render_options, false);
+    ok &= check(masked.cursors.empty() && masked.cursor_text_runs.empty() &&
+            !masked.text_runs.empty(),
+        "presentation mask removes cursor fill and inverse text, not terminal content");
+    ok &= check(snapshot.cursor.visible && !snapshot.cursor.blink_enabled,
+        "presentation mask leaves logical nonblinking cursor state unchanged");
+    for (bool logical_visible : {false, true}) {
+        for (bool blink_enabled : {false, true}) {
+            for (bool blink_phase : {false, true}) {
+                for (bool suppressed : {false, true}) {
+                    snapshot.cursor.visible       = logical_visible;
+                    snapshot.cursor.blink_enabled = blink_enabled;
+                    render_options.cursor_presentation_suppressed = suppressed;
+                    const bool expected = logical_visible && !suppressed && (!blink_enabled || blink_phase);
+                    ok &= check(term::terminal_render_cursor_visible(snapshot, render_options, blink_phase) == expected,
+                        "presentation gate composes with logical visibility and blink state");
+                }
+            }
+        }
+    }
+    render_options.cursor_presentation_suppressed = true;
+    render_options.cursor_blink_enabled_override = false;
+    ok &= check(!term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "disabling blink cannot override the presentation mask");
+    return ok;
+}
+
 bool test_terminal_render_cursor_visible_truth_table()
 {
     bool ok = true;
@@ -3046,6 +3082,7 @@ int main()
     ok &= test_overlay_cell_masks_preserve_geometry_and_order();
     ok &= test_wide_search_match_uses_highest_cell_state();
     ok &= test_terminal_render_cursor_visible_truth_table();
+    ok &= test_cursor_presentation_mask();
     ok &= test_decorations_preedit_hyperlink_and_bell();
     ok &= test_zero_grid_and_preedit_width();
     ok &= test_preedit_override_takes_precedence_over_snapshot();

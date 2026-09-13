@@ -1829,6 +1829,56 @@ struct VNM_TerminalSurface::Private
 {
     using Renderer_lifecycle_recorder = term::Terminal_renderer_lifecycle_recorder;
 
+    void refresh_cursor_presentation(VNM_TerminalSurface& surface)
+    {
+        Q_ASSERT(surface.thread() == QThread::currentThread());
+        const bool suppressed =
+            cursor_settle_timer.isActive() && !cursor_input_grace_timer.isActive();
+        if (cursor_presentation_suppressed != suppressed) {
+            cursor_presentation_suppressed = suppressed;
+            request_render_update(surface);
+        }
+    }
+
+    void reset_cursor_presentation(VNM_TerminalSurface& surface)
+    {
+        cursor_settle_timer.stop();
+        cursor_input_grace_timer.stop();
+        refresh_cursor_presentation(surface);
+    }
+
+    void grant_cursor_input_grace(VNM_TerminalSurface& surface)
+    {
+        if (surface.cursor_settle_delay_ms() == 0) {
+            return;
+        }
+        // A brief trial grace keeps repeated typing from hiding the editing caret.
+        cursor_input_grace_timer.start(200);
+        refresh_cursor_presentation(surface);
+    }
+
+    void observe_cursor_publication(
+        VNM_TerminalSurface& surface,
+        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
+    {
+        if (surface.cursor_settle_delay_ms() == 0 ||
+            snapshot == nullptr || render_snapshot == nullptr ||
+            snapshot->viewport.active_buffer != render_snapshot->viewport.active_buffer)
+        {
+            reset_cursor_presentation(surface);
+            return;
+        }
+
+        const auto& old_position = render_snapshot->cursor.position;
+        const auto& new_position = snapshot->cursor.position;
+        if (old_position.row != new_position.row ||
+            old_position.column != new_position.column)
+        {
+            cursor_settle_timer.start(surface.cursor_settle_delay_ms());
+            refresh_cursor_presentation(surface);
+        }
+    }
+
     std::shared_ptr<Renderer_lifecycle_recorder> lifecycle_recorder() const
     {
         if (!renderer_lifecycle_recorder_enabled.load(std::memory_order_acquire)) {
@@ -2862,6 +2912,9 @@ struct VNM_TerminalSurface::Private
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
+    QTimer                                                 cursor_settle_timer;
+    QTimer                                                 cursor_input_grace_timer;
+    bool                                                   cursor_presentation_suppressed        = false;
     std::shared_ptr<term::Qsg_atlas_recorder>              qsg_atlas_recorder;
     mutable std::mutex                                     paint_completion_mutex;
     std::uint64_t                                          paint_completed_frame_count = 0U;
@@ -3027,6 +3080,14 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
     setAcceptedMouseButtons(Qt::AllButtons);
     setAcceptHoverEvents(true);
     setFocus(true);
+    m_private->cursor_settle_timer.setSingleShot(true);
+    m_private->cursor_input_grace_timer.setSingleShot(true);
+    QObject::connect(
+        &m_private->cursor_settle_timer, &QTimer::timeout, this,
+        [this] { m_private->refresh_cursor_presentation(*this); });
+    QObject::connect(
+        &m_private->cursor_input_grace_timer, &QTimer::timeout, this,
+        [this] { m_private->refresh_cursor_presentation(*this); });
     m_private->backend_callback_frame_progress_watchdog.setSingleShot(true);
     m_private->backend_callback_frame_progress_watchdog.setInterval(
         k_backend_callback_frame_progress_watchdog_ms);
@@ -3381,6 +3442,23 @@ void VNM_TerminalSurface::set_cursor_blink_enabled(bool enabled)
     m_cursor_blink_enabled = enabled;
     emit cursor_blink_enabled_changed();
     m_private->request_render_update(*this);
+}
+
+int VNM_TerminalSurface::cursor_settle_delay_ms() const
+{
+    return m_cursor_settle_delay_ms;
+}
+
+void VNM_TerminalSurface::set_cursor_settle_delay_ms(int delay_ms)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    const int bounded_delay_ms = std::max(0, delay_ms);
+    if (m_cursor_settle_delay_ms == bounded_delay_ms) {
+        return;
+    }
+    m_cursor_settle_delay_ms = bounded_delay_ms;
+    m_private->reset_cursor_presentation(*this);
+    emit cursor_settle_delay_ms_changed();
 }
 
 int VNM_TerminalSurface::scrollback_limit() const
@@ -5310,6 +5388,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             report_result_failure(key_result.result);
             return;
         }
+        m_private->grant_cursor_input_grace(*this);
         return;
     }
 
@@ -7167,6 +7246,11 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
             commit_result.has_value()                &&
             commit_result->handled                   &&
             !is_accepted(commit_result->result.code);
+        if (commit_result.has_value() && commit_result->handled &&
+            is_accepted(commit_result->result.code))
+        {
+            m_private->grant_cursor_input_grace(*this);
+        }
         if (preedit_text.isEmpty()) {
             if (!commit_blocks_empty_preedit_cancel) {
                 m_private->session->cancel_ime_preedit();
@@ -7547,6 +7631,7 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
     set_backend_geometry_in_sync(false);
     m_private->clear_hyperlink_activation_state();
     m_private->render_snapshot.reset();
+    m_private->reset_cursor_presentation(*this);
     refresh_hyperlink_hover_feedback();
     m_private->set_ime_preedit_state(*this, {});
     m_private->last_installed_render_publication_generation = 0U;
@@ -8658,6 +8743,8 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         }
 
         term::Terminal_render_options options = render_options_for_surface(*this);
+        options.cursor_presentation_suppressed =
+            m_private->cursor_presentation_suppressed;
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(
                 m_private->render_snapshot,
@@ -8731,6 +8818,7 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
     std::shared_ptr<const Terminal_render_snapshot>    snapshot)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->observe_cursor_publication(surface, snapshot);
     surface.m_private->render_snapshot = std::move(snapshot);
     surface.refresh_hyperlink_hover_feedback();
     surface.updateInputMethod(Qt::ImCursorRectangle);

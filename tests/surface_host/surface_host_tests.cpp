@@ -2276,6 +2276,133 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
     return ok;
 }
 
+bool test_surface_cursor_settle_presentation(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
+    fixture.surface.set_cursor_blink_enabled(false);
+    term::Terminal_viewport_state viewport;
+    viewport.visible_rows = 4;
+    auto snapshot = term::make_empty_render_snapshot({4, 8}, viewport, 1U);
+    snapshot.cursor = {{0, 0}, term::Terminal_cursor_shape::BLOCK, true, false};
+    const auto publish = [&]() {
+        ++snapshot.metadata.sequence;
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface, std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+    };
+    const auto presentation_is = [&](bool visible) {
+        const auto frame = capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+        return frame.valid && frame.report.captured_render_cursor.visible == visible;
+    };
+    bool ok = check(fixture.surface.cursor_settle_delay_ms() == 0,
+        "library cursor settle presentation defaults to disabled");
+    publish();
+    ok &= check(presentation_is(true), "first cursor publication is immediately visible");
+    snapshot.cursor.position.column = 1;
+    publish();
+    ok &= check(presentation_is(true), "default cursor presentation does not delay relocation");
+
+    constexpr int k_test_dwell_ms = 800;
+    fixture.surface.set_cursor_settle_delay_ms(k_test_dwell_ms);
+    snapshot.cursor.position.column = 2;
+    publish();
+    ok &= check(presentation_is(false), "cursor relocation suppresses presentation during configured dwell");
+    const auto logical_snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(logical_snapshot != nullptr && logical_snapshot->cursor.visible &&
+            logical_snapshot->cursor.position.column == 2,
+        "cursor dwell preserves the published logical cursor position and visibility");
+
+    // Continuing identical-position publications must not postpone the timer.
+    bool settled_during_publications = false;
+    for (int attempt = 0; attempt < 160; ++attempt) {
+        publish();
+        pump_events(app, 1);
+        const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+        if (report.captured_render_cursor.visible) {
+            settled_during_publications = true;
+            break;
+        }
+    }
+    ok &= check(settled_during_publications,
+        "same-position publications do not restart cursor settle dwell");
+
+    snapshot.cursor.position.column = 3;
+    publish();
+    ok &= check(presentation_is(false), "a later relocation starts another cursor dwell");
+    const auto settled_sequence = snapshot.metadata.sequence;
+    ok &= check(pump_until(app, [&]() {
+            const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+            return report.captured_snapshot_sequence == settled_sequence && report.captured_render_cursor.visible;
+        }, 200), "cursor settle timer restores presentation without another publication or explicit update");
+
+    snapshot.cursor.position.column = 4;
+    publish();
+    ok &= check(presentation_is(false), "cursor is suppressed before disabling dwell");
+    fixture.surface.set_cursor_settle_delay_ms(0);
+    ok &= check(presentation_is(true), "disabling cursor settle delay immediately clears suppression");
+
+    fixture.surface.set_cursor_settle_delay_ms(k_test_dwell_ms);
+    snapshot.cursor.position.column = 5;
+    publish();
+    ok &= check(presentation_is(false), "cursor is suppressed before snapshot reset");
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(fixture.surface, nullptr);
+    publish();
+    ok &= check(presentation_is(true), "snapshot reset makes the next cursor publication immediately visible");
+    snapshot.cursor.position.column = 6;
+    publish();
+    ok &= check(presentation_is(false), "cursor is suppressed before active-buffer replacement");
+    snapshot.viewport.active_buffer = term::Terminal_buffer_id::ALTERNATE;
+    publish();
+    ok &= check(presentation_is(true), "active-buffer replacement clears cursor presentation dwell");
+    return ok;
+}
+
+bool test_surface_cursor_settle_input_grace(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
+    fixture.surface.set_cursor_blink_enabled(false);
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("prompt> ")};
+    bool started = false;
+    auto* backend_ptr = start_surface_with_backend(fixture.surface, std::move(backend),
+        {QStringLiteral("scripted-terminal")}, &started);
+    if (!check(started && backend_ptr != nullptr, "cursor input-grace fixture starts")) {
+        return false;
+    }
+    auto baseline = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    if (!check(baseline != nullptr, "cursor input-grace fixture publishes its prompt")) {
+        return false;
+    }
+    bool ok = check(capture_surface_sequence(app, fixture.window, fixture.surface, baseline->metadata.sequence),
+        "cursor input-grace fixture captures its baseline");
+    fixture.surface.set_cursor_settle_delay_ms(1000);
+    const auto relocate = [&]() {
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[C"));
+        term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    };
+    const auto presentation_is = [&](bool visible) {
+        const auto frame = capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+        return frame.valid && frame.report.captured_render_cursor.visible == visible;
+    };
+    relocate();
+    ok &= check(presentation_is(false), "cursor is suppressed before accepted keyboard input");
+    ok &= send_key_and_expect_write(fixture.surface, *backend_ptr, Qt::Key_X, Qt::NoModifier,
+        QStringLiteral("x"), QByteArrayLiteral("x"), "cursor grace accepts printable keyboard input");
+    ok &= check(presentation_is(true), "accepted keyboard input immediately restores cursor presentation");
+    relocate();
+    ok &= check(presentation_is(true), "cursor relocation during keyboard grace remains visible");
+
+    pump_for(app, 300);
+    relocate();
+    ok &= check(presentation_is(false), "cursor is suppressed again after keyboard grace expires");
+    ok &= send_ime_commit(fixture.surface, QStringLiteral("a"), "cursor grace accepts committed IME input");
+    ok &= check(presentation_is(true), "committed IME input immediately restores cursor presentation");
+    relocate();
+    ok &= check(presentation_is(true), "cursor relocation during IME grace remains visible");
+    return ok;
+}
+
 bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
 {
     bool ok = true;
@@ -18407,6 +18534,11 @@ int main(int argc, char** argv)
         ok &= test_search_completion_after_session_restart(app);
         return ok ? 0 : 1;
     }
+    if (app.arguments().contains(QStringLiteral("--cursor-settle-only"))) {
+        bool ok = test_surface_cursor_settle_presentation(app);
+        ok &= test_surface_cursor_settle_input_grace(app);
+        return ok ? 0 : 1;
+    }
 
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
@@ -18421,6 +18553,8 @@ int main(int argc, char** argv)
     ok &= test_surface_output_backpressure_uses_posted_callback_owner(app);
     ok &= test_surface_pressure_bypasses_active_after_frame_owner(app);
     ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
+    ok &= test_surface_cursor_settle_presentation(app);
+    ok &= test_surface_cursor_settle_input_grace(app);
     ok &= test_surface_unrendered_publication_input_keeps_cursor_visible(app);
     ok &= test_surface_undrawn_publication_keeps_atlas_completion_pending(app);
     ok &= test_surface_undrawn_publication_restores_cursor_after_render(app);

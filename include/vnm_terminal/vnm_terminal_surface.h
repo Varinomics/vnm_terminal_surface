@@ -87,6 +87,9 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(bool cursorBlinkEnabled
         READ cursor_blink_enabled WRITE set_cursor_blink_enabled
         NOTIFY cursor_blink_enabled_changed)
+    Q_PROPERTY(int cursorSettleDelayMs
+        READ cursor_settle_delay_ms WRITE set_cursor_settle_delay_ms
+        NOTIFY cursor_settle_delay_ms_changed)
     Q_PROPERTY(int scrollbackLimit
         READ scrollback_limit WRITE set_scrollback_limit NOTIFY scrollback_limit_changed)
     Q_PROPERTY(bool interactionDiagnosticsEnabled
@@ -415,6 +418,9 @@ public:
 
     bool cursor_blink_enabled() const;
     void set_cursor_blink_enabled(bool enabled);
+    // Presentation-only movement suppression; zero disables the experiment.
+    int cursor_settle_delay_ms() const;
+    void set_cursor_settle_delay_ms(int delay_ms);
 
     int scrollback_limit() const;
     void set_scrollback_limit(int limit);
@@ -730,6 +736,7 @@ signals:
     void color_scheme_changed();
     void cursor_style_changed();
     void cursor_blink_enabled_changed();
+    void cursor_settle_delay_ms_changed();
     void scrollback_limit_changed();
     void interaction_diagnostics_enabled_changed();
     void interaction_diagnostics_error_changed();
@@ -965,6 +972,7 @@ private:
     QString                  m_color_scheme                         = QStringLiteral("Classic");
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;
+    int                      m_cursor_settle_delay_ms               = 0;
     int                      m_scrollback_limit                     = 10000;
     std::size_t              m_retained_history_capacity_bytes     = 0U;
 #if defined(Q_OS_WIN)

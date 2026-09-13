@@ -1487,6 +1487,7 @@ void append_frame_key_render_options(
             ? static_cast<int>(*options.cursor_shape_override)
             : 0);
     append_frame_key_bool(key, options.cursor_blink_enabled_override.has_value());
+    append_frame_key_bool(key, options.cursor_presentation_suppressed);
     append_frame_key_bool(
         key,
         options.cursor_blink_enabled_override.has_value() &&

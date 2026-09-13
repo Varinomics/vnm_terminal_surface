@@ -71,6 +71,7 @@ struct Terminal_render_options
     std::optional<Terminal_cursor_shape>
                                cursor_shape_override;
     std::optional<bool>        cursor_blink_enabled_override;
+    bool                       cursor_presentation_suppressed = false;
     bool                       visual_bell_enabled  = true;
     bool                       underline_hyperlinks = false;
     Terminal_text_renderer_policy
@@ -103,6 +104,7 @@ inline bool terminal_render_cursor_visible(
     return
         cursor_in_grid                         &&
         snapshot.cursor.visible                &&
+        !options.cursor_presentation_suppressed &&
         (!cursor_blink_enabled || cursor_blink_visible);
 }
 
