@@ -14487,6 +14487,39 @@ bool test_terminal_canvas_fixture_script_through_session()
     return ok;
 }
 
+constexpr qsizetype k_budgeted_output_slice_contract_bytes = 4096;
+
+bool test_generated_replies_settle_with_output_callback_epoch()
+{
+    bool ok = true;
+    for (const bool sliced : {false, true}) {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "reply epoch session starts");
+
+        QByteArray output = QByteArrayLiteral("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        if (sliced) {
+            output += QByteArray(k_budgeted_output_slice_contract_bytes * 2, ' ');
+        }
+        ok &= check(backend->emit_output(output), "reply epoch queues color queries");
+        const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+        session->process_backend_callback_events_until_epoch(epoch, std::chrono::seconds{1});
+        ok &= check(session->backend_callback_processed_epoch() == epoch,
+            "query callback epoch completes");
+        ok &= check(backend->writes == std::vector<QByteArray>{
+                QByteArrayLiteral("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+                QByteArrayLiteral("\x1b]11;rgb:0000/0000/0000\x1b\\")},
+            "query callback completion includes both queued color replies");
+        ok &= check(!session->has_pending_backend_callback_events(),
+            "completed query callback leaves no owed reply for a later frame");
+    }
+    return ok;
+}
+
 bool test_generated_reply_write_failure_reports_backend_error()
 {
     bool ok = true;
@@ -14520,6 +14553,35 @@ bool test_generated_reply_write_failure_reports_backend_error()
         commands.back().kind == term::Terminal_session_command_kind::TERMINAL_REPLY,
         "failed generated terminal reply still uses command stream ordering");
 
+    return ok;
+}
+
+bool test_generated_reply_epoch_settles_after_write_rejection()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "rejected reply epoch session starts");
+    backend->fail_write = true;
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b]10;?\x1b\\")),
+        "rejected reply epoch queues color query");
+    const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+    session->process_backend_callback_events_until_epoch(epoch, std::chrono::seconds{1});
+    ok &= check(session->backend_callback_processed_epoch() == epoch,
+        "rejected reply settles its originating callback epoch");
+    ok &= check(backend->writes.empty(), "rejected reply records no accepted write");
+    const auto error = first_notification(
+        *session, term::Terminal_session_notification_kind::BACKEND_ERROR);
+    ok &= check(error.has_value() && error->backend_error.has_value() &&
+        error->backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED,
+        "rejected reply retains backend error reporting");
+    ok &= check(session->processed_commands().back().kind ==
+        term::Terminal_session_command_kind::TERMINAL_REPLY,
+        "rejected reply retains processed command recording");
     return ok;
 }
 
@@ -14788,8 +14850,6 @@ bool test_deferred_callback_ingress_merges_adjacent_output()
 
 // Budgeted owner drains slice a BACKEND_OUTPUT command at this byte boundary.
 // The production contract is `k_backend_output_drain_slice_bytes`.
-constexpr qsizetype k_budgeted_output_slice_contract_bytes = 4096;
-
 QByteArray cursor_position_sequence(int row, int column)
 {
     QByteArray sequence = QByteArrayLiteral("\x1b[");
@@ -19716,7 +19776,9 @@ int main()
     ok &= test_backend_output_replies_use_write_path();
     ok &= test_mixed_output_query_ordering();
     ok &= test_terminal_canvas_fixture_script_through_session();
+    ok &= test_generated_replies_settle_with_output_callback_epoch();
     ok &= test_generated_reply_write_failure_reports_backend_error();
+    ok &= test_generated_reply_epoch_settles_after_write_rejection();
     ok &= test_generated_reply_byte_enqueue_failure_reports_backend_error();
     ok &= test_generated_reply_command_enqueue_failure_reports_backend_error();
     ok &= test_reentrant_start_callbacks_preserve_order();

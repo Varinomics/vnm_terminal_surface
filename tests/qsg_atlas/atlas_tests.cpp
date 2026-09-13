@@ -36,6 +36,7 @@
 #include <QPainter>
 #include <QSaveFile>
 #include <QScreen>
+#include <QSemaphore>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QQuickItem>
@@ -46,6 +47,7 @@
 #include <QSGSimpleRectNode>
 #include <QSGTextNode>
 #include <QThread>
+#include <QThreadPool>
 #include <private/qquickitem_p.h>
 #include <private/qquickwindow_p.h>
 #include <rhi/qrhi.h>
@@ -10214,6 +10216,14 @@ public:
         return m_capture_sequence;
     }
 
+    void set_font(term::terminal_cell_metrics_t metrics, QFont font)
+    {
+        m_metrics = metrics;
+        m_font    = std::move(font);
+        ++m_font_epoch;
+        update();
+    }
+
     term::Qsg_atlas_frame_report report() const
     {
         return m_recorder->snapshot();
@@ -10244,7 +10254,8 @@ protected:
         return term::update_qsg_atlas_node(
             old_node,
             std::move(frame),
-            m_recorder);
+            m_recorder,
+            this);
     }
 
 private:
@@ -11877,6 +11888,217 @@ bool test_atlas_msdf_text_path_adapter_skip_predicate()
     return ok;
 }
 
+class Atlas_worker_barrier
+{
+public:
+    Atlas_worker_barrier()
+    :
+        m_pool(QThreadPool::globalInstance()),
+        m_previous_width(m_pool->maxThreadCount())
+    {
+        m_pool->setMaxThreadCount(1);
+        m_pool->start([this]() {
+            m_started.release();
+            m_release.acquire();
+            m_finished.release();
+        });
+    }
+
+    ~Atlas_worker_barrier()
+    {
+        release();
+        m_finished.acquire();
+        m_pool->setMaxThreadCount(m_previous_width);
+    }
+
+    bool started() { return m_started.tryAcquire(1, 5000); }
+
+    void release()
+    {
+        if (!m_released) {
+            m_released = true;
+            m_release.release();
+        }
+    }
+
+private:
+    QThreadPool* m_pool;
+    int          m_previous_width;
+    QSemaphore   m_started;
+    QSemaphore   m_release;
+    QSemaphore   m_finished;
+    bool         m_released = false;
+};
+
+bool test_async_msdf_atlas_case(
+    QGuiApplication& app,
+    term::Terminal_text_renderer_policy policy,
+    bool destroy_pending_owner)
+{
+    std::cerr << "async atlas case policy=" << (int)policy
+        << " destroy=" << destroy_pending_owner << '\n';
+    QQuickWindow window;
+    window.resize(640, 240);
+    const QString family = term::vnm_terminal_default_monospace_font_family();
+    auto item = std::make_unique<Direct_atlas_item>(
+        pixel_metrics(1.0, 18.0, family),
+        term::vnm_terminal_font(family, 18.0),
+        QSizeF(600.0, 200.0));
+    item->setParentItem(window.contentItem());
+    term::Terminal_render_options options;
+    options.text_renderer_policy = term::Terminal_text_renderer_policy::GLYPH;
+    const auto snapshot = std::make_shared<const term::Terminal_render_snapshot>(
+        make_text_snapshot(19901U, QStringLiteral("A")));
+    item->set_frame(snapshot, options);
+    window.show();
+
+    // Establish a coherent frame before testing a pending renderer transition.
+    term::Qsg_atlas_frame_report baseline;
+    if (!check(pump_direct_atlas_until(
+            app, window, *item, atlas_report_render_state_ready, baseline),
+            "async atlas window reaches a glyph baseline")) {
+        return false;
+    }
+    Atlas_worker_barrier barrier;
+    if (!check(barrier.started(), "async atlas worker barrier starts")) {
+        return false;
+    }
+    options.text_renderer_policy = policy;
+    item->set_frame(snapshot, options);
+
+    term::Qsg_atlas_frame_report pending;
+    const bool prepared = pump_direct_atlas_until(
+        app, window, *item,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return report.prepare_count > baseline.prepare_count && report.capture_sequence == 2U;
+        }, pending);
+    if (!check(prepared, "async atlas prepares while CPU worker is held")) {
+        const auto failed = item->report();
+        std::cerr << "async atlas initial failure exposed=" << window.isExposed()
+            << " visible=" << item->isVisible()
+            << " prepare=" << failed.prepare_count
+            << " render=" << failed.render_count
+            << " capture=" << failed.capture_sequence
+            << " rhi=" << failed.rhi_non_null
+            << " attempts=" << failed.render.msdf_text_atlas_build_attempts_total << '\n';
+        return false;
+    }
+    if (!pending.render.msdf_text_renderer_enabled ||
+        window_uses_known_software_adapter(window))
+    {
+        std::cerr << "SKIP: async MSDF atlas unavailable on this renderer\n";
+        return true;
+    }
+    bool ok = check(
+        pending.render.msdf_text_atlas_build_attempts_total == 1U &&
+            pending.render.msdf_text_atlas_build_successes_total == 0U &&
+            !pending.render.msdf_text_atlas_ready,
+        "async atlas queues CPU work without baking on the render thread");
+    if (policy == term::Terminal_text_renderer_policy::AUTO) {
+        ok &= check(pending.prepared_generation_committed &&
+                pending.render.glyph_buffer_instances > 0,
+            "async AUTO atlas pending frame commits visible glyph fallback");
+    }
+    else {
+        ok &= check(!pending.prepared_generation_committed &&
+                pending.render.msdf_text_missed_supported_runs == 0,
+            "async forced atlas pending frame neither commits partial text nor reports failure");
+    }
+    if (destroy_pending_owner) {
+        item.reset();
+        barrier.release();
+        QThreadPool::globalInstance()->waitForDone();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        return ok;
+    }
+
+    // Supersede the immutable request before its worker starts. Its result must
+    // not be uploaded for the new font bucket.
+    item->set_font(pixel_metrics(1.0, 72.0, family),
+        term::vnm_terminal_font(family, 72.0));
+    item->set_frame(snapshot, options);
+    term::Qsg_atlas_frame_report changed;
+    ok &= check(pump_next_direct_atlas_report(
+            app, window, *item, pending.prepare_count, 3U, changed),
+        "async atlas accepts font change while previous bake is pending");
+    barrier.release();
+
+    // Do not call update/requestUpdate here: only the worker completion can
+    // wake this timer-free item after the last pending frame.
+    term::Qsg_atlas_frame_report ready;
+    bool completed = false;
+    for (int attempt = 0; attempt < 600; ++attempt) {
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        ready = item->report();
+        if (ready.prepared_generation_committed &&
+            ready.render.msdf_text_renderer_active &&
+            ready.render.msdf_text_texture_ready &&
+            ready.render.msdf_text_baked_pixel_height > 48) {
+            completed = true;
+            break;
+        }
+    }
+    ok &= check(completed,
+        "async atlas completion wakes the item and renders the latest bake bucket");
+    ok &= check(ready.render.msdf_text_atlas_build_attempts_total == 2U &&
+            ready.render.msdf_text_atlas_build_successes_total == 1U &&
+            ready.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "async atlas discards superseded result without adopting or uploading it");
+    if (completed && policy == term::Terminal_text_renderer_policy::MSDF) {
+        Atlas_worker_barrier replacement_barrier;
+        if (!check(replacement_barrier.started(), "async replacement barrier starts")) {
+            return false;
+        }
+        item->set_font(pixel_metrics(1.0, 96.0, family),
+            term::vnm_terminal_font(family, 96.0));
+        item->set_frame(std::make_shared<const term::Terminal_render_snapshot>(
+            make_text_snapshot(19902U, QStringLiteral("B"))), options);
+        term::Qsg_atlas_frame_report replacement;
+        ok &= check(pump_next_direct_atlas_report(
+                app, window, *item, ready.prepare_count, 4U, replacement),
+            "async forced atlas prepares replacement while worker is held");
+        ok &= check(!replacement.prepared_generation_committed &&
+                replacement.render_snapshot_sequence == ready.render_snapshot_sequence &&
+                replacement.render.msdf_text_missed_supported_runs == 0,
+            "async forced atlas retains prior coherent generation while replacement is pending");
+        replacement_barrier.release();
+        bool replaced = false;
+        for (int attempt = 0; attempt < 600; ++attempt) {
+            app.processEvents(QEventLoop::AllEvents, 50);
+            QThread::msleep(20);
+            replacement = item->report();
+            if (replacement.prepared_generation_committed &&
+                replacement.render_snapshot_sequence == 19902U &&
+                replacement.render.msdf_text_renderer_active &&
+                replacement.render.msdf_text_baked_pixel_height >
+                    ready.render.msdf_text_baked_pixel_height) {
+                replaced = true;
+                break;
+            }
+        }
+        ok &= check(replaced,
+            "async forced replacement completion publishes the new coherent generation");
+    }
+    return ok;
+}
+
+int test_async_msdf_atlas(QGuiApplication& app, const char* backend)
+{
+    const int backend_status =
+        verify_requested_backend(app, backend, "async MSDF atlas", true);
+    if (backend_status != 0) {
+        return backend_status;
+    }
+    bool ok = test_async_msdf_atlas_case(
+        app, term::Terminal_text_renderer_policy::AUTO, false);
+    ok &= test_async_msdf_atlas_case(
+        app, term::Terminal_text_renderer_policy::MSDF, false);
+    ok &= test_async_msdf_atlas_case(
+        app, term::Terminal_text_renderer_policy::MSDF, true);
+    return ok ? 0 : 1;
+}
+
 enum class Atlas_msdf_steady_buffer_expectation
 {
     SKIPPED,
@@ -12247,10 +12469,12 @@ bool test_atlas_msdf_zoom_reuses_baked_atlas(QGuiApplication& app)
     }
 
     bool ok = true;
+    // The miss launches CPU work; readiness is a later adoption frame. Durable
+    // counters preserve the exact once-only build contract across that split.
     ok &= check(
-        small_report.render.msdf_text_cache_miss &&
-            small_report.render.msdf_text_atlas_build_succeeded &&
+        small_report.render.msdf_text_baked_cache_misses_total == 1U &&
             small_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            small_report.render.msdf_text_atlas_build_successes_total == 1U &&
             small_report.render.msdf_text_atlas_texture_uploads_total == 1U,
         "msdf zoom reuse builds and uploads exactly one atlas at the first size");
 
@@ -20703,6 +20927,7 @@ int main(int argc, char** argv)
     const bool text_renderer_fallback =
         has_argument(argc, argv, "--text-renderer-fallback");
     const bool atlas_report = has_argument(argc, argv, "--atlas-report");
+    const bool async_msdf_atlas = has_argument(argc, argv, "--async-msdf-atlas");
     const bool arc_row_provenance =
         has_argument(argc, argv, "--arc-row-provenance");
     const bool warm_lazy_smoke = has_argument(argc, argv, "--warm-lazy-smoke");
@@ -20718,7 +20943,7 @@ int main(int argc, char** argv)
         render_smoke || dense_grid_smoke || primitive_parity ||
         forced_glyph_parity || forced_msdf_parity || auto_text_renderer ||
         layout_contract || text_renderer_fallback ||
-        atlas_report || arc_row_provenance || warm_lazy_smoke ||
+        atlas_report || async_msdf_atlas || arc_row_provenance || warm_lazy_smoke ||
         lcd_capability_probe || host_state_smoke || cursor_descender_smoke ||
         msdf_orientation_discriminator;
     if (graphics_mode) {
@@ -20744,6 +20969,9 @@ int main(int argc, char** argv)
     }
     if (atlas_report) {
         return test_atlas_report(app, backend);
+    }
+    if (async_msdf_atlas) {
+        return test_async_msdf_atlas(app, backend);
     }
     if (arc_row_provenance) {
         return test_atlas_arc_row_provenance(app, backend);

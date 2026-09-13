@@ -1,6 +1,9 @@
 add_executable(vnm_terminal_surface_stress_benchmark
     terminal_surface_stress_benchmark.cpp
 )
+if(WIN32)
+    vnm_terminal_deploy_conpty(vnm_terminal_surface_stress_benchmark)
+endif()
 
 set_target_properties(vnm_terminal_surface_stress_benchmark PROPERTIES
     AUTOMOC OFF

@@ -438,6 +438,7 @@ if(WIN32)
     target_sources(vnm_terminal_surface PRIVATE
         src/windows_conpty_backend.cpp
     )
+    include(cmake/vnm_terminal_conpty_dependency.cmake)
     # Windows system APIs used by font discovery, clipboard, and audible bell support.
     target_link_libraries(vnm_terminal_surface PRIVATE
         dwrite
@@ -689,6 +690,7 @@ if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     )
 
     if(WIN32)
+        vnm_terminal_deploy_conpty(vnm_terminal_transcript_replay)
         add_custom_command(TARGET vnm_terminal_transcript_replay POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 $<TARGET_RUNTIME_DLLS:vnm_terminal_transcript_replay>

@@ -1,6 +1,9 @@
 add_executable(vnm_terminal_search_incremental_benchmark
     search_incremental_benchmark.cpp
 )
+if(WIN32)
+    vnm_terminal_deploy_conpty(vnm_terminal_search_incremental_benchmark)
+endif()
 
 target_link_libraries(vnm_terminal_search_incremental_benchmark PRIVATE
     vnm_terminal_surface::vnm_terminal_surface

@@ -2,6 +2,7 @@
 #include "helpers/test_check.h"
 #include "../../src/native_backend_io_core.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
+#include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
@@ -34,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <variant>
 #include <vector>
 #include <cstddef>
 #include <cwchar>
@@ -55,7 +57,7 @@ constexpr std::chrono::milliseconds k_wait_timeout(20000);
 // costs nothing on a healthy run and stays inside the 120 second CTest budget
 // even if several fixtures genuinely fail.
 constexpr std::chrono::milliseconds k_file_marker_wait_timeout(20000);
-constexpr std::chrono::milliseconds k_conhost_exit_timeout(1000);
+constexpr std::chrono::milliseconds k_console_host_exit_timeout(1000);
 // The slowest recorded cold ASan completion of this entire test executable was
 // 57.73 seconds, and it reached 80 seconds under full CPU saturation. Bound the
 // first scenario's progressing-output phase at 60 seconds, comfortably inside
@@ -100,11 +102,12 @@ bool output_contains_in_order(
     return true;
 }
 
-int diagnostic_count(const term::Terminal_screen_model_result& result)
+int parser_failure_count(const term::Terminal_screen_model_result& result)
 {
     int count = 0;
     for (const term::Parser_action& action : result.actions) {
-        if (term::parser_action_kind(action) == term::Parser_action_kind::DIAGNOSTIC) {
+        const auto* diagnostic = std::get_if<term::Parser_payload_diagnostic>(&action.payload);
+        if (diagnostic != nullptr && diagnostic->code != term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE) {
             ++count;
         }
     }
@@ -140,7 +143,7 @@ bool write_gate_file(const QString& path)
     return file.write(QByteArrayLiteral("go\n")) == 3;
 }
 
-std::vector<DWORD> current_process_conhost_children()
+std::vector<DWORD> current_process_console_host_children()
 {
     std::vector<DWORD> pids;
     const DWORD        current_pid = GetCurrentProcessId();
@@ -158,7 +161,7 @@ std::vector<DWORD> current_process_conhost_children()
 
     do {
         if (entry.th32ParentProcessID == current_pid &&
-            std::wcscmp(entry.szExeFile, L"conhost.exe") == 0)
+            std::wcscmp(entry.szExeFile, L"OpenConsole.exe") == 0)
         {
             pids.push_back(entry.th32ProcessID);
         }
@@ -169,12 +172,12 @@ std::vector<DWORD> current_process_conhost_children()
     return pids;
 }
 
-bool wait_for_conhost_children_to_exit(std::string_view test_name)
+bool wait_for_console_host_children_to_exit(std::string_view test_name)
 {
-    const auto deadline = std::chrono::steady_clock::now() + k_conhost_exit_timeout;
+    const auto deadline = std::chrono::steady_clock::now() + k_console_host_exit_timeout;
     std::vector<DWORD> pids;
     do {
-        pids = current_process_conhost_children();
+        pids = current_process_console_host_children();
         if (pids.empty()) {
             return true;
         }
@@ -183,13 +186,13 @@ bool wait_for_conhost_children_to_exit(std::string_view test_name)
     }
     while (std::chrono::steady_clock::now() < deadline);
 
-    std::cerr << "ConPTY test left conhost.exe child processes after "
+    std::cerr << "ConPTY test left OpenConsole.exe child processes after "
         << test_name << ':';
     for (const DWORD pid : pids) {
         std::cerr << ' ' << pid;
     }
     std::cerr << '\n';
-    return check(false, "ConPTY backend releases conhost child processes");
+    return check(false, "ConPTY backend releases console host child processes");
 }
 
 std::optional<DWORD> parse_pid_after_prefix(
@@ -1500,6 +1503,86 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
     return ok;
 }
 
+int run_paste_input_reader(const QString& output_path)
+{
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (!SetConsoleMode(input, ENABLE_VIRTUAL_TERMINAL_INPUT)) {
+        return 1;
+    }
+
+    std::cout << "paste-reader-ready\n" << std::flush;
+    QString received;
+    for (;;) {
+        INPUT_RECORD records[128];
+        DWORD count = 0;
+        if (!ReadConsoleInputW(input, records, 128, &count)) {
+            return 1;
+        }
+        for (DWORD index = 0; index < count; ++index) {
+            const INPUT_RECORD& record = records[index];
+            if (record.EventType != KEY_EVENT || !record.Event.KeyEvent.bKeyDown) {
+                continue;
+            }
+            const KEY_EVENT_RECORD& key = record.Event.KeyEvent;
+            if (key.uChar.UnicodeChar == L'!') {
+                QFile output(output_path);
+                const QByteArray bytes = received.toUtf8();
+                return output.open(QIODevice::WriteOnly) && output.write(bytes) == bytes.size() ? 0 : 1;
+            }
+            if (key.uChar.UnicodeChar != 0) {
+                received.append(QString(key.wRepeatCount, QChar(key.uChar.UnicodeChar)));
+            }
+        }
+    }
+}
+
+bool test_unicode_paste_preserves_console_input(const QString& executable_path)
+{
+    QTemporaryDir directory;
+    if (!check(directory.isValid(), "Unicode paste fixture has a temporary directory")) {
+        return false;
+    }
+
+    const QString output_path = directory.filePath(QStringLiteral("paste.txt"));
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    const auto started = backend->start(
+        launch_config(executable_path, {QStringLiteral("--paste-input-reader"), output_path}),
+        capture.callbacks());
+    if (!check(started.code == term::Terminal_backend_result_code::ACCEPTED,
+            "Unicode paste reader starts") ||
+        !check(capture.wait_for_output(QByteArrayLiteral("paste-reader-ready")),
+            "Unicode paste reader is ready"))
+    {
+        return false;
+    }
+
+    // Long box borders cross the console host's input read boundaries. The
+    // reader filters key releases, as interactive console clients do.
+    const QString text =
+        QStringLiteral("\u256d") + QString(80, QChar(0x2500)) + QStringLiteral("\u256e\n") +
+        QStringLiteral("\u2502 OpenAI Codex 23\u00b0 C \u20ac \u2502\n") +
+        QStringLiteral("\u2570") + QString(80, QChar(0x2500)) + QStringLiteral("\u256f");
+    QByteArray payload = term::encode_terminal_paste_text(
+        text, {}, term::Terminal_paste_framing_policy::ENABLED);
+    payload.append('!');
+    bool ok = check(backend->write(payload).code == term::Terminal_backend_result_code::ACCEPTED,
+        "Unicode paste is accepted by the native backend");
+    ok &= check(capture.wait_for_exit(), "Unicode paste reader exits");
+    QFile output(output_path);
+    if (!check(output.open(QIODevice::ReadOnly), "Unicode paste reader records received text")) {
+        return false;
+    }
+    const QByteArray received = output.readAll();
+    const QByteArray expected = QByteArrayLiteral("\x1b[200~") + text.toUtf8() + QByteArrayLiteral("\x1b[201~");
+    if (received != expected) {
+        std::cerr << "Unicode paste received=" << received.toHex(' ').constData() << '\n';
+    }
+    ok &= check(received == expected, "Unicode paste preserves box borders and symbols without protocol residue");
+    ok &= check_no_backend_errors(capture, "Unicode paste produces no backend errors");
+    return ok;
+}
+
 bool test_resize_storm_reports_final_shell_size(const QString& fixture_path)
 {
     bool ok = true;
@@ -1643,8 +1726,10 @@ bool test_scroll_region_scrollback_survives_conpty(const QString& fixture_path)
     term::Terminal_screen_model model(recovery_model_config);
     const term::Terminal_screen_model_result result =
         model.ingest(capture.output_snapshot());
-    ok &= check(diagnostic_count(result) == 0,
-        "ConPTY-observed scroll-region scrollback has no parser diagnostics");
+    // The host can advertise extensions that this model ignores. Malformed or
+    // truncated output still fails the scrollback integration contract.
+    ok &= check(parser_failure_count(result) == 0,
+        "ConPTY-observed scroll-region scrollback has no parsing failures");
     if (!check(model.scrollback_size() > 0,
         "ConPTY-observed scroll-region scrollback creates model scrollback"))
     {
@@ -3124,6 +3209,175 @@ bool test_terminate_returns_before_child_exit(const QString& fixture_path)
     return ok;
 }
 
+class Foreign_compatibility_window
+{
+public:
+    Foreign_compatibility_window()
+    {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc   = DefWindowProcW;
+        window_class.hInstance     = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"PseudoConsoleWindow";
+        m_class_atom = RegisterClassW(&window_class);
+        if (m_class_atom == 0) {
+            return;
+        }
+        m_owner = CreateWindowExW(0, L"STATIC", L"ConPTY test foreign owner",
+            WS_OVERLAPPED, 0, 0, 100, 80, nullptr, nullptr, window_class.hInstance, nullptr);
+        m_window = CreateWindowExW(WS_EX_TOOLWINDOW, L"PseudoConsoleWindow", L"ConPTY test foreign window",
+            WS_OVERLAPPEDWINDOW, 20, 20, 160, 100, m_owner, nullptr, window_class.hInstance, nullptr);
+    }
+
+    ~Foreign_compatibility_window()
+    {
+        if (m_window != nullptr) {
+            DestroyWindow(m_window);
+        }
+        if (m_owner != nullptr) {
+            DestroyWindow(m_owner);
+        }
+        if (m_class_atom != 0) {
+            UnregisterClassW(L"PseudoConsoleWindow", GetModuleHandleW(nullptr));
+        }
+    }
+
+    Foreign_compatibility_window(const Foreign_compatibility_window&)            = delete;
+    Foreign_compatibility_window& operator=(const Foreign_compatibility_window&) = delete;
+
+    HWND window() const { return m_window; }
+
+private:
+    ATOM m_class_atom = 0;
+    HWND m_owner      = nullptr;
+    HWND m_window     = nullptr;
+};
+
+bool wait_for_window_state(HWND window, const std::function<bool(HWND)>& predicate)
+{
+    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    do {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (predicate(window)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+bool test_compatibility_window_stays_hidden(const QString& fixture_path, bool force_close)
+{
+    Foreign_compatibility_window foreign;
+    if (!check(IsWindow(foreign.window()), "foreign compatibility-class window is test-owned")) {
+        return false;
+    }
+    Backend_capture capture;
+    auto backend = term::make_windows_conpty_backend();
+    if (!check(backend->start(
+            launch_config(fixture_path, {QStringLiteral("--show-console-window")}),
+            capture.callbacks()).code == term::Terminal_backend_result_code::ACCEPTED,
+            "compatibility window fixture starts")) {
+        return false;
+    }
+    const QByteArray prefix = QByteArrayLiteral("compat-window ");
+    if (!check(capture.wait_for_output_matching_within(
+            [&](const QByteArray& output) {
+                const auto start = output.indexOf(prefix);
+                return start >= 0 && output.indexOf('\n', start) >= 0;
+            }, k_wait_timeout), "compatibility fixture reports its HWND and healthy output")) {
+        return false;
+    }
+    const QByteArray output = capture.output_snapshot();
+    const auto number_start = output.indexOf(prefix) + prefix.size();
+    const auto number_end   = output.indexOf(" pid ", number_start);
+    bool parsed = false;
+    const auto window_value = output.mid(number_start, number_end - number_start).toULongLong(&parsed);
+    const HWND compatibility = reinterpret_cast<HWND>((ULONG_PTR)window_value);
+    if (!check(parsed && IsWindow(compatibility), "live child compatibility HWND remains valid")) {
+        return false;
+    }
+    const HWND owner = GetWindow(compatibility, GW_OWNER);
+    DWORD owner_pid = 0;
+    GetWindowThreadProcessId(owner, &owner_pid);
+    bool ok = check(owner != nullptr && owner_pid == GetCurrentProcessId(),
+        "compatibility HWND is bound to this backend's private owner before child startup");
+    ShowWindow(foreign.window(), SW_SHOWNOACTIVATE);
+    const bool hidden = wait_for_window_state(compatibility, [](HWND window) {
+        return IsWindow(window) && !IsWindowVisible(window);
+    });
+    ok &= check(hidden, "child's immediate maximize leaves its compatibility HWND alive but hidden");
+    ok &= check(IsWindowVisible(foreign.window()),
+        "hiding compatibility HWND does not hide unrelated same-class window");
+    if (!hidden) {
+        return false;
+    }
+    for (int index = 1; index <= 3; ++index) {
+        ok &= check(backend->write(QByteArrayLiteral("s")).code ==
+                term::Terminal_backend_result_code::ACCEPTED,
+            "compatibility fixture receives repeated show request");
+        ok &= check(capture.wait_for_output(QByteArrayLiteral("compat-show ") + QByteArray::number(index)),
+            "compatibility child remains responsive after show request");
+        ok &= check(wait_for_window_state(compatibility, [](HWND window) {
+                return IsWindow(window) && !IsWindowVisible(window);
+            }), "repeated maximize leaves compatibility HWND alive but hidden");
+        ok &= check(IsWindowVisible(foreign.window()),
+            "repeated show handling preserves foreign window visibility");
+    }
+    if (!force_close) {
+        ok &= check(backend->write(QByteArrayLiteral("q")).code ==
+                term::Terminal_backend_result_code::ACCEPTED,
+            "compatibility fixture receives normal exit");
+        ok &= check(capture.wait_for_exit(), "compatibility fixture exits normally");
+        const auto exit = capture.exit_snapshot();
+        ok &= check(exit.has_value() && exit->reason == term::Terminal_exit_reason::EXITED &&
+                exit->exit_code == 0,
+            "compatibility fixture normal close preserves its successful exit");
+    }
+    std::atomic_bool stop_flood   = false;
+    std::atomic_bool flood_active = false;
+    std::atomic_uint flood_count  = 0U;
+    std::thread flood;
+    if (force_close) {
+        flood = std::thread([&]() {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            flood_active.store(true, std::memory_order_release);
+            while (!stop_flood.load(std::memory_order_acquire) &&
+                std::chrono::steady_clock::now() < deadline)
+            {
+                NotifyWinEvent(EVENT_OBJECT_SHOW, foreign.window(), OBJID_WINDOW, CHILDID_SELF);
+                flood_count.fetch_add(1U, std::memory_order_release);
+            }
+            flood_active.store(false, std::memory_order_release);
+        });
+        ok &= check(wait_for_window_state(foreign.window(), [&](HWND) {
+                return flood_count.load(std::memory_order_acquire) >= 100U;
+            }), "foreign SHOW notification traffic is active before backend teardown");
+    }
+    backend.reset();
+    ok &= check(wait_for_window_state(compatibility, [](HWND window) { return !IsWindow(window); }),
+        "backend close releases the compatibility HWND");
+    ok &= check(owner != nullptr && wait_for_window_state(owner, [](HWND window) { return !IsWindow(window); }),
+        "backend close releases its private owner after ConPTY closes");
+    if (force_close) {
+        const bool stopped_during_flood = flood_active.load(std::memory_order_acquire);
+        stop_flood.store(true, std::memory_order_release);
+        flood.join();
+        ok &= check(stopped_during_flood,
+            "observer teardown completes without waiting for notification traffic to stop");
+    }
+    ShowWindow(foreign.window(), SW_HIDE);
+    ShowWindow(foreign.window(), SW_SHOWNOACTIVATE);
+    ok &= check(IsWindowVisible(foreign.window()),
+        "foreign show remains safe after backend observer teardown");
+    ok &= check_no_backend_errors(capture, "compatibility window handling produces no backend errors");
+    return ok;
+}
+
 bool test_destructor_stops_running_process(const QString& fixture_path)
 {
     bool ok = true;
@@ -3282,6 +3536,16 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--compatibility-window") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_compatibility_window_stays_hidden(fixture_path, false);
+        ok &= test_compatibility_window_stays_hidden(fixture_path, true);
+        ok &= wait_for_console_host_children_to_exit("compatibility window");
+        return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--paste-input-reader") {
+        return run_paste_input_reader(QString::fromLocal8Bit(argv[2]));
+    }
     if (argc != 2) {
         std::cerr << "usage: windows_conpty_backend_tests <fixture-executable>\n";
         return 2;
@@ -3292,13 +3556,17 @@ int main(int argc, char** argv)
     bool ok = true;
     const auto run_test = [&ok](std::string_view test_name, bool test_result) {
         ok &= test_result;
-        ok &= wait_for_conhost_children_to_exit(test_name);
+        ok &= wait_for_console_host_children_to_exit(test_name);
     };
 
     run_test("pid parser", test_pid_parser_requires_line_delimiter());
     run_test("progressing output exit wait has absolute bound",
         test_progressing_output_exit_wait_has_absolute_bound());
     run_test("interactive canvas fixture", test_interactive_canvas_fixture(fixture_path));
+    run_test("compatibility window normal close", test_compatibility_window_stays_hidden(fixture_path, false));
+    run_test("compatibility window forced close", test_compatibility_window_stays_hidden(fixture_path, true));
+    run_test("Unicode paste preserves console input",
+        test_unicode_paste_preserves_console_input(QString::fromLocal8Bit(argv[0])));
     run_test("resize storm reports final shell size",
         test_resize_storm_reports_final_shell_size(fixture_path));
     run_test("resize interleaved with shell output",

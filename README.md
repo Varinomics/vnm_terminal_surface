@@ -56,6 +56,20 @@ links to the reference material.
 
 ## Build On Windows
 
+Windows process hosting uses the Microsoft ConPTY NuGet runtime, downloaded
+and hash-verified during configuration. To supply an extracted package offline,
+set `VNM_TERMINAL_CONPTY_PACKAGE_DIR`. To select a newer compatible release,
+set `VNM_TERMINAL_CONPTY_VERSION` and its `VNM_TERMINAL_CONPTY_SHA256` together.
+The backend requires the `ConptyCreatePseudoConsole`, `ConptyResizePseudoConsole`,
+and `ConptyClosePseudoConsole` exports.
+
+Windows hosts linking the full surface target must call
+`vnm_terminal_deploy_conpty(their_executable)` after creating their executable.
+For distribution, call `vnm_terminal_install_conpty(DESTINATION bin COMPONENT runtime)`
+with the executable's install directory and component. These helpers preserve
+the native and emulated architecture host layout and the Microsoft MIT license;
+they are available with both source and installed surface packages.
+
 Configure once:
 
 ```powershell

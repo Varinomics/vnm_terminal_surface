@@ -8685,7 +8685,8 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         QSGNode* updated_node = term::update_qsg_atlas_node(
             old_node,
             std::move(captured_frame),
-            m_private->qsg_atlas_recorder);
+            m_private->qsg_atlas_recorder,
+            this);
         if (created_render_node && updated_node != nullptr) {
             if (auto lifecycle_recorder = m_private->lifecycle_recorder();
                 lifecycle_recorder != nullptr)

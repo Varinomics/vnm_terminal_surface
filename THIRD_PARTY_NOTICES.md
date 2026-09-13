@@ -18,6 +18,13 @@ and the Qt Company distribution materials:
 - https://www.qt.io/licensing/
 - https://doc.qt.io/qt-6/licenses-used-in-qt.html
 
+## Windows ConPTY
+
+Windows sessions use Microsoft's redistributable ConPTY host from the
+`Microsoft.Windows.Console.ConPTY` NuGet package, licensed under MIT.
+The upstream project is https://github.com/microsoft/terminal and its license
+is preserved in `THIRD_PARTY/conpty/LICENSE` and deployed with the runtime.
+
 ## Embedded Fonts
 
 The default monospace face is supplied by

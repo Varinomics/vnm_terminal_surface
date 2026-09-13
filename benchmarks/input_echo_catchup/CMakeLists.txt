@@ -5,6 +5,10 @@ add_executable(vnm_terminal_input_echo_catchup_benchmark
 add_executable(vnm_terminal_input_echo_ordering_benchmark
     input_echo_ordering_benchmark.cpp
 )
+if(WIN32)
+    vnm_terminal_deploy_conpty(vnm_terminal_input_echo_catchup_benchmark)
+    vnm_terminal_deploy_conpty(vnm_terminal_input_echo_ordering_benchmark)
+endif()
 
 find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 

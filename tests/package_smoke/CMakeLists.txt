@@ -95,3 +95,7 @@ add_executable(vnm_terminal_surface_package_smoke
 target_link_libraries(vnm_terminal_surface_package_smoke PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
 )
+
+if(WIN32)
+    vnm_terminal_deploy_conpty(vnm_terminal_surface_package_smoke)
+endif()

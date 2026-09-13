@@ -4394,7 +4394,9 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         m_backend_error_queued_during_command = false;
         m_processing_backend_callback_epoch =
             completes_backend_callback ? command_backend_callback_epoch : 0U;
+        m_processing_command_callback_epoch = command_backend_callback_epoch;
         Terminal_session_result result = process_command(std::move(command));
+        m_processing_command_callback_epoch = 0U;
         m_processing_backend_callback_epoch = 0U;
         if (!slice_backend_output) {
             record_result(std::move(result));
@@ -7436,8 +7438,14 @@ void Terminal_session::handle_parser_actions(
                 {
                     const Terminal_reply& reply          = std::get<Terminal_reply>(action.payload);
                     const std::uint64_t   reply_sequence = next_sequence();
+                    Terminal_session_command reply_command =
+                        make_terminal_reply_command(reply_sequence, reply);
+                    // The output callback is not settled until its protocol
+                    // replies have passed through the normal write queue. Keep
+                    // that provenance even when output is consumed in slices.
+                    reply_command.backend_callback_epoch = m_processing_command_callback_epoch;
                     const Terminal_session_result enqueue_result = enqueue_command(
-                        make_terminal_reply_command(reply_sequence, reply));
+                        std::move(reply_command));
                     record_result(enqueue_result);
                     if (enqueue_result.code != Terminal_session_result_code::ACCEPTED &&
                         enqueue_result.error.has_value())

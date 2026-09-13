@@ -1,6 +1,9 @@
 add_executable(vnm_terminal_embedded_benchmark
     embedded_terminal_benchmark.cpp
 )
+if(WIN32)
+    vnm_terminal_deploy_conpty(vnm_terminal_embedded_benchmark)
+endif()
 
 find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 

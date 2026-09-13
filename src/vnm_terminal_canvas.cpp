@@ -704,7 +704,8 @@ QSGNode* VNM_TerminalCanvas::updatePaintNode(
     return term::update_qsg_atlas_node(
         old_node,
         std::move(captured),
-        m_private->recorder);
+        m_private->recorder,
+        this);
 }
 
 void VNM_TerminalCanvas::releaseResources()

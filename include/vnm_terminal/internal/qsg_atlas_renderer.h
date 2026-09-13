@@ -25,6 +25,7 @@
 
 struct QRhiDriverInfo;
 class QSGNode;
+class QQuickItem;
 
 namespace vnm_terminal::internal {
 
@@ -923,6 +924,7 @@ QSGNode* update_qsg_atlas_node(
     QSGNode*                                      old_node,
     Captured_atlas_frame                         frame,
     const std::shared_ptr<Qsg_atlas_recorder>&
-                                                  recorder);
+                                                  recorder,
+    QQuickItem*                                   update_owner);
 
 }

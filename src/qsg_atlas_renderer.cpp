@@ -19,10 +19,12 @@
 #include <QMatrix4x4>
 #include <QPainter>
 #include <QPainterPath>
+#include <QQuickItem>
 #include <QSGRenderNode>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QThread>
+#include <QThreadPool>
 #include <QTransform>
 #include <QtGui/private/qfontengine_p.h>
 #include <QtGui/private/qrawfont_p.h>
@@ -35,6 +37,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <limits>
 #include <numeric>
@@ -47,6 +50,16 @@
 #include <utility>
 
 namespace vnm_terminal::internal {
+
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+class Msdf_atlas_completion final : public QObject
+{
+    Q_OBJECT
+
+signals:
+    void atlas_ready();
+};
+#endif
 
 namespace {
 
@@ -248,6 +261,7 @@ struct Glyph_atlas_runtime_configuration
 
 struct Atlas_prepare_result
 {
+    bool                          msdf_text_build_pending = false;
     bool                          raw_font_rasterized = false;
     std::uint64_t                 raster_thread       = 0U;
     int                           rasterized_glyphs   = 0;
@@ -352,6 +366,13 @@ struct Msdf_terminal_text_cache
     bool          ready       = false;
     QString       message;
     msdf_text_atlas_t atlas;
+};
+
+struct Msdf_terminal_atlas_build
+{
+    Msdf_terminal_baked_atlas_key key;
+    std::atomic<bool>            complete = false;
+    msdf_text::build_result_t    result;
 };
 
 // Draw-size layout derived from one baked atlas for the current terminal size.
@@ -2121,10 +2142,24 @@ class Qsg_atlas_render_node final : public QSGRenderNode
 {
 public:
     explicit Qsg_atlas_render_node(
-        std::shared_ptr<Qsg_atlas_recorder> recorder)
+        std::shared_ptr<Qsg_atlas_recorder> recorder,
+        QQuickItem*                         update_owner)
     :
         m_recorder(std::move(recorder))
-    {}
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        // updatePaintNode holds GUI synchronization here. Qt owns receiver
+        // disconnection after this point; a worker never submits through a raw
+        // GUI pointer. The threadless sender can outlive either render owner.
+        m_msdf_completion = std::make_shared<Msdf_atlas_completion>();
+        QObject::connect(
+            m_msdf_completion.get(), &Msdf_atlas_completion::atlas_ready,
+            update_owner, &QQuickItem::update, Qt::QueuedConnection);
+        m_msdf_completion->moveToThread(nullptr);
+#else
+        Q_UNUSED(update_owner);
+#endif
+    }
 
     ~Qsg_atlas_render_node() override
     {
@@ -2204,7 +2239,9 @@ public:
         bool prepared_generation_complete =
             prepare_result.frame_build.glyph_missed_instances == 0 &&
             prepare_result.frame_build.glyph_coverage_failures == 0 &&
-            prepare_result.frame_build.glyph_atlas_insert_failures == 0;
+            prepare_result.frame_build.glyph_atlas_insert_failures == 0 &&
+            !(prepare_result.msdf_text_build_pending &&
+                qsg_atlas_text_renderer_policy_requires_msdf(m_frame.options.text_renderer_policy));
         if (prepared_generation_complete) {
             publish_prepare_upload_directives(prepare_result.commit);
         }
@@ -5516,6 +5553,43 @@ private:
         const Msdf_terminal_baked_atlas_key baked_key =
             make_msdf_baked_atlas_key(baked_pixel_height);
 
+        if (m_msdf_text_build != nullptr) {
+            if (!m_msdf_text_build->complete.load(std::memory_order_acquire)) {
+                result.msdf_text_build_pending = true;
+                return false;
+            }
+            if (msdf_baked_atlas_key_equal(m_msdf_text_build->key, baked_key)) {
+                msdf_text::build_result_t build = std::move(m_msdf_text_build->result);
+                m_msdf_text_build.reset();
+                m_msdf_text_cache.atlas_built = build.status != msdf_text::Build_status::FAILURE;
+                if (m_msdf_text_cache.atlas_built) {
+                    result.render.msdf_text_atlas_build_succeeded = true;
+                    ++m_msdf_text_counters.atlas_build_successes;
+                    m_msdf_text_cache.atlas = std::move(build.atlas);
+                    m_msdf_text_cache.message.clear();
+                    m_msdf_text_cache.ready = atlas_msdf_text_atlas_has_supported_codepoints(
+                        m_msdf_text_cache.atlas, &m_msdf_text_cache.message);
+                    if (m_msdf_text_cache.ready && m_msdf_text_cache.message.isEmpty()) {
+                        m_msdf_text_cache.message = QStringLiteral("ok");
+                    }
+                }
+                else {
+                    m_msdf_text_cache.message = QString::fromStdString(build.message);
+                }
+                // The snapshot may be unchanged since its glyph fallback was
+                // committed, but atlas adoption changes the text draw owner.
+                m_force_next_render_full_upload = true;
+                if (m_msdf_text_cache.ready) {
+                    m_render_glyph_text_row_capacities.clear();
+                    m_render_glyph_cursor_text_row_capacities.clear();
+                }
+            }
+            else {
+                m_msdf_text_build.reset();
+                m_msdf_text_cache.initialized = false;
+            }
+        }
+
         if (m_msdf_text_cache.initialized &&
             msdf_baked_atlas_key_equal(m_msdf_text_cache.baked_key, baked_key))
         {
@@ -5570,46 +5644,37 @@ private:
             return false;
         }
 
-        const QByteArray& font_data = resolution.bytes;
+        const QByteArray font_data = resolution.bytes;
         m_msdf_text_cache.font_data_bytes = static_cast<int>(font_data.size());
 
-        const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
+        const std::vector<char32_t> codepoints = atlas_msdf_text_codepoints();
         result.render.msdf_text_atlas_build_attempted = true;
         ++m_msdf_text_counters.atlas_build_attempts;
-        msdf_text::build_result_t build = msdf_text::build_font_atlas(
-            reinterpret_cast<const std::uint8_t*>(font_data.constData()),
-            static_cast<std::size_t>(font_data.size()),
-            baked_pixel_height,
-            std::span<const char32_t>(codepoints.data(), codepoints.size()),
-            options);
-        m_msdf_text_cache.atlas_built =
-            build.status != msdf_text::Build_status::FAILURE;
-        if (m_msdf_text_cache.atlas_built) {
-            result.render.msdf_text_atlas_build_succeeded = true;
-            ++m_msdf_text_counters.atlas_build_successes;
-        }
-        if (!m_msdf_text_cache.atlas_built) {
-            m_msdf_text_cache.message = QString::fromStdString(build.message);
-            result.render.msdf_text_atlas_built = false;
-            result.render.msdf_text_atlas_ready = false;
-            return false;
-        }
-
-        m_msdf_text_cache.atlas = std::move(build.atlas);
-        m_msdf_text_cache.ready =
-            atlas_msdf_text_atlas_has_supported_codepoints(
-                m_msdf_text_cache.atlas,
-                &m_msdf_text_cache.message);
-        if (m_msdf_text_cache.ready && m_msdf_text_cache.message.isEmpty()) {
-            m_msdf_text_cache.message = QStringLiteral("ok");
-        }
-        result.render.msdf_text_atlas_built = m_msdf_text_cache.atlas_built;
-        result.render.msdf_text_atlas_ready = m_msdf_text_cache.ready;
-        if (m_msdf_text_cache.ready) {
-            ensure_msdf_draw_layout_state(
-                normalized_device_pixel_ratio, draw_pixel_height);
-        }
-        return m_msdf_text_cache.ready;
+        m_msdf_text_cache.message = QStringLiteral("MSDF atlas build pending");
+        m_msdf_text_build = std::make_shared<Msdf_terminal_atlas_build>();
+        m_msdf_text_build->key = baked_key;
+        const auto build = m_msdf_text_build;
+        const auto completion = m_msdf_completion;
+        // A single in-flight request bounds work while zoom/font changes arrive.
+        // Neither the worker nor its completion retains a render node or GPU resource.
+        QThreadPool::globalInstance()->start([
+            build, font_data, codepoints, options, baked_pixel_height, completion]() {
+            try {
+                build->result = msdf_text::build_font_atlas(
+                    reinterpret_cast<const std::uint8_t*>(font_data.constData()),
+                    static_cast<std::size_t>(font_data.size()),
+                    baked_pixel_height,
+                    std::span<const char32_t>(codepoints.data(), codepoints.size()),
+                    options);
+            }
+            catch (const std::exception& error) {
+                build->result.message = error.what();
+            }
+            build->complete.store(true, std::memory_order_release);
+            emit completion->atlas_ready();
+        });
+        result.msdf_text_build_pending = true;
+        return false;
     }
 
     void record_msdf_supported_text_miss(
@@ -5727,7 +5792,9 @@ private:
         }
 
         if (!ensure_msdf_text_cache(result)) {
-            record_msdf_supported_text_miss(run, result, drawable_glyphs);
+            if (!result.msdf_text_build_pending) {
+                record_msdf_supported_text_miss(run, result, drawable_glyphs);
+            }
             return false;
         }
 
@@ -6036,6 +6103,9 @@ private:
                 const int missed_runs_before =
                     result.render.msdf_text_missed_supported_runs;
                 if (append_msdf_text_run(run, opacity, result)) {
+                    return;
+                }
+                if (result.msdf_text_build_pending) {
                     return;
                 }
                 if (result.render.msdf_text_missed_supported_runs ==
@@ -6843,6 +6913,8 @@ private:
         false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     Msdf_terminal_text_cache                 m_msdf_text_cache;
+    std::shared_ptr<Msdf_terminal_atlas_build> m_msdf_text_build;
+    std::shared_ptr<Msdf_atlas_completion>     m_msdf_completion;
     Msdf_terminal_draw_layout_state          m_msdf_draw_layout;
     // Last MSDF font resolution (bytes + fingerprint), cached so the per-run
     // support gate, the baked-atlas key, and the atlas build share one file read.
@@ -8715,7 +8787,8 @@ QSGNode* update_qsg_atlas_node(
     QSGNode*                                      old_node,
     Captured_atlas_frame                         frame,
     const std::shared_ptr<Qsg_atlas_recorder>&
-                                                  recorder)
+                                                  recorder,
+    QQuickItem*                                   update_owner)
 {
     Qsg_atlas_render_node* node =
         dynamic_cast<Qsg_atlas_render_node*>(old_node);
@@ -8728,7 +8801,7 @@ QSGNode* update_qsg_atlas_node(
     }
     if (node == nullptr) {
         delete old_node;
-        node = new Qsg_atlas_render_node(recorder);
+        node = new Qsg_atlas_render_node(recorder, update_owner);
     }
 
     node->set_frame(std::move(frame), recorder);
@@ -8736,3 +8809,5 @@ QSGNode* update_qsg_atlas_node(
 }
 
 }
+
+#include "qsg_atlas_renderer.moc"

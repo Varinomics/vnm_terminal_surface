@@ -31,11 +31,14 @@ DECLARE_HANDLE(HPCON);
 #include <deque>
 #include <exception>
 #include <latch>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -205,10 +208,150 @@ struct Conpty_api
     using CreatePseudoConsole_fn = HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
     using ResizePseudoConsole_fn = HRESULT(WINAPI*)(HPCON, COORD);
     using ClosePseudoConsole_fn  = void(WINAPI*)(HPCON);
+    using ReparentPseudoConsole_fn = HRESULT(WINAPI*)(HPCON, HWND);
 
     CreatePseudoConsole_fn create = nullptr;
     ResizePseudoConsole_fn resize = nullptr;
     ClosePseudoConsole_fn  close  = nullptr;
+    ReparentPseudoConsole_fn reparent = nullptr;
+};
+
+class Conpty_window_observer
+{
+public:
+    ~Conpty_window_observer()
+    {
+        if (m_thread.joinable()) {
+            SetEvent(m_stop.get());
+            m_thread.join();
+        }
+    }
+
+    bool start()
+    {
+        m_stop.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        if (!m_stop) {
+            m_error = GetLastError();
+            return false;
+        }
+        try {
+            m_thread = std::thread([this] { run(); });
+        }
+        catch (const std::system_error&) {
+            m_error = ERROR_NOT_ENOUGH_MEMORY;
+            return false;
+        }
+        m_ready.wait();
+        return m_error == ERROR_SUCCESS;
+    }
+
+    HWND owner() const { return m_owner; }
+    DWORD error() const { return m_error; }
+
+private:
+    static void CALLBACK window_event(
+        HWINEVENTHOOK, DWORD, HWND window, LONG object, LONG child, DWORD, DWORD)
+    {
+        auto* observer = s_observer;
+        if (observer == nullptr) {
+            return;
+        }
+        // Windows can dispatch a batch of WinEvents inside PeekMessage itself.
+        // Cut off the producer on this hook's thread when teardown is requested.
+        if (WaitForSingleObject(observer->m_stop.get(), 0) == WAIT_OBJECT_0) {
+            observer->unhook();
+            return;
+        }
+        if (window == nullptr ||
+            object != OBJID_WINDOW || child != CHILDID_SELF ||
+            GetWindow(window, GW_OWNER) != observer->m_owner)
+        {
+            return;
+        }
+
+        wchar_t class_name[64]{};
+        if (GetClassNameW(window, class_name, static_cast<int>(std::size(class_name))) > 0 &&
+            std::wstring_view(class_name) == L"PseudoConsoleWindow" && IsWindowVisible(window))
+        {
+            // The host can be draining terminal output. Do not synchronously
+            // enter its window procedure from this independent observer thread.
+            ShowWindowAsync(window, SW_HIDE);
+        }
+    }
+
+    void run()
+    {
+        s_observer = this;
+        m_owner = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            L"STATIC", L"vnm_terminal ConPTY window owner", WS_POPUP,
+            0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (m_owner == nullptr) {
+            m_error = GetLastError();
+            m_ready.count_down();
+            s_observer = nullptr;
+            return;
+        }
+
+        m_create_hook = SetWinEventHook(
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, nullptr, window_event,
+            0, 0, WINEVENT_OUTOFCONTEXT);
+        const DWORD create_error = m_create_hook == nullptr ? GetLastError() : ERROR_SUCCESS;
+        m_show_hook = SetWinEventHook(
+            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, window_event,
+            0, 0, WINEVENT_OUTOFCONTEXT);
+        if (m_create_hook == nullptr || m_show_hook == nullptr) {
+            m_error = m_create_hook == nullptr ? create_error : GetLastError();
+            if (m_error == ERROR_SUCCESS) {
+                m_error = ERROR_GEN_FAILURE;
+            }
+        }
+        m_ready.count_down();
+
+        if (m_error == ERROR_SUCCESS) {
+            const HANDLE stop = m_stop.get();
+            for (;;) {
+                const DWORD wait_result = MsgWaitForMultipleObjectsEx(
+                    1, &stop, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if (wait_result != WAIT_OBJECT_0 + 1) {
+                    break;
+                }
+                MSG message{};
+                // Recheck the stop event between messages even if other
+                // applications continuously generate window events.
+                if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        }
+
+        unhook();
+        // This marker belongs to our process, while the compatibility HWND
+        // belongs to ConPTY. Windows detaches that cross-process ownership on
+        // marker destruction; it does not destroy the host's window.
+        DestroyWindow(m_owner);
+        s_observer = nullptr;
+    }
+
+    void unhook()
+    {
+        if (const auto hook = std::exchange(m_show_hook, nullptr)) {
+            UnhookWinEvent(hook);
+        }
+        if (const auto hook = std::exchange(m_create_hook, nullptr)) {
+            UnhookWinEvent(hook);
+        }
+    }
+
+    inline static thread_local Conpty_window_observer* s_observer = nullptr;
+    Unique_handle m_stop;
+    std::thread   m_thread;
+    std::latch    m_ready{1};
+    HWND          m_owner = nullptr;
+    DWORD         m_error = ERROR_SUCCESS;
+    HWINEVENTHOOK m_create_hook = nullptr;
+    HWINEVENTHOOK m_show_hook = nullptr;
 };
 
 QString windows_error_message(QStringView context, DWORD code)
@@ -246,38 +389,65 @@ QString hresult_message(QStringView context, HRESULT result)
         .arg(static_cast<qulonglong>(static_cast<unsigned long>(result)), 8, 16, QLatin1Char('0'));
 }
 
-std::optional<Conpty_api> load_conpty_api()
+struct Conpty_api_load_result
 {
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (kernel32 == nullptr) {
-        return std::nullopt;
-    }
+    std::optional<Conpty_api> api;
+    QString                  error;
+};
 
-    Conpty_api api;
-    api.create = reinterpret_cast<Conpty_api::CreatePseudoConsole_fn>(
-        GetProcAddress(kernel32, "CreatePseudoConsole"));
-    api.resize = reinterpret_cast<Conpty_api::ResizePseudoConsole_fn>(
-        GetProcAddress(kernel32, "ResizePseudoConsole"));
-    api.close  = reinterpret_cast<Conpty_api::ClosePseudoConsole_fn>(
-        GetProcAddress(kernel32, "ClosePseudoConsole"));
+const Conpty_api_load_result& load_conpty_api()
+{
+    // Detached close callbacks can outlive their backend, so retain the module
+    // for the process lifetime. The inbox host corrupts split Unicode input.
+    static const Conpty_api_load_result loaded = []() -> Conpty_api_load_result {
+        std::wstring executable_path(32768, L'\0');
+        const DWORD size = GetModuleFileNameW(nullptr, executable_path.data(), (DWORD)executable_path.size());
+        if (size == 0 || size == executable_path.size()) {
+            return {{}, windows_error_message(QStringLiteral("GetModuleFileNameW"), GetLastError())};
+        }
+        executable_path.resize(size);
+        const QString library_path = QFileInfo(QString::fromStdWString(executable_path))
+            .dir().filePath(QStringLiteral("conpty.dll"));
+        const HMODULE module = LoadLibraryExW(
+            reinterpret_cast<LPCWSTR>(library_path.utf16()),
+            nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (module == nullptr) {
+            return {{}, windows_error_message(
+                QStringLiteral("Cannot load packaged ConPTY runtime %1").arg(library_path), GetLastError())};
+        }
 
-    if (api.create == nullptr || api.resize == nullptr || api.close == nullptr) {
-        return std::nullopt;
-    }
+        Conpty_api api;
+        api.create = reinterpret_cast<Conpty_api::CreatePseudoConsole_fn>(
+            GetProcAddress(module, "ConptyCreatePseudoConsole"));
+        api.resize = reinterpret_cast<Conpty_api::ResizePseudoConsole_fn>(
+            GetProcAddress(module, "ConptyResizePseudoConsole"));
+        api.close  = reinterpret_cast<Conpty_api::ClosePseudoConsole_fn>(
+            GetProcAddress(module, "ConptyClosePseudoConsole"));
+        api.reparent = reinterpret_cast<Conpty_api::ReparentPseudoConsole_fn>(
+            GetProcAddress(module, "ConptyReparentPseudoConsole"));
+        if (api.create == nullptr || api.resize == nullptr || api.close == nullptr || api.reparent == nullptr) {
+            FreeLibrary(module);
+            return {{}, QStringLiteral("Packaged ConPTY runtime lacks required pseudoconsole APIs: %1")
+                .arg(library_path)};
+        }
 
-    return api;
+        return {api, {}};
+    }();
+    return loaded;
 }
 
 void close_pseudoconsole_detached(
     Conpty_api::ClosePseudoConsole_fn  close_conpty,
-    HPCON                             conpty)
+    HPCON                             conpty,
+    std::shared_ptr<Conpty_window_observer> window_observer)
 {
     if (close_conpty == nullptr || conpty == nullptr) {
         return;
     }
 
     try {
-        std::thread([close_conpty, conpty] {
+        std::thread([close_conpty, conpty, window_observer] {
             close_conpty(conpty);
         }).detach();
     }
@@ -582,12 +752,13 @@ public:
                 QStringLiteral("executable lookup failed in the final environment"));
         }
 
-        const std::optional<Conpty_api> conpty_api = load_conpty_api();
+        const Conpty_api_load_result& conpty_load = load_conpty_api();
+        const std::optional<Conpty_api>& conpty_api = conpty_load.api;
         if (!conpty_api.has_value()) {
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
-                    QStringLiteral("Windows ConPTY API is not available"));
+                    conpty_load.error);
         }
 
         if (!size_fits_conpty(effective_config.initial_grid_size)) {
@@ -636,6 +807,23 @@ public:
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
                     hresult_message(QStringLiteral("CreatePseudoConsole"), create_result));
+        }
+
+        auto window_observer = std::make_shared<Conpty_window_observer>();
+        if (!window_observer->start()) {
+            conpty_api->close(local_conpty);
+            return reject_start(
+                Terminal_backend_error_code::START_FAILED,
+                windows_error_message(QStringLiteral("ConPTY window observer"), window_observer->error()));
+        }
+        // Supply the owner before client attachment can create the host's
+        // compatibility window. Reported window PIDs can refer to clients.
+        const HRESULT reparent_result = conpty_api->reparent(local_conpty, window_observer->owner());
+        if (FAILED(reparent_result)) {
+            conpty_api->close(local_conpty);
+            return reject_start(
+                Terminal_backend_error_code::START_FAILED,
+                hresult_message(QStringLiteral("ConptyReparentPseudoConsole"), reparent_result));
         }
 
         LPPROC_THREAD_ATTRIBUTE_LIST attribute_list = nullptr;
@@ -752,6 +940,7 @@ public:
             std::lock_guard<std::mutex> lock(m_mutex);
             m_api                = *conpty_api;
             m_conpty             = local_conpty;
+            m_window_observer    = std::move(window_observer);
             m_callbacks          = std::move(callbacks);
             m_input_write        = std::move(pty_input_write);
             m_output_read        = std::move(pty_output_read);
@@ -1277,11 +1466,13 @@ private:
     {
         HPCON conpty = nullptr;
         Conpty_api::ClosePseudoConsole_fn close_conpty_api = nullptr;
+        std::shared_ptr<Conpty_window_observer> window_observer;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             conpty           = m_conpty;
             close_conpty_api = m_api.close;
             m_conpty         = nullptr;
+            window_observer  = std::move(m_window_observer);
             if (conpty != nullptr) {
                 m_conpty_cv.wait(lock, [&] {
                     return m_conpty_active_calls == 0U;
@@ -1289,7 +1480,7 @@ private:
             }
         }
 
-        close_pseudoconsole_detached(close_conpty_api, conpty);
+        close_pseudoconsole_detached(close_conpty_api, conpty, std::move(window_observer));
     }
 
     void record_reader_thread_handle()
@@ -1594,7 +1785,9 @@ private:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         ++m_child_output_sequence;
-        if (!m_exit_reported &&
+        // Console-host teardown emits mode resets after the child exits; that
+        // output cannot acknowledge input delivered to the child.
+        if (!m_stopping && !m_exit_reported &&
             m_interrupt_delivery_exit_code_pending &&
             m_interrupt_clear_waits_for_output)
         {
@@ -1855,6 +2048,7 @@ private:
     Terminal_backend_callbacks         m_callbacks;
     Conpty_api                         m_api;
     HPCON                              m_conpty = nullptr;
+    std::shared_ptr<Conpty_window_observer> m_window_observer;
     Unique_handle                      m_input_write;
     Unique_handle                      m_output_read;
     Unique_handle                      m_process_job;

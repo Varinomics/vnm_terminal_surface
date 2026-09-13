@@ -141,6 +141,9 @@ mark_as_advanced(
 )
 
 function(vnm_terminal_configure_test_process target_name)
+    if(WIN32 AND NOT target_name STREQUAL "vnm_terminal_canvas_fixture")
+        vnm_terminal_deploy_conpty(${target_name})
+    endif()
     target_include_directories(${target_name} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
     )
@@ -1061,6 +1064,25 @@ if(WIN32)
             # The report suite includes several real-window transactional
             # render-loop regressions and can run slowly on debug D3D/WARP.
             TIMEOUT ${vnm_terminal_qsg_atlas_report_timeout_seconds}
+    )
+
+    add_test(
+        NAME vnm_terminal_qsg_async_msdf_atlas_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_report_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--async-msdf-atlas"
+            "--backend"
+            "d3d11"
+    )
+    set_tests_properties(
+        vnm_terminal_qsg_async_msdf_atlas_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;async"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 60
     )
 
     set(vnm_terminal_qsg_atlas_arc_row_provenance_environment
@@ -2009,6 +2031,18 @@ if(WIN32)
     set_target_properties(vnm_terminal_windows_conpty_backend PROPERTIES
         AUTOMOC OFF
     )
+
+    get_property(vnm_terminal_conpty_package_dir GLOBAL PROPERTY vnm_terminal_conpty_package_dir)
+    add_test(NAME vnm_terminal_conpty_runtime_package
+        COMMAND "${CMAKE_COMMAND}"
+            "-Dpackage_dir=${vnm_terminal_conpty_package_dir}"
+            "-Dhelper_file=${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_conpty.cmake"
+            "-Druntime_dir=$<TARGET_FILE_DIR:vnm_terminal_windows_conpty_backend>"
+            "-DCMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P}"
+            "-DCMAKE_CXX_COMPILER_ARCHITECTURE_ID=${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}"
+            "-DCMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
+            -P "${PROJECT_SOURCE_DIR}/tests/conpty_package/verify_runtime.cmake")
+    set_tests_properties(vnm_terminal_conpty_runtime_package PROPERTIES LABELS "package;windows;conpty")
 
     add_test(
         NAME vnm_terminal_windows_conpty_backend

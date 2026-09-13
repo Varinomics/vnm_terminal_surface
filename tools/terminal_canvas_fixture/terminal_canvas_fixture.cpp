@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -577,56 +578,6 @@ bool configure_interactive_console()
 #endif
 
     return true;
-}
-
-bool configure_raw_sync_console()
-{
-#if defined(_WIN32)
-    if (_setmode(_fileno(stdin), _O_BINARY)  == -1 ||
-        _setmode(_fileno(stdout), _O_BINARY) == -1)
-    {
-        std::cerr << "failed to set binary stdio mode\n";
-        return false;
-    }
-
-    HANDLE input      = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD  input_mode = 0U;
-    if (input == INVALID_HANDLE_VALUE ||
-        !GetConsoleMode(input, &input_mode))
-    {
-        std::cerr << "failed to read input console mode\n";
-        return false;
-    }
-
-    input_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-    input_mode &= ~ENABLE_LINE_INPUT;
-    input_mode &= ~ENABLE_ECHO_INPUT;
-    input_mode &= ~ENABLE_PROCESSED_INPUT;
-    if (!SetConsoleMode(input, input_mode)) {
-        std::cerr << "failed to set input console mode\n";
-        return false;
-    }
-
-    HANDLE output      = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD  output_mode = 0U;
-    if (output == INVALID_HANDLE_VALUE ||
-        !GetConsoleMode(output, &output_mode))
-    {
-        std::cerr << "failed to read output console mode\n";
-        return false;
-    }
-
-    output_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    output_mode &= ~ENABLE_PROCESSED_OUTPUT;
-    if (!SetConsoleMode(output, output_mode)) {
-        std::cerr << "failed to set raw output console mode\n";
-        return false;
-    }
-
-    return true;
-#else
-    return configure_interactive_console();
-#endif
 }
 
 bool console_size_matches(int rows, int columns)
@@ -1221,6 +1172,44 @@ unsigned long current_process_id()
 #endif
 }
 
+#if defined(_WIN32)
+int run_show_console_window()
+{
+    const HWND console_window = GetConsoleWindow();
+    if (console_window == nullptr) {
+        return 80;
+    }
+    ShowWindow(console_window, SW_MAXIMIZE);
+    if (!configure_interactive_console()) {
+        return 81;
+    }
+    std::ostringstream ready;
+    ready << "compat-window " << reinterpret_cast<std::uintptr_t>(console_window)
+        << " pid " << GetCurrentProcessId();
+    if (!write_stdout_line(ready.str())) {
+        return 82;
+    }
+    unsigned int show_count = 0U;
+    for (;;) {
+        unsigned char byte = 0U;
+        if (std::fread(&byte, 1U, 1U, stdin) != 1U) {
+            return 83;
+        }
+        if (byte == 'q') {
+            return 0;
+        }
+        if (byte != 's') {
+            return 84;
+        }
+        ShowWindow(console_window, SW_MAXIMIZE);
+        ++show_count;
+        if (!write_stdout_line("compat-show " + std::to_string(show_count))) {
+            return 85;
+        }
+    }
+}
+#endif
+
 int run_hold_open()
 {
     if (!configure_interactive_console()) {
@@ -1548,7 +1537,7 @@ int run_utf8_payload()
 
 int run_sync_raw_resize_gate(const std::string& checkpoint_path)
 {
-    if (!configure_raw_sync_console()) {
+    if (!configure_interactive_console()) {
         return 62;
     }
 
@@ -1611,6 +1600,11 @@ int run_write_start_marker(const std::string& marker_path)
 
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    if (argc == 2 && argument_equals(argv[1], "--show-console-window")) {
+        return run_show_console_window();
+    }
+#endif
     if (argc == 2 && argument_equals(argv[1], "--list")) {
         print_list();
         return 0;

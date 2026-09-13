@@ -1022,6 +1022,7 @@ private:
     std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_ready_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_processing_backend_callback_epoch = 0U;
+    std::uint64_t                                          m_processing_command_callback_epoch = 0U;
     std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
