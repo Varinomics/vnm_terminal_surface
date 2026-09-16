@@ -4509,11 +4509,16 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
     }
 
     const term::Terminal_selection_result result = m_private->session->selected_text();
-    // A tiny drag within a blank cell can create a one-space selection, so
-    // automatic copying must leave the user's existing clipboard intact.
+    // An empty selection is never copied. Replacing the clipboard with nothing
+    // is not a copy, and reporting one lets the copy shortcut consume a chord
+    // it did nothing with - which is how Ctrl+C stopped reaching the terminal
+    // as an interrupt. A tiny drag within a blank cell can also create a
+    // one-space selection, so automatic copying leaves that clipboard intact
+    // as well.
     if (result.code != term::Terminal_selection_result_code::OK ||
+        result.text.isEmpty()                                   ||
         (policy == Selection_copy_policy::SKIP_EMPTY_OR_SINGLE_SPACE &&
-            (result.text.isEmpty() || result.text == QStringLiteral(" "))))
+            result.text == QStringLiteral(" ")))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
@@ -5316,6 +5321,13 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             if (m_private->has_copyable_selection_attachment() &&
                 copy_selected_text_to_clipboard(Selection_copy_policy::COPY))
             {
+                // The copy retires the selection. A selection outlives the
+                // gesture that made it and follows the content into
+                // scrollback, so one left behind would answer for every later
+                // Ctrl+C and the chord would never reach the terminal as an
+                // interrupt again. Retiring it here is also what makes the
+                // documented rule usable: copy, then interrupt.
+                clear_selection();
                 event->accept();
                 term::record_interaction_trace("surface", "key-route", QStringLiteral("copy"), trace_id);
                 return;

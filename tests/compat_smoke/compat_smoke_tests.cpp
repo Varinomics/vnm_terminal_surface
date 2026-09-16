@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QKeyEvent>
 #include <QProcessEnvironment>
 #include <QQuickWindow>
 #include <QSizeF>
@@ -1683,6 +1684,147 @@ bool test_shell_like_surface_interrupt_smoke(QGuiApplication& app, const QString
     return ok;
 }
 
+// The keyboard route to the same interrupt. interrupt_process() is an API a
+// host calls and Ctrl+C is what a user presses; they meet only at the backend
+// write, so everything above it is covered by one of them alone. This drives
+// the key path, and it asks the child rather than the surface whether the
+// interrupt arrived: the fixture reports 130 only once the interrupt byte has
+// reached it.
+bool test_shell_like_surface_chord_interrupt_smoke(
+    QGuiApplication& app,
+    const QString&   fixture_path)
+{
+    bool ok = true;
+    const term::terminal_canvas_fixture_shell_like_smoke_contract_t contract =
+        term::terminal_canvas_fixture_shell_like_smoke_contract();
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int backend_error_count = 0;
+    QStringList backend_errors;
+    bool process_exited = false;
+    int process_exit_code = -1;
+
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::backend_error,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Backend_error_code code, const QString& message) {
+            ++backend_error_count;
+            backend_errors.push_back(
+                QStringLiteral("%1: %2")
+                    .arg(static_cast<int>(code))
+                    .arg(message));
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Exit_reason, int exit_code) {
+            process_exited    = true;
+            process_exit_code = exit_code;
+        });
+
+    const bool started = start_terminal_fixture(
+        fixture.surface,
+        {
+            fixture_path,
+            QStringLiteral("--shell-like-smoke"),
+        },
+        QFileInfo(fixture_path).absolutePath(),
+        explicit_environment_entries(
+            QProcessEnvironment::systemEnvironment())).accepted;
+    ok &= check(started, "shell-like chord interrupt surface smoke starts fixture");
+    if (!started) {
+        return false;
+    }
+
+    auto require = [&](bool condition, const std::string& message) -> bool {
+        if (check(condition, message)) {
+            return true;
+        }
+
+        (void)cleanup_surface_process(
+            app,
+            fixture.surface,
+            process_exited,
+            "shell-like chord interrupt surface smoke");
+        return false;
+    };
+
+    const QString prompt = QString::fromLatin1(
+        contract.prompt.data(),
+        static_cast<qsizetype>(contract.prompt.size()));
+    QString visible_prompt = prompt;
+    while (!visible_prompt.isEmpty() && visible_prompt.back() == QChar(u' ')) {
+        visible_prompt.chop(1);
+    }
+    if (!require(
+            wait_for_snapshot_row(app, fixture.surface, visible_prompt),
+            "shell-like chord interrupt prompt reaches surface snapshot"))
+    {
+        return false;
+    }
+
+    if (!require(
+            fixture.surface.paste_text(
+                QStringLiteral("%1\n")
+                    .arg(QString::fromLatin1(
+                        contract.wait_command.data(),
+                        static_cast<qsizetype>(contract.wait_command.size())))),
+            "shell-like chord interrupt wait command writes through public paste_text"))
+    {
+        return false;
+    }
+
+    const QString wait_output = QString::fromLatin1(
+        contract.wait_output.data(),
+        static_cast<qsizetype>(contract.wait_output.size()));
+    if (!require(
+            wait_for_snapshot_row(app, fixture.surface, prompt + wait_output),
+            "shell-like chord interrupt reaches blocking fixture path"))
+    {
+        return false;
+    }
+
+    QKeyEvent chord(
+        QEvent::KeyPress,
+        Qt::Key_C,
+        Qt::ControlModifier,
+        QString(QChar(u'')));
+    QCoreApplication::sendEvent(&fixture.surface, &chord);
+    if (!require(chord.isAccepted(),
+            "shell-like wait path accepts the Ctrl+C chord"))
+    {
+        return false;
+    }
+
+    if (!require(
+            wait_for_process_exit(app, process_exited),
+            "shell-like chord interrupted fixture exits before timeout"))
+    {
+        return false;
+    }
+    pump_events(app);
+
+    print_backend_errors("shell-like chord interrupt surface", backend_errors);
+
+    // 130 is the fixture's own answer to a console control event, so the code
+    // is the child reporting that the interrupt arrived. The exit reason is
+    // deliberately not asserted: an interrupt the surface was asked for and one
+    // the child was sent through the keyboard need not be classified alike.
+    ok &= check(process_exit_code == 130,
+        "Ctrl+C without a selection interrupts the running child");
+    ok &= check(backend_error_count == 0,
+        "shell-like chord interrupt smoke has no backend errors");
+    ok &= check(fixture.surface.process_state() ==
+        VNM_TerminalSurface::Process_state::EXITED,
+        "shell-like chord interrupted surface publishes exited process state");
+
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -1705,5 +1847,6 @@ int main(int argc, char** argv)
     ok &= test_invalid_second_start_preserves_live_session(app, fixture_path);
     ok &= test_shell_like_surface_native_smoke(app, fixture_path);
     ok &= test_shell_like_surface_interrupt_smoke(app, fixture_path);
+    ok &= test_shell_like_surface_chord_interrupt_smoke(app, fixture_path);
     return ok ? 0 : 1;
 }

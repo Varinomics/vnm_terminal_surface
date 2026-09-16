@@ -5367,6 +5367,21 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             QStringLiteral("lpha"),
             "Ctrl+C with selection copies selected text to clipboard");
 
+        // The copy retires the selection, so the next chord is the interrupt. A
+        // selection outlives the gesture that made it and follows the content
+        // into scrollback, so one left behind answered for every later Ctrl+C
+        // and left no keyboard way to stop a running command.
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::NONE,
+            "Ctrl+C copy retires the selection");
+        ok &= send_key_and_expect_write(
+            fixture.surface, *backend_ptr, Qt::Key_C, Qt::ControlModifier,
+            {}, bytes_from_hex("03"),
+            "a second Ctrl+C interrupts once the copy retired the selection");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("lpha"),
+            "the interrupting Ctrl+C keeps the copied text on the clipboard");
+
         fixture.surface.clear_selection();
         const int last_column = std::max(0, fixture.surface.columns() - 1);
         ok &= check(last_column > 5,
@@ -5515,17 +5530,13 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
 
         QGuiApplication::clipboard()->setText(QStringLiteral("empty-selection-sentinel"),
             QClipboard::Clipboard);
-        const std::size_t empty_selection_write_count = backend_ptr->writes.size();
-        ok &= send_key(
-            fixture.surface,
-            Qt::Key_C,
-            Qt::ControlModifier,
-            {},
-            "Ctrl+C with empty active selection is accepted by copy policy");
-        ok &= check(backend_ptr->writes.size() == empty_selection_write_count,
-            "Ctrl+C with empty active selection writes no ETX");
-    ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard).isEmpty(),
-        "Ctrl+C with empty active selection copies empty text");
+        ok &= send_key_and_expect_write(
+            fixture.surface, *backend_ptr, Qt::Key_C, Qt::ControlModifier,
+            {}, bytes_from_hex("03"),
+            "Ctrl+C with empty active selection interrupts the terminal");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("empty-selection-sentinel"),
+            "Ctrl+C with empty active selection leaves the clipboard alone");
     }
 
     {
