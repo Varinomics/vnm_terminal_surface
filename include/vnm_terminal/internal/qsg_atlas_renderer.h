@@ -17,6 +17,7 @@
 #include <QSizeF>
 #include <QString>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,8 +25,8 @@
 #include <vector>
 
 struct QRhiDriverInfo;
+class QObject;
 class QSGNode;
-class QQuickItem;
 
 namespace vnm_terminal::internal {
 
@@ -920,11 +921,22 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     std::uint64_t                 ownership_generation = 1U,
     std::uint64_t                 canvas_frame_generation = 0U);
 
+// Invalidation the render owner supplies so the render node can report an
+// asynchronously completed atlas build without reaching a surface API. The
+// render node only relays it: `context` scopes delivery to the owner's thread
+// and lifetime, and `invalidate` is whatever accounted repaint request the
+// owner already uses, so the owner keeps sole authority over invalidation.
+struct Qsg_atlas_update_request
+{
+    QObject*              context = nullptr;
+    std::function<void()> invalidate;
+};
+
 QSGNode* update_qsg_atlas_node(
     QSGNode*                                      old_node,
     Captured_atlas_frame                         frame,
     const std::shared_ptr<Qsg_atlas_recorder>&
                                                   recorder,
-    QQuickItem*                                   update_owner);
+    const Qsg_atlas_update_request&               update_request);
 
 }

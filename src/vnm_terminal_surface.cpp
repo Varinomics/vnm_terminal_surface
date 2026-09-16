@@ -2024,6 +2024,25 @@ struct VNM_TerminalSurface::Private
         surface.update();
     }
 
+    // The render node relays this from an atlas worker thread through a queued
+    // connection, so it must enter the same accounted invalidation every other
+    // caller uses. A bare item update would repaint without marking an update
+    // pending, leaving frame_work_pending() reporting idle with a frame queued.
+    term::Qsg_atlas_update_request atlas_update_request(VNM_TerminalSurface& surface)
+    {
+        const auto invalidate = [
+                this,
+                &surface
+            ]()
+            {
+                if (shutting_down.load()) {
+                    return;
+                }
+                request_render_update(surface);
+            };
+        return {&surface, invalidate};
+    }
+
     bool backend_callback_frame_target_live_visible(
         const VNM_TerminalSurface& surface) const
     {
@@ -8785,7 +8804,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             old_node,
             std::move(captured_frame),
             m_private->qsg_atlas_recorder,
-            this);
+            m_private->atlas_update_request(*this));
         if (created_render_node && updated_node != nullptr) {
             if (auto lifecycle_recorder = m_private->lifecycle_recorder();
                 lifecycle_recorder != nullptr)

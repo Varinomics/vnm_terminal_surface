@@ -10255,7 +10255,7 @@ protected:
             old_node,
             std::move(frame),
             m_recorder,
-            this);
+            term::Qsg_atlas_update_request{this, [this] { update(); }});
     }
 
 private:

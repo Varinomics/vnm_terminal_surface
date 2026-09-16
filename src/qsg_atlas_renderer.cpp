@@ -19,7 +19,6 @@
 #include <QMatrix4x4>
 #include <QPainter>
 #include <QPainterPath>
-#include <QQuickItem>
 #include <QSGRenderNode>
 #include <QTextLayout>
 #include <QTextOption>
@@ -2143,7 +2142,7 @@ class Qsg_atlas_render_node final : public QSGRenderNode
 public:
     explicit Qsg_atlas_render_node(
         std::shared_ptr<Qsg_atlas_recorder> recorder,
-        QQuickItem*                         update_owner)
+        const Qsg_atlas_update_request&     update_request)
     :
         m_recorder(std::move(recorder))
     {
@@ -2154,10 +2153,11 @@ public:
         m_msdf_completion = std::make_shared<Msdf_atlas_completion>();
         QObject::connect(
             m_msdf_completion.get(), &Msdf_atlas_completion::atlas_ready,
-            update_owner, &QQuickItem::update, Qt::QueuedConnection);
+            update_request.context, update_request.invalidate,
+            Qt::QueuedConnection);
         m_msdf_completion->moveToThread(nullptr);
 #else
-        Q_UNUSED(update_owner);
+        Q_UNUSED(update_request);
 #endif
     }
 
@@ -8789,7 +8789,7 @@ QSGNode* update_qsg_atlas_node(
     Captured_atlas_frame                         frame,
     const std::shared_ptr<Qsg_atlas_recorder>&
                                                   recorder,
-    QQuickItem*                                   update_owner)
+    const Qsg_atlas_update_request&               update_request)
 {
     Qsg_atlas_render_node* node =
         dynamic_cast<Qsg_atlas_render_node*>(old_node);
@@ -8802,7 +8802,7 @@ QSGNode* update_qsg_atlas_node(
     }
     if (node == nullptr) {
         delete old_node;
-        node = new Qsg_atlas_render_node(recorder, update_owner);
+        node = new Qsg_atlas_render_node(recorder, update_request);
     }
 
     node->set_frame(std::move(frame), recorder);
