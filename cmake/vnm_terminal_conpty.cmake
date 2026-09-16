@@ -35,23 +35,49 @@ function(vnm_terminal_conpty_runtime_files output)
     set(${output} "${files}" PARENT_SCOPE)
 endfunction()
 
+# The backend loads conpty.dll from the directory of the running process's main
+# module, so the runtime belongs beside whichever executable hosts a terminal.
+# Without DESTINATION that is the target's own output directory, staged from a
+# POST_BUILD command. DESTINATION covers the two cases a POST_BUILD command
+# cannot: an executable that runs from a private runtime directory rather than
+# its build output directory, and a target created in another directory, which
+# add_custom_command(TARGET) rejects. The destination is spelled out rather than
+# derived from $<TARGET_FILE_DIR:${target}> because the staging target has to
+# run before ${target} is considered built, and reading the target's own
+# location would close that dependency into a cycle.
 function(vnm_terminal_deploy_conpty target)
     if(NOT WIN32)
         return()
     endif()
+    cmake_parse_arguments(arg "" "DESTINATION" "" ${ARGN})
+    if(arg_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "vnm_terminal_deploy_conpty: unexpected arguments: ${arg_UNPARSED_ARGUMENTS}")
+    endif()
     get_property(package_dir GLOBAL PROPERTY vnm_terminal_conpty_package_dir)
     vnm_terminal_conpty_runtime_files(files)
+    set(runtime_dir "${arg_DESTINATION}")
+    if(NOT runtime_dir)
+        set(runtime_dir "$<TARGET_FILE_DIR:${target}>")
+    endif()
+    set(commands)
     foreach(file IN LISTS files)
         string(REPLACE "|" ";" parts "${file}")
         list(GET parts 0 source)
         list(GET parts 1 destination)
         get_filename_component(directory "${destination}" DIRECTORY)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:${target}>/${directory}"
+        list(APPEND commands
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${runtime_dir}/${directory}"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${package_dir}/${source}" "$<TARGET_FILE_DIR:${target}>/${destination}"
-            VERBATIM)
+                "${package_dir}/${source}" "${runtime_dir}/${destination}")
     endforeach()
+    if(arg_DESTINATION)
+        add_custom_target(${target}_conpty_runtime ${commands}
+            COMMENT "Staging the ConPTY runtime for ${target}"
+            VERBATIM)
+        add_dependencies(${target} ${target}_conpty_runtime)
+    else()
+        add_custom_command(TARGET ${target} POST_BUILD ${commands} VERBATIM)
+    endif()
 endfunction()
 
 function(vnm_terminal_install_conpty)
