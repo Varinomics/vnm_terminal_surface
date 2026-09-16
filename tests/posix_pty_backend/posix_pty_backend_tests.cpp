@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -28,8 +29,11 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace term = vnm_terminal::internal;
 
@@ -146,7 +150,8 @@ class Backend_capture
 {
 public:
     term::Terminal_backend_callbacks callbacks(
-        std::function<void(const QByteArray&)> output_observer = {})
+        std::function<void(const QByteArray&)> output_observer = {},
+        std::function<void()>                  exit_observer   = {})
     {
         term::Terminal_backend_callbacks callbacks;
         callbacks.output_received = [this, output_observer](QByteArray bytes) {
@@ -164,11 +169,20 @@ public:
             }
             m_cv.notify_all();
         };
-        callbacks.process_exited = [this](term::Terminal_backend_exit exit) {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_callback_sequence;
-            m_exit_event_sequence = m_callback_sequence;
-            m_exit = exit;
+        callbacks.process_exited = [this, exit_observer](term::Terminal_backend_exit exit) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_callback_sequence;
+                m_exit_event_sequence = m_callback_sequence;
+                m_exit = exit;
+            }
+
+            // Observed before the notification, so a case that has to inspect
+            // native state between the exit report and the descendant cleanup
+            // that follows it holds the backend there.
+            if (exit_observer) {
+                exit_observer();
+            }
             m_cv.notify_all();
         };
         callbacks.error_reported = [this](term::Terminal_backend_error error) {
@@ -360,6 +374,29 @@ QString shell_quote(const QString& value)
     return QStringLiteral("'") + out + QStringLiteral("'");
 }
 
+std::optional<pid_t> parse_marked_pid(const QByteArray& output, const QByteArray& marker)
+{
+    const qsizetype start = output.indexOf(marker);
+    if (start < 0) {
+        return std::nullopt;
+    }
+
+    qsizetype end = start + marker.size();
+    while (end < output.size() && output.at(end) >= '0' && output.at(end) <= '9') {
+        ++end;
+    }
+
+    bool ok = false;
+    const qlonglong pid = output.mid(
+        start + marker.size(),
+        end - start - marker.size()).toLongLong(&ok);
+    if (!ok || pid <= 0) {
+        return std::nullopt;
+    }
+
+    return static_cast<pid_t>(pid);
+}
+
 std::optional<pid_t> read_pid_file(const QString& path)
 {
     QFile file(path);
@@ -384,6 +421,155 @@ bool process_is_alive(pid_t pid)
 
     return errno == EPERM;
 }
+
+#if defined(__linux__)
+
+struct Process_stat
+{
+    char     state  = '\0';
+    pid_t    parent = -1;
+};
+
+// /proc keeps an entry for an exited child until its status is consumed, and
+// reports it as a zombie whose parent is this process. That is the exact way to
+// ask whether a PID still names this test's own unreaped child rather than
+// whoever the kernel may have given the number to next.
+std::optional<Process_stat> read_process_stat(pid_t pid)
+{
+    QFile file(QStringLiteral("/proc/%1/stat").arg(pid));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return std::nullopt;
+    }
+
+    // The command name is parenthesised and may itself contain spaces and
+    // parentheses, so the fixed fields start after its last closing bracket.
+    const QByteArray contents = file.readAll();
+    const qsizetype  name_end = contents.lastIndexOf(')');
+    if (name_end < 0) {
+        return std::nullopt;
+    }
+
+    const QList<QByteArray> fields =
+        contents.mid(name_end + 1).simplified().split(' ');
+    if (fields.size() < 2 || fields.at(0).isEmpty()) {
+        return std::nullopt;
+    }
+
+    Process_stat stat;
+    stat.state  = fields.at(0).at(0);
+    stat.parent = static_cast<pid_t>(fields.at(1).toLongLong());
+    return stat;
+}
+
+bool process_is_own_unreaped_child(pid_t pid)
+{
+    const std::optional<Process_stat> stat = read_process_stat(pid);
+    return stat.has_value() && stat->state == 'Z' && stat->parent == ::getpid();
+}
+
+// A process of the test's own, unrelated to any terminal, leading a new session
+// and process group whose number is the one a terminal has just released. The
+// kernel's next PID is steered onto that number through ns_last_pid, which takes
+// CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE; without it the case says why and
+// cannot construct the reuse it judges.
+class Group_bystander
+{
+public:
+    Group_bystander() = default;
+
+    ~Group_bystander()
+    {
+        if (m_pid > 0) {
+            ::kill(m_pid, SIGKILL);
+            int status = 0;
+            (void)::waitpid(m_pid, &status, 0);
+        }
+    }
+
+    Group_bystander(const Group_bystander&)            = delete;
+    Group_bystander& operator=(const Group_bystander&) = delete;
+
+    bool occupy(pid_t group_number, QByteArray& unavailable)
+    {
+        const QByteArray last_pid = QByteArray::number(group_number - 1);
+        constexpr int k_reuse_attempts = 16;
+        for (int attempt = 0; attempt < k_reuse_attempts; ++attempt) {
+            const int control =
+                ::open("/proc/sys/kernel/ns_last_pid", O_WRONLY | O_CLOEXEC);
+            if (control < 0) {
+                unavailable = QByteArrayLiteral("ns_last_pid cannot be opened: ") +
+                    std::strerror(errno);
+                return false;
+            }
+
+            const ssize_t written = ::write(
+                control,
+                last_pid.constData(),
+                static_cast<std::size_t>(last_pid.size()));
+            const int steer_error = errno;
+            ::close(control);
+            if (written != static_cast<ssize_t>(last_pid.size())) {
+                unavailable = QByteArrayLiteral("ns_last_pid cannot be written: ") +
+                    std::strerror(steer_error);
+                return false;
+            }
+
+            int reported[2] = {-1, -1};
+            if (::pipe(reported) != 0) {
+                unavailable = QByteArrayLiteral("pipe: ") + std::strerror(errno);
+                return false;
+            }
+
+            const pid_t child = ::fork();
+            if (child == 0) {
+                ::close(reported[0]);
+                const char led =
+                    (::getpid() == group_number && ::setsid() == group_number)
+                        ? 'Y'
+                        : 'N';
+                if (::write(reported[1], &led, 1) != 1 || led != 'Y') {
+                    _exit(0);
+                }
+                for (;;) {
+                    ::pause();
+                }
+            }
+
+            ::close(reported[1]);
+            char led = 'N';
+            const bool answered = child > 0 && ::read(reported[0], &led, 1) == 1;
+            ::close(reported[0]);
+            if (child < 0) {
+                unavailable = QByteArrayLiteral("fork: ") + std::strerror(errno);
+                return false;
+            }
+
+            if (answered && led == 'Y') {
+                m_pid = child;
+                return true;
+            }
+
+            int status = 0;
+            (void)::waitpid(child, &status, 0);
+        }
+
+        unavailable = QByteArrayLiteral("the group number could not be reused");
+        return false;
+    }
+
+    // The bystander is this test's own unwaited child, so its PID still names
+    // it and a zombie means it was killed rather than left alone.
+    bool still_running() const
+    {
+        const std::optional<Process_stat> stat = read_process_stat(m_pid);
+        return stat.has_value() && stat->state != 'Z' && stat->state != 'X';
+    }
+
+private:
+    pid_t m_pid = -1;
+};
+
+#endif
 
 bool wait_for_process_absent(pid_t pid)
 {
@@ -1312,6 +1498,231 @@ bool test_destructor_from_process_exited_callback_returns()
     return ok;
 }
 
+// The process group a terminal signals to reach leftover descendants is
+// numbered with its root child's PID, and the kernel keeps that number reserved
+// only until the root's exit status is consumed. A terminal that consumes the
+// status first and signals the group afterwards is naming a number the kernel
+// is free to have handed to an unrelated process group by then.
+bool test_descendant_cleanup_precedes_root_status_consumption()
+{
+#if !defined(__linux__)
+    std::cout << "skipped: exact root custody observation requires Linux /proc\n";
+    return true;
+#else
+    bool ok = true;
+
+    QTemporaryDir pid_dir;
+    ok &= check(pid_dir.isValid(), "exact-custody pid directory is available");
+    if (!pid_dir.isValid()) {
+        return false;
+    }
+
+    const QString pid_path   = pid_dir.filePath(QStringLiteral("descendant.pid"));
+    const QString ready_path = pid_dir.filePath(QStringLiteral("descendant.ready"));
+    const QString go_path    = pid_dir.filePath(QStringLiteral("root.go"));
+
+    // A second terminal, started first and destroyed last: the unrelated
+    // original whose input has to keep working across the first terminal's
+    // descendant cleanup and teardown.
+    Backend_capture unrelated_capture;
+    std::unique_ptr<term::Terminal_backend> unrelated_terminal =
+        term::make_posix_pty_backend();
+    ok &= check(unrelated_terminal->start(
+            shell_launch_config(QStringLiteral(
+                "echo unrelated-ready; "
+                "while IFS= read -r line; do echo \"pong-$line\"; done")),
+            unrelated_capture.callbacks()).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "unrelated terminal starts");
+    ok &= check(unrelated_capture.wait_for_output(QByteArrayLiteral("unrelated-ready")),
+        "unrelated terminal reaches its ready marker");
+
+    std::optional<pid_t> descendant_pid;
+    std::atomic<pid_t>   root_pid{-1};
+    std::atomic_bool     root_owned_at_exit_report{false};
+    {
+        Backend_capture capture;
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        const term::Terminal_backend_result start_result = backend->start(
+            shell_launch_config(
+                QStringLiteral(
+                    "trap '' HUP TERM INT; "
+                    "echo exact-custody-root $$; "
+                    "(echo ready > %1; sleep 30) & "
+                    "echo $! > %2; "
+                    "while [ ! -f %3 ]; do sleep 0.05; done; "
+                    "exit 0").arg(
+                        shell_quote(ready_path),
+                        shell_quote(pid_path),
+                        shell_quote(go_path))),
+            capture.callbacks({}, [&] {
+                const pid_t observed = root_pid.load();
+                root_owned_at_exit_report.store(
+                    observed > 0 && process_is_own_unreaped_child(observed));
+            }));
+        ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "exact-custody shell starts");
+        ok &= check(capture.wait_for_output(QByteArrayLiteral("exact-custody-root ")),
+            "exact-custody shell reports its own pid");
+        const std::optional<pid_t> reported_root = parse_marked_pid(
+            capture.output_snapshot(),
+            QByteArrayLiteral("exact-custody-root "));
+        ok &= check(reported_root.has_value(), "exact-custody root pid is readable");
+        if (reported_root.has_value()) {
+            root_pid.store(*reported_root);
+        }
+        ok &= check(wait_for_file(pid_path),
+            "exact-custody shell records descendant pid");
+        ok &= check(wait_for_file(ready_path),
+            "exact-custody shell confirms descendant is ready");
+        descendant_pid = read_pid_file(pid_path);
+        ok &= check(descendant_pid.has_value(),
+            "exact-custody descendant pid file is readable");
+
+        // The shell only exits once the case holds the root's pid, so the exit
+        // report cannot outrun the observation it feeds.
+        ok &= check(create_empty_file(go_path), "exact-custody shell is released to exit");
+        ok &= check(capture.wait_for_exit(), "exact-custody shell exit is reported");
+        ok &= check(root_owned_at_exit_report.load(),
+            "the terminal still holds its root child's status when it reports the exit "
+            "that precedes its descendant cleanup");
+        if (descendant_pid.has_value()) {
+            ok &= check(wait_for_process_absent(*descendant_pid),
+                "exact-custody descendant is ended by the group cleanup");
+        }
+
+        const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+        ok &= check(exit.has_value() &&
+            exit->reason == term::Terminal_exit_reason::EXITED &&
+            exit->exit_code == 0,
+            "exact-custody shell reports the direct child's clean exit");
+        ok &= check_no_backend_errors(capture,
+            "exact-custody shell produces no backend errors");
+    }
+
+    ok &= check(unrelated_terminal->write(QByteArrayLiteral("ping\n")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "unrelated terminal accepts input after the other terminal is torn down");
+    ok &= check(unrelated_capture.wait_for_output(QByteArrayLiteral("pong-ping")),
+        "unrelated terminal answers input after the other terminal is torn down");
+    ok &= check_no_backend_errors(unrelated_capture,
+        "unrelated terminal produces no backend errors");
+
+    if (descendant_pid.has_value() && process_is_alive(*descendant_pid)) {
+        ::kill(*descendant_pid, SIGKILL);
+    }
+
+    return ok;
+#endif
+}
+
+// The discriminating case for the same defect: an unrelated process group
+// really does take the released number, and must survive the cleanup that
+// follows.
+bool test_released_group_number_is_not_signalled()
+{
+#if !defined(__linux__)
+    std::cout << "skipped: released group-number reuse requires Linux /proc\n";
+    return true;
+#else
+    bool ok = true;
+
+    QTemporaryDir go_dir;
+    ok &= check(go_dir.isValid(), "released-number go directory is available");
+    if (!go_dir.isValid()) {
+        return false;
+    }
+
+    const QString go_path = go_dir.filePath(QStringLiteral("root.go"));
+
+    std::mutex              barrier_mutex;
+    std::condition_variable barrier_cv;
+    bool                    exit_reported             = false;
+    bool                    cleanup_allowed           = false;
+    bool                    root_owned_at_exit_report = false;
+    bool                    occupied                  = false;
+    QByteArray              unavailable;
+    Group_bystander         bystander;
+    std::atomic<pid_t>      root_pid{-1};
+    {
+        Backend_capture capture;
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        const term::Terminal_backend_result start_result = backend->start(
+            shell_launch_config(
+                QStringLiteral(
+                    "echo released-number-root $$; "
+                    "while [ ! -f %1 ]; do sleep 0.05; done; "
+                    "exit 0").arg(shell_quote(go_path))),
+            capture.callbacks({}, [&] {
+                {
+                    std::lock_guard<std::mutex> lock(barrier_mutex);
+                    exit_reported = true;
+                }
+                barrier_cv.notify_all();
+
+                std::unique_lock<std::mutex> lock(barrier_mutex);
+                barrier_cv.wait_for(lock, k_wait_timeout, [&] {
+                    return cleanup_allowed;
+                });
+            }));
+        ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "released-number shell starts");
+        ok &= check(capture.wait_for_output(QByteArrayLiteral("released-number-root ")),
+            "released-number shell reports its own pid");
+        const std::optional<pid_t> reported_root = parse_marked_pid(
+            capture.output_snapshot(),
+            QByteArrayLiteral("released-number-root "));
+        ok &= check(reported_root.has_value(), "released-number root pid is readable");
+        if (!reported_root.has_value()) {
+            return false;
+        }
+        root_pid.store(*reported_root);
+        ok &= check(create_empty_file(go_path), "released-number shell is released to exit");
+
+        // Hold the terminal between its exit report and the group cleanup that
+        // follows it, which is where the group number is named.
+        {
+            std::unique_lock<std::mutex> lock(barrier_mutex);
+            ok &= check(barrier_cv.wait_for(lock, k_wait_timeout, [&] {
+                    return exit_reported;
+                }),
+                "released-number shell exit is reported");
+        }
+
+        root_owned_at_exit_report = process_is_own_unreaped_child(root_pid.load());
+        occupied = bystander.occupy(root_pid.load(), unavailable);
+
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            cleanup_allowed = true;
+        }
+        barrier_cv.notify_all();
+
+        ok &= check(capture.wait_for_exit(), "released-number shell exit is observed");
+        ok &= check_no_backend_errors(capture,
+            "released-number shell produces no backend errors");
+    }
+
+    ok &= check(root_owned_at_exit_report,
+        "the terminal still holds its root child's status when it names the group it leads");
+    if (occupied) {
+        std::cout << "released group number was taken by an unrelated session\n";
+        ok &= check(bystander.still_running(),
+            "an unrelated process group that took the released number survives the cleanup");
+    }
+    else
+    if (unavailable == QByteArrayLiteral("the group number could not be reused")) {
+        std::cout << "released group number stayed unavailable to an unrelated session\n";
+    }
+    else {
+        std::cout << "skipped: released group-number reuse unavailable: "
+            << unavailable.constData() << '\n';
+    }
+
+    return ok;
+#endif
+}
+
 bool test_terminate_kills_descendant_in_target_group()
 {
     bool ok = true;
@@ -1482,6 +1893,8 @@ int main(int argc, char** argv)
     ok &= test_paused_release_with_tight_delivery_limits_does_not_trap_output();
     ok &= test_destructor_from_output_callback_returns();
     ok &= test_destructor_from_process_exited_callback_returns();
+    ok &= test_descendant_cleanup_precedes_root_status_consumption();
+    ok &= test_released_group_number_is_not_signalled();
     ok &= test_terminate_kills_descendant_in_target_group();
     ok &= test_terminate(fixture_path);
     ok &= test_terminate_accepts_zero_grace_policy(fixture_path);

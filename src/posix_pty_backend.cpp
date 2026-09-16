@@ -404,17 +404,16 @@ bool pipe_read_exact(int fd, int& value)
     pipe_write_errno_and_exit(startup_error_write, errno);
 }
 
-Terminal_exit_reason exit_reason_from_wait_status(
-    int                                    status,
+Terminal_exit_reason exit_reason_from_exit_info(
+    const siginfo_t&                       exit_info,
     std::optional<Terminal_exit_reason>    override_reason)
 {
     if (override_reason.has_value()) {
         return *override_reason;
     }
 
-    if (WIFSIGNALED(status)) {
-        const int signal_number = WTERMSIG(status);
-        if (signal_number == SIGINT) {
+    if (exit_info.si_code == CLD_KILLED || exit_info.si_code == CLD_DUMPED) {
+        if (exit_info.si_status == SIGINT) {
             return Terminal_exit_reason::INTERRUPTED;
         }
 
@@ -424,14 +423,14 @@ Terminal_exit_reason exit_reason_from_wait_status(
     return Terminal_exit_reason::EXITED;
 }
 
-int exit_code_from_wait_status(int status)
+int exit_code_from_exit_info(const siginfo_t& exit_info)
 {
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
+    if (exit_info.si_code == CLD_EXITED) {
+        return exit_info.si_status;
     }
 
-    if (WIFSIGNALED(status)) {
-        return 128 + WTERMSIG(status);
+    if (exit_info.si_code == CLD_KILLED || exit_info.si_code == CLD_DUMPED) {
+        return 128 + exit_info.si_status;
     }
 
     return 1;
@@ -443,6 +442,22 @@ int waitpid_nointr(pid_t pid, int* status, int options)
         const pid_t result = ::waitpid(pid, status, options);
         if (result >= 0 || errno != EINTR) {
             return static_cast<int>(result);
+        }
+    }
+}
+
+// waitid() reports the same termination as waitpid() but can leave the status
+// waitable (WNOWAIT), which is what keeps the child's PID -- and therefore the
+// number of the process group it leads -- reserved for this backend after it
+// has exited. The siginfo_t is cleared first because a caller reads si_code and
+// si_status even when the call reports an error.
+int waitid_nointr(pid_t pid, siginfo_t& exit_info, int options)
+{
+    for (;;) {
+        exit_info = siginfo_t{};
+        const int result = ::waitid(P_PID, static_cast<id_t>(pid), &exit_info, options);
+        if (result == 0 || errno != EINTR) {
+            return result;
         }
     }
 }
@@ -521,10 +536,10 @@ Signal_targets process_signal_targets(pid_t child_process_group, int master)
 Signal_targets shutdown_signal_targets(
     pid_t  child_process_group,
     int    master,
-    bool   child_reaped,
+    bool   root_exited,
     bool   reader_finished)
 {
-    if (child_reaped && reader_finished) {
+    if (root_exited && reader_finished) {
         return {};
     }
 
@@ -820,7 +835,8 @@ public:
             m_reader_finished                    = false;
             m_writer_failed                      = false;
             m_startup_aborted                    = false;
-            m_child_reaped                       = false;
+            m_root_exited                        = false;
+            m_root_consumed                      = false;
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
             m_paused_output_limits =
@@ -1022,7 +1038,6 @@ public:
 
     Terminal_backend_result terminate()
     {
-        pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
         QByteArray paused_output;
@@ -1037,7 +1052,6 @@ public:
                         QStringLiteral("POSIX PTY terminate requires a running process"));
             }
 
-            child_pid           = m_child_pid;
             child_process_group = m_child_process_group;
             master              = m_master.get();
             policy              = m_termination_policy;
@@ -1064,27 +1078,25 @@ public:
         m_write_cv.notify_all();
         wake_io_threads();
         return start_termination_escalation(
-            child_pid,
             process_signal_targets(child_process_group, master),
             policy);
     }
 
     Terminal_backend_result start_termination_escalation(
-        pid_t                          child_pid,
         Signal_targets                 targets,
         Terminal_termination_policy    policy)
     {
         return start_native_backend_termination_escalation(
             call_state(),
             m_termination_thread,
-            [this, child_pid, targets, policy] {
-                termination_escalation_loop(child_pid, targets, policy);
+            [this, targets, policy] {
+                termination_escalation_loop(targets, policy);
             },
-            [targets](const std::exception& error) {
+            [this, targets](const std::exception& error) {
                 const QString message =
                     QStringLiteral("POSIX PTY termination escalation worker failed: %1")
                         .arg(QString::fromLocal8Bit(error.what()));
-                const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
+                const std::optional<int> kill_error = signal_owned_targets(targets, SIGKILL);
                 if (kill_error.has_value()) {
                     return
                         backend_reject(
@@ -1098,11 +1110,10 @@ public:
 
     void shutdown()
     {
-        pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
         Signal_targets targets;
-        bool child_reaped         = false;
+        bool root_exited          = false;
         bool reader_finished      = false;
         bool close_master         = false;
         {
@@ -1118,16 +1129,15 @@ public:
             m_output_paused                      = false;
             m_paused_output_delivery_in_progress = false;
             m_callbacks                          = {};
-            child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            child_reaped                         = m_child_reaped;
+            root_exited                          = m_root_exited;
             reader_finished                      = m_reader_finished;
             if (m_master) {
                 master = m_master.get();
                 targets = shutdown_signal_targets(
                     child_process_group,
                     master,
-                    child_reaped,
+                    root_exited,
                     reader_finished);
                 if (defer_master_close) {
                     m_close_master_pending = true;
@@ -1141,7 +1151,7 @@ public:
                 targets = shutdown_signal_targets(
                     child_process_group,
                     master,
-                    child_reaped,
+                    root_exited,
                     reader_finished);
             }
         }
@@ -1150,20 +1160,21 @@ public:
         m_write_cv.notify_all();
         wake_io_threads();
 
-        (void)send_signal_to_targets(targets, SIGKILL);
+        (void)signal_owned_targets(targets, SIGKILL);
 
         // The signal above targets process groups (kill(-pgid)). During the
         // brief window after forkpty() but before the child has established its
         // own session/process group, kill(-pgid) fails with ESRCH -- which
         // send_signal_to_targets() ignores -- so the still-running child is not
-        // killed. The wait thread is then stuck forever in its blocking
-        // waitpid(child_pid) and join_native_backend_threads() below deadlocks,
-        // hanging teardown. (The race is timing-dependent and was observed on
-        // macOS.) Signal the child PID directly, which always reaches it, so
-        // waitpid() returns and the wait thread can be joined.
-        if (!child_reaped && child_pid > 0) {
-            ::kill(child_pid, SIGKILL);
-        }
+        // killed. The wait thread is then stuck forever in its blocking wait on
+        // the child and join_native_backend_threads() below deadlocks, hanging
+        // teardown. (The race is timing-dependent and was observed on macOS.)
+        // Signal the child directly, which always reaches it, so the wait
+        // returns and the wait thread can be joined. Reaching it by PID is
+        // exact only while the status is unconsumed, which signal_owned_root()
+        // decides under the mutex the consuming wait also takes; a snapshot
+        // taken above would already be stale by now.
+        signal_owned_root(SIGKILL);
 
         // In ordinary shutdown, close the master before
         // join_native_backend_threads() so a child blocked writing to the slave
@@ -1178,7 +1189,7 @@ public:
             m_writer_thread,
             m_wait_thread,
             m_termination_thread);
-        reap_child_if_unreaped(child_pid);
+        consume_root_status();
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_master.reset();
@@ -1220,11 +1231,10 @@ public:
 
     void request_shutdown_without_cleanup()
     {
-        pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
         Signal_targets targets;
-        bool child_reaped         = false;
+        bool root_exited          = false;
         bool reader_finished      = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -1238,36 +1248,25 @@ public:
             m_output_paused                      = false;
             m_paused_output_delivery_in_progress = false;
             m_callbacks                          = {};
-            child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            child_reaped                         = m_child_reaped;
+            root_exited                          = m_root_exited;
             reader_finished                      = m_reader_finished;
             if (m_master) {
                 master = m_master.get();
-                targets = shutdown_signal_targets(
-                    child_process_group,
-                    master,
-                    child_reaped,
-                    reader_finished);
             }
-            else {
-                targets = shutdown_signal_targets(
-                    child_process_group,
-                    master,
-                    child_reaped,
-                    reader_finished);
-            }
+            targets = shutdown_signal_targets(
+                child_process_group,
+                master,
+                root_exited,
+                reader_finished);
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
 
-        (void)send_signal_to_targets(targets, SIGKILL);
-
-        if (!child_reaped && child_pid > 0) {
-            ::kill(child_pid, SIGKILL);
-        }
+        (void)signal_owned_targets(targets, SIGKILL);
+        signal_owned_root(SIGKILL);
     }
 
 private:
@@ -1298,7 +1297,7 @@ private:
         };
     }
 
-    void report_exit_once(int wait_status)
+    void report_exit_once(const siginfo_t& exit_info)
     {
         std::optional<Terminal_exit_reason> override_reason;
         {
@@ -1307,8 +1306,8 @@ private:
         }
 
         report_exit_once(
-            exit_reason_from_wait_status(wait_status, override_reason),
-            exit_code_from_wait_status(wait_status));
+            exit_reason_from_exit_info(exit_info, override_reason),
+            exit_code_from_exit_info(exit_info));
     }
 
     void report_exit_once(Terminal_exit_reason reason, int exit_code)
@@ -1424,37 +1423,83 @@ private:
             });
     }
 
-    // Block until the exit-drain window (reap_time + k_exit_output_drain_timeout)
+    // Block until the exit-drain window (exit_time + k_exit_output_drain_timeout)
     // elapses, returning early if shutdown begins. Uses m_output_cv, which
     // shutdown notifies after setting m_stopping, so teardown is never delayed.
-    void wait_out_exit_drain_window(std::chrono::steady_clock::time_point reap_time)
+    void wait_out_exit_drain_window(std::chrono::steady_clock::time_point exit_time)
     {
-        const auto deadline = reap_time + k_exit_output_drain_timeout;
+        const auto deadline = exit_time + k_exit_output_drain_timeout;
         std::unique_lock<std::mutex> lock(m_mutex);
         m_output_cv.wait_until(lock, deadline, [&] {
             return m_stopping;
         });
     }
 
-    void reap_child_if_unreaped(pid_t child_pid)
+    // Consume the root child's exit status, which is what finally releases its
+    // PID and the number of the process group it leads. Both coordinates are
+    // retired under the mutex before the wait runs, so a signalling path that
+    // wins the mutex first either finds them owned -- and the kernel still
+    // cannot have given them away -- or finds them retired and sends nothing.
+    void consume_root_status()
     {
-        if (child_pid <= 0) {
+        pid_t child_pid = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_root_consumed || m_child_pid <= 0) {
+                return;
+            }
+
+            m_root_consumed       = true;
+            child_pid             = m_child_pid;
+            m_child_pid           = -1;
+            m_child_process_group = -1;
+        }
+
+        // A failing wait leaves the status unconsumed, but the coordinates stay
+        // retired and are never signalled again: a backend that has stopped
+        // being able to wait for its child can no longer tell it from a later
+        // holder of the same number.
+        (void)waitpid_nointr(child_pid, nullptr, 0);
+    }
+
+    // A signal that names a PID or a process group by number reaches exactly
+    // this terminal's family only while the root child's status is unconsumed:
+    // the root leads the group, so the kernel keeps both its PID and the group
+    // number reserved until that status is taken. Every such signal, and every
+    // liveness probe that names the same numbers, therefore asks here, under
+    // the mutex that consume_root_status() takes before it waits.
+    std::optional<int> signal_owned_targets(
+        const Signal_targets&  targets,
+        int                    signal_number)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_root_consumed) {
+            return std::nullopt;
+        }
+
+        return send_signal_to_targets(targets, signal_number);
+    }
+
+    void signal_owned_root(int signal_number)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_root_consumed || m_child_pid <= 0) {
             return;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_child_reaped) {
-                return;
-            }
+        ::kill(m_child_pid, signal_number);
+    }
+
+    void signal_owned_child_process_group(int signal_number)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_root_consumed) {
+            return;
         }
 
-        const int result = waitpid_nointr(child_pid, nullptr, 0);
-        if (result == child_pid || (result < 0 && errno == ECHILD)) {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_child_reaped = true;
-            m_child_pid = -1;
-        }
+        (void)send_signal_to_targets(
+            process_signal_targets(m_child_process_group, m_master.get()),
+            signal_number);
     }
 
     bool signal_target_active(pid_t process_group)
@@ -1480,6 +1525,14 @@ private:
 
     bool signal_targets_active(const Signal_targets& targets)
     {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_root_consumed) {
+            // The numbers these targets hold have been released, so only a
+            // stranger that reused one could answer the probe. Nothing this
+            // backend is entitled to reach is still reachable through them.
+            return false;
+        }
+
         for (std::size_t i = 0U; i < targets.count; ++i) {
             if (signal_target_active(targets.process_groups[i])) {
                 return true;
@@ -1589,7 +1642,7 @@ private:
                     break;
                 }
 
-                if (m_child_reaped && !final_drain_deadline.has_value()) {
+                if (m_root_exited && !final_drain_deadline.has_value()) {
                     final_drain_deadline =
                         std::chrono::steady_clock::now() + k_exit_output_drain_timeout;
                 }
@@ -1849,19 +1902,29 @@ private:
             return;
         }
 
-        int status = 0;
-        const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
-        const int reaped_errno = errno;
-        const auto reap_time = std::chrono::steady_clock::now();
-        if (reaped != child_pid) {
-            const int wait_error = reaped_errno;
+        // Observe the exit without consuming it. The status stays waitable, so
+        // the root's PID -- and the number of the process group it leads -- stay
+        // reserved for this backend until the descendant cleanup below has
+        // finished naming them. consume_root_status() at the end of this
+        // function is what releases them.
+        siginfo_t exit_info{};
+        const int observed = waitid_nointr(child_pid, exit_info, WEXITED | WNOWAIT);
+        const int observe_errno = errno;
+        const auto exit_time = std::chrono::steady_clock::now();
+        if (observed != 0) {
+            const int wait_error = observe_errno;
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_child_reaped = wait_error == ECHILD;
-                if (m_child_reaped) {
-                    m_child_pid = -1;
+                // ECHILD means the status is already gone: something outside
+                // this backend consumed it, so both coordinates are retired
+                // and nothing may name them again.
+                m_root_exited   = wait_error == ECHILD;
+                m_root_consumed = m_root_exited;
+                if (m_root_consumed) {
+                    m_child_pid           = -1;
+                    m_child_process_group = -1;
                 }
                 m_process_stopping = true;
                 m_output_paused = false;
@@ -1902,8 +1965,7 @@ private:
         bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_child_reaped     = true;
-            m_child_pid        = -1;
+            m_root_exited      = true;
             m_process_stopping = true;
             m_output_paused    = false;
             m_post_exit_process_group_cleanup_pending = true;
@@ -1937,7 +1999,7 @@ private:
         // within microseconds on macOS -- before a consumer could observe the
         // descendant alive -- diverging from Linux. Wait out the remainder of the
         // drain window (interruptibly, so shutdown is not delayed).
-        wait_out_exit_drain_window(reap_time);
+        wait_out_exit_drain_window(exit_time);
         drain_paused_output_before_exit_report();
         // Report the child's exit BEFORE reaping leftover descendants. The
         // descendant must remain observable as alive until the backend reports
@@ -1946,11 +2008,12 @@ private:
         // landing slightly later. Killing first would race the descendant dead
         // before the exit is reported -- which on macOS (immediate EOF, no drain
         // wait) happens fast enough to be observed.
-        report_exit_once(status);
-        kill_child_process_group_after_exit_timeout();
+        report_exit_once(exit_info);
+        kill_child_process_group_before_consuming_root();
+        consume_root_status();
     }
 
-    void kill_child_process_group_after_exit_timeout()
+    void kill_child_process_group_before_consuming_root()
     {
         // Kill any leftover members of the child's process group (e.g. a
         // backgrounded descendant still holding the PTY slave open) once the
@@ -1962,23 +2025,18 @@ private:
         // finishes via EOF (timed_out == false) and the descendant would leak.
         // kill(-pgid) is best effort and ignores ESRCH, so a clean exit with no
         // descendants is a harmless no-op.
-        pid_t child_process_group = -1;
-        Signal_targets targets;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            child_process_group = m_child_process_group;
-            targets = process_signal_targets(child_process_group, m_master.get());
-        }
-
-        (void)send_signal_to_targets(targets, SIGKILL);
+        //
+        // The group is named by the exited root's PID, and the caller has not
+        // consumed that status yet, so the number still belongs to this
+        // terminal's family and cannot have been handed to an unrelated group.
+        // Consuming it first and signalling afterwards would name whatever had
+        // since taken the number.
+        signal_owned_child_process_group(SIGKILL);
 
         int master_to_close = -1;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_post_exit_process_group_cleanup_pending = false;
-            if (m_child_process_group == child_process_group) {
-                m_child_process_group = -1;
-            }
             master_to_close = take_pending_master_close_if_ready_locked();
         }
 
@@ -1988,17 +2046,14 @@ private:
     }
 
     void termination_escalation_loop(
-        pid_t                          child_pid,
         Signal_targets                 targets,
         Terminal_termination_policy    policy)
     {
-        (void)child_pid;
-
         if (!signal_targets_active(targets)) {
             return;
         }
 
-        const std::optional<int> term_error = send_signal_to_targets(targets, SIGTERM);
+        const std::optional<int> term_error = signal_owned_targets(targets, SIGTERM);
         if (term_error.has_value()) {
             report_native_backend_error_with_snapshot(
                 m_mutex,
@@ -2012,7 +2067,7 @@ private:
             return;
         }
 
-        const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
+        const std::optional<int> kill_error = signal_owned_targets(targets, SIGKILL);
         if (kill_error.has_value()) {
             report_native_backend_error_with_snapshot(
                 m_mutex,
@@ -2075,7 +2130,11 @@ private:
     bool                                m_post_exit_process_group_cleanup_pending = false;
     bool                                m_reader_finished = false;
     bool                                m_writer_failed = false;
-    bool                                m_child_reaped = false;
+    // The root child's termination has been observed; its status may or may not
+    // have been taken yet. Only m_root_consumed retires the PID and process-group
+    // numbers this backend signals by.
+    bool                                m_root_exited = false;
+    bool                                m_root_consumed = false;
 };
 
 Posix_pty_backend::Posix_pty_backend()
