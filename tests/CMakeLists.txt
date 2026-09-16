@@ -2020,8 +2020,15 @@ if(WIN32)
         windows_conpty_backend/windows_conpty_backend_tests.cpp
     )
 
+    # Kept out of vnm_terminal_test_process_targets: that setup replaces the
+    # error mode at startup, and this program reports the one it inherited.
+    add_executable(vnm_terminal_error_mode_reporter
+        windows_conpty_backend/error_mode_reporter.cpp
+    )
+
     add_dependencies(vnm_terminal_windows_conpty_backend
         vnm_terminal_canvas_fixture
+        vnm_terminal_error_mode_reporter
     )
 
     target_link_libraries(vnm_terminal_windows_conpty_backend PRIVATE
@@ -2051,6 +2058,7 @@ if(WIN32)
             "${vnm_terminal_qt_runtime_path}"
             "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
             "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+            "$<TARGET_FILE:vnm_terminal_error_mode_reporter>"
     )
 
     set_tests_properties(vnm_terminal_windows_conpty_backend PROPERTIES

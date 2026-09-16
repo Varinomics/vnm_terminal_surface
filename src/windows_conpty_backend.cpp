@@ -870,9 +870,15 @@ public:
         }
         Unique_handle process_job = std::move(process_job_result.handle);
 
+        // A process hosting terminals may suppress loader and critical-error
+        // dialogs for its own helpers, and Windows hands that error mode to
+        // every child that does not opt out. The terminal runs the user's own
+        // program, which must behave as it would in any other console, missing
+        // DLL dialog included.
         DWORD creation_flags =
             EXTENDED_STARTUPINFO_PRESENT |
             CREATE_UNICODE_ENVIRONMENT |
+            CREATE_DEFAULT_ERROR_MODE |
             CREATE_SUSPENDED;
         if (effective_config.process_group_policy ==
             Terminal_process_group_policy::CREATE_NEW_SESSION)

@@ -11,6 +11,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QIODevice>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -1584,6 +1585,38 @@ bool test_unicode_paste_preserves_console_input(const QString& executable_path)
     }
     ok &= check(received == expected, "Unicode paste preserves box borders and symbols without protocol residue");
     ok &= check_no_backend_errors(capture, "Unicode paste produces no backend errors");
+    return ok;
+}
+
+bool test_terminal_child_starts_with_default_error_mode(const QString& reporter_path)
+{
+    // Stand in for a host that suppresses loader dialogs for its own helpers.
+    const UINT suppression = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX;
+    const UINT host_mode   = SetErrorMode(GetErrorMode() | suppression);
+    bool ok = check((GetErrorMode() & suppression) == suppression,
+        "hosting process suppresses loader dialogs");
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    const auto started = backend->start(launch_config(reporter_path, {}), capture.callbacks());
+    SetErrorMode(host_mode);
+    if (!check(started.code == term::Terminal_backend_result_code::ACCEPTED,
+            "error mode reporter starts"))
+    {
+        return false;
+    }
+
+    ok &= check(capture.wait_for_exit(), "error mode reporter exits");
+    const QRegularExpressionMatch reported =
+        QRegularExpression(QStringLiteral("error-mode=(\\d+)"))
+            .match(QString::fromUtf8(capture.output_snapshot()));
+    bool parsed = false;
+    const UINT child_mode = reported.captured(1).toUInt(&parsed);
+    std::cerr << "terminal child error mode=0x" << std::hex << child_mode << std::dec << '\n';
+    ok &= check(parsed, "error mode reporter prints its error mode");
+    ok &= check((child_mode & suppression) == 0,
+        "terminal child keeps the loader dialogs its hosting process suppresses");
+    ok &= check_no_backend_errors(capture, "error mode reporter produces no backend errors");
     return ok;
 }
 
@@ -3550,12 +3583,13 @@ int main(int argc, char** argv)
     if (argc == 3 && std::string_view(argv[1]) == "--paste-input-reader") {
         return run_paste_input_reader(QString::fromLocal8Bit(argv[2]));
     }
-    if (argc != 2) {
-        std::cerr << "usage: windows_conpty_backend_tests <fixture-executable>\n";
+    if (argc != 3) {
+        std::cerr << "usage: windows_conpty_backend_tests <fixture-executable> <error-mode-reporter>\n";
         return 2;
     }
 
-    const QString fixture_path = QString::fromLocal8Bit(argv[1]);
+    const QString fixture_path  = QString::fromLocal8Bit(argv[1]);
+    const QString reporter_path = QString::fromLocal8Bit(argv[2]);
 
     bool ok = true;
     const auto run_test = [&ok](std::string_view test_name, bool test_result) {
@@ -3571,6 +3605,8 @@ int main(int argc, char** argv)
     run_test("compatibility window forced close", test_compatibility_window_stays_hidden(fixture_path, true));
     run_test("Unicode paste preserves console input",
         test_unicode_paste_preserves_console_input(QString::fromLocal8Bit(argv[0])));
+    run_test("terminal child starts with default error mode",
+        test_terminal_child_starts_with_default_error_mode(reporter_path));
     run_test("resize storm reports final shell size",
         test_resize_storm_reports_final_shell_size(fixture_path));
     run_test("resize interleaved with shell output",
