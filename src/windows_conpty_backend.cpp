@@ -26,6 +26,7 @@ DECLARE_HANDLE(HPCON);
 #include <QProcessEnvironment>
 #include <QStringList>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -50,6 +51,13 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
+// Bounds the wait for a created-but-rejected child to leave. TerminateProcess
+// and TerminateJobObject only queue the kill, so the root handle is the only
+// exit observation Windows offers, and a suspended child that has never run an
+// instruction signals it in about a millisecond. A start that outlasts the
+// bound is reported as an unsettled native child rather than as no child at
+// all, so the wait never has to grow to cover a pathological host.
+constexpr std::chrono::milliseconds k_conpty_failed_start_settle_grace(1000);
 // Keep the ConPTY pipe draining while session output is paused, but keep the
 // existing backend-side paused buffer ceiling for default session limits.
 constexpr std::size_t k_conpty_paused_output_high_watermark_ceiling_bytes =
@@ -75,6 +83,11 @@ bool process_exited_within(HANDLE process, std::chrono::milliseconds interval)
 {
     return WaitForSingleObject(process, wait_timeout_from_interval(interval)) == WAIT_OBJECT_0;
 }
+
+std::atomic<Windows_conpty_start_failure_injection> s_start_failure_injection{
+    Windows_conpty_start_failure_injection::NONE};
+std::atomic<bool>  s_suppress_failed_start_termination{false};
+std::atomic<DWORD> s_last_created_process_id{0U};
 
 class Unique_handle
 {
@@ -732,13 +745,15 @@ public:
         const auto reject_start = [&] (
             Terminal_backend_error_code code,
             QString                     message,
-            bool                        native_dispatch_occurred = false) {
+            bool                        native_dispatch_occurred = false,
+            bool                        determinate              = true) {
             return reject_native_backend_start_attempt(
                 callbacks,
                 start_gate,
                 code,
                 std::move(message),
-                native_dispatch_occurred);
+                native_dispatch_occurred,
+                determinate);
         };
 
         const std::optional<QString> resolved_executable =
@@ -911,29 +926,89 @@ public:
         Unique_handle thread_handle(process_information.hThread);
         pty_input_read.reset();
         pty_output_write.reset();
+        s_last_created_process_id.store(
+            process_information.dwProcessId,
+            std::memory_order_relaxed);
+        const Windows_conpty_start_failure_injection injected_failure =
+            s_start_failure_injection.exchange(
+                Windows_conpty_start_failure_injection::NONE,
+                std::memory_order_relaxed);
 
-        if (!AssignProcessToJobObject(process_job.get(), process_handle.get())) {
-            const DWORD assign_job_error = GetLastError();
-            TerminateProcess(process_handle.get(), 1U);
+        // A child that exists is this backend's obligation even when the start
+        // is rejected. Request the strongest termination the failure leaves
+        // valid, then wait on the exact root handle, because a termination
+        // request is not an exit. A child that outlasts the wait is moved into
+        // backend state so destruction acts on it again instead of closing its
+        // handles silently, and the rejection is reported as indeterminate so
+        // no consumer can record the start as "no child was ever created".
+        const auto reject_created_child = [&] (
+            Unique_handle  containing_job,
+            QString        message) {
+            if (!s_suppress_failed_start_termination.load(std::memory_order_relaxed)) {
+                if (containing_job) {
+                    TerminateJobObject(containing_job.get(), 1U);
+                }
+                else {
+                    TerminateProcess(process_handle.get(), 1U);
+                }
+            }
+
+            const bool settled = process_exited_within(
+                process_handle.get(),
+                k_conpty_failed_start_settle_grace);
+            // Release the pseudoconsole after the shell is gone where it can
+            // be: closing it first would hand the packaged close its own
+            // still-attached client to drain.
             conpty_api->close(local_conpty);
+            if (!settled) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_process_job = std::move(containing_job);
+                m_process     = std::move(process_handle);
+            }
+
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
+                    std::move(message),
+                    true,
+                    settled);
+        };
+
+        BOOL assigned_to_job = FALSE;
+        if (injected_failure == Windows_conpty_start_failure_injection::JOB_ASSIGNMENT) {
+            SetLastError(ERROR_ACCESS_DENIED);
+        }
+        else {
+            assigned_to_job =
+                AssignProcessToJobObject(process_job.get(), process_handle.get());
+        }
+        if (!assigned_to_job) {
+            const DWORD assign_job_error = GetLastError();
+            // The child never entered this backend's Job, so its own handle is
+            // the only containment this failure leaves valid.
+            return
+                reject_created_child(
+                    Unique_handle{},
                     windows_error_message(
                         QStringLiteral("AssignProcessToJobObject"),
-                        assign_job_error),
-                    true);
+                        assign_job_error));
         }
 
-        if (ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+        DWORD resume_result = static_cast<DWORD>(-1);
+        if (injected_failure == Windows_conpty_start_failure_injection::RESUME_THREAD) {
+            SetLastError(ERROR_ACCESS_DENIED);
+        }
+        else {
+            resume_result = ResumeThread(thread_handle.get());
+        }
+        if (resume_result == static_cast<DWORD>(-1)) {
             const DWORD resume_error = GetLastError();
-            TerminateJobObject(process_job.get(), 1U);
-            conpty_api->close(local_conpty);
+            // Assignment succeeded, so the Job contains whatever the child
+            // reaches; the root handle still supplies the exit proof.
             return
-                reject_start(
-                    Terminal_backend_error_code::START_FAILED,
-                    windows_error_message(QStringLiteral("ResumeThread"), resume_error),
-                    true);
+                reject_created_child(
+                    std::move(process_job),
+                    windows_error_message(QStringLiteral("ResumeThread"), resume_error));
         }
 
         {
@@ -2162,6 +2237,22 @@ Windows_conpty_backend::write_state_for_testing()
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->write_state_for_testing();
+}
+
+void windows_conpty_inject_start_failure_after_creation_for_testing(
+    Windows_conpty_start_failure_injection injection)
+{
+    s_start_failure_injection.store(injection, std::memory_order_relaxed);
+}
+
+void windows_conpty_suppress_failed_start_termination_for_testing(bool suppress)
+{
+    s_suppress_failed_start_termination.store(suppress, std::memory_order_relaxed);
+}
+
+unsigned long windows_conpty_last_created_process_id_for_testing()
+{
+    return s_last_created_process_id.load(std::memory_order_relaxed);
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()

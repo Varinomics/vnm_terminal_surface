@@ -28,6 +28,32 @@ struct Windows_conpty_backend_write_state_for_testing
     bool        interrupt_left_write_queue = false;
 };
 
+// Which of the two post-creation start failures to force on the next start.
+// Windows offers no way to make AssignProcessToJobObject or ResumeThread fail
+// on demand, and the created-child custody the backend owes after either one is
+// only observable when they do.
+enum class Windows_conpty_start_failure_injection
+{
+    NONE,
+    JOB_ASSIGNMENT,
+    RESUME_THREAD,
+};
+
+// Arms one injected post-creation failure; the next start consumes it.
+void windows_conpty_inject_start_failure_after_creation_for_testing(
+    Windows_conpty_start_failure_injection injection);
+
+// Withholds the termination request a rejected created child would receive, so
+// a test can hold that child alive across the rejection and see whether the
+// backend reports a settled exit it never observed. The retained custody still
+// acts on destruction, which is what settles the child.
+void windows_conpty_suppress_failed_start_termination_for_testing(
+    bool                                   suppress);
+
+// The process id of the most recent child this backend created, so a test can
+// name the exact process whose custody it is checking.
+unsigned long windows_conpty_last_created_process_id_for_testing();
+
 class Windows_conpty_backend final : public Terminal_backend
 {
 public:

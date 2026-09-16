@@ -2616,6 +2616,90 @@ bool test_rejection_paths(const QString& fixture_path)
     return ok;
 }
 
+// A start that fails after CreateProcessW still created a child, and the exit
+// of that child is the only fact that settles it. Both branches here are the
+// real ones: the injection decides which of them runs, and withholding the
+// termination request holds the child across the rejection, so what the
+// rejection reports is an observation the backend made rather than one it
+// assumed. The scenario also runs an unrelated original throughout, because a
+// rejected start must not cost a terminal that is already taking input.
+bool test_rejected_created_child_keeps_custody(
+    const QString&                               fixture_path,
+    term::Windows_conpty_start_failure_injection injection,
+    std::string_view                             label)
+{
+    const auto message = [label](std::string_view text) {
+        return std::string(label) + ": " + std::string(text);
+    };
+
+    bool ok = true;
+
+    Backend_capture unrelated_capture;
+    std::unique_ptr<term::Terminal_backend> unrelated =
+        term::make_windows_conpty_backend();
+    ok &= check(
+        unrelated->start(
+            launch_config(fixture_path, {QStringLiteral("--hold-open")}),
+            unrelated_capture.callbacks()).code ==
+                term::Terminal_backend_result_code::ACCEPTED,
+        message("the unrelated original starts"));
+    ok &= check(
+        unrelated_capture.wait_for_output(QByteArrayLiteral("hold-open")),
+        message("the unrelated original reaches its ready marker"));
+
+    Win32_process_handle created;
+    {
+        Backend_capture capture;
+        std::unique_ptr<term::Terminal_backend> backend =
+            term::make_windows_conpty_backend();
+        term::windows_conpty_suppress_failed_start_termination_for_testing(true);
+        term::windows_conpty_inject_start_failure_after_creation_for_testing(injection);
+        const term::Terminal_backend_result start_result =
+            backend->start(
+                launch_config(fixture_path, {QStringLiteral("--hold-open")}),
+                capture.callbacks());
+        term::windows_conpty_suppress_failed_start_termination_for_testing(false);
+        created = open_process_handle(
+            static_cast<DWORD>(term::windows_conpty_last_created_process_id_for_testing()));
+
+        ok &= check(
+            start_result.code == term::Terminal_backend_result_code::REJECTED &&
+                start_result.error.has_value() &&
+                start_result.native_dispatch_occurred,
+            message("the injected failure rejects a start that reached the OS"));
+        ok &= check(
+            !start_result.start_outcome_determinate,
+            message("an unsettled created child is not reported as a settled start"));
+        ok &= check(
+            created.is_valid() &&
+                process_handle_is_running(created.get()) == std::optional<bool>(true),
+            message("the exact created child outlives the rejection"));
+    }
+
+    // Destruction is where the retained custody acts: the assignment failure
+    // keeps only the root handle, the resume failure keeps the Job that
+    // contains it, and either one has to finish the child it created.
+    ok &= check(
+        created.is_valid() && wait_for_process_exit(created.get()),
+        message("retained custody settles the created child"));
+    if (created.is_valid() &&
+        process_handle_is_running(created.get()) == std::optional<bool>(true))
+    {
+        TerminateProcess(created.get(), 1U);
+        (void)wait_for_process_exit(created.get());
+    }
+
+    ok &= check(
+        unrelated->write(QByteArrayLiteral("\x03")).code ==
+            term::Terminal_backend_result_code::ACCEPTED,
+        message("the unrelated original still accepts input"));
+    ok &= check(
+        unrelated_capture.wait_for_exit(),
+        message("the unrelated original acts on the input it was given"));
+
+    return ok;
+}
+
 bool test_repeated_start_precheck_callback_runs_after_gate_unlock(const QString& fixture_path)
 {
     bool ok = true;
@@ -3601,6 +3685,16 @@ int main(int argc, char** argv)
     run_test("missing working directory", test_missing_working_directory(fixture_path));
     run_test("failed executable", test_failed_executable(fixture_path));
     run_test("rejection paths", test_rejection_paths(fixture_path));
+    run_test("rejected created child keeps custody after failed Job assignment",
+        test_rejected_created_child_keeps_custody(
+            fixture_path,
+            term::Windows_conpty_start_failure_injection::JOB_ASSIGNMENT,
+            "failed Job assignment"));
+    run_test("rejected created child keeps custody after failed resume",
+        test_rejected_created_child_keeps_custody(
+            fixture_path,
+            term::Windows_conpty_start_failure_injection::RESUME_THREAD,
+            "failed resume"));
     run_test("repeated start precheck releases gate before callback",
         test_repeated_start_precheck_callback_runs_after_gate_unlock(fixture_path));
     run_test("interrupt", test_interrupt(fixture_path));
