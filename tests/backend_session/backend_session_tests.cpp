@@ -16579,6 +16579,9 @@ bool test_paste_policy_modes_and_drain()
         term::Terminal_session_result_code::ACCEPTED,
         "paste policy session starts");
 
+    // CRLF and a lone CR both leave as one carriage return, framed or not. A
+    // pasted line break is the Enter a terminal sends, and a line feed reaches
+    // a Windows console child as Ctrl+Enter - see sanitize_paste_text().
     const term::Terminal_paste_text_result disabled =
         policy_session->write_paste_text(
             QStringLiteral("line1\r\nline2\rc"),
@@ -16587,7 +16590,7 @@ bool test_paste_policy_modes_and_drain()
         disabled.result.code == term::Terminal_session_result_code::ACCEPTED,
         "disabled paste policy is accepted");
     ok &= check(policy_backend->writes.size() == 1U &&
-        policy_backend->writes.back() == QByteArrayLiteral("line1\nline2\nc"),
+        policy_backend->writes.back() == QByteArrayLiteral("line1\rline2\rc"),
         "disabled paste policy writes sanitized unframed text");
 
     const term::Terminal_paste_text_result enabled =
@@ -16598,7 +16601,7 @@ bool test_paste_policy_modes_and_drain()
         enabled.result.code == term::Terminal_session_result_code::ACCEPTED,
         "enabled paste policy is accepted");
     ok &= check(concatenate_writes(policy_backend->writes, 1U) ==
-        framed_paste(QByteArrayLiteral("multi\nline")),
+        framed_paste(QByteArrayLiteral("multi\rline")),
         "enabled paste policy writes a bracketed multiline frame");
 
     const std::size_t write_count_before_empty_paste = policy_backend->writes.size();
@@ -17027,9 +17030,11 @@ bool test_message_submission_is_one_atomic_write()
     ok &= check(framed.handled &&
         framed.result.code == term::Terminal_session_result_code::ACCEPTED,
         "bracketed multiline message is admitted");
+    // Two carriage returns with different jobs: the one inside the frame is the
+    // pasted line break, the one after the closing delimiter is the submit.
     ok &= check(backend->writes.size() == framed_write_count + 1U &&
         backend->writes.back() ==
-            framed_paste(QByteArrayLiteral("multi\nline")) + '\r',
+            framed_paste(QByteArrayLiteral("multi\rline")) + '\r',
         "submit action follows the closing bracket in one backend write");
 
     const auto commands = session->processed_commands();

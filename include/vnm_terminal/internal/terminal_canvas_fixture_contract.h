@@ -200,11 +200,15 @@ terminal_canvas_fixture_contract_script()
             0,
         },
         // Bracketed paste is expected only after the fixture has enabled mode
-        // 2004, because hosts should frame paste input from terminal state.
+        // 2004, because hosts should frame paste input from terminal state. The
+        // body's line break is a carriage return rather than a line feed: that
+        // is the byte a pasted line break has to reach the child as, because a
+        // line feed resolves through the Windows console input parser to
+        // Ctrl+Enter instead of Enter. See sanitize_paste_text().
         {
             Terminal_canvas_fixture_record_kind::EXPECT_INPUT,
             "bracketed-paste",
-            "1b5b3230307e6c696e65310a6c696e65321b5b3230317e",
+            "1b5b3230307e6c696e65310d6c696e65321b5b3230317e",
             0,
             0,
             0,
