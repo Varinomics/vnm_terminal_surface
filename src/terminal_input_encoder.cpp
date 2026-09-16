@@ -56,15 +56,29 @@ QString sanitize_paste_text(QString text, qsizetype stop_beyond_units)
     for (qsizetype i = 0; i < text.size() && sanitized.size() <= stop_beyond_units; ++i) {
         const QChar  ch   = text.at(i);
         const ushort code = ch.unicode();
-        if (code == u'\r') {
-            sanitized.append(QChar(u'\n'));
-            if (i + 1 < text.size() && text.at(i + 1) == QChar(u'\n')) {
+        // Every line break becomes one carriage return, which is what a
+        // terminal sends for Enter. A line feed is not a weaker spelling of
+        // it: the Windows console input parser resolves an unrecognised C0
+        // byte through VkKeyScanW(), and VkKeyScanW(0x0a) answers VK_RETURN
+        // with the control modifier, so a pasted line feed arrives at the
+        // child as Ctrl+Enter. PSReadLine binds Ctrl+Enter to InsertLineAbove,
+        // which put each pasted line above the one before it and ran the
+        // pasted sequence backwards; cmd.exe has no line-editor binding for it
+        // and merged the whole paste into a single command line. Shift+Enter
+        // taught the same lesson for a single key - see
+        // win32_shift_enter_bytes().
+        if (code == u'\r' || code == u'\n') {
+            sanitized.append(QChar(u'\r'));
+            if (code == u'\r' &&
+                i + 1 < text.size() &&
+                text.at(i + 1) == QChar(u'\n'))
+            {
                 ++i;
             }
             continue;
         }
 
-        if (code == u'\n' || code == u'\t') {
+        if (code == u'\t') {
             sanitized.append(ch);
             continue;
         }

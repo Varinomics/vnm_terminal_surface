@@ -15311,7 +15311,7 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
         ok &= check(fixture.surface.paste_text(QStringLiteral("plain\r\ntext")),
             "application-controlled paste without DECSET returns true");
         ok &= check(joined_writes_since(backend_ptr->writes, initial_write_index) ==
-            QByteArrayLiteral("plain\ntext"),
+            QByteArrayLiteral("plain\rtext"),
             "application-controlled paste without DECSET writes unframed sanitized text");
 
         const std::size_t message_write_index = backend_ptr->writes.size();
@@ -15379,6 +15379,22 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
         ok &= check(joined_writes_since(backend_ptr->writes, reader_write_index) ==
             framed_paste(QByteArrayLiteral("reader-paste")),
             "surface paste_clipboard_text writes injected clipboard text");
+
+        // The clipboard entry point a right-click and Ctrl+V both reach, with a
+        // clipboard the way Windows fills one. Every line break has to leave as
+        // a carriage return: a line feed reaches a ConPTY child as Ctrl+Enter,
+        // which reordered pasted lines under PSReadLine and merged them in cmd.
+        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
+            return QStringLiteral(
+                "echo STEP-ONE\r\necho STEP-TWO\r\necho STEP-THREE");
+        });
+        const std::size_t multiline_write_index = backend_ptr->writes.size();
+        ok &= check(fixture.surface.paste_clipboard_text(),
+            "surface paste_clipboard_text accepts a multiline clipboard");
+        ok &= check(joined_writes_since(backend_ptr->writes, multiline_write_index) ==
+            framed_paste(QByteArrayLiteral(
+                "echo STEP-ONE\recho STEP-TWO\recho STEP-THREE")),
+            "clipboard paste sends one carriage return for every pasted line break");
 
         fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
             return std::nullopt;

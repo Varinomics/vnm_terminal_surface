@@ -345,37 +345,51 @@ bool test_paste_sanitization()
             QStringLiteral("a\r\nb\rc\n"),
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        QByteArrayLiteral("a\nb\nc\n"),
-        "paste sanitization normalizes CRLF and lone CR to LF");
+        QByteArrayLiteral("a\rb\rc\r"),
+        "paste sanitization normalizes CRLF, lone CR and lone LF to CR");
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
             QStringLiteral("\r"),
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        QByteArrayLiteral("\n"),
+        QByteArrayLiteral("\r"),
         "paste sanitization normalizes trailing lone CR");
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
             QStringLiteral("\r\r"),
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        QByteArrayLiteral("\n\n"),
+        QByteArrayLiteral("\r\r"),
         "paste sanitization normalizes consecutive lone CRs");
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
             QStringLiteral("\r\n\r\n"),
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        QByteArrayLiteral("\n\n"),
+        QByteArrayLiteral("\r\r"),
         "paste sanitization normalizes consecutive CRLF pairs");
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            QStringLiteral("\n\n"),
+            {},
+            term::Terminal_paste_framing_policy::DISABLED),
+        QByteArrayLiteral("\r\r"),
+        "paste sanitization normalizes consecutive lone LFs");
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            QStringLiteral("\n\r"),
+            {},
+            term::Terminal_paste_framing_policy::DISABLED),
+        QByteArrayLiteral("\r\r"),
+        "paste sanitization keeps LF CR two line breaks");
 
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
             QStringLiteral(" \t\nkept  "),
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        QByteArrayLiteral(" \t\nkept  "),
-        "paste sanitization preserves spaces tabs LF and trailing spaces");
+        QByteArrayLiteral(" \t\rkept  "),
+        "paste sanitization preserves spaces tabs and trailing spaces");
 
     QString controls;
     controls.append(QChar(0x0000));
@@ -402,7 +416,7 @@ bool test_paste_sanitization()
     control_boundaries.append(QChar(0x007f));
     control_boundaries.append(QChar(0x009f));
     control_boundaries.append(QChar(0x00a0));
-    QByteArray expected_boundaries = QByteArrayLiteral("\t\n\n ");
+    QByteArray expected_boundaries = QByteArrayLiteral("\t\r\r ");
     expected_boundaries += QString(QChar(0x00a0U)).toUtf8();
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(

@@ -1574,7 +1574,11 @@ bool test_unicode_paste_preserves_console_input(const QString& executable_path)
         return false;
     }
     const QByteArray received = output.readAll();
-    const QByteArray expected = QByteArrayLiteral("\x1b[200~") + text.toUtf8() + QByteArrayLiteral("\x1b[201~");
+    // The console delivers exactly what was written, so the encoded paste is
+    // the expectation: its line breaks are carriage returns, not the line feeds
+    // the source text was written with.
+    QByteArray expected = payload;
+    expected.chop(1);
     if (received != expected) {
         std::cerr << "Unicode paste received=" << received.toHex(' ').constData() << '\n';
     }
