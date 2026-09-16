@@ -65,6 +65,12 @@ and `ConptyClosePseudoConsole` exports.
 
 Windows hosts linking the full surface target must call
 `vnm_terminal_deploy_conpty(their_executable)` after creating their executable.
+An executable that runs from somewhere other than its build output directory,
+or that was created in another directory, passes
+`vnm_terminal_deploy_conpty(their_executable DESTINATION <directory>)` instead.
+The global property `vnm_terminal_conpty_deploy_destination_supported` is `TRUE`
+where that form is available, so a consumer that requires it can say so itself
+rather than fail inside the helper.
 For distribution, call `vnm_terminal_install_conpty(DESTINATION bin COMPONENT runtime)`
 with the executable's install directory and component. These helpers preserve
 the native and emulated architecture host layout and the Microsoft MIT license;

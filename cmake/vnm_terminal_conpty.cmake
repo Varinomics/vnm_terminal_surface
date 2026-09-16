@@ -45,6 +45,17 @@ endfunction()
 # derived from $<TARGET_FILE_DIR:${target}> because the staging target has to
 # run before ${target} is considered built, and reading the target's own
 # location would close that dependency into a cycle.
+#
+# A consumer that needs DESTINATION cannot read the signature to find out
+# whether this surface provides it: a package without it accepts the argument
+# silently through ${ARGN} and then fails inside add_custom_command with an
+# error that names neither DESTINATION nor this module. The global property
+# below is the answer to that question, so such a consumer can state what it
+# needs. It is a global property rather than a variable because the surface is
+# commonly added as a subproject, and a variable set here would not reach the
+# consumer's own directory scope.
+set_property(GLOBAL PROPERTY vnm_terminal_conpty_deploy_destination_supported TRUE)
+
 function(vnm_terminal_deploy_conpty target)
     if(NOT WIN32)
         return()
