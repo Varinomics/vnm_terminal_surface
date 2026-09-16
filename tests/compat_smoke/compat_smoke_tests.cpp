@@ -364,6 +364,34 @@ QString missing_environment_probe_line(const QString& name)
     return QStringLiteral("%1=missing").arg(name);
 }
 
+// Mirrors the rule the launch validator applies to an =-prefixed name. A
+// drive pseudo-variable is the one shape it admits.
+bool is_windows_drive_pseudo_variable(const QString& name)
+{
+#if defined(_WIN32)
+    return
+        name.size() == 3                     &&
+        name.at(0)  == QLatin1Char('=')      &&
+        name.at(1).isLetter()                &&
+        name.at(2)  == QLatin1Char(':');
+#else
+    Q_UNUSED(name);
+    return false;
+#endif
+}
+
+// Ambient content, handed on as an explicit base. The two are not the same
+// contract. A caller that captures the ambient environment sanitizes it
+// first, and that sanitizer strips an unsupported Windows pseudo-variable
+// rather than refusing the capture, because the operating system and not the
+// caller put it there; the explicit tier is deliberately strict and refuses
+// one, so that a base a caller constructed cannot carry a name it never
+// wrote. Passing a raw capture straight to the strict tier confused the two:
+// any shell descended from cmd.exe contributes =ExitCode, which is
+// =-prefixed and not a drive pseudo-variable, and every launch in this suite
+// then failed on an entry no test had written. Strip what an ambient
+// sanitizer strips and no more - =C: and every ordinary name survive, so the
+// suite still exercises a realistic environment.
 std::vector<vnm_terminal::Terminal_environment_entry> explicit_environment_entries(
     const QProcessEnvironment& environment)
 {
@@ -371,6 +399,12 @@ std::vector<vnm_terminal::Terminal_environment_entry> explicit_environment_entri
     const QStringList names = environment.keys();
     entries.reserve(static_cast<std::size_t>(names.size()));
     for (const QString& name : names) {
+        if (name.startsWith(QLatin1Char('=')) &&
+            !is_windows_drive_pseudo_variable(name))
+        {
+            continue;
+        }
+
         entries.push_back({name, environment.value(name)});
     }
     return entries;
