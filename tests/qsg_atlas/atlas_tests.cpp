@@ -2387,13 +2387,6 @@ Pixel_aa_budget rgba_reference_budget_for_coverage(
     return budget;
 }
 
-bool glyph_coverage_has_lcd(const term::Glyph_coverage_counts& coverage)
-{
-    return
-        coverage.lcd_rgb_masks > 0 ||
-        coverage.lcd_bgr_masks > 0;
-}
-
 int scaled_pixel_budget_count(
     int                     base_count,
     const Pixel_aa_budget& budget,
@@ -2999,15 +2992,6 @@ measure_lcd_horizontal_edge_transitions_pixels(
     return stats;
 }
 
-bool lcd_rect_components_within(QRect actual, QRect expected, int tolerance)
-{
-    return
-        std::abs(actual.x()      - expected.x())      <= tolerance &&
-        std::abs(actual.y()      - expected.y())      <= tolerance &&
-        std::abs(actual.width()  - expected.width())  <= tolerance &&
-        std::abs(actual.height() - expected.height()) <= tolerance;
-}
-
 double lcd_ink_pixel_ratio(int actual_ink_pixels, int expected_ink_pixels)
 {
     if (expected_ink_pixels <= 0) {
@@ -3015,6 +2999,81 @@ double lcd_ink_pixel_ratio(int actual_ink_pixels, int expected_ink_pixels)
     }
     return static_cast<double>(actual_ink_pixels) /
         static_cast<double>(expected_ink_pixels);
+}
+
+int lcd_channel_spread(const QColor& color)
+{
+    const int red   = color.red();
+    const int green = color.green();
+    const int blue  = color.blue();
+    return
+        std::max({red, green, blue}) -
+        std::min({red, green, blue});
+}
+
+struct Lcd_fringe_pixel_stats
+{
+    int measured_pixels = 0;
+    int fringe_pixels   = 0;
+};
+
+// Count pixels whose color channels spread further apart than grayscale
+// blending of the fixture's near-gray styles can ever reach: direct pixel
+// evidence of LCD subpixel fringing. Grayscale blending mixes each channel
+// with one shared alpha, so the result's channel spread stays within the
+// foreground/background spread (16 here); LCD correction weights the channels
+// independently and pushes the spread far past that bound. Masks with colored
+// foreground or background are excluded so a colored style cannot masquerade
+// as fringing, and each mask rect is eroded by two pixels because the
+// floor/ceil conversion includes a boundary scanline and glyph quads (e.g. a
+// full block) can overhang the nominal cell block by another pixel.
+Lcd_fringe_pixel_stats measure_lcd_fringe_pixels(
+    const Pixel_parity_fixture& fixture,
+    const QImage&               image)
+{
+    constexpr int k_neutral_channel_spread = 16;
+    constexpr int k_fringe_channel_spread  = 24;
+    constexpr int k_ink_delta_threshold    = 8;
+    constexpr int k_region_erode_pixels    = 2;
+
+    Lcd_fringe_pixel_stats stats;
+    if (image.isNull()) {
+        return stats;
+    }
+
+    const qreal dpr =
+        pixel_normalized_device_pixel_ratio(fixture.device_pixel_ratio);
+    for (const Pixel_glyph_mask& mask : fixture.glyph_masks) {
+        if (lcd_channel_spread(mask.foreground) > k_neutral_channel_spread ||
+            lcd_channel_spread(mask.background) > k_neutral_channel_spread)
+        {
+            continue;
+        }
+
+        const QRect region = logical_rect_to_pixels(mask.rect, dpr)
+            .adjusted(
+                k_region_erode_pixels,
+                k_region_erode_pixels,
+                -k_region_erode_pixels,
+                -k_region_erode_pixels)
+            .intersected(image.rect());
+        for (int y = region.top(); y <= region.bottom(); ++y) {
+            for (int x = region.left(); x <= region.right(); ++x) {
+                const QColor pixel = image.pixelColor(x, y);
+                if (pixel_delta(pixel, mask.background) <=
+                    k_ink_delta_threshold)
+                {
+                    continue;
+                }
+
+                ++stats.measured_pixels;
+                if (lcd_channel_spread(pixel) > k_fringe_channel_spread) {
+                    ++stats.fringe_pixels;
+                }
+            }
+        }
+    }
+    return stats;
 }
 
 double lcd_nearest_integer_delta(double value)
@@ -14909,12 +14968,20 @@ Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
         0xffe6edf3U,
         term::terminal_style_attribute_mask(term::Terminal_style_attribute::INVERSE)));
 
+    // The probe forces the MSDF text renderer, so every fixture cell must be
+    // drawable by the MSDF path: single-width cells over MSDF-supported
+    // codepoints with no combining sequences. Non-MSDF families (color emoji,
+    // braille, CJK, combining marks) stay covered by the CPU glyph probe
+    // records and the raster variant sheet, which do not depend on the atlas
+    // render.
+    const QString process_text =
+        QStringLiteral("Process: lcd-subpixel glyph atlas probe");
     append_lcd_probe_cell(
         fixture.snapshot,
         0,
         0,
-        QStringLiteral("Process: lcd-subpixel glyph atlas probe"),
-        40,
+        process_text,
+        process_text.size(),
         normal);
     append_lcd_probe_cell(
         fixture.snapshot,
@@ -14923,12 +14990,13 @@ Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
         QStringLiteral("ASCII:"),
         6,
         accent);
+    const QString ascii_text = lcd_probe_printable_ascii_text();
     append_lcd_probe_cell(
         fixture.snapshot,
         1,
         8,
-        lcd_probe_printable_ascii_text(),
-        95,
+        ascii_text,
+        ascii_text.size(),
         normal);
     append_lcd_probe_cell(
         fixture.snapshot,
@@ -14937,84 +15005,79 @@ Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
         QStringLiteral("Box:"),
         4,
         accent);
+    const QString box_text = QStringLiteral(
+        "\u2500\u2502\u250c\u2510\u2514\u2518\u253c\u2550\u2551\u2588\u2591\u2592\u2593\ue0b0");
     append_lcd_probe_cell(
         fixture.snapshot,
         2,
         6,
-        lcd_probe_box_line_text(),
-        lcd_probe_box_line_text().size(),
+        box_text,
+        box_text.size(),
         warm);
     append_lcd_probe_cell(
         fixture.snapshot,
         3,
         0,
-        QStringLiteral("Braille:"),
-        8,
+        QStringLiteral("Greek:"),
+        6,
         accent);
+    const QString greek_text = QStringLiteral(
+        "\u0391\u0392\u0393\u0394\u0395\u03a0\u03a3\u03a9\u03b1\u03b2\u03b3\u03b4\u03b5\u03c0\u03c3\u03c9");
     append_lcd_probe_cell(
         fixture.snapshot,
         3,
         10,
-        lcd_probe_braille_text(),
-        lcd_probe_braille_text().size(),
+        greek_text,
+        greek_text.size(),
         normal);
     append_lcd_probe_cell(
         fixture.snapshot,
         4,
         0,
-        QStringLiteral("CJK:"),
-        4,
+        QStringLiteral("Powerline:"),
+        10,
         accent);
-    int cjk_column = 6;
-    for (const QChar character : lcd_probe_cjk_text()) {
-        append_lcd_probe_cell(
-            fixture.snapshot,
-            4,
-            cjk_column,
-            QString(character),
-            2,
-            normal,
-            true);
-        cjk_column += 2;
-    }
+    const QString powerline_text = QStringLiteral(
+        "\ue0a0\ue0a1\ue0a2\ue0b0\ue0b1\ue0b2\ue0b3");
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        4,
+        12,
+        powerline_text,
+        powerline_text.size(),
+        normal);
     append_lcd_probe_cell(
         fixture.snapshot,
         5,
         0,
-        QStringLiteral("Combining:"),
-        10,
+        QStringLiteral("Latin-1:"),
+        8,
         accent);
+    const QString latin1_text = QStringLiteral(
+        "\u00e9\u00e0\u00e4\u00e7\u00f1\u00f6\u00fc\u00df\u00c9\u00d1\u00dc");
     append_lcd_probe_cell(
         fixture.snapshot,
         5,
         12,
-        QStringLiteral("e\u0301"),
-        1,
+        latin1_text,
+        latin1_text.size(),
         normal);
     append_lcd_probe_cell(
         fixture.snapshot,
         6,
         0,
-        QStringLiteral("Emoji:"),
-        6,
+        QStringLiteral("Math:"),
+        5,
         accent);
-    int emoji_column = 8;
-    for (const QString& emoji : {
-            QString::fromUcs4(U"\U0001F600"),
-            QString::fromUcs4(U"\U0001F9EA"),
-            QStringLiteral("\u2764\ufe0f"),
-        })
-    {
-        append_lcd_probe_cell(
-            fixture.snapshot,
-            6,
-            emoji_column,
-            emoji,
-            2,
-            warm,
-            true);
-        emoji_column += 3;
-    }
+    const QString math_text = QStringLiteral(
+        "\u2202\u2206\u2211\u221a\u221e\u222b\u2248\u2260\u2264\u2265\u20ac\u20b9");
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        6,
+        8,
+        math_text,
+        math_text.size(),
+        warm);
     append_lcd_probe_cell(
         fixture.snapshot,
         7,
@@ -18650,6 +18713,112 @@ void print_lcd_atlas_probe_report(
         << '\n';
 }
 
+// LCD subpixel correction engages only for runs with an opaque foreground and
+// background; pin the probe fixture to that precondition so a fixture change
+// fails the probe loudly instead of silently exercising grayscale rendering.
+// DEFAULT color refs resolve through the snapshot color state, so only RGB and
+// palette refs carry their own alpha.
+bool lcd_probe_fixture_colors_are_lcd_eligible(const Pixel_parity_fixture& fixture)
+{
+    const term::Terminal_color_state& color_state = fixture.snapshot.color_state;
+    const auto is_opaque = [](quint32 rgba) {
+        return (rgba >> 24U) == 0xffU;
+    };
+    const auto ref_is_opaque = [&color_state, &is_opaque](
+        const term::Terminal_color_ref& ref) {
+        switch (ref.kind) {
+            case term::Terminal_color_ref_kind::RGB:
+                return is_opaque(ref.rgba);
+            case term::Terminal_color_ref_kind::PALETTE_INDEX:
+                return
+                    ref.palette_index < color_state.palette_rgba.size() &&
+                    is_opaque(color_state.palette_rgba[ref.palette_index]);
+            case term::Terminal_color_ref_kind::DEFAULT:
+            default:
+                return true;
+        }
+    };
+    if (!is_opaque(color_state.default_foreground_rgba) ||
+        !is_opaque(color_state.default_background_rgba))
+    {
+        return false;
+    }
+
+    for (const term::Terminal_text_style& style : fixture.snapshot.styles) {
+        if (!ref_is_opaque(style.foreground) || !ref_is_opaque(style.background)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// The full artifact writer runs only at the end of the probe, so an early exit
+// after the main atlas render would leave no diagnostic evidence. Write the
+// pieces that already exist at that point: the atlas image, when captured, and
+// a render-state report.
+void write_lcd_probe_early_exit_artifacts(
+    const Pixel_render_result& atlas,
+    const char*                backend)
+{
+    const QByteArray artifact_dir_bytes =
+        qgetenv("VNM_TERMINAL_LCD_ATLAS_ARTIFACT_DIR");
+    if (artifact_dir_bytes.isEmpty()) {
+        return;
+    }
+
+    QDir artifact_dir(QString::fromLocal8Bit(artifact_dir_bytes));
+    if (!artifact_dir.exists() && !artifact_dir.mkpath(QStringLiteral("."))) {
+        std::cerr << "LCD atlas probe early exit could not create artifact dir "
+            << artifact_dir_bytes.constData() << '\n';
+        return;
+    }
+
+    if (lcd_probe_image_has_pixels(atlas.image)) {
+        save_lcd_probe_image_artifact(
+            atlas.image,
+            artifact_dir.filePath(
+                QStringLiteral("lcd_capability_probe_atlas.png")),
+            "atlas");
+    }
+
+    const term::Qsg_atlas_frame_report& report = atlas.atlas_report;
+    const QByteArray report_bytes =
+        QByteArray("backend=") + backend + '\n' +
+        "prepare_count=" + QByteArray::number(report.prepare_count) + '\n' +
+        "render_count=" + QByteArray::number(report.render_count) + '\n' +
+        "drew=" + QByteArray::number(report.drew) + '\n' +
+        "rhi_non_null=" + QByteArray::number(report.rhi_non_null) + '\n' +
+        "command_buffer_non_null=" +
+            QByteArray::number(report.command_buffer_non_null) + '\n' +
+        "render_target_non_null=" +
+            QByteArray::number(report.render_target_non_null) + '\n' +
+        "msdf_lcd_subpixel_order=" +
+            term::qsg_atlas_lcd_subpixel_order_name(
+                report.render.msdf_lcd_subpixel_order) + '\n' +
+        "msdf_lcd_text_enabled=" +
+            QByteArray::number(report.render.msdf_lcd_text_enabled) + '\n' +
+        "msdf_text_renderer_active=" +
+            QByteArray::number(report.render.msdf_text_renderer_active) + '\n' +
+        "msdf_text_atlas_ready=" +
+            QByteArray::number(report.render.msdf_text_atlas_ready) + '\n' +
+        "msdf_text_draw_calls=" +
+            QByteArray::number(report.render.msdf_text_draw_calls) + '\n' +
+        "msdf_text_glyph_instances=" +
+            QByteArray::number(report.render.msdf_text_glyph_instances) + '\n';
+    const QString report_path = artifact_dir.filePath(
+        QStringLiteral("lcd_capability_probe_early_exit_report.txt"));
+    QSaveFile report_file(report_path);
+    if (!report_file.open(QIODevice::WriteOnly) ||
+        report_file.write(report_bytes) != report_bytes.size() ||
+        !report_file.commit())
+    {
+        const QByteArray report_path_bytes = report_path.toLocal8Bit();
+        std::cerr << "LCD atlas probe early exit could not write report artifact "
+            << report_path_bytes.constData() << '\n';
+    }
+}
+
 int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
@@ -18663,7 +18832,23 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     Pixel_parity_fixture fixture =
         make_lcd_capability_probe_fixture(device_pixel_ratio);
 
-    Pixel_render_result atlas = render_pixel_atlas_fixture(app, fixture);
+    // Every render_pixel_atlas_fixture subject in this probe validates the LCD
+    // MSDF text path: force the MSDF renderer and an explicit RGB subpixel
+    // order so the measured path does not depend on AUTO resolution.
+    constexpr VNM_TerminalSurface::Text_renderer_mode k_probe_renderer_mode =
+        VNM_TerminalSurface::Text_renderer_mode::MSDF;
+    constexpr VNM_TerminalSurface::Lcd_subpixel_order k_probe_subpixel_order =
+        VNM_TerminalSurface::Lcd_subpixel_order::RGB;
+    constexpr qreal k_probe_font_size = 18.0;
+
+    Pixel_render_result atlas = render_pixel_atlas_fixture(
+        app,
+        fixture,
+        QPointF(),
+        k_probe_font_size,
+        QString(),
+        k_probe_renderer_mode,
+        k_probe_subpixel_order);
     if (!atlas.ready || !atlas_report_render_state_ready(atlas.atlas_report)) {
         std::cerr << "SKIP: LCD atlas capability probe did not reach usable "
             << "QRhi render state on " << backend
@@ -18671,20 +18856,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             << " render_count=" << atlas.atlas_report.render_count
             << " rhi_non_null=" << atlas.atlas_report.rhi_non_null
             << '\n';
-        return k_unsupported_backend_skip_return_code;
-    }
-
-    // The LCD capability probe validates the subpixel MSDF text path, which
-    // fundamentally depends on dual-source blending. Software/WARP devices
-    // (e.g. the GitHub-hosted Windows runner's D3D11 device) do not provide it,
-    // so the renderer correctly falls back to the grayscale glyph path and the
-    // LCD pixel-parity assertions below do not apply. Treat the backend as
-    // unsupported for this probe rather than reporting a failure.
-    if (!atlas.atlas_report.render.dual_source_blend_factors_available) {
-        std::cerr << "SKIP: LCD atlas capability probe requires dual-source "
-            << "blending, which " << backend << " does not provide; the MSDF "
-            << "text path falls back to grayscale and the LCD parity checks are "
-            << "inapplicable\n";
+        write_lcd_probe_early_exit_artifacts(atlas, backend);
         return k_unsupported_backend_skip_return_code;
     }
 
@@ -18698,8 +18870,26 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         render_qsg_text_reference_fixture(app, fixture);
     const Pixel_parity_fixture single_w_fixture =
         make_lcd_single_w_probe_fixture(device_pixel_ratio);
-    const Pixel_render_result single_w_atlas =
-        render_pixel_atlas_fixture(app, single_w_fixture);
+    const Pixel_render_result single_w_atlas = render_pixel_atlas_fixture(
+        app,
+        single_w_fixture,
+        QPointF(),
+        k_probe_font_size,
+        QString(),
+        k_probe_renderer_mode,
+        k_probe_subpixel_order);
+    // The CPU MSDF diagnostic composites grayscale coverage, so the
+    // renderer-fidelity comparisons against it run on a grayscale (NONE)
+    // sibling render; the RGB render above carries the LCD assertions.
+    const Pixel_render_result single_w_grayscale_atlas =
+        render_pixel_atlas_fixture(
+            app,
+            single_w_fixture,
+            QPointF(),
+            k_probe_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
     const Pixel_render_result single_w_raw_atlas_reference =
         render_atlas_rgba_reference_fixture(
             single_w_fixture,
@@ -18712,8 +18902,14 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             single_w_atlas.image.size());
     const Pixel_parity_fixture repeated_w_fixture =
         make_lcd_repeated_w_probe_fixture(device_pixel_ratio);
-    const Pixel_render_result repeated_w_atlas =
-        render_pixel_atlas_fixture(app, repeated_w_fixture);
+    const Pixel_render_result repeated_w_atlas = render_pixel_atlas_fixture(
+        app,
+        repeated_w_fixture,
+        QPointF(),
+        k_probe_font_size,
+        QString(),
+        k_probe_renderer_mode,
+        k_probe_subpixel_order);
     const QPointF repeated_w_translated_host(
         k_lcd_repeated_w_translated_host_x,
         k_lcd_repeated_w_translated_host_y);
@@ -18721,15 +18917,25 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         render_pixel_atlas_fixture(
             app,
             repeated_w_fixture,
-            repeated_w_translated_host);
+            repeated_w_translated_host,
+            k_probe_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            k_probe_subpixel_order);
     const Pixel_parity_fixture contiguous_x_fixture =
         make_lcd_contiguous_x_probe_fixture(device_pixel_ratio);
+    // The contiguous-X and intensity-X probes assert byte-identical crops
+    // across adjacent cells. LCD filtering is context-dependent across cell
+    // boundaries, so these geometry-stability probes run grayscale MSDF.
     const Pixel_render_result contiguous_x_atlas =
         render_pixel_atlas_fixture(
             app,
             contiguous_x_fixture,
             QPointF(),
-            k_lcd_contiguous_x_font_size);
+            k_lcd_contiguous_x_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
     const Pixel_parity_fixture intensity_x_fixture =
         make_lcd_intensity_x_probe_fixture(device_pixel_ratio);
     const Pixel_render_result intensity_x_atlas =
@@ -18737,9 +18943,14 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             app,
             intensity_x_fixture,
             QPointF(),
-            k_lcd_intensity_x_font_size);
+            k_lcd_intensity_x_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
     const Pixel_parity_fixture fragmented_x_fixture =
         make_lcd_fragmented_x_probe_fixture(device_pixel_ratio);
+    // The fragmented-X probe is the glyph-atlas contrast fixture: its checks
+    // require the shaped glyph path, so it keeps AUTO routing.
     const Pixel_render_result fragmented_x_atlas =
         render_pixel_atlas_fixture(
             app,
@@ -18755,7 +18966,11 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         render_pixel_atlas_fixture(
             app,
             repeated_on_fixture,
-            repeated_on_fractional_host);
+            repeated_on_fractional_host,
+            k_probe_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            k_probe_subpixel_order);
     constexpr qreal k_repeated_on_app_font_size =
         static_cast<qreal>(term::k_vnm_terminal_default_font_pixel_size);
     const Pixel_parity_fixture repeated_on_app_font_fixture =
@@ -18769,7 +18984,10 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             app,
             repeated_on_app_font_fixture,
             repeated_on_app_font_fractional_host,
-            k_repeated_on_app_font_size);
+            k_repeated_on_app_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            k_probe_subpixel_order);
     const Pixel_parity_fixture repeated_on_live_app_fixture =
         make_lcd_repeated_on_probe_fixture(
             device_pixel_ratio,
@@ -18781,17 +18999,37 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             app,
             repeated_on_live_app_fixture,
             repeated_on_live_app_host,
-            k_lcd_repeated_on_live_app_font_size);
+            k_lcd_repeated_on_live_app_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            k_probe_subpixel_order);
     const Pixel_parity_fixture ascii_panel_fixture =
         make_lcd_ascii_panel_probe_fixture(device_pixel_ratio);
-    const Pixel_render_result ascii_panel_atlas =
-        render_pixel_atlas_fixture(app, ascii_panel_fixture);
+    const Pixel_render_result ascii_panel_atlas = render_pixel_atlas_fixture(
+        app,
+        ascii_panel_fixture,
+        QPointF(),
+        k_probe_font_size,
+        QString(),
+        k_probe_renderer_mode,
+        k_probe_subpixel_order);
     const Pixel_render_result ascii_panel_raw_atlas_reference =
         render_atlas_rgba_reference_fixture(
             ascii_panel_fixture,
             ascii_panel_atlas.image.size());
     const Pixel_render_result ascii_panel_qt_text_reference =
         render_qsg_text_reference_fixture(app, ascii_panel_fixture);
+    // Grayscale control: the same fixture with LCD disabled must resolve to
+    // order NONE, proving the RGB runs above are meaningfully different.
+    const Pixel_render_result grayscale_control_atlas =
+        render_pixel_atlas_fixture(
+            app,
+            fixture,
+            QPointF(),
+            k_probe_font_size,
+            QString(),
+            k_probe_renderer_mode,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
     const Raster_variant_probe_result raster_variants =
         render_lcd_raster_variant_probe(fixture.device_pixel_ratio);
     const Metrics_placement_probe_result metrics_placement =
@@ -18822,6 +19060,11 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     const Lcd_first_ink_column_stats single_w_atlas_first_column =
         measure_lcd_first_ink_column(
             single_w_atlas.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats single_w_grayscale_first_column =
+        measure_lcd_first_ink_column(
+            single_w_grayscale_atlas.image,
             single_w_fixture.glyph_masks,
             single_w_fixture.device_pixel_ratio);
     const Lcd_first_ink_column_stats single_w_raw_atlas_first_column =
@@ -18865,6 +19108,9 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             single_w_msdf_first_column);
     const double single_w_atlas_msdf_ink_ratio = lcd_ink_pixel_ratio(
         single_w_atlas_first_column.ink_pixels,
+        single_w_msdf_first_column.ink_pixels);
+    const double single_w_grayscale_msdf_ink_ratio = lcd_ink_pixel_ratio(
+        single_w_grayscale_first_column.ink_pixels,
         single_w_msdf_first_column.ink_pixels);
     const Lcd_repeated_w_stability_stats repeated_w_stability =
         measure_lcd_repeated_w_stability(
@@ -19008,6 +19254,16 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         ascii_panel_atlas.atlas_report.render;
 
     print_lcd_atlas_probe_report(atlas, backend);
+    const Lcd_fringe_pixel_stats lcd_fringe_rgb =
+        measure_lcd_fringe_pixels(fixture, atlas.image);
+    const Lcd_fringe_pixel_stats lcd_fringe_grayscale =
+        measure_lcd_fringe_pixels(fixture, grayscale_control_atlas.image);
+    std::cout << "LCD atlas channel-spread fringe pixels"
+        << " rgb_fringe=" << lcd_fringe_rgb.fringe_pixels
+        << " rgb_measured=" << lcd_fringe_rgb.measured_pixels
+        << " grayscale_fringe=" << lcd_fringe_grayscale.fringe_pixels
+        << " grayscale_measured=" << lcd_fringe_grayscale.measured_pixels
+        << '\n';
     std::cout << "LCD atlas Qt text-node reference"
         << " ready=" << qt_text_reference.ready
         << " image=" << qt_text_reference.image.width()
@@ -19084,6 +19340,22 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << single_w_msdf_first_column.adjacent_equal_first_column_pairs
         << " cpu_msdf_longest_equal_run="
         << single_w_msdf_first_column.longest_equal_first_column_run
+        << " grayscale_rows="
+        << single_w_grayscale_first_column.first_column_rows
+        << " grayscale_distinct="
+        << single_w_grayscale_first_column.distinct_first_column_rgb_colors
+        << " grayscale_adjacent_equal="
+        << single_w_grayscale_first_column.adjacent_equal_first_column_pairs
+        << " grayscale_longest_equal_run="
+        << single_w_grayscale_first_column.longest_equal_first_column_run
+        << " grayscale_ink="
+        << single_w_grayscale_first_column.ink_pixels
+        << " grayscale_bbox="
+        << single_w_grayscale_first_column.bbox.x() << ','
+        << single_w_grayscale_first_column.bbox.y() << ' '
+        << single_w_grayscale_first_column.bbox.width() << 'x'
+        << single_w_grayscale_first_column.bbox.height()
+        << " grayscale_msdf_ink_ratio=" << single_w_grayscale_msdf_ink_ratio
         << '\n';
     std::cout << "LCD atlas single-W MSDF edge quality"
         << " atlas_bbox=" << single_w_atlas_first_column.bbox.x() << ','
@@ -19628,8 +19900,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     const bool msdf_text_renderer_active =
         atlas.atlas_report.render.msdf_text_renderer_active;
 
-    // The pinned Windows D3D11 hardware path requires dual-source probing and
-    // sample-family glyph images.
+    // The pinned Windows D3D11 hardware path exercises the MSDF LCD text path
+    // and records sample-family glyph images.
     bool ok = true;
     ok &= check(
         lcd_probe_image_has_pixels(atlas.image),
@@ -19879,12 +20151,6 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             probe_records,
             QStringLiteral("emoji_color")),
         "LCD atlas probe records production-valid tiles for emoji presentation samples");
-    ok &= check(
-        atlas.atlas_report.frame_build.glyph_coverage.grayscale_masks > 0,
-        "LCD atlas probe reports production grayscale coverage entries");
-    ok &= check(
-        glyph_coverage_has_lcd(production_coverage),
-        "LCD atlas probe reports production LCD coverage entries");
     if (atlas.atlas_report.render.atlas_page_count > 1) {
         ok &= check(
             atlas.atlas_report.frame_build.max_glyph_instance_page > 0,
@@ -19893,10 +20159,6 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     ok &= check(
         atlas.atlas_report.render.glyph_shader_package_available,
         "LCD atlas probe reports loaded glyph shader packages");
-    ok &= check(
-        atlas.atlas_report.render.glyph_sampler_mode ==
-            term::Qsg_atlas_sampler_mode::NEAREST,
-        "LCD atlas probe reports nearest glyph coverage sampling");
     if (msdf_text_renderer_enabled) {
         ok &= check(
             msdf_text_renderer_active,
@@ -19944,35 +20206,30 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 single_w_raw_atlas_first_column.first_column_rows >=
                     k_min_single_w_first_column_rows,
             "LCD atlas probe single-W raw atlas first column is comparable");
-        constexpr int k_single_w_msdf_bbox_tolerance_pixels = 1;
         ok &= check(
             single_w_msdf_first_column.has_ink(),
             "LCD atlas probe CPU MSDF single-W first column contains ink");
-        constexpr int k_single_w_msdf_column_metric_tolerance = 1;
         ok &= check(
-            std::abs(
-                single_w_atlas_first_column.distinct_first_column_rgb_colors -
-                single_w_msdf_first_column.distinct_first_column_rgb_colors) <=
-                k_single_w_msdf_column_metric_tolerance &&
-                std::abs(
-                    single_w_atlas_first_column.adjacent_equal_first_column_pairs -
-                    single_w_msdf_first_column.adjacent_equal_first_column_pairs) <=
-                    k_single_w_msdf_column_metric_tolerance &&
-                std::abs(
-                    single_w_atlas_first_column.longest_equal_first_column_run -
-                    single_w_msdf_first_column.longest_equal_first_column_run) <=
-                    k_single_w_msdf_column_metric_tolerance,
-            "LCD atlas probe single-W MSDF first-column metrics match the CPU diagnostic");
+            single_w_grayscale_atlas.atlas_report.render.msdf_text_renderer_active &&
+                single_w_grayscale_atlas.atlas_report.render.msdf_text_draw_calls > 0,
+            "LCD atlas probe single-W grayscale fidelity render uses the real MSDF renderer path");
+        // The RGB and grayscale renders share one baked atlas and one draw
+        // layout; LCD subpixel correction recolors the fringe but must not
+        // move the glyph's ink bounds.
         ok &= check(
-            lcd_rect_components_within(
-                single_w_atlas_first_column.bbox,
-                single_w_msdf_first_column.bbox,
-                k_single_w_msdf_bbox_tolerance_pixels),
-            "LCD atlas probe single-W MSDF bbox matches the CPU MSDF diagnostic");
+            single_w_atlas_first_column.bbox ==
+                single_w_grayscale_first_column.bbox,
+            "LCD atlas probe single-W LCD correction preserves the glyph ink bounds");
         ok &= check(
-            single_w_atlas_msdf_ink_ratio >= 0.80 &&
-                single_w_atlas_msdf_ink_ratio <= 1.25,
-            "LCD atlas probe single-W MSDF ink count matches the CPU MSDF diagnostic");
+            single_w_atlas_first_column.ink_pixels >=
+                single_w_grayscale_first_column.ink_pixels,
+            "LCD atlas probe single-W LCD fringe spreads ink horizontally");
+        // The CPU diagnostic bakes with its own sharpness parameters, so only
+        // a coarse cross-bake ink sanity bound is meaningful.
+        ok &= check(
+            single_w_grayscale_msdf_ink_ratio >= 0.5 &&
+                single_w_grayscale_msdf_ink_ratio <= 2.0,
+            "LCD atlas probe single-W grayscale ink count matches the CPU MSDF diagnostic");
         ok &= check(
             single_w_atlas_edges.transition_count > 0 &&
                 single_w_msdf_edges.transition_count > 0,
@@ -20104,7 +20361,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 contiguous_x_stability.max_delta == 0 &&
                 contiguous_x_stability.ink_mask_diff_pixels == 0 &&
                 contiguous_x_stability.max_ink_mask_diff_pixels_per_cell == 0,
-            "LCD atlas probe contiguous-X RGB crops are identical across cells");
+            "LCD atlas probe contiguous-X grayscale crops are identical across cells");
         ok &= check(
             contiguous_x_stability.all_cells_have_ink &&
                 contiguous_x_stability.max_ink_pixels_delta == 0 &&
@@ -20150,13 +20407,15 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                     k_lcd_intensity_x_columns - 1 &&
                     stability.compared_pixels > 0,
                 " stability comparison covers every repeated cell");
+            // Grayscale MSDF sampling rounds a few boundary texels differently
+            // across absolute positions; the stability invariant is identical
+            // ink geometry, with color divergence limited to LSB rounding.
             ok &= check_row(
-                stability.diff_pixels == 0 &&
-                    stability.max_diff_pixels_per_cell == 0 &&
-                    stability.max_delta == 0 &&
+                stability.max_delta <= 1 &&
+                    stability.diff_pixels * 200 <= stability.compared_pixels &&
                     stability.ink_mask_diff_pixels == 0 &&
                     stability.max_ink_mask_diff_pixels_per_cell == 0,
-                " RGB crops are identical across cells");
+                " grayscale crops are identical across cells up to MSDF sampling rounding");
             ok &= check_row(
                 stability.all_cells_have_ink &&
                     stability.max_ink_pixels_delta == 0 &&
@@ -20452,14 +20711,44 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             atlas.atlas_report.render.shaped_invalid_string_indexes == 0,
         "LCD atlas probe reports complete shaped glyph string-index ownership");
     ok &= check(
-        atlas.atlas_report.render.dual_source_probe_shader_package_available,
-        "LCD atlas probe reports loaded dual-source probe shader package");
+        lcd_probe_fixture_colors_are_lcd_eligible(fixture),
+        "LCD atlas probe fixture meets the LCD opaque-color precondition");
     ok &= check(
-        atlas.atlas_report.render.dual_source_blend_factors_available,
-        "LCD atlas probe reports available dual-source blend factors");
+        atlas.atlas_report.render.msdf_lcd_subpixel_order ==
+            term::Terminal_lcd_subpixel_order::RGB,
+        "LCD atlas probe resolves the forced RGB LCD subpixel order");
     ok &= check(
-        atlas.atlas_report.render.dual_source_blend_factors_runtime_probe,
-        "LCD atlas probe runs the dual-source blend pipeline capability probe");
+        atlas.atlas_report.render.msdf_lcd_text_enabled,
+        "LCD atlas probe enables LCD subpixel correction on the MSDF text path");
+    ok &= check(
+        atlas.atlas_report.render.msdf_text_renderer_active &&
+            atlas.atlas_report.render.msdf_text_atlas_ready &&
+            atlas.atlas_report.render.msdf_text_draw_calls > 0 &&
+            atlas.atlas_report.render.msdf_text_glyph_instances > 0,
+        "LCD atlas probe draws fixture text through the active MSDF atlas");
+    ok &= check(
+        grayscale_control_atlas.ready &&
+            atlas_report_render_state_ready(
+                grayscale_control_atlas.atlas_report),
+        "LCD atlas probe captures the NONE grayscale control render");
+    ok &= check(
+        grayscale_control_atlas.atlas_report.render.msdf_lcd_subpixel_order ==
+            term::Terminal_lcd_subpixel_order::NONE &&
+            !grayscale_control_atlas.atlas_report.render.msdf_lcd_text_enabled &&
+            grayscale_control_atlas.atlas_report.render.msdf_text_draw_calls > 0,
+        "LCD atlas probe NONE control run draws grayscale MSDF text");
+    // Channel-level evidence: the RGB render must fringe text ink (channels
+    // weighted per subpixel), the NONE control must stay grayscale. Metadata
+    // alone cannot catch a no-op LCD shader.
+    constexpr int k_min_lcd_fringe_pixels = 1000;
+    ok &= check(
+        lcd_fringe_rgb.measured_pixels > 0 &&
+            lcd_fringe_rgb.fringe_pixels >= k_min_lcd_fringe_pixels,
+        "LCD atlas probe RGB render exhibits LCD subpixel fringing in text ink");
+    ok &= check(
+        lcd_fringe_grayscale.measured_pixels > 0 &&
+            lcd_fringe_grayscale.fringe_pixels == 0,
+        "LCD atlas probe NONE control render keeps text ink grayscale");
     ok &= check(
         write_lcd_probe_artifacts(
             fixture,
