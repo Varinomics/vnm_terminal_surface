@@ -23,34 +23,37 @@
 
 namespace {
 
-constexpr unsigned int k_windows_font_smoothing_cleartype       = 0x0002U;
 constexpr unsigned int k_windows_font_smoothing_orientation_bgr = 0x0000U;
 constexpr unsigned int k_windows_font_smoothing_orientation_rgb = 0x0001U;
 
 #if defined(_WIN32)
-constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
-constexpr unsigned int k_win_spi_get_font_smoothing_type        = 0x200AU;
 constexpr unsigned int k_win_spi_get_font_smoothing_orientation = 0x2012U;
 
-std::optional<vnm_terminal::Resolved_lcd_subpixel_order>
+vnm_terminal::internal::windows_screen_layout_t
 read_windows_screen_subpixel_order(const QScreen& screen)
 {
+    using vnm_terminal::Resolved_lcd_subpixel_order;
+    using vnm_terminal::internal::Windows_screen_layout_state;
+    using vnm_terminal::internal::windows_screen_layout_t;
+
     const auto* const native_screen =
         screen.nativeInterface<QNativeInterface::QWindowsScreen>();
+    // Without an identified monitor there is no per-monitor answer at all;
+    // the resolver fails closed instead of borrowing the global orientation.
     if (native_screen == nullptr || native_screen->handle() == nullptr) {
-        return std::nullopt;
+        return {};
     }
 
     MONITORINFOEXW monitor_info{};
     monitor_info.cbSize = sizeof(monitor_info);
     if (GetMonitorInfoW(native_screen->handle(), &monitor_info) == FALSE) {
-        return std::nullopt;
+        return {};
     }
 
     const QString device_name = QString::fromWCharArray(monitor_info.szDevice);
     const QString device_prefix = QStringLiteral("\\\\.\\DISPLAY");
     if (!device_name.startsWith(device_prefix)) {
-        return std::nullopt;
+        return {};
     }
     const QString display_number = device_name.mid(device_prefix.size());
     if (display_number.isEmpty() ||
@@ -59,7 +62,7 @@ read_windows_screen_subpixel_order(const QScreen& screen)
             display_number.cend(),
             [](QChar character) { return character.isDigit(); }))
     {
-        return std::nullopt;
+        return {};
     }
 
     QSettings registry(
@@ -67,22 +70,36 @@ read_windows_screen_subpixel_order(const QScreen& screen)
             "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Avalon.Graphics\\DISPLAY%1")
             .arg(display_number),
         QSettings::NativeFormat);
+    const QVariant raw_pixel_structure =
+        registry.value(QStringLiteral("PixelStructure"));
+    if (!raw_pixel_structure.isValid()) {
+        // The monitor is identified but stores no override; only here may the
+        // resolver fall back to the global orientation.
+        return {
+            Windows_screen_layout_state::ABSENT,
+            Resolved_lcd_subpixel_order::NONE};
+    }
     bool pixel_structure_valid = false;
-    const int pixel_structure = registry.value(
-        QStringLiteral("PixelStructure"),
-        -1).toInt(&pixel_structure_valid);
-    if (!pixel_structure_valid) {
-        return std::nullopt;
+    const int pixel_structure = raw_pixel_structure.toInt(&pixel_structure_valid);
+    if (pixel_structure_valid) {
+        switch (pixel_structure) {
+            case 0:
+                return {
+                    Windows_screen_layout_state::RESOLVED,
+                    Resolved_lcd_subpixel_order::NONE};
+            case 1:
+                return {
+                    Windows_screen_layout_state::RESOLVED,
+                    Resolved_lcd_subpixel_order::RGB};
+            case 2:
+                return {
+                    Windows_screen_layout_state::RESOLVED,
+                    Resolved_lcd_subpixel_order::BGR};
+            default:
+                break;
+        }
     }
-    switch (pixel_structure) {
-        case 0:
-            return vnm_terminal::Resolved_lcd_subpixel_order::NONE;
-        case 1:
-            return vnm_terminal::Resolved_lcd_subpixel_order::RGB;
-        case 2:
-            return vnm_terminal::Resolved_lcd_subpixel_order::BGR;
-    }
-    return std::nullopt;
+    return {Windows_screen_layout_state::INVALID, Resolved_lcd_subpixel_order::NONE};
 }
 
 std::optional<int> windows_screen_rotation_degrees(const QScreen& screen)
@@ -106,53 +123,22 @@ std::optional<int> windows_screen_rotation_degrees(const QScreen& screen)
 }
 #endif
 
-std::optional<vnm_terminal::internal::windows_font_smoothing_settings_t>
-read_windows_font_smoothing_settings()
+vnm_terminal::internal::windows_lcd_orientation_query_t
+read_windows_lcd_orientation()
 {
+    vnm_terminal::internal::windows_lcd_orientation_query_t query;
 #if defined(_WIN32)
-    vnm_terminal::internal::windows_font_smoothing_settings_t settings;
-
-    int font_smoothing_enabled = 0;
-    if (SystemParametersInfoW(
-            k_win_spi_get_font_smoothing,
-            0U,
-            &font_smoothing_enabled,
-            0U) == 0)
-    {
-        return std::nullopt;
-    }
-
-    settings.enabled = font_smoothing_enabled != 0;
-    if (!settings.enabled) {
-        return settings;
-    }
-
-    if (SystemParametersInfoW(
-            k_win_spi_get_font_smoothing_type,
-            0U,
-            &settings.type,
-            0U) == 0)
-    {
-        return std::nullopt;
-    }
-
-    if (settings.type != k_windows_font_smoothing_cleartype) {
-        return settings;
-    }
-
+    unsigned int orientation = 0U;
     if (SystemParametersInfoW(
             k_win_spi_get_font_smoothing_orientation,
             0U,
-            &settings.orientation,
-            0U) == 0)
+            &orientation,
+            0U) != 0)
     {
-        return std::nullopt;
+        query.orientation = orientation;
     }
-
-    return settings;
-#else
-    return std::nullopt;
 #endif
+    return query;
 }
 
 }
@@ -178,56 +164,68 @@ resolved_lcd_subpixel_order_from_qt_hint(int hint)
     return std::nullopt;
 }
 
-Resolved_lcd_subpixel_order resolved_lcd_subpixel_order_from_windows_settings(
-    const std::optional<windows_font_smoothing_settings_t>& settings)
+std::optional<Resolved_lcd_subpixel_order>
+resolved_lcd_subpixel_order_from_windows_orientation(
+    const windows_lcd_orientation_query_t& query)
 {
-    if (!settings.has_value() || !settings->enabled ||
-        settings->type != k_windows_font_smoothing_cleartype)
-    {
-        return Resolved_lcd_subpixel_order::NONE;
+    if (!query.orientation.has_value()) {
+        return std::nullopt;
     }
-
-    switch (settings->orientation) {
-        case k_windows_font_smoothing_orientation_rgb:
-            return Resolved_lcd_subpixel_order::RGB;
-        case k_windows_font_smoothing_orientation_bgr:
-            return Resolved_lcd_subpixel_order::BGR;
+    switch (*query.orientation) {
+        case k_windows_font_smoothing_orientation_rgb: return Resolved_lcd_subpixel_order::RGB;
+        case k_windows_font_smoothing_orientation_bgr: return Resolved_lcd_subpixel_order::BGR;
+        default:                                       return std::nullopt;
     }
-
-    return Resolved_lcd_subpixel_order::NONE;
 }
 
 Resolved_lcd_subpixel_order resolved_lcd_subpixel_order_from_windows_sources(
-    const std::optional<Resolved_lcd_subpixel_order>&        screen_order,
-    int                                                     rotation_degrees,
-    const std::optional<windows_font_smoothing_settings_t>& settings)
+    const windows_screen_layout_t&         screen_layout,
+    int                                    rotation_degrees,
+    const windows_lcd_orientation_query_t& orientation_query)
 {
-    const Resolved_lcd_subpixel_order windows_order =
-        resolved_lcd_subpixel_order_from_windows_settings(settings);
-    if (windows_order == Resolved_lcd_subpixel_order::NONE) {
-        return Resolved_lcd_subpixel_order::NONE;
+    // UNAVAILABLE and INVALID both mean the monitor's layout is genuinely
+    // unknown; borrowing the global orientation would risk wrong-direction
+    // fringing. Any state added later fails closed here as well.
+    std::optional<Resolved_lcd_subpixel_order> layout;
+    switch (screen_layout.state) {
+        case Windows_screen_layout_state::RESOLVED:
+            layout = screen_layout.order;
+            break;
+        case Windows_screen_layout_state::ABSENT:
+            // The global ClearType orientation is a best-effort fallback,
+            // expressed in final-screen terms for the primary display.
+            layout = resolved_lcd_subpixel_order_from_windows_orientation(
+                orientation_query);
+            break;
+        case Windows_screen_layout_state::UNAVAILABLE:
+        case Windows_screen_layout_state::INVALID:
+        default:
+            return Resolved_lcd_subpixel_order::NONE;
     }
 
-    if (!screen_order.has_value() ||
-        (*screen_order != Resolved_lcd_subpixel_order::RGB &&
-            *screen_order != Resolved_lcd_subpixel_order::BGR))
+    // A RESOLVED Flat answer is a real layout, and the orientation fallback
+    // never yields one: anything other than horizontal RGB/BGR here is an
+    // explicit or unknown NONE.
+    if (!layout.has_value() ||
+        (*layout != Resolved_lcd_subpixel_order::RGB &&
+            *layout != Resolved_lcd_subpixel_order::BGR))
     {
         return Resolved_lcd_subpixel_order::NONE;
     }
 
     switch (rotation_degrees) {
         case 0:
-            return *screen_order;
+            return *layout;
         case 90:
-            return *screen_order == Resolved_lcd_subpixel_order::RGB
+            return *layout == Resolved_lcd_subpixel_order::RGB
                 ? Resolved_lcd_subpixel_order::VRGB
                 : Resolved_lcd_subpixel_order::VBGR;
         case 180:
-            return *screen_order == Resolved_lcd_subpixel_order::RGB
+            return *layout == Resolved_lcd_subpixel_order::RGB
                 ? Resolved_lcd_subpixel_order::BGR
                 : Resolved_lcd_subpixel_order::RGB;
         case 270:
-            return *screen_order == Resolved_lcd_subpixel_order::RGB
+            return *layout == Resolved_lcd_subpixel_order::RGB
                 ? Resolved_lcd_subpixel_order::VBGR
                 : Resolved_lcd_subpixel_order::VRGB;
     }
@@ -277,7 +275,7 @@ Resolved_lcd_subpixel_order resolve_lcd_subpixel_order(
     return internal::resolved_lcd_subpixel_order_from_windows_sources(
         read_windows_screen_subpixel_order(*screen),
         *rotation_degrees,
-        read_windows_font_smoothing_settings());
+        read_windows_lcd_orientation());
 #else
     const int qt_hint =
         static_cast<int>(platform_screen->subpixelAntialiasingTypeHint());
