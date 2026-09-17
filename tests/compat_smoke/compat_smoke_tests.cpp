@@ -460,6 +460,36 @@ bool test_launch_environment_validation_contract()
     bool ok = true;
     term::Terminal_launch_config config = environment_validation_config();
 
+    auto native_config = environment_validation_config();
+    native_config.argv = {QStringLiteral("cmd.exe")};
+    native_config.windows_native_arguments = QStringLiteral("/s /c echo native");
+#if defined(_WIN32)
+    ok &= check(
+        !term::is_backend_rejection(term::validate_launch_config(native_config)),
+        "Windows accepts an explicit native command tail");
+    const auto native_effective = term::make_effective_launch_config(native_config, {});
+    ok &= check(
+        native_effective.has_value() &&
+            native_effective->windows_native_arguments == native_config.windows_native_arguments,
+        "effective configuration preserves the native command tail");
+    native_config.argv.push_back(QStringLiteral("ambiguous"));
+    ok &= check(
+        is_launch_config_rejection_for(term::validate_launch_config(native_config),
+            QStringLiteral("Native arguments require one executable")),
+        "native command tails cannot coexist with argv arguments");
+    native_config.argv.removeLast();
+    native_config.windows_native_arguments->append(QChar(u'\0'));
+    ok &= check(
+        is_launch_config_rejection_for(term::validate_launch_config(native_config),
+            QStringLiteral("no NUL")),
+        "native command tails reject NUL before dispatch");
+#else
+    ok &= check(
+        is_launch_config_rejection_for(term::validate_launch_config(native_config),
+            QStringLiteral("unsupported on this platform")),
+        "non-Windows launchers reject rather than ignore native command tails");
+#endif
+
     ok &= check(
         !term::is_backend_rejection(term::validate_launch_config(config)),
         "launch validation accepts a missing explicit TERM override");

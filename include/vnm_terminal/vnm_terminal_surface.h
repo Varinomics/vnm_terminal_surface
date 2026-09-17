@@ -33,6 +33,10 @@ struct Terminal_process_start_request
     std::vector<Terminal_environment_entry> base_environment;
     std::optional<std::vector<Terminal_environment_entry>>
         capability_environment;
+    // Explicit native Windows syntax; argv must contain exactly one executable.
+    // The tail is passed verbatim, without argv escaping. Embedded NUL and use
+    // on other platforms are rejected; absence preserves ordinary argv handling.
+    std::optional<QString> windows_native_arguments = std::nullopt;
 };
 
 enum class Terminal_process_start_determinacy

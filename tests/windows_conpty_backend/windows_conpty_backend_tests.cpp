@@ -2538,6 +2538,106 @@ bool test_windows_command_line_quoting(const QString& fixture_path)
     return ok;
 }
 
+bool test_native_cmd_script_quoting(const QString& fixture_path, bool keep_open)
+{
+    QTemporaryDir workspace;
+    if (!check(workspace.isValid(), "native cmd workspace is available")) {
+        return false;
+    }
+    const QString cmd_path = qEnvironmentVariable("ComSpec");
+    if (!check(!cmd_path.isEmpty() && QFileInfo::exists(cmd_path),
+            "ComSpec names an existing command processor"))
+    {
+        return false;
+    }
+    const QString fixture_directory = workspace.filePath(QStringLiteral("program path with spaces"));
+    if (!check(QDir().mkpath(fixture_directory), "native cmd fixture directory is available")) {
+        return false;
+    }
+    const QString copied_fixture = QDir(fixture_directory).filePath(QFileInfo(fixture_path).fileName());
+    if (!check(QFile::copy(fixture_path, copied_fixture), "native cmd fixture copy is available")) {
+        return false;
+    }
+
+    // The first case preserves embedded quotes and a quoted redirect target.
+    // The second starts with a quoted executable, exercising /s framing too.
+    const QStringList scripts{
+        QStringLiteral(">\"result file.txt\" echo \"alpha beta\""),
+        QLatin1Char('"') + QDir::toNativeSeparators(copied_fixture) +
+            QStringLiteral("\" --echo-argv \"argument with spaces\" > \"arguments result.txt\""),
+    };
+    const QStringList filenames{
+        QStringLiteral("result file.txt"), QStringLiteral("arguments result.txt"),
+    };
+    bool ok = true;
+    for (qsizetype index = 0; index < scripts.size(); ++index) {
+        Backend_capture capture;
+        std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+        term::Terminal_launch_config config = launch_config(cmd_path, {});
+        config.working_directory = workspace.path();
+        config.windows_native_arguments =
+            (keep_open ? QStringLiteral("/s /k ") : QStringLiteral("/s /c ")) +
+            QLatin1Char('"') + scripts.at(index) + QLatin1Char('"');
+        const auto started = backend->start(config, capture.callbacks());
+        if (!check(started.code == term::Terminal_backend_result_code::ACCEPTED,
+                "native cmd script starts"))
+        {
+            return false;
+        }
+        const QString result_path = workspace.filePath(filenames.at(index));
+        const QString follow_up_name = QStringLiteral("follow-up %1.txt").arg(index);
+        if (keep_open) {
+            // Unlike /c, /k must execute the script and keep accepting input.
+            if (!check(wait_for_file(result_path), "interactive cmd executes its script")) {
+                return false;
+            }
+            if (!check(!capture.exit_snapshot().has_value(), "native /k remains interactive")) {
+                return false;
+            }
+            const QByteArray follow_up = (
+                QStringLiteral(">\"") + follow_up_name +
+                QStringLiteral("\" echo continued\rexit 0\r")).toUtf8();
+            const auto written = backend->write(follow_up);
+            if (!check(written.code == term::Terminal_backend_result_code::ACCEPTED,
+                    "native /k accepts a subsequent command"))
+            {
+                return false;
+            }
+        }
+        if (!check(capture.wait_for_exit(), "native cmd exits")) {
+            return false;
+        }
+        const auto exit = capture.exit_snapshot();
+        ok &= check(exit.has_value() && exit->reason == term::Terminal_exit_reason::EXITED &&
+            exit->exit_code == 0, "native cmd reports clean exit");
+        QFile result(result_path);
+        if (!check(result.open(QIODevice::ReadOnly), "quoted redirect names the intended file")) {
+            return false;
+        }
+        const QByteArray contents = result.readAll();
+        if (index == 0) {
+            ok &= check(contents == QByteArrayLiteral("\"alpha beta\"\r\n"),
+                "cmd preserves echo's quotation marks and exact output bytes");
+        }
+        else {
+            ok &= check(contents.contains(QByteArrayLiteral("argv[2]=argument with spaces")),
+                "quoted executable and argument survive cmd framing");
+        }
+        if (keep_open) {
+            QFile follow_up(workspace.filePath(follow_up_name));
+            if (!check(follow_up.open(QIODevice::ReadOnly),
+                    "native /k executes subsequent terminal input"))
+            {
+                return false;
+            }
+            ok &= check(follow_up.readAll() == QByteArrayLiteral("continued\r\n"),
+                "subsequent command produces the expected file contents");
+        }
+        ok &= check_no_backend_errors(capture, "native cmd produces no backend errors");
+    }
+    return ok;
+}
+
 bool test_failed_executable(const QString& fixture_path)
 {
     bool ok = true;
@@ -3580,6 +3680,14 @@ int main(int argc, char** argv)
         ok &= wait_for_console_host_children_to_exit("compatibility window");
         return ok ? 0 : 1;
     }
+    if (argc == 3 && std::string_view(argv[1]) == "--native-cmd-script") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_native_cmd_script_quoting(fixture_path, false);
+        ok &= test_native_cmd_script_quoting(fixture_path, true);
+        ok &= test_windows_command_line_quoting(fixture_path);
+        ok &= wait_for_console_host_children_to_exit("native cmd script");
+        return ok ? 0 : 1;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--paste-input-reader") {
         return run_paste_input_reader(QString::fromLocal8Bit(argv[2]));
     }
@@ -3634,6 +3742,8 @@ int main(int argc, char** argv)
         test_absolute_forward_slash_cmd_stays_running());
     run_test("Windows command-line quoting",
         test_windows_command_line_quoting(fixture_path));
+    run_test("native cmd /c script quoting", test_native_cmd_script_quoting(fixture_path, false));
+    run_test("native cmd /k script quoting", test_native_cmd_script_quoting(fixture_path, true));
     run_test("missing working directory", test_missing_working_directory(fixture_path));
     run_test("failed executable", test_failed_executable(fixture_path));
     run_test("rejection paths", test_rejection_paths(fixture_path));

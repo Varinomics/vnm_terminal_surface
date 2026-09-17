@@ -113,6 +113,7 @@ struct Terminal_launch_config
     Terminal_termination_policy            termination_policy;
     std::optional<Terminal_backend_output_delivery_limits>
                                            output_delivery_limits;
+    std::optional<QString>                 windows_native_arguments = std::nullopt;
 };
 
 struct Terminal_effective_launch_config
@@ -126,6 +127,7 @@ struct Terminal_effective_launch_config
     Terminal_termination_policy            termination_policy;
     std::optional<Terminal_backend_output_delivery_limits>
                                            output_delivery_limits;
+    std::optional<QString>                 windows_native_arguments = std::nullopt;
 };
 
 struct Terminal_backend_error
@@ -273,6 +275,22 @@ inline Terminal_backend_result validate_launch_config(
         }
     }
 
+    if (config.windows_native_arguments.has_value()) {
+#if !defined(_WIN32)
+        return backend_reject(
+            Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+            QStringLiteral("Windows native arguments are unsupported on this platform"));
+#else
+        if (config.argv.size() != 1 ||
+            config.windows_native_arguments->contains(QChar(u'\0')))
+        {
+            return backend_reject(
+                Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+                QStringLiteral("Native arguments require one executable and no NUL"));
+        }
+#endif
+    }
+
     if (config.working_directory.contains(QChar(u'\0'))) {
         return
             backend_reject(
@@ -380,6 +398,7 @@ inline std::optional<Terminal_effective_launch_config> make_effective_launch_con
         config.process_group_policy,
         config.termination_policy,
         config.output_delivery_limits,
+        config.windows_native_arguments,
     };
 }
 

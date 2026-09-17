@@ -848,6 +848,12 @@ public:
 
         PROCESS_INFORMATION process_information{};
         std::wstring command_line = command_line_from_argv(effective_config.argv);
+        if (effective_config.windows_native_arguments.has_value()) {
+            // cmd.exe consumes native syntax, not CRT-escaped argv. Only the
+            // executable token above is quoted; the explicit tail is verbatim.
+            command_line += L" ";
+            command_line += wide_from_qstring(*effective_config.windows_native_arguments);
+        }
         std::wstring working_directory;
         LPCWSTR working_directory_ptr = nullptr;
         if (!effective_config.working_directory.isEmpty()) {

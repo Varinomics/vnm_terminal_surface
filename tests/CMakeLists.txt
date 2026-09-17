@@ -2061,6 +2061,20 @@ if(WIN32)
             "$<TARGET_FILE:vnm_terminal_error_mode_reporter>"
     )
 
+    add_test(
+        NAME vnm_terminal_windows_native_cmd
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-script
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd PROPERTIES
+        LABELS "conformance;windows;conpty"
+        TIMEOUT 300
+    )
+
     set_tests_properties(vnm_terminal_windows_conpty_backend PROPERTIES
         LABELS "conformance;windows;conpty"
         # This suite drives real ConPTY sessions and PowerShell fixtures, so its
