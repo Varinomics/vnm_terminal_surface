@@ -27,6 +27,8 @@ is preserved in `THIRD_PARTY/conpty/LICENSE` and deployed with the runtime.
 
 ## Embedded Fonts
 
+The default terminal face is Ubuntu Sans Mono derivative vnm.
+
 The default monospace face is supplied by
 [`vnm_fonts`](https://github.com/Varinomics/vnm_fonts), which ships the file
 byte-verbatim as its author published it and marks the family name in memory as

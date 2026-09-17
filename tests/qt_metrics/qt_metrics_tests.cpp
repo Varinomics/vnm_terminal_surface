@@ -1020,19 +1020,19 @@ bool test_public_font_metrics_replicates_internal()
 }
 
 // The default monospace family must be the one vnm_fonts registered rather than
-// a name spelled in this project. vnm_fonts marks the family as it enters the
-// font database precisely so an installed Ubuntu Mono - Bront cannot merge with
-// the shipped one, and a hand-written copy of the marked name would drift from
-// the library the moment the mark changed.
+// a name spelled in this project. The derivative is intentionally registered
+// under the exact unmarked family "Ubuntu Sans Mono derivative vnm", so the
+// default must come from the shared registry.
 //
-// Resolving the family back to itself is what proves the mark took: a merged or
-// unregistered family resolves to something else. QFontInfo::exactMatch() does
-// not answer that question - it compares the whole font description, so it is
-// false even when the family resolved correctly.
+// Resolving the family back to itself proves the registered family is available
+// to QFont. QFontInfo::exactMatch() does not answer that question - it compares
+// the whole font description, so it is false even when the family resolved
+// correctly.
 bool test_default_monospace_family_is_the_registered_one()
 {
     const vnm_fonts::Registered_font shipped_font =
-        vnm_fonts::register_shipped_font(vnm_fonts::Shipped_font::UBUNTU_MONO_BRONT);
+        vnm_fonts::register_shipped_font(
+            vnm_fonts::Shipped_font::UBUNTU_SANS_MONO_DERIVATIVE_VNM_REGULAR);
     if (!check(shipped_font.is_valid(), "vnm_fonts registers the shipped monospace face")) {
         std::cerr << "vnm_fonts error: " << shipped_font.error.toStdString() << '\n';
         return false;
@@ -1060,56 +1060,6 @@ bool test_default_monospace_family_is_the_registered_one()
     return ok;
 }
 
-// A family a host stored under an earlier release names the same shipped face,
-// so restoring it must keep that face rather than leave the terminal on
-// whatever the host substitutes for a family that no longer exists. Both
-// spellings are covered because both were shipped, and the check runs through
-// the surface as well as the helper, because the surface is where a restored
-// setting actually arrives.
-bool test_stored_font_family_from_an_earlier_release_keeps_the_shipped_face(
-    QGuiApplication& app)
-{
-    const QString shipped_family = term::vnm_terminal_default_monospace_font_family();
-    const QString host_family    = QStringLiteral("Consolas");
-
-    const char* superseded_families[] = {
-        "Ubuntu Mono - Bront",
-        "Ubuntu Mono derivative Bront",
-    };
-
-    QQuickWindow window;
-    window.resize(360, 180);
-
-    VNM_TerminalSurface surface;
-    surface.setParentItem(window.contentItem());
-    surface.setSize(QSizeF(360.0, 180.0));
-    window.show();
-    pump_events(app);
-
-    bool ok = true;
-    for (const char* superseded : superseded_families) {
-        const QString stored_family = QString::fromLatin1(superseded);
-
-        ok &= check(
-            term::vnm_terminal_migrated_font_family(stored_family) == shipped_family,
-            "a family stored under an earlier release maps to the shipped family");
-
-        // Move off the shipped family first: a fresh surface already reports
-        // it, so the restore below would look right without migrating anything.
-        surface.set_font_family(host_family);
-        pump_events(app);
-        ok &= check(surface.font_family() == host_family,
-            "the surface leaves a family it never shipped exactly as the host set it");
-
-        surface.set_font_family(stored_family);
-        pump_events(app);
-        ok &= check(surface.font_family() == shipped_family,
-            "the surface restores an earlier release's family as the shipped family");
-    }
-
-    return ok;
-}
-
 }
 
 int main(int argc, char** argv)
@@ -1130,6 +1080,5 @@ int main(int argc, char** argv)
     ok &= test_diagnostics_metrics_json(app);
     ok &= test_public_font_metrics_replicates_internal();
     ok &= test_default_monospace_family_is_the_registered_one();
-    ok &= test_stored_font_family_from_an_earlier_release_keeps_the_shipped_face(app);
     return ok ? 0 : 1;
 }

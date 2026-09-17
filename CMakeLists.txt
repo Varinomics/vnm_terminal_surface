@@ -125,13 +125,11 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL AND
         "vnm_qt_dispatch target is unavailable after dependency discovery.")
 endif()
 
-# The renderer's default monospace face comes from vnm_fonts, which registers
-# it under a family name unique to the process. Two font files declaring one
-# family name merge into a single font-database entry, after which glyph lookup
-# and rasterisation can be served from different files; the marking vnm_fonts
-# applies at load time is what keeps an installed Ubuntu Mono - Bront from
-# merging with the embedded one. It is added by several dependency paths in one
-# configure, so it guards its own repeated inclusion.
+# The renderer's default monospace face comes from the vnm_fonts registry. The
+# derivative intentionally retains its exact published unmarked family name,
+# "Ubuntu Sans Mono derivative vnm"; consumers use the family returned by the
+# registry rather than spelling a local fallback. It is added by several
+# dependency paths during one configure, so it guards its own repeated inclusion.
 if(NOT TARGET vnm::fonts)
     if(VNM_FONTS_SOURCE_DIR)
         if(NOT EXISTS "${VNM_FONTS_SOURCE_DIR}/CMakeLists.txt")

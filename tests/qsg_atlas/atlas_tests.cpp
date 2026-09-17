@@ -201,7 +201,7 @@ constexpr float k_msdf_single_w_atlas_px_range = 10.0f;
 constexpr float k_msdf_single_w_sharpness_bias = 2.5f;
 constexpr char32_t k_msdf_single_w_codepoint = U'W';
 constexpr const char* k_terminal_monospace_font_resource =
-    ":/vnm_fonts/UbuntuMono-Bront.ttf";
+    ":/vnm_fonts/UbuntuSansMonoDerivativeVnm-Regular.ttf";
 #endif
 
 } // namespace

@@ -31,7 +31,7 @@ namespace {
 // outlines that both copies share; reading the shipped file is the path
 // vnm_fonts documents for a consumer that needs a file rather than a family.
 constexpr const char* k_bundled_monospace_font_resource =
-    ":/vnm_fonts/UbuntuMono-Bront.ttf";
+    ":/vnm_fonts/UbuntuSansMonoDerivativeVnm-Regular.ttf";
 
 std::optional<QByteArray> bundled_font_bytes()
 {
