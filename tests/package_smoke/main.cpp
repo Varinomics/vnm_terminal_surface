@@ -55,8 +55,12 @@ int main()
     // Prove the installed public font/metrics header is includable and that its
     // functions link from the packaged library.
     QString (*default_family)() = &vnm_terminal::default_monospace_font_family;
-    vnm_terminal::Cell_metrics (*metrics_for_font)(const QString&, qreal, qreal) =
-        &vnm_terminal::cell_metrics_for_font;
+    vnm_terminal::Cell_metrics (*metrics_for_font)(
+        const QString&,
+        qreal,
+        qreal,
+        vnm_terminal::Font_advance_policy,
+        qreal) = &vnm_terminal::cell_metrics_for_font;
     bool (*metrics_valid)(const vnm_terminal::Cell_metrics&) =
         &vnm_terminal::cell_metrics_valid;
     const auto standalone_boundary = &invoke_standalone_boundary;
