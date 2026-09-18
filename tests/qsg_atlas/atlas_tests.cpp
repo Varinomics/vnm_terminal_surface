@@ -5710,6 +5710,7 @@ Pixel_render_result render_pixel_atlas_fixture(
         VNM_TerminalSurface::Lcd_subpixel_order::AUTO)
 {
     QQuickWindow window;
+    window.setFlags(Qt::Window | Qt::FramelessWindowHint);
     window.setColor(QColor(1, 2, 3));
     const QSizeF window_logical_size(
         fixture.logical_size.width() + std::max<qreal>(0.0, surface_position.x()),
@@ -5810,6 +5811,7 @@ Pixel_render_result render_qsg_text_reference_fixture(
     const Pixel_parity_fixture&  fixture)
 {
     QQuickWindow window;
+    window.setFlags(Qt::Window | Qt::FramelessWindowHint);
     window.setColor(QColor(1, 2, 3));
     window.resize(pixel_window_logical_pixel_size(fixture.logical_size));
 
