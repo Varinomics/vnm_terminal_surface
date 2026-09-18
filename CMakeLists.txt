@@ -266,12 +266,14 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/unicode_width_tables.h
     include/vnm_terminal/internal/vnm_terminal_font.h
     include/vnm_terminal/internal/viewport_contract.h
+    include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/vnm_terminal_canvas.h
     src/qsg_atlas_font_bytes.cpp
     src/qsg_atlas_renderer.cpp
     src/qsg_terminal_renderer.cpp
     src/qt_grid_metrics_provider.cpp
+    src/font_metrics.cpp
     src/metrics_contract.cpp
     src/unicode_width_tables.cpp
     src/vnm_terminal_font.cpp
@@ -400,7 +402,6 @@ add_library(vnm_terminal_surface STATIC
     src/diagnostics/metrics_json.cpp
     src/diagnostics/diagnostic_sink.cpp
     src/diagnostics/profile_text.cpp
-    src/font_metrics.cpp
     src/interaction_trace.cpp
     src/terminal_history_ring.cpp
     src/terminal_history_row_record_codec.cpp
