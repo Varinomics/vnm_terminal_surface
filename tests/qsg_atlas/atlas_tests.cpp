@@ -8730,19 +8730,18 @@ bool test_cell_stable_ascii_layout_font()
         value <= k_ascii_layout_probe_last;
         ++value)
     {
-        // The terminal snaps each cell to an integer pixel width, so the cell
-        // width is the rounded glyph advance. QFontMetricsF reports the precise
-        // fractional advance, which differs from that rounded width by up to half
-        // a pixel depending on the font engine (FreeType returns the unrounded
-        // design advance; DirectWrite/CoreText round to whole pixels). Per-cell
-        // glyph placement uses the cell width, not this advance, and the actual
-        // cell-stability of positions is asserted separately below, so require the
-        // advance only to round to the cell width.
+        // The default provider policy snaps the monospace advance upward to
+        // the device-pixel grid. QFontMetricsF reports the precise fractional
+        // advance, so it may be almost one logical pixel below the cell width
+        // at dpr=1 (FreeType exposes the fractional design advance while the
+        // grid stores its upward snap). Per-cell placement uses the snapped
+        // cell width, not this raw advance.
+        const qreal raw_advance = font_metrics.horizontalAdvance(
+            QLatin1Char(static_cast<char>(value)));
         ok &= check(
-            std::abs(
-                font_metrics.horizontalAdvance(
-                    QLatin1Char(static_cast<char>(value))) -
-                metrics.width) <= 0.5,
+            std::isfinite(raw_advance) &&
+                raw_advance <= metrics.width + 0.001 &&
+                metrics.width - raw_advance < 1.001,
             "cell-stable ASCII glyph advances match terminal cell width");
     }
 
