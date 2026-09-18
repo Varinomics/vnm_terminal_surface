@@ -159,6 +159,14 @@ struct atlas_uniform_t
     float matrix[16] = {};
 };
 
+struct atlas_invert_uniform_t
+{
+    float invert_brightness = 0.0f;
+    float padding[3] = {};
+};
+
+static_assert(sizeof(atlas_invert_uniform_t) == 16);
+
 struct atlas_msdf_uniform_t
 {
     float matrix[16]    = {};
@@ -2574,6 +2582,7 @@ public:
         delete_resource(m_msdf_text_sampler);
         delete_resource(m_coverage_sampler);
         delete_resource(m_msdf_text_uniform_buffer);
+        delete_resource(m_invert_uniform_buffer);
         delete_resource(m_uniform_buffer);
         delete_resource(m_msdf_text_instance_buffer);
         delete_resource(m_glyph_instance_buffer);
@@ -2981,14 +2990,20 @@ private:
             QRhiBuffer::Dynamic,
             QRhiBuffer::UniformBuffer,
             static_cast<quint32>(rhi->ubufAligned(sizeof(atlas_uniform_t))));
+        m_invert_uniform_buffer = rhi->newBuffer(
+            QRhiBuffer::Dynamic,
+            QRhiBuffer::UniformBuffer,
+            static_cast<quint32>(rhi->ubufAligned(sizeof(atlas_invert_uniform_t))));
         if (m_vertex_buffer == nullptr ||
-            m_uniform_buffer == nullptr)
+            m_uniform_buffer == nullptr ||
+            m_invert_uniform_buffer == nullptr)
         {
             releaseResources();
             return false;
         }
         if (!m_vertex_buffer->create() ||
-            !m_uniform_buffer->create())
+            !m_uniform_buffer->create() ||
+            !m_invert_uniform_buffer->create())
         {
             releaseResources();
             return false;
@@ -3004,6 +3019,10 @@ private:
                 0,
                 QRhiShaderResourceBinding::VertexStage,
                 m_uniform_buffer),
+            QRhiShaderResourceBinding::uniformBuffer(
+                1,
+                QRhiShaderResourceBinding::FragmentStage,
+                m_invert_uniform_buffer),
         });
         if (!m_rect_shader_resources->create()) {
             releaseResources();
@@ -3145,6 +3164,10 @@ private:
                 QRhiShaderResourceBinding::FragmentStage,
                 coverage_texture,
                 m_coverage_sampler),
+            QRhiShaderResourceBinding::uniformBuffer(
+                2,
+                QRhiShaderResourceBinding::FragmentStage,
+                m_invert_uniform_buffer),
         });
         if (!shader_resources->create()) {
             delete_resource(shader_resources);
@@ -3355,6 +3378,10 @@ private:
                 QRhiShaderResourceBinding::FragmentStage,
                 m_msdf_text_atlas_texture,
                 m_msdf_text_sampler),
+            QRhiShaderResourceBinding::uniformBuffer(
+                2,
+                QRhiShaderResourceBinding::FragmentStage,
+                m_invert_uniform_buffer),
         });
         if (!shader_resources->create()) {
             delete_resource(shader_resources);
@@ -4403,6 +4430,7 @@ private:
                 *options.cursor_blink_enabled_override);
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
+        append_key_bool(key, options.invert_brightness);
         append_key_int(key, static_cast<int>(options.text_renderer_policy));
         append_key_int(key, static_cast<int>(options.msdf_lcd_subpixel_order));
         return key;
@@ -6623,6 +6651,9 @@ private:
         }
 
         atlas_uniform_t uniform;
+        atlas_invert_uniform_t invert_uniform;
+        invert_uniform.invert_brightness =
+            m_frame.options.invert_brightness ? 1.0f : 0.0f;
         const QMatrix4x4 projection =
             projectionMatrix() != nullptr ? *projectionMatrix() : QMatrix4x4();
         const QMatrix4x4 model =
@@ -6637,6 +6668,11 @@ private:
             0U,
             sizeof(uniform),
             &uniform);
+        updates->updateDynamicBuffer(
+            m_invert_uniform_buffer,
+            0U,
+            sizeof(invert_uniform),
+            &invert_uniform);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         if (msdf_text_buffer_needed &&
             m_msdf_text_uniform_buffer != nullptr)
@@ -6857,6 +6893,7 @@ private:
     QRhiBuffer*                              m_glyph_instance_buffer = nullptr;
     QRhiBuffer*                              m_msdf_text_instance_buffer = nullptr;
     QRhiBuffer*                              m_uniform_buffer = nullptr;
+    QRhiBuffer*                              m_invert_uniform_buffer = nullptr;
     QRhiBuffer*                              m_msdf_text_uniform_buffer = nullptr;
     QRhiShaderResourceBindings*              m_rect_shader_resources = nullptr;
     QRhiShaderResourceBindings*              m_glyph_shader_resources = nullptr;

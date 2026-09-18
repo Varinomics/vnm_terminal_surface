@@ -3054,6 +3054,36 @@ bool test_viewport_empty_and_dirty_ranges()
     return ok;
 }
 
+bool test_invert_brightness_is_a_gpu_render_option()
+{
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 2});
+    snapshot.cursor.visible = false;
+
+    term::Terminal_text_style colored = term::make_default_terminal_text_style();
+    colored.foreground = term::make_rgb_terminal_color_ref(0xffcc0000U);
+    colored.background = term::make_rgb_terminal_color_ref(0xff0030ccU);
+    snapshot.styles.push_back(colored);
+    snapshot.cells.push_back({{0, 0}, QStringLiteral("A"), 0U, 1, false, 1U});
+
+    term::Terminal_render_options render_options = options();
+    render_options.invert_brightness = true;
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+
+    bool ok = true;
+    ok &= check(
+        frame.text_runs.size() == 1U &&
+            frame.text_runs.front().foreground == QColor(204, 0, 0) &&
+            frame.text_runs.front().background == QColor(0, 48, 204),
+        "brightness inversion leaves frame source colors for the GPU fragment stage");
+
+    const term::Terminal_render_frame normal_frame = build(snapshot, options());
+    ok &= check(
+        normal_frame.layer_descriptors.render_options_key !=
+            frame.layer_descriptors.render_options_key,
+        "brightness inversion participates in render-option invalidation");
+    return ok;
+}
+
 }
 
 int main()
@@ -3097,5 +3127,6 @@ int main()
     ok &= test_row_descriptor_build_can_be_skipped_for_layer_only_frame();
     ok &= test_content_layer_descriptor_build_can_be_skipped_for_state_only_frame();
     ok &= test_viewport_empty_and_dirty_ranges();
+    ok &= test_invert_brightness_is_a_gpu_render_option();
     return ok ? 0 : 1;
 }

@@ -174,6 +174,9 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Lcd_subpixel_order lcdSubpixelOrder
         READ lcd_subpixel_order WRITE set_lcd_subpixel_order
         NOTIFY lcd_subpixel_order_changed)
+    Q_PROPERTY(bool invertBrightness
+        READ invert_brightness WRITE set_invert_brightness
+        NOTIFY invert_brightness_changed)
     Q_PROPERTY(bool msdfTextAvailable
         READ msdf_text_available NOTIFY msdf_text_available_changed)
     Q_PROPERTY(bool msdfTextChecking
@@ -624,6 +627,9 @@ public:
     Lcd_subpixel_order lcd_subpixel_order() const;
     void set_lcd_subpixel_order(Lcd_subpixel_order order);
 
+    bool invert_brightness() const;
+    void set_invert_brightness(bool enabled);
+
     QString terminal_title() const;
     QString terminal_icon_name() const;
     Process_state process_state() const;
@@ -806,6 +812,7 @@ signals:
     void msdf_text_available_changed();
     void msdf_text_checking_changed();
     void lcd_subpixel_order_changed();
+    void invert_brightness_changed();
     void terminal_title_changed();
     void terminal_icon_name_changed();
     void process_state_changed();
@@ -1052,6 +1059,7 @@ private:
     bool                     m_row_timestamp_tooltip_enabled = true;
     Text_renderer_mode       m_text_renderer_mode        = Text_renderer_mode::AUTO;
     Lcd_subpixel_order       m_lcd_subpixel_order        = Lcd_subpixel_order::AUTO;
+    bool                     m_invert_brightness         = false;
     bool                     m_msdf_text_available       = true;
     bool                     m_msdf_text_checking        = false;
     unsigned long long       m_msdf_availability_generation = 0;

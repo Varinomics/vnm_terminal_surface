@@ -74,6 +74,7 @@ struct Terminal_render_options
     bool                       cursor_presentation_suppressed = false;
     bool                       visual_bell_enabled  = true;
     bool                       underline_hyperlinks = false;
+    bool                       invert_brightness    = false;
     Terminal_text_renderer_policy
                                text_renderer_policy =
                                    Terminal_text_renderer_policy::AUTO;

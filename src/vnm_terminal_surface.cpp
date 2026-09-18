@@ -1311,11 +1311,13 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
     options.underline_hyperlinks           = true;
     options.visual_bell_enabled =
         surface.visual_bell_policy() == VNM_TerminalSurface::Bell_policy::ENABLED;
+    options.invert_brightness = surface.invert_brightness();
     options.text_renderer_policy =
         terminal_text_renderer_policy(surface.text_renderer_mode());
     QQuickWindow* const window = surface.window();
-    options.msdf_lcd_subpixel_order =
-        terminal_lcd_subpixel_order(
+    options.msdf_lcd_subpixel_order = options.invert_brightness
+        ? term::Terminal_lcd_subpixel_order::NONE
+        : terminal_lcd_subpixel_order(
             vnm_terminal::resolve_lcd_subpixel_order(
                 lcd_subpixel_order_policy(surface.lcd_subpixel_order()),
                 window != nullptr ? window->screen() : nullptr));
@@ -4340,6 +4342,22 @@ void VNM_TerminalSurface::set_lcd_subpixel_order(Lcd_subpixel_order order)
 
     m_lcd_subpixel_order = order;
     emit lcd_subpixel_order_changed();
+    m_private->request_render_update(*this);
+}
+
+bool VNM_TerminalSurface::invert_brightness() const
+{
+    return m_invert_brightness;
+}
+
+void VNM_TerminalSurface::set_invert_brightness(bool enabled)
+{
+    if (m_invert_brightness == enabled) {
+        return;
+    }
+
+    m_invert_brightness = enabled;
+    emit invert_brightness_changed();
     m_private->request_render_update(*this);
 }
 

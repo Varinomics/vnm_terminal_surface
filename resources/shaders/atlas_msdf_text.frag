@@ -13,6 +13,11 @@ layout(std140, binding = 0) uniform msdf_text_block
 
 layout(binding = 1) uniform sampler2D msdf_atlas;
 
+layout(std140, binding = 2) uniform invert_block
+{
+    float invert_brightness;
+};
+
 layout(location = 0) smooth in vec4 fragment_uv_rect;
 layout(location = 1) smooth in vec4 fragment_color;
 layout(location = 2) smooth in vec4 fragment_background_color;
@@ -24,6 +29,21 @@ layout(location = 0) out vec4 output_color;
 float median(vec3 v)
 {
     return max(min(v.r, v.g), min(max(v.r, v.g), v.b));
+}
+
+vec3 invert_hsv_value(vec3 color)
+{
+    float value = max(max(color.r, color.g), color.b);
+    return value <= 0.0
+        ? vec3(1.0)
+        : color * ((1.0 - value) / value);
+}
+
+vec3 render_rgb(vec3 color)
+{
+    return invert_brightness > 0.5
+        ? invert_hsv_value(color)
+        : color;
 }
 
 vec4 sample_glyph(vec2 uv, vec2 uv_min, vec2 uv_max)
@@ -125,7 +145,7 @@ void main()
             filtered_lcd_coverage(glyph_ratio, subpixel_step, forward_order);
         float alpha = max(lcd_coverage.r, max(lcd_coverage.g, lcd_coverage.b));
         if (alpha <= 0.0) {
-            output_color = vec4(fragment_color.rgb, 0.0);
+            output_color = vec4(render_rgb(fragment_color.rgb), 0.0);
             return;
         }
 
@@ -137,10 +157,12 @@ void main()
             (precomposed_rgb -
                 fragment_background_color.rgb * (1.0 - alpha)) /
             alpha;
-        output_color = vec4(clamp(straight_rgb, 0.0, 1.0), alpha);
+        output_color = vec4(render_rgb(clamp(straight_rgb, 0.0, 1.0)), alpha);
         return;
     }
 
     float glyph_alpha = glyph_alpha_at_ratio(glyph_ratio);
-    output_color = vec4(fragment_color.rgb, fragment_color.a * glyph_alpha);
+    output_color = vec4(
+        render_rgb(fragment_color.rgb),
+        fragment_color.a * glyph_alpha);
 }
