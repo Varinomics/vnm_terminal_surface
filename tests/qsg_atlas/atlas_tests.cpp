@@ -971,6 +971,8 @@ struct Pixel_parity_fixture
     term::terminal_cell_metrics_t       cell_metrics;
     QSizeF                              logical_size;
     qreal                               device_pixel_ratio = 1.0;
+    vnm_terminal::Font_advance_policy   font_advance_policy =
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP;
     std::vector<Pixel_exact_mask_class>
                                         exact_mask_classes;
     std::vector<Pixel_decorative_primitive>
@@ -1133,16 +1135,25 @@ qreal pixel_logical_dpi()
 term::terminal_cell_metrics_t pixel_metrics(
     qreal device_pixel_ratio,
     qreal font_size,
-    QString font_family = QString())
+    QString font_family = QString(),
+    vnm_terminal::Font_advance_policy policy =
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP)
 {
     const qreal logical_dpi = pixel_logical_dpi();
+    const qreal effective_font_size =
+        vnm_terminal::effective_font_size_for_font(
+            font_family,
+            font_size,
+            device_pixel_ratio,
+            policy,
+            logical_dpi);
     term::Qt_grid_metrics_provider provider(
         term::vnm_terminal_font(
             std::move(font_family),
-            font_size,
+            effective_font_size,
             logical_dpi),
         pixel_normalized_device_pixel_ratio(device_pixel_ratio),
-        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP,
+        policy,
         logical_dpi);
     return provider.cell_metrics();
 }
@@ -5729,13 +5740,11 @@ Pixel_render_result render_pixel_atlas_fixture(
     surface.setSize(fixture.logical_size);
     surface.set_font_family(std::move(font_family));
     surface.set_font_size(font_size);
-    // These fixtures derive their expected cell rectangles from the explicit
-    // upward-snapped metrics above. Keep the renderer on that same policy;
-    // otherwise the surface's product default (adjust font size) changes the
-    // geometry at fractional DPR and makes the pixel-stability checks compare
-    // different grids.
-    surface.set_font_advance_policy(
-        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
+    // Keep the renderer on the policy used to derive the fixture metrics;
+    // otherwise the surface's product default can change the geometry at
+    // fractional DPR and make the pixel-stability checks compare different
+    // grids.
+    surface.set_font_advance_policy(fixture.font_advance_policy);
     surface.set_color_scheme(QStringLiteral("Classic"));
     surface.set_cursor_blink_enabled(false);
     surface.set_text_renderer_mode(text_renderer_mode);
@@ -15364,10 +15373,16 @@ Pixel_parity_fixture make_lcd_fragmented_x_probe_fixture(
 
 Pixel_parity_fixture make_lcd_repeated_on_probe_fixture(
     qreal device_pixel_ratio,
-    qreal font_size = 18.0)
+    qreal font_size = 18.0,
+    vnm_terminal::Font_advance_policy policy =
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP)
 {
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
-    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr, font_size);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(
+        dpr,
+        font_size,
+        QString(),
+        policy);
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_repeated_on_probe",
@@ -15375,6 +15390,7 @@ Pixel_parity_fixture make_lcd_repeated_on_probe_fixture(
         990U,
         metrics,
         dpr);
+    fixture.font_advance_policy = policy;
     const term::Terminal_style_id normal = 1U;
     fixture.snapshot.styles.push_back(rgb_style(
         k_lcd_w_probe_foreground_rgba,
@@ -19009,7 +19025,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     const Pixel_parity_fixture repeated_on_app_font_fixture =
         make_lcd_repeated_on_probe_fixture(
             device_pixel_ratio,
-            k_repeated_on_app_font_size);
+            k_repeated_on_app_font_size,
+            vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE);
     const QPointF repeated_on_app_font_fractional_host =
         lcd_repeated_on_fractional_host(device_pixel_ratio);
     const Pixel_render_result repeated_on_app_font_atlas =
