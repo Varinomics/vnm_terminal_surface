@@ -1121,15 +1121,29 @@ qreal pixel_probe_render_window_device_pixel_ratio(QGuiApplication& app)
     return device_pixel_ratio;
 }
 
+qreal pixel_logical_dpi()
+{
+    const QScreen* const screen = QGuiApplication::primaryScreen();
+    return term::normalized_logical_dpi(
+        screen != nullptr
+            ? screen->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
+}
+
 term::terminal_cell_metrics_t pixel_metrics(
     qreal device_pixel_ratio,
     qreal font_size,
     QString font_family = QString())
 {
+    const qreal logical_dpi = pixel_logical_dpi();
     term::Qt_grid_metrics_provider provider(
-        term::vnm_terminal_font(std::move(font_family), font_size),
+        term::vnm_terminal_font(
+            std::move(font_family),
+            font_size,
+            logical_dpi),
         pixel_normalized_device_pixel_ratio(device_pixel_ratio),
-        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP,
+        logical_dpi);
     return provider.cell_metrics();
 }
 
