@@ -55,13 +55,13 @@ jobs:
       # in this job runs git, so none of the three checkouts needs the
       # credential to survive the step that created it.
       - name: Checkout surface
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: vnm_terminal_surface
           persist-credentials: false
 
       - name: Checkout app
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Varinomics/vnm_terminal
           path: vnm_terminal
@@ -70,7 +70,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout chrome
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Varinomics/vnm_qml_chrome
           path: vnm_qml_chrome
