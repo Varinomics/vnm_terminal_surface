@@ -1128,7 +1128,8 @@ term::terminal_cell_metrics_t pixel_metrics(
 {
     term::Qt_grid_metrics_provider provider(
         term::vnm_terminal_font(std::move(font_family), font_size),
-        pixel_normalized_device_pixel_ratio(device_pixel_ratio));
+        pixel_normalized_device_pixel_ratio(device_pixel_ratio),
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
     return provider.cell_metrics();
 }
 
@@ -5713,6 +5714,13 @@ Pixel_render_result render_pixel_atlas_fixture(
     surface.setSize(fixture.logical_size);
     surface.set_font_family(std::move(font_family));
     surface.set_font_size(font_size);
+    // These fixtures derive their expected cell rectangles from the explicit
+    // upward-snapped metrics above. Keep the renderer on that same policy;
+    // otherwise the surface's product default (adjust font size) changes the
+    // geometry at fractional DPR and makes the pixel-stability checks compare
+    // different grids.
+    surface.set_font_advance_policy(
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
     surface.set_color_scheme(QStringLiteral("Classic"));
     surface.set_cursor_blink_enabled(false);
     surface.set_text_renderer_mode(text_renderer_mode);
@@ -11138,6 +11146,8 @@ int test_dense_grid_smoke(QGuiApplication& app, const char* backend)
     surface.setSize(logical_size);
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(k_font_size);
+    surface.set_font_advance_policy(
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
     term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
         surface,
         true);
