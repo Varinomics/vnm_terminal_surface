@@ -12747,6 +12747,8 @@ bool run_atlas_glyph_row_stable_report_case(
     surface.setSize(QSizeF(220.0, 110.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
+    surface.set_font_advance_policy(
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
     surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
@@ -13051,6 +13053,8 @@ bool test_atlas_rect_row_stable_graphic_arc_update(
     surface.setSize(QSizeF(220.0, 110.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
+    surface.set_font_advance_policy(
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP);
     surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
