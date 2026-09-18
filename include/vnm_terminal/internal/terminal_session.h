@@ -206,6 +206,7 @@ public:
 
     void clear_selection();
     void set_scrollback_limit(int limit);
+    void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
     void set_color_state(Terminal_color_state state);
     void set_primary_repaint_recovery_enabled(bool enabled);
     Terminal_session_result interrupt();

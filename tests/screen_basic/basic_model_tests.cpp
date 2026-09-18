@@ -407,6 +407,21 @@ bool test_retained_history_capacity_override()
         "retained records stay within the overridden byte budget");
     ok &= check(diagnostics.retained_rows > 0U && diagnostics.retained_rows < emitted_rows,
         "2 MiB override evicts history before the row limit");
+
+    const int rows_before_resize = model.scrollback_size();
+    (void)model.set_retained_history_capacity_bytes(
+        term::k_terminal_min_retained_history_capacity_bytes);
+    const term::terminal_retained_history_diagnostics_t reduced_diagnostics =
+        model.retained_history_diagnostics();
+    ok &= check(
+        reduced_diagnostics.byte_budget ==
+            term::k_terminal_min_retained_history_capacity_bytes &&
+        reduced_diagnostics.retained_rows < static_cast<std::uint64_t>(rows_before_resize),
+        "reducing the retained-history capacity evicts only the oldest rows");
+    (void)model.set_retained_history_capacity_bytes(capacity_bytes);
+    ok &= check(
+        model.retained_history_diagnostics().byte_budget == capacity_bytes,
+        "increasing the retained-history capacity is applied to the live model");
     return ok;
 }
 

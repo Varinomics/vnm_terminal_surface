@@ -9,6 +9,7 @@
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
+#include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
@@ -272,6 +273,7 @@ constexpr int         k_msdf_availability_completion_poll_ms     = 10;
 constexpr int         k_msdf_availability_completion_timeout_ms  = 30000;
 constexpr std::size_t k_surface_output_queue_high_water_bytes    = 1024U * 1024U;
 constexpr std::size_t k_surface_output_queue_hard_limit_bytes    = 2U * 1024U * 1024U;
+constexpr std::size_t k_bytes_per_mib                             = 1024U * 1024U;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
 // Posted drains are the primary backend-output pump; keep each wakeup bounded
 // but large enough that high-volume output does not depend on pointer redelivery.
@@ -3552,6 +3554,50 @@ void VNM_TerminalSurface::set_scrollback_limit(int limit)
     }
 }
 
+int VNM_TerminalSurface::scrollback_buffer_size_mib() const
+{
+    return static_cast<int>(m_retained_history_capacity_bytes / k_bytes_per_mib);
+}
+
+void VNM_TerminalSurface::set_scrollback_buffer_size_mib(int size_mib)
+{
+    const int minimum_mib = minimum_scrollback_buffer_size_mib();
+    const int maximum_mib = maximum_scrollback_buffer_size_mib();
+    if (size_mib < minimum_mib || size_mib > maximum_mib) {
+        return;
+    }
+
+    set_retained_history_capacity_bytes(
+        static_cast<std::size_t>(size_mib) * k_bytes_per_mib);
+}
+
+int VNM_TerminalSurface::minimum_scrollback_buffer_size_mib() const
+{
+    return static_cast<int>(
+        (minimum_retained_history_capacity_bytes() + k_bytes_per_mib - 1U) /
+        k_bytes_per_mib);
+}
+
+int VNM_TerminalSurface::maximum_scrollback_buffer_size_mib() const
+{
+    return static_cast<int>(maximum_retained_history_capacity_bytes() / k_bytes_per_mib);
+}
+
+int VNM_TerminalSurface::estimated_scrollback_lines() const
+{
+    if (m_columns <= 0) {
+        return 0;
+    }
+
+    const term::terminal_history_prefix_plain_ascii_retention_estimate_t estimate =
+        term::make_terminal_history_prefix_plain_ascii_retention_estimate(
+            m_retained_history_capacity_bytes,
+            m_columns);
+    return static_cast<int>(std::min<std::uint64_t>(
+        estimate.retained_rows,
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
+}
+
 std::size_t VNM_TerminalSurface::default_retained_history_capacity_bytes()
 {
     return term::k_terminal_default_retained_history_capacity_bytes;
@@ -3586,15 +3632,20 @@ void VNM_TerminalSurface::set_retained_history_capacity_bytes(
         return;
     }
 
-    if (m_private->session != nullptr) {
-        vnm_terminal::diagnostics::write(
-            vnm_terminal::diagnostics::Level::WARNING,
-            QStringLiteral("retained-history capacity must be set before starting a session"));
+    const std::size_t aligned_capacity =
+        term::terminal_history_ring_aligned_capacity(capacity_bytes);
+    if (m_retained_history_capacity_bytes == aligned_capacity) {
         return;
     }
 
-    m_retained_history_capacity_bytes =
-        term::terminal_history_ring_aligned_capacity(capacity_bytes);
+    m_retained_history_capacity_bytes = aligned_capacity;
+    emit scrollback_buffer_size_mib_changed();
+    emit scrollback_estimate_changed();
+    if (m_private->session != nullptr) {
+        m_private->session->set_retained_history_capacity_bytes(
+            m_retained_history_capacity_bytes);
+        sync_from_session();
+    }
 }
 
 bool VNM_TerminalSurface::interaction_diagnostics_enabled() const
@@ -7495,6 +7546,7 @@ void VNM_TerminalSurface::set_grid_size(int rows, int columns)
     m_rows    = rows;
     m_columns = columns;
     emit grid_geometry_changed();
+    emit scrollback_estimate_changed();
 }
 
 void VNM_TerminalSurface::set_viewport_state(

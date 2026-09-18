@@ -2958,6 +2958,45 @@ void Terminal_session::set_scrollback_limit(int limit)
     }
 }
 
+void Terminal_session::set_retained_history_capacity_bytes(
+    std::size_t capacity_bytes)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    drain_backend_callback_commands();
+    process_pending_commands();
+
+    m_config.retained_history_capacity_bytes = capacity_bytes;
+    if (!m_screen_model.has_value()) {
+        return;
+    }
+
+    const std::optional<Live_primary_viewport_anchor> detached_viewport_anchor =
+        capture_live_primary_detached_viewport_anchor();
+    const Terminal_screen_model_result model_result =
+        m_screen_model->set_retained_history_capacity_bytes(capacity_bytes);
+    const Terminal_viewport_state previous_viewport  = m_viewport_controller.state();
+    const terminal_grid_size_t    previous_grid_size = m_grid_size;
+    m_render_snapshot_model_result = model_result;
+    sync_viewport_from_model_result(model_result, detached_viewport_anchor);
+
+    const bool render_snapshot_available = model_allows_render_snapshot(*m_screen_model);
+    if (!render_snapshot_available) {
+        accumulate_synchronized_selection_continuity(model_result);
+        record_blocked_synchronized_row_origin_change(model_result);
+    }
+    if ((model_result_warrants_render_snapshot(model_result) || m_visual_bell_active) &&
+        render_snapshot_available)
+    {
+        const Terminal_screen_model_result selection_basis_result =
+            model_result_with_deferred_synchronized_row_origins(model_result);
+        advance_selection_content_basis_for_model_result(
+            selection_basis_result,
+            previous_viewport,
+            previous_grid_size);
+        publish_render_snapshot(next_sequence(), QStringLiteral("retained history capacity changed"));
+    }
+}
+
 void Terminal_session::set_color_state(Terminal_color_state state)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

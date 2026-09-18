@@ -1202,8 +1202,17 @@ bool test_surface_retained_history_capacity()
 
     fixture.surface.set_retained_history_capacity_bytes(
         VNM_TerminalSurface::default_retained_history_capacity_bytes());
-    ok &= check(fixture.surface.retained_history_capacity_bytes() == capacity_bytes,
-        "surface ignores retained-history capacity changes after session start");
+    const term::terminal_retained_history_diagnostics_t resized_diagnostics =
+        term::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(
+            fixture.surface);
+    ok &= check(
+        fixture.surface.retained_history_capacity_bytes() ==
+            VNM_TerminalSurface::default_retained_history_capacity_bytes(),
+        "surface applies retained-history capacity changes after session start");
+    ok &= check(
+        resized_diagnostics.byte_budget ==
+            VNM_TerminalSurface::default_retained_history_capacity_bytes(),
+        "live retained-history capacity reaches the running screen model");
     return ok;
 }
 

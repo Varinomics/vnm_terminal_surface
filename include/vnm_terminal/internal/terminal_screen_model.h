@@ -583,6 +583,8 @@ public:
         const terminal_screen_model_resize_transition_sink_t*
             resize_transition_sink = nullptr);
     Terminal_screen_model_result set_scrollback_limit(int limit);
+    Terminal_screen_model_result set_retained_history_capacity_bytes(
+        std::size_t capacity_bytes);
     Terminal_screen_model_result set_color_state(Terminal_color_state state);
     void set_primary_repaint_recovery_enabled(bool enabled);
     void set_text_area_resize_policy(Terminal_text_area_resize_policy policy);
@@ -815,6 +817,8 @@ private:
 
         void ensure_allocated();
         void reset();
+        terminal_history_ring_resize_result_t resize_capacity(
+            std::size_t capacity_bytes);
         void track_record_in_reserved_index_slot(
             terminal_history_handle_t                history_handle,
             Terminal_history_row_record_payload_kind payload_kind) noexcept;
@@ -879,6 +883,8 @@ private:
             retained_row_record_t row);
         std::vector<terminal_history_handle_t>
             discard_oldest_retained_history_records(int row_count);
+        std::vector<terminal_history_handle_t>
+            resize_retained_history_capacity(std::size_t capacity_bytes);
         void clear_retained_history();
         std::vector<terminal_history_handle_t>
             prune_retained_history_rows_outside_live_window() const;

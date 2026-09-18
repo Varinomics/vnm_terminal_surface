@@ -2820,6 +2820,23 @@ void Terminal_screen_model::Retained_history_storage::reset()
     next_ordinal = 0U;
 }
 
+terminal_history_ring_resize_result_t
+Terminal_screen_model::Retained_history_storage::resize_capacity(
+    std::size_t capacity_bytes)
+{
+    if (ring == nullptr) {
+        this->capacity_bytes = capacity_bytes;
+        return {};
+    }
+
+    const terminal_history_ring_resize_result_t result = ring->resize_capacity(
+        capacity_bytes);
+    if (result.status == Terminal_history_ring_status::OK) {
+        this->capacity_bytes = ring->capacity_bytes();
+    }
+    return result;
+}
+
 void Terminal_screen_model::Retained_history_storage::
     track_record_in_reserved_index_slot(
         terminal_history_handle_t                history_handle,
@@ -3022,6 +3039,25 @@ Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_history_r
     }
 
     return discarded_handles;
+}
+
+std::vector<terminal_history_handle_t>
+Terminal_screen_model::Primary_backing_buffer::resize_retained_history_capacity(
+    std::size_t capacity_bytes)
+{
+    const terminal_history_ring_resize_result_t resize_result =
+        retained_history.resize_capacity(capacity_bytes);
+    if (resize_result.status != Terminal_history_ring_status::OK) {
+        throw_retained_history_storage_failure();
+    }
+
+    if (retained_history.ring == nullptr ||
+        resize_result.discarded_records == 0U)
+    {
+        return {};
+    }
+
+    return prune_retained_history_rows_outside_live_window();
 }
 
 void Terminal_screen_model::Primary_backing_buffer::clear_retained_history()
@@ -3653,6 +3689,78 @@ Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int lim
         m_active_buffer_id        == Terminal_buffer_id::PRIMARY)
     {
         mark_viewport_changed();
+    }
+    if (m_modes.synchronized_output) {
+        collect_synchronized_changes();
+    }
+    retain_referenced_active_hyperlink_ids();
+
+    return finalize_result(std::move(result));
+}
+
+Terminal_screen_model_result
+Terminal_screen_model::set_retained_history_capacity_bytes(
+    std::size_t capacity_bytes)
+{
+    if (capacity_bytes < k_terminal_min_retained_history_capacity_bytes ||
+        capacity_bytes > k_terminal_max_retained_history_capacity_bytes)
+    {
+        throw std::invalid_argument("invalid retained history capacity");
+    }
+
+    const std::size_t aligned_capacity = terminal_history_ring_aligned_capacity(
+        capacity_bytes);
+    Terminal_screen_model_result result;
+    m_scrollback_evicted_rows = 0;
+    clear_backing_deltas();
+    clear_recovery_proposals();
+    clear_selection_continuity();
+    clear_dirty();
+
+    if (m_config.retained_history_capacity_bytes == aligned_capacity) {
+        record_primary_history_delta(
+            Terminal_backing_delta_kind::BACKING_UNCHANGED,
+            scrollback_size(),
+            scrollback_size(),
+            0,
+            0,
+            0);
+        return finalize_result(std::move(result));
+    }
+
+    const int scrollback_rows_before = scrollback_size();
+    const std::vector<terminal_history_handle_t> evicted_handles =
+        m_primary_backing.resize_retained_history_capacity(aligned_capacity);
+    m_config.retained_history_capacity_bytes = aligned_capacity;
+    for (const terminal_history_handle_t handle : evicted_handles) {
+        erase_retained_lookup_entry(
+            Terminal_buffer_id::PRIMARY,
+            handle.row_sequence);
+    }
+
+    const int evicted_rows = static_cast<int>(evicted_handles.size());
+    m_scrollback_evicted_rows = evicted_rows;
+    if (evicted_rows > 0) {
+        record_primary_history_delta(
+            Terminal_backing_delta_kind::PRIMARY_HISTORY_EVICTED,
+            scrollback_rows_before,
+            scrollback_size(),
+            0,
+            evicted_rows,
+            0);
+        mark_terminal_content_changed();
+        if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
+            mark_viewport_changed();
+        }
+    }
+    else {
+        record_primary_history_delta(
+            Terminal_backing_delta_kind::BACKING_UNCHANGED,
+            scrollback_rows_before,
+            scrollback_size(),
+            0,
+            0,
+            0);
     }
     if (m_modes.synchronized_output) {
         collect_synchronized_changes();

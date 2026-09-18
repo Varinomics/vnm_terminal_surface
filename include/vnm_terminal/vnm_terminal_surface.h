@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -102,6 +103,15 @@ class VNM_TerminalSurface : public QQuickItem
         NOTIFY cursor_settle_delay_ms_changed)
     Q_PROPERTY(int scrollbackLimit
         READ scrollback_limit WRITE set_scrollback_limit NOTIFY scrollback_limit_changed)
+    Q_PROPERTY(int scrollbackBufferSizeMiB
+        READ scrollback_buffer_size_mib WRITE set_scrollback_buffer_size_mib
+        NOTIFY scrollback_buffer_size_mib_changed)
+    Q_PROPERTY(int minimumScrollbackBufferSizeMiB
+        READ minimum_scrollback_buffer_size_mib CONSTANT)
+    Q_PROPERTY(int maximumScrollbackBufferSizeMiB
+        READ maximum_scrollback_buffer_size_mib CONSTANT)
+    Q_PROPERTY(int estimatedScrollbackLines
+        READ estimated_scrollback_lines NOTIFY scrollback_estimate_changed)
     Q_PROPERTY(bool interactionDiagnosticsEnabled
         READ interaction_diagnostics_enabled WRITE set_interaction_diagnostics_enabled
         NOTIFY interaction_diagnostics_enabled_changed)
@@ -440,6 +450,11 @@ public:
 
     int scrollback_limit() const;
     void set_scrollback_limit(int limit);
+    int scrollback_buffer_size_mib() const;
+    void set_scrollback_buffer_size_mib(int size_mib);
+    int minimum_scrollback_buffer_size_mib() const;
+    int maximum_scrollback_buffer_size_mib() const;
+    int estimated_scrollback_lines() const;
 
     // Interaction diagnostics use one bounded process-global trace writer.
     // Only one surface may own it at a time. Printable text is redacted, but
@@ -756,6 +771,8 @@ signals:
     void cursor_blink_enabled_changed();
     void cursor_settle_delay_ms_changed();
     void scrollback_limit_changed();
+    void scrollback_buffer_size_mib_changed();
+    void scrollback_estimate_changed();
     void interaction_diagnostics_enabled_changed();
     void interaction_diagnostics_error_changed();
     void primary_repaint_recovery_enabled_changed();
@@ -993,7 +1010,7 @@ private:
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;
     int                      m_cursor_settle_delay_ms               = 0;
-    int                      m_scrollback_limit                     = 10000;
+    int                      m_scrollback_limit                     = std::numeric_limits<int>::max();
     std::size_t              m_retained_history_capacity_bytes     = 0U;
 #if defined(Q_OS_WIN)
     bool                     m_primary_repaint_recovery_enabled     = true;

@@ -479,6 +479,95 @@ terminal_history_ring_discard_result_t Terminal_history_ring::discard_oldest_rec
     return result;
 }
 
+terminal_history_ring_resize_result_t Terminal_history_ring::resize_capacity(
+    std::size_t requested_capacity_bytes,
+    std::size_t alignment_bytes)
+{
+    terminal_history_ring_resize_result_t result;
+    const std::size_t new_capacity = terminal_history_ring_aligned_capacity(
+        requested_capacity_bytes,
+        alignment_bytes);
+    if (new_capacity == 0U ||
+        new_capacity / 8U < terminal_history_ring_record_overhead_bytes())
+    {
+        result.status = Terminal_history_ring_status::INVALID_CAPACITY;
+        return result;
+    }
+
+    if (m_reservation_open) {
+        result.status = Terminal_history_ring_status::RESERVATION_IN_PROGRESS;
+        return result;
+    }
+
+    if (new_capacity == m_capacity_bytes) {
+        return result;
+    }
+
+    struct Record_bytes
+    {
+        terminal_history_ring_record_descriptor_t descriptor;
+        std::vector<std::byte>                   bytes;
+    };
+
+    std::vector<Record_bytes> retained_records;
+    std::size_t retained_bytes = 0U;
+    const std::size_t new_max_record_bytes = new_capacity / 8U;
+    for (auto it = m_records.rbegin(); it != m_records.rend(); ++it) {
+        if (it->record_bytes > new_max_record_bytes ||
+            retained_bytes > new_capacity - it->record_bytes)
+        {
+            break;
+        }
+
+        retained_records.push_back({
+            *it,
+            copy_record_bytes(it->byte_sequence, it->record_bytes),
+        });
+        retained_bytes += it->record_bytes;
+    }
+    std::reverse(retained_records.begin(), retained_records.end());
+
+    std::vector<std::byte> new_storage(new_capacity);
+    std::deque<terminal_history_ring_record_descriptor_t> new_records;
+    const auto write_new_record = [
+        &new_storage,
+        new_capacity
+    ](
+        std::uint64_t              byte_sequence,
+        std::span<const std::byte> bytes)
+    {
+        const std::size_t offset = static_cast<std::size_t>(
+            byte_sequence % new_capacity);
+        const std::size_t first_count = std::min(
+            bytes.size(),
+            new_capacity - offset);
+        std::copy_n(bytes.begin(), first_count, new_storage.begin() + offset);
+        if (first_count < bytes.size()) {
+            std::copy(
+                bytes.begin() + static_cast<std::ptrdiff_t>(first_count),
+                bytes.end(),
+                new_storage.begin());
+        }
+    };
+
+    for (const Record_bytes& record : retained_records) {
+        write_new_record(record.descriptor.byte_sequence, record.bytes);
+        new_records.push_back(record.descriptor);
+    }
+
+    result.discarded_records = m_records.size() - new_records.size();
+    m_capacity_bytes = new_capacity;
+    m_storage        = std::move(new_storage);
+    m_records        = std::move(new_records);
+    m_oldest_live_byte_sequence.store(
+        m_records.empty()
+            ? head_byte_sequence()
+            : m_records.front().byte_sequence,
+        std::memory_order_release);
+    m_status = Terminal_history_ring_status::OK;
+    return result;
+}
+
 void Terminal_history_ring::clear() noexcept
 {
     m_records.clear();

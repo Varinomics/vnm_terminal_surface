@@ -72,6 +72,12 @@ struct terminal_history_ring_discard_result_t
     std::uint64_t                head_byte_sequence        = 0U;
 };
 
+struct terminal_history_ring_resize_result_t
+{
+    Terminal_history_ring_status status            = Terminal_history_ring_status::OK;
+    std::size_t                  discarded_records = 0U;
+};
+
 std::size_t terminal_history_ring_backend_alignment_bytes();
 std::size_t terminal_history_ring_aligned_capacity(
     std::size_t requested_capacity_bytes,
@@ -180,6 +186,9 @@ public:
         Terminal_history_ring_record_reservation&& reservation);
     terminal_history_ring_discard_result_t discard_oldest_records(
         std::size_t record_count);
+    terminal_history_ring_resize_result_t resize_capacity(
+        std::size_t requested_capacity_bytes,
+        std::size_t alignment_bytes = 0U);
     void clear() noexcept;
 
     Terminal_history_ring_read_scope read_record(std::uint64_t byte_sequence);
