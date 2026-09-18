@@ -15,6 +15,7 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 
 #include <QQuickWindow>
+#include <QScreen>
 #include <QString>
 
 #include <algorithm>
@@ -829,12 +830,28 @@ void append_surface_geometry_profile_text(
     const VNM_TerminalSurface& surface,
     QTextStream&               out)
 {
+    const QQuickWindow* const window = surface.window();
+    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
+    const qreal logical_dpi = term::normalized_logical_dpi(
+        screen != nullptr
+            ? screen->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
+    const qreal effective_font_size = vnm_terminal::effective_font_size_for_font(
+        surface.font_family(),
+        surface.font_size(),
+        window != nullptr ? window->effectiveDevicePixelRatio() : 1.0,
+        surface.font_advance_policy(),
+        logical_dpi);
     const term::Qt_grid_metrics_provider metrics_provider(
-        term::vnm_terminal_font(surface.font_family(), surface.font_size()),
-        surface.window() != nullptr ? surface.window()->devicePixelRatio() : 1.0);
+        term::vnm_terminal_font(
+            surface.font_family(),
+            effective_font_size,
+            logical_dpi),
+        window != nullptr ? window->devicePixelRatio() : 1.0,
+        surface.font_advance_policy(),
+        logical_dpi);
     const term::terminal_cell_metrics_t cell_metrics =
         metrics_provider.cell_metrics();
-    const QQuickWindow* const window = surface.window();
 
     out << "surface_geometry\n";
     out << "  rows=" << surface.rows() << '\n';

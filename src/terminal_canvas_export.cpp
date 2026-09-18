@@ -9,6 +9,8 @@
 
 #include <QByteArray>
 #include <QFontInfo>
+#include <QQuickWindow>
+#include <QScreen>
 #include <QThread>
 #include <algorithm>
 #include <cmath>
@@ -18,6 +20,16 @@
 namespace term = vnm_terminal::internal;
 
 namespace {
+
+qreal logical_dpi_for_surface(const VNM_TerminalSurface& surface)
+{
+    const QQuickWindow* const window = surface.window();
+    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
+    return term::normalized_logical_dpi(
+        screen != nullptr
+            ? screen->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
+}
 
 std::uint16_t canvas_color_reference(const term::Terminal_color_ref& color)
 {
@@ -105,7 +117,8 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     frame->font_size                   = surface.font_size();
     const QFontInfo active_font(term::vnm_terminal_font(
         surface.font_family(),
-        surface.font_size()));
+        surface.effective_font_size(),
+        logical_dpi_for_surface(surface)));
     frame->font_family                 = active_font.family();
     frame->font_style                  = active_font.styleName();
     frame->font_weight                 = active_font.weight();

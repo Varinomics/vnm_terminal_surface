@@ -15,6 +15,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QGlyphRun>
+#include <QFontInfo>
 #include <QLatin1Char>
 #include <QMatrix4x4>
 #include <QPainter>
@@ -437,6 +438,7 @@ int atlas_power_of_two_extent(int required, int maximum)
 Glyph_atlas_runtime_configuration glyph_atlas_runtime_configuration(
     const QFont& font,
     qreal        device_pixel_ratio,
+    qreal        logical_dpi,
     QRhi*        rhi)
 {
     const int texture_extent_limit = rhi != nullptr
@@ -455,7 +457,8 @@ Glyph_atlas_runtime_configuration glyph_atlas_runtime_configuration(
             : 1.0;
     const qreal physical_pixel_size = qsg_atlas_physical_pixel_size(
         font,
-        normalized_device_pixel_ratio);
+        normalized_device_pixel_ratio,
+        logical_dpi);
     if (!std::isfinite(physical_pixel_size) || physical_pixel_size <= 0.0) {
         return {};
     }
@@ -4110,6 +4113,7 @@ private:
             glyph_atlas_runtime_configuration(
                 m_frame.font,
                 m_frame.device_pixel_ratio,
+                m_frame.logical_dpi,
                 rhi);
         if (atlas_configuration.is_valid()) {
             (void)m_cache.configure(
@@ -8390,11 +8394,16 @@ QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font)
         .arg(QString::number(qHash(name_table), 16));
 }
 
-qreal qsg_atlas_physical_pixel_size(const QFont& font, qreal device_pixel_ratio)
+qreal qsg_atlas_physical_pixel_size(
+    const QFont& font,
+    qreal        device_pixel_ratio,
+    qreal        logical_dpi)
 {
     const qreal logical_pixel_size = font.pixelSize() > 0
         ? static_cast<qreal>(font.pixelSize())
-        : font.pointSizeF();
+        : font.pointSizeF() > 0.0
+            ? font.pointSizeF() * normalized_logical_dpi(logical_dpi) / 72.0
+            : static_cast<qreal>(QFontInfo(font).pixelSize());
     return logical_pixel_size * device_pixel_ratio;
 }
 
@@ -8762,7 +8771,8 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     std::uint64_t                 capture_sequence,
     bool                          cursor_blink_visible,
     std::uint64_t                 ownership_generation,
-    std::uint64_t                 canvas_frame_generation)
+    std::uint64_t                 canvas_frame_generation,
+    qreal                         logical_dpi)
 {
     Captured_atlas_frame frame;
     frame.snapshot             = std::move(snapshot);
@@ -8773,6 +8783,7 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     frame.font                 = std::move(font);
     frame.render_profiler      = std::move(render_profiler);
     frame.device_pixel_ratio   = device_pixel_ratio;
+    frame.logical_dpi          = normalized_logical_dpi(logical_dpi);
     frame.font_epoch           = font_epoch;
     frame.capture_sequence     = capture_sequence;
     frame.publication_generation = publication_generation(frame);

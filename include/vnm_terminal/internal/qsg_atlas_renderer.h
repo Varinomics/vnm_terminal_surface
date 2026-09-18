@@ -665,6 +665,7 @@ struct Captured_atlas_frame
     std::shared_ptr<Hierarchical_profiler>
                                      render_profiler;
     qreal                            device_pixel_ratio  = 1.0;
+    qreal                            logical_dpi         = 96.0;
     std::uint64_t                    font_epoch          = 0U;
     std::uint64_t                    capture_sequence    = 0U;
     std::uint64_t                    publication_generation = 0U;
@@ -863,7 +864,8 @@ QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
 
 qreal qsg_atlas_physical_pixel_size(
     const QFont& font,
-    qreal        device_pixel_ratio);
+    qreal        device_pixel_ratio,
+    qreal        logical_dpi = 96.0);
 
 qreal qsg_atlas_physical_pixel_size(
     const QRawFont& raw_font,
@@ -919,7 +921,8 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     std::uint64_t                 capture_sequence,
     bool                          cursor_blink_visible,
     std::uint64_t                 ownership_generation = 1U,
-    std::uint64_t                 canvas_frame_generation = 0U);
+    std::uint64_t                 canvas_frame_generation = 0U,
+    qreal                         logical_dpi = 96.0);
 
 // Invalidation the render owner supplies so the render node can report an
 // asynchronously completed atlas build without reaching a surface API. The

@@ -7424,6 +7424,10 @@ bool test_source_posture()
 bool test_cache_key_includes_physical_size_and_face()
 {
     const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const QFont fractional_font = term::vnm_terminal_font(
+        QString(),
+        13.5,
+        120.5);
     const QRawFont raw_font = QRawFont::fromFont(font);
     const QString face_id = term::qsg_atlas_face_id_for_raw_font(raw_font);
     const qreal physical_pixel_size =
@@ -7567,6 +7571,10 @@ bool test_cache_key_includes_physical_size_and_face()
         "atlas cache stores distinct coverage and presentation variants independently");
     ok &= check(std::abs(raw_physical_pixel_size - raw_font.pixelSize() * 2.0) < 0.001,
         "raw-font physical pixel size is derived from the run font");
+    ok &= check(std::abs(
+            term::qsg_atlas_physical_pixel_size(fractional_font, 1.0, 120.5) -
+            13.5) < 0.001,
+        "atlas physical pixel size preserves fractional logical size at non-96 DPI");
     return ok;
 }
 

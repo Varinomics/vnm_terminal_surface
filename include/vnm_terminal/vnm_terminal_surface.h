@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/backend_output_capture.h"
+#include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/terminal_message_submission.h"
 
 #include <QQuickItem>
@@ -84,6 +85,11 @@ class VNM_TerminalSurface : public QQuickItem
         READ font_family WRITE set_font_family NOTIFY font_family_changed)
     Q_PROPERTY(qreal fontSize
         READ font_size WRITE set_font_size NOTIFY font_size_changed)
+    Q_PROPERTY(qreal effectiveFontSize
+        READ effective_font_size NOTIFY effective_font_size_changed)
+    Q_PROPERTY(int fontAdvancePolicy
+        READ font_advance_policy_value WRITE set_font_advance_policy_value
+        NOTIFY font_advance_policy_changed)
     Q_PROPERTY(QString colorScheme
         READ color_scheme WRITE set_color_scheme NOTIFY color_scheme_changed)
     Q_PROPERTY(Cursor_style cursorStyle
@@ -411,6 +417,12 @@ public:
     qreal font_size() const;
     void set_font_size(qreal font_size);
 
+    qreal effective_font_size() const;
+    vnm_terminal::Font_advance_policy font_advance_policy() const;
+    void set_font_advance_policy(vnm_terminal::Font_advance_policy policy);
+    int font_advance_policy_value() const;
+    void set_font_advance_policy_value(int policy);
+
     QString color_scheme() const;
     void set_color_scheme(const QString& color_scheme);
 
@@ -737,6 +749,8 @@ signals:
     void font_family_changed();
 
     void font_size_changed();
+    void effective_font_size_changed();
+    void font_advance_policy_changed();
     void color_scheme_changed();
     void cursor_style_changed();
     void cursor_blink_enabled_changed();
@@ -973,6 +987,8 @@ private:
 
     QString                  m_font_family;
     qreal                    m_font_size                            = 13.0;
+    vnm_terminal::Font_advance_policy m_font_advance_policy =
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE;
     QString                  m_color_scheme                         = QStringLiteral("Classic");
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;

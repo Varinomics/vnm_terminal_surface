@@ -4,10 +4,12 @@
 
 #include <vnm_font_namespace.h>
 
+#include <QImage>
 #include <QtGlobal>
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 static void init_vnm_terminal_resources()
 {
@@ -60,7 +62,27 @@ bool vnm_terminal_default_monospace_font_loaded()
     return default_monospace_font().embedded_resource_loaded;
 }
 
-QFont vnm_terminal_font(QString family, qreal pixel_size)
+qreal normalized_logical_dpi(qreal logical_dpi)
+{
+    if (!std::isfinite(logical_dpi) || logical_dpi <= 0.0) {
+        return k_vnm_terminal_default_logical_dpi;
+    }
+
+    // Keep the screen's fractional DPI for point-size conversion. The only
+    // integer conversion is the QImage paint-device representation below.
+    return std::max<qreal>(1.0, logical_dpi);
+}
+
+QFont vnm_terminal_font_for_logical_dpi(QFont font, qreal logical_dpi)
+{
+    const qreal normalized_dpi = normalized_logical_dpi(logical_dpi);
+    QImage dpi_device(1, 1, QImage::Format_ARGB32);
+    dpi_device.setDotsPerMeterX(qRound(normalized_dpi / 0.0254));
+    dpi_device.setDotsPerMeterY(qRound(normalized_dpi / 0.0254));
+    return QFont(font, &dpi_device);
+}
+
+QFont vnm_terminal_font(QString family, qreal pixel_size, qreal logical_dpi)
 {
     if (family.trimmed().isEmpty()) {
         family = vnm_terminal_default_monospace_font_family();
@@ -73,9 +95,14 @@ QFont vnm_terminal_font(QString family, qreal pixel_size)
         const qreal bounded_pixel_size = std::min(
             pixel_size,
             static_cast<qreal>(k_vnm_terminal_max_font_pixel_size));
-        font.setPixelSize(std::max(1, static_cast<int>(std::round(bounded_pixel_size))));
+        // A point size preserves the requested fractional logical size. The
+        // active logical DPI is supplied explicitly so Qt resolves that point
+        // size back to the same logical pixels on every screen.
+        font.setPointSizeF(std::max<qreal>(
+            1.0,
+            bounded_pixel_size * 72.0 / normalized_logical_dpi(logical_dpi)));
     }
-    return font;
+    return vnm_terminal_font_for_logical_dpi(std::move(font), logical_dpi);
 }
 
 }

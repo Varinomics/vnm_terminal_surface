@@ -12,10 +12,12 @@
 
 #include <QColor>
 #include <QFont>
+#include <QFontMetricsF>
 #include <QFontInfo>
 #include <QGuiApplication>
 #include <QJsonObject>
 #include <QQuickWindow>
+#include <QScreen>
 #include <QThread>
 #include <cmath>
 #include <initializer_list>
@@ -64,9 +66,42 @@ void pump_events(QGuiApplication& app, int rounds = 6)
     }
 }
 
-QFont terminal_font(const QString& family, qreal pixel_size)
+QFont terminal_font(
+    const QString& family,
+    qreal          pixel_size,
+    qreal          logical_dpi = term::k_vnm_terminal_default_logical_dpi)
 {
-    return term::vnm_terminal_font(family, pixel_size);
+    return term::vnm_terminal_font(family, pixel_size, logical_dpi);
+}
+
+qreal surface_logical_dpi(const VNM_TerminalSurface& surface)
+{
+    const QQuickWindow* const window = surface.window();
+    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
+    return term::normalized_logical_dpi(
+        screen != nullptr
+            ? screen->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
+}
+
+term::Qt_grid_metrics_provider surface_metrics_provider(
+    const VNM_TerminalSurface& surface,
+    qreal                     device_pixel_ratio)
+{
+    const qreal logical_dpi = surface_logical_dpi(surface);
+    return term::Qt_grid_metrics_provider(
+        terminal_font(
+            surface.font_family(),
+            vnm_terminal::effective_font_size_for_font(
+                surface.font_family(),
+                surface.font_size(),
+                device_pixel_ratio,
+                surface.font_advance_policy(),
+                logical_dpi),
+            logical_dpi),
+        device_pixel_ratio,
+        surface.font_advance_policy(),
+        logical_dpi);
 }
 
 term::Terminal_launch_config valid_launch_config()
@@ -388,8 +423,7 @@ bool test_surface_publication(QGuiApplication& app, qreal device_pixel_ratio)
     pump_events(app);
 
     term::Qt_grid_metrics_provider provider(
-        terminal_font(surface.font_family(), surface.font_size()),
-        device_pixel_ratio);
+        surface_metrics_provider(surface, device_pixel_ratio));
     term::Terminal_metrics_result grid = expected_grid(surface, provider);
     ok &= check(grid.status == term::Terminal_metrics_status::OK,
         "surface positive geometry has provider-derived grid");
@@ -426,7 +460,7 @@ bool test_surface_publication(QGuiApplication& app, qreal device_pixel_ratio)
 
     surface.setSize(QSizeF(360.0, 180.0));
     pump_events(app);
-    provider.set_font(terminal_font(surface.font_family(), surface.font_size()));
+    provider = surface_metrics_provider(surface, device_pixel_ratio);
     const std::optional<qreal> changed_pixel_size = pixel_size_with_different_grid(
         provider,
         surface.font_family(),
@@ -444,7 +478,7 @@ bool test_surface_publication(QGuiApplication& app, qreal device_pixel_ratio)
     ok &= check(grid_signal_count >= grid_signals_before_font_change + 1,
         "font-size grid change emits grid signal");
 
-    provider.set_font(terminal_font(surface.font_family(), surface.font_size()));
+    provider = surface_metrics_provider(surface, device_pixel_ratio);
     grid = expected_grid(surface, provider);
     ok &= check(grid.status == term::Terminal_metrics_status::OK &&
         grid_matches_surface(surface, grid.grid_size),
@@ -501,8 +535,7 @@ bool test_controller_with_real_provider(QGuiApplication& app, qreal device_pixel
     pump_events(app);
 
     term::Qt_grid_metrics_provider provider(
-        terminal_font(surface.font_family(), surface.font_size()),
-        device_pixel_ratio);
+        surface_metrics_provider(surface, device_pixel_ratio));
     const term::Terminal_metrics_result initial_grid = expected_grid(surface, provider);
     ok &= check(initial_grid.status == term::Terminal_metrics_status::OK,
         "controller test initial grid is valid");
@@ -963,6 +996,126 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
     return ok;
 }
 
+bool test_font_advance_policies()
+{
+    bool ok = true;
+    const QString family = QStringLiteral("monospace");
+    const qreal requested_size = 13.0;
+    const qreal device_pixel_ratio = 1.5;
+    const qreal logical_dpi = 120.5;
+    const QFont fractional_font = terminal_font(family, 13.5, logical_dpi);
+    ok &= check(nearly_equal(
+            fractional_font.pointSizeF(),
+            13.5 * 72.0 / logical_dpi),
+        "font factory preserves fractional logical size at non-96 DPI");
+    ok &= check(
+        QFontInfo(terminal_font(family, requested_size, logical_dpi)).pixelSize() ==
+            static_cast<int>(requested_size),
+        "font factory resolves requested logical pixels at non-96 DPI");
+    ok &= check(nearly_equal(
+            terminal_font(
+                family,
+                requested_size,
+                std::numeric_limits<qreal>::quiet_NaN()).pointSizeF(),
+            requested_size * 72.0 / term::k_vnm_terminal_default_logical_dpi),
+        "font factory falls back to 96 DPI when logical DPI is invalid");
+
+    const qreal raw_advance = QFontMetricsF(
+        terminal_font(family, requested_size, logical_dpi))
+        .horizontalAdvance(QChar(u'M'));
+
+    const term::Qt_grid_metrics_provider upward_provider(
+        terminal_font(family, requested_size, logical_dpi),
+        device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP,
+        logical_dpi);
+    const term::Qt_grid_metrics_provider nearest_provider(
+        terminal_font(family, requested_size, logical_dpi),
+        device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::SNAP_ADVANCE_NEAREST,
+        logical_dpi);
+    const qreal upward_width = upward_provider.cell_metrics().width;
+    const qreal nearest_width = nearest_provider.cell_metrics().width;
+    ok &= check(nearly_equal(
+            upward_width,
+            std::ceil(raw_advance * device_pixel_ratio) / device_pixel_ratio),
+        "upward advance policy uses device-pixel ceil");
+    ok &= check(nearly_equal(
+            nearest_width,
+            std::max<qreal>(1.0, std::round(raw_advance * device_pixel_ratio)) /
+                device_pixel_ratio),
+        "nearest advance policy uses device-pixel rounding");
+
+    const qreal effective_size = vnm_terminal::effective_font_size_for_font(
+        family,
+        requested_size,
+        device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        logical_dpi);
+    const term::Qt_grid_metrics_provider adjusted_provider(
+        terminal_font(family, effective_size, logical_dpi),
+        device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        logical_dpi);
+    const vnm_terminal::Cell_metrics adjusted_public_metrics =
+        vnm_terminal::cell_metrics_for_font(
+            family,
+            requested_size,
+            device_pixel_ratio,
+            vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+            logical_dpi);
+    const term::terminal_cell_metrics_t adjusted_internal_metrics =
+        adjusted_provider.cell_metrics();
+    ok &= check(adjusted_public_metrics.width == adjusted_internal_metrics.width,
+        "adjust-font-size policy uses the effective font in the public width path");
+    ok &= check(metric_is_device_pixel_aligned(
+            adjusted_internal_metrics.width, device_pixel_ratio),
+        "adjust-font-size policy aligns the effective advance to device pixels");
+
+    const qreal invalid_policy_size = vnm_terminal::effective_font_size_for_font(
+        family,
+        requested_size,
+        device_pixel_ratio,
+        static_cast<vnm_terminal::Font_advance_policy>(99),
+        logical_dpi);
+    ok &= check(nearly_equal(invalid_policy_size, effective_size),
+        "invalid font-advance policy values use the default adjustment policy");
+    const QString shipped_family = vnm_terminal::default_monospace_font_family();
+    // Match the shipped default font on the 125% Windows display used by the
+    // settings surface: Qt reports 1.25 device scaling and 120 logical DPI.
+    const qreal adjacent_device_pixel_ratio = 1.25;
+    const qreal adjacent_logical_dpi = 120.0;
+    const qreal effective_size_14 = vnm_terminal::effective_font_size_for_font(
+        shipped_family,
+        14.0,
+        adjacent_device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        adjacent_logical_dpi);
+    const qreal effective_size_15 = vnm_terminal::effective_font_size_for_font(
+        shipped_family,
+        15.0,
+        adjacent_device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        adjacent_logical_dpi);
+    const qreal effective_size_16 = vnm_terminal::effective_font_size_for_font(
+        shipped_family,
+        16.0,
+        adjacent_device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        adjacent_logical_dpi);
+    const qreal effective_size_17 = vnm_terminal::effective_font_size_for_font(
+        shipped_family,
+        17.0,
+        adjacent_device_pixel_ratio,
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        adjacent_logical_dpi);
+    ok &= check(effective_size_15 >= effective_size_14,
+        "adjust-font-size effective size does not invert for adjacent requests");
+    ok &= check(effective_size_17 >= effective_size_16,
+        "adjust-font-size effective size remains monotonic for the 16/17 boundary");
+    return ok;
+}
+
 // Prove the public font/metrics API replicates the internal Qt_grid_metrics_provider
 // computation exactly, so a consumer that drops the internal includes sees no
 // behavior change. Equality is exact (not tolerance-based): the public path must
@@ -980,26 +1133,37 @@ bool test_public_font_metrics_replicates_internal()
         const char* family;
         qreal       pixel_size;
         qreal       device_pixel_ratio;
+        qreal       logical_dpi;
     };
     const font_case_t cases[] = {
-        {"monospace", 12.0, 1.0},
-        {"monospace", 18.0, 2.0},
-        {"monospace", 13.0, 1.5},
+        {"monospace", 12.0, 1.0, 96.0},
+        {"monospace", 18.0, 2.0, 120.0},
+        {"monospace", 13.0, 1.5, 144.0},
     };
 
     for (const font_case_t& font_case : cases) {
         const QString family = QString::fromLatin1(font_case.family);
+        const qreal effective_size = vnm_terminal::effective_font_size_for_font(
+            family,
+            font_case.pixel_size,
+            font_case.device_pixel_ratio,
+            vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+            font_case.logical_dpi);
 
         const term::Qt_grid_metrics_provider provider(
-            terminal_font(family, font_case.pixel_size),
-            font_case.device_pixel_ratio);
+            terminal_font(family, effective_size, font_case.logical_dpi),
+            font_case.device_pixel_ratio,
+            vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+            font_case.logical_dpi);
         const term::terminal_cell_metrics_t internal_metrics = provider.cell_metrics();
 
         const vnm_terminal::Cell_metrics public_metrics =
             vnm_terminal::cell_metrics_for_font(
                 family,
                 font_case.pixel_size,
-                font_case.device_pixel_ratio);
+                font_case.device_pixel_ratio,
+                vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+                font_case.logical_dpi);
 
         ok &= check(public_metrics.width == internal_metrics.width,
             "public cell width equals internal provider cell width");
@@ -1078,6 +1242,7 @@ int main(int argc, char** argv)
     ok &= test_surface_publication(app, observed_dpr);
     ok &= test_controller_with_real_provider(app, observed_dpr);
     ok &= test_diagnostics_metrics_json(app);
+    ok &= test_font_advance_policies();
     ok &= test_public_font_metrics_replicates_internal();
     ok &= test_default_monospace_family_is_the_registered_one();
     return ok ? 0 : 1;

@@ -6,6 +6,9 @@
 #include <QString>
 #include <memory>
 
+class QQuickWindow;
+class QScreen;
+
 class VNM_TerminalCanvas : public QQuickItem
 {
     Q_OBJECT
@@ -114,6 +117,8 @@ protected:
     void itemChange(ItemChange change, const ItemChangeData& value) override;
 
 private:
+    void bind_window_signals(QQuickWindow* window);
+    void bind_screen_signals(QScreen* screen);
     void refresh_render_state();
     void refresh_render_status();
     void refresh_cursor_blink(bool was_enabled);

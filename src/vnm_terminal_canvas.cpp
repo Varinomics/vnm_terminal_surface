@@ -1,6 +1,7 @@
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
 #include "vnm_terminal/terminal_canvas_appearance.h"
+#include "vnm_terminal/font_metrics.h"
 
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
@@ -11,6 +12,7 @@
 #include <QColor>
 #include <QFont>
 #include <QQuickWindow>
+#include <QScreen>
 #include <QThread>
 #include <QTimer>
 #include <algorithm>
@@ -25,6 +27,8 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 constexpr std::uint16_t k_canvas_style_attribute_mask = 0xffU;
+constexpr vnm_terminal::Font_advance_policy k_canvas_font_advance_policy =
+    vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE;
 
 qreal normalized_font_pixel_size(qreal font_size)
 {
@@ -47,6 +51,15 @@ qreal device_pixel_ratio(const QQuickWindow* window)
 
     const qreal ratio = window->effectiveDevicePixelRatio();
     return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
+}
+
+qreal logical_dpi(const QQuickWindow* window)
+{
+    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
+    return term::normalized_logical_dpi(
+        screen != nullptr
+            ? screen->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
 }
 
 term::Terminal_cursor_shape internal_cursor_shape(
@@ -364,6 +377,8 @@ struct VNM_TerminalCanvas::Private
     bool                                                        cursor_blink_visible = true;
     bool                                                        render_ready         = false;
     qreal                                                       device_pixel_ratio = 1.0;
+    qreal                                                       logical_dpi =
+                                                                term::k_vnm_terminal_default_logical_dpi;
     std::uint64_t                                               font_epoch          = 1U;
     std::uint64_t                                               capture_sequence    = 0U;
     std::uint64_t                                               ownership_generation = 1U;
@@ -372,6 +387,9 @@ struct VNM_TerminalCanvas::Private
     std::uint64_t                                               rendered_canvas_frame_generation = 0U;
     std::uint64_t                                               rendered_frame_sequence = 0U;
     std::uint64_t                                               rendered_publication_generation = 0U;
+    QMetaObject::Connection                                      window_screen_changed_connection;
+    QMetaObject::Connection                                      screen_dpi_changed_connection;
+    QMetaObject::Connection                                      screen_physical_dpi_changed_connection;
 };
 
 VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
@@ -401,7 +419,12 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
     refresh_render_state();
 }
 
-VNM_TerminalCanvas::~VNM_TerminalCanvas() = default;
+VNM_TerminalCanvas::~VNM_TerminalCanvas()
+{
+    QObject::disconnect(m_private->window_screen_changed_connection);
+    QObject::disconnect(m_private->screen_dpi_changed_connection);
+    QObject::disconnect(m_private->screen_physical_dpi_changed_connection);
+}
 
 QString VNM_TerminalCanvas::font_family() const
 {
@@ -700,7 +723,8 @@ QSGNode* VNM_TerminalCanvas::updatePaintNode(
         ++m_private->capture_sequence,
         m_private->cursor_blink_visible,
         m_private->ownership_generation,
-        m_private->canvas_frame_generation);
+        m_private->canvas_frame_generation,
+        m_private->logical_dpi);
     return term::update_qsg_atlas_node(
         old_node,
         std::move(captured),
@@ -716,17 +740,81 @@ void VNM_TerminalCanvas::releaseResources()
 void VNM_TerminalCanvas::itemChange(ItemChange change, const ItemChangeData& value)
 {
     QQuickItem::itemChange(change, value);
-    if (change == ItemSceneChange || change == ItemDevicePixelRatioHasChanged) {
+    if (change == ItemSceneChange) {
+        bind_window_signals(value.window);
         refresh_render_state();
     }
+    else
+    if (change == ItemDevicePixelRatioHasChanged) {
+        refresh_render_state();
+    }
+}
+
+void VNM_TerminalCanvas::bind_window_signals(QQuickWindow* window)
+{
+    QObject::disconnect(m_private->window_screen_changed_connection);
+    m_private->window_screen_changed_connection = {};
+    bind_screen_signals(window != nullptr ? window->screen() : nullptr);
+
+    if (window == nullptr) {
+        return;
+    }
+
+    m_private->window_screen_changed_connection = QObject::connect(
+        window,
+        &QWindow::screenChanged,
+        this,
+        [this](QScreen* screen) {
+            bind_screen_signals(screen);
+            refresh_render_state();
+        });
+}
+
+void VNM_TerminalCanvas::bind_screen_signals(QScreen* screen)
+{
+    QObject::disconnect(m_private->screen_dpi_changed_connection);
+    QObject::disconnect(m_private->screen_physical_dpi_changed_connection);
+    m_private->screen_dpi_changed_connection = {};
+    m_private->screen_physical_dpi_changed_connection = {};
+
+    if (screen == nullptr) {
+        return;
+    }
+
+    m_private->screen_dpi_changed_connection = QObject::connect(
+        screen,
+        &QScreen::logicalDotsPerInchChanged,
+        this,
+        [this](qreal) {
+            refresh_render_state();
+        });
+    m_private->screen_physical_dpi_changed_connection = QObject::connect(
+        screen,
+        &QScreen::physicalDotsPerInchChanged,
+        this,
+        [this](qreal) {
+            refresh_render_state();
+        });
 }
 
 void VNM_TerminalCanvas::refresh_render_state()
 {
     const qreal previous_ratio = m_private->device_pixel_ratio;
+    const qreal previous_logical_dpi = m_private->logical_dpi;
     const QFont previous_font  = m_private->render_font;
     m_private->device_pixel_ratio = device_pixel_ratio(window());
-    m_private->render_font = term::vnm_terminal_font(m_font_family, m_font_size);
+    m_private->logical_dpi = logical_dpi(window());
+    const qreal effective_font_size =
+        vnm_terminal::effective_font_size_for_font(
+            m_font_family,
+            m_font_size,
+            m_private->device_pixel_ratio,
+            k_canvas_font_advance_policy,
+            m_private->logical_dpi);
+    m_private->render_font = term::vnm_terminal_font(
+        m_font_family,
+        effective_font_size,
+        m_private->logical_dpi);
     if (!m_font_style.isEmpty()) {
         m_private->render_font.setStyleName(m_font_style);
     }
@@ -734,6 +822,7 @@ void VNM_TerminalCanvas::refresh_render_state()
         static_cast<QFont::Weight>(m_font_weight));
     m_private->render_font.setItalic(m_font_italic);
     if (previous_ratio != m_private->device_pixel_ratio ||
+        previous_logical_dpi != m_private->logical_dpi ||
         previous_font != m_private->render_font)
     {
         ++m_private->font_epoch;
@@ -744,6 +833,9 @@ void VNM_TerminalCanvas::refresh_render_state()
     m_private->metrics_provider.set_font(m_private->render_font);
     m_private->metrics_provider.set_device_pixel_ratio(
         m_private->device_pixel_ratio);
+    m_private->metrics_provider.set_logical_dpi(m_private->logical_dpi);
+    m_private->metrics_provider.set_font_advance_policy(
+        k_canvas_font_advance_policy);
     m_private->cell_metrics = m_private->metrics_provider.cell_metrics();
 
     if (m_authoritative_cell_metrics_enabled && m_private->frame != nullptr &&

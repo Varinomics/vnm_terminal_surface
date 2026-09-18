@@ -1504,10 +1504,26 @@ bool test_surface_polish_refreshes_metrics_after_window_dpr_change(QGuiApplicati
         current_cell_metrics(fixture.surface);
     qreal selected_device_pixel_ratio = 0.0;
     term::terminal_cell_metrics_t expected_metrics{};
+    const qreal logical_dpi = term::normalized_logical_dpi(
+        fixture.window.screen() != nullptr
+            ? fixture.window.screen()->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
+    const vnm_terminal::Font_advance_policy policy =
+        fixture.surface.font_advance_policy();
     for (const qreal candidate : {1.1, 1.2, 1.25, 1.333333333333, 1.5, 1.75, 2.0, 2.25}) {
         const term::Qt_grid_metrics_provider expected_provider(
-            term::vnm_terminal_font(fixture.surface.font_family(), fixture.surface.font_size()),
-            candidate);
+            term::vnm_terminal_font(
+                fixture.surface.font_family(),
+                vnm_terminal::effective_font_size_for_font(
+                    fixture.surface.font_family(),
+                    fixture.surface.font_size(),
+                    candidate,
+                    policy,
+                    logical_dpi),
+                logical_dpi),
+            candidate,
+            policy,
+            logical_dpi);
         const term::terminal_cell_metrics_t candidate_metrics =
             expected_provider.cell_metrics();
         if (!metrics_equal(initial_metrics, candidate_metrics, 0.000001)) {

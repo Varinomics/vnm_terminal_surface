@@ -6,6 +6,7 @@
 namespace vnm_terminal::internal {
 
 constexpr int k_vnm_terminal_default_font_pixel_size = 13;
+constexpr qreal k_vnm_terminal_default_logical_dpi = 96.0;
 
 // The largest pixel size the terminal will build a font at. fontSize is a
 // public property, so a host can hand it any finite number, and converting a
@@ -18,6 +19,11 @@ constexpr int k_vnm_terminal_max_font_pixel_size = 1024;
 
 QString vnm_terminal_default_monospace_font_family();
 bool vnm_terminal_default_monospace_font_loaded();
-QFont vnm_terminal_font(QString family, qreal pixel_size);
+qreal normalized_logical_dpi(qreal logical_dpi);
+QFont vnm_terminal_font(
+    QString family,
+    qreal   pixel_size,
+    qreal   logical_dpi = k_vnm_terminal_default_logical_dpi);
+QFont vnm_terminal_font_for_logical_dpi(QFont font, qreal logical_dpi);
 
 }

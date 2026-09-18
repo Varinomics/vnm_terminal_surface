@@ -435,7 +435,7 @@ qreal normalized_font_pixel_size(qreal font_size)
     const qreal bounded_font_size = std::min(
         font_size,
         static_cast<qreal>(term::k_vnm_terminal_max_font_pixel_size));
-    return static_cast<qreal>(std::max(1, static_cast<int>(std::round(bounded_font_size))));
+    return std::max<qreal>(1.0, bounded_font_size);
 }
 
 int vertical_wheel_direction(const QWheelEvent& event)
@@ -602,6 +602,15 @@ qreal current_device_pixel_ratio(const QQuickWindow* window)
     }
 
     return device_pixel_ratio;
+}
+
+qreal current_logical_dpi(const QQuickWindow* window)
+{
+    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
+    return term::normalized_logical_dpi(
+        screen != nullptr
+            ? screen->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
 }
 
 std::unique_ptr<term::Terminal_backend> make_native_backend()
@@ -2928,7 +2937,11 @@ struct VNM_TerminalSurface::Private
     term::Qt_grid_metrics_provider                         grid_metrics_provider;
     term::terminal_cell_metrics_t                          cell_metrics;
     QFont                                                  render_font;
+    qreal                                                  effective_font_size =
+                                                           term::k_vnm_terminal_default_font_pixel_size;
     qreal                                                  render_device_pixel_ratio             = 1.0;
+    qreal                                                  render_logical_dpi                    =
+                                                           term::k_vnm_terminal_default_logical_dpi;
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
@@ -3348,6 +3361,45 @@ void VNM_TerminalSurface::apply_msdf_availability_result(
 qreal VNM_TerminalSurface::font_size() const
 {
     return m_font_size;
+}
+
+qreal VNM_TerminalSurface::effective_font_size() const
+{
+    return m_private->effective_font_size;
+}
+
+vnm_terminal::Font_advance_policy VNM_TerminalSurface::font_advance_policy() const
+{
+    return m_font_advance_policy;
+}
+
+void VNM_TerminalSurface::set_font_advance_policy(
+    vnm_terminal::Font_advance_policy policy)
+{
+    if (!vnm_terminal::font_advance_policy_is_valid(policy)) {
+        policy = vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE;
+    }
+    if (m_font_advance_policy == policy) {
+        return;
+    }
+
+    m_font_advance_policy = policy;
+    emit font_advance_policy_changed();
+    refresh_grid_metrics();
+}
+
+int VNM_TerminalSurface::font_advance_policy_value() const
+{
+    return static_cast<int>(m_font_advance_policy);
+}
+
+void VNM_TerminalSurface::set_font_advance_policy_value(int policy)
+{
+    const auto value = static_cast<vnm_terminal::Font_advance_policy>(policy);
+    set_font_advance_policy(
+        vnm_terminal::font_advance_policy_is_valid(value)
+            ? value
+            : vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE);
 }
 
 void VNM_TerminalSurface::set_font_size(qreal font_size)
@@ -7338,11 +7390,23 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
 
 void VNM_TerminalSurface::refresh_grid_metrics()
 {
-    m_private->render_font               = term::vnm_terminal_font(m_font_family, m_font_size);
     m_private->render_device_pixel_ratio = current_device_pixel_ratio(window());
-    const QString atlas_font_epoch_key = QStringLiteral("%1|%2")
+    m_private->render_logical_dpi        = current_logical_dpi(window());
+    const qreal previous_effective_font_size = m_private->effective_font_size;
+    m_private->effective_font_size = vnm_terminal::effective_font_size_for_font(
+        m_font_family,
+        m_font_size,
+        m_private->render_device_pixel_ratio,
+        m_font_advance_policy,
+        m_private->render_logical_dpi);
+    m_private->render_font = term::vnm_terminal_font(
+        m_font_family,
+        m_private->effective_font_size,
+        m_private->render_logical_dpi);
+    const QString atlas_font_epoch_key = QStringLiteral("%1|%2|%3")
         .arg(m_private->render_font.toString())
-        .arg(m_private->render_device_pixel_ratio, 0, 'g', 17);
+        .arg(m_private->render_device_pixel_ratio, 0, 'g', 17)
+        .arg(m_private->render_logical_dpi, 0, 'g', 17);
     if (m_private->qsg_atlas_font_epoch_key != atlas_font_epoch_key) {
         m_private->qsg_atlas_font_epoch_key = atlas_font_epoch_key;
         ++m_private->qsg_atlas_font_epoch;
@@ -7353,6 +7417,17 @@ void VNM_TerminalSurface::refresh_grid_metrics()
     m_private->grid_metrics_provider.set_font(m_private->render_font);
     m_private->grid_metrics_provider.set_device_pixel_ratio(
         m_private->render_device_pixel_ratio);
+    m_private->grid_metrics_provider.set_logical_dpi(
+        m_private->render_logical_dpi);
+    m_private->grid_metrics_provider.set_font_advance_policy(
+        m_font_advance_policy);
+
+    if (!same_property_value(
+            previous_effective_font_size,
+            m_private->effective_font_size))
+    {
+        emit effective_font_size_changed();
+    }
 
     if (!std::isfinite(m_font_size) || m_font_size <= 0.0) {
         m_private->cell_metrics = {};
@@ -7390,7 +7465,10 @@ void VNM_TerminalSurface::refresh_grid_metrics()
 void VNM_TerminalSurface::refresh_grid_metrics_if_device_pixel_ratio_changed()
 {
     const qreal device_pixel_ratio = current_device_pixel_ratio(window());
-    if (same_property_value(device_pixel_ratio, m_private->render_device_pixel_ratio)) {
+    const qreal logical_dpi = current_logical_dpi(window());
+    if (same_property_value(device_pixel_ratio, m_private->render_device_pixel_ratio) &&
+        same_property_value(logical_dpi, m_private->render_logical_dpi))
+    {
         return;
     }
 
@@ -8787,7 +8865,10 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
                 device_pixel_ratio,
                 m_private->qsg_atlas_font_epoch,
                 ++m_private->qsg_atlas_capture_sequence,
-                m_private->cursor_blink_visible);
+                m_private->cursor_blink_visible,
+                1U,
+                0U,
+                m_private->render_logical_dpi);
         const std::uint64_t captured_snapshot_sequence =
             atlas_frame_snapshot_sequence(captured_frame);
         const std::uint64_t captured_publication_generation =
