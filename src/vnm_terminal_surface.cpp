@@ -3473,7 +3473,11 @@ QVariantMap VNM_TerminalSurface::color_scheme_preview(const QString& color_schem
     preview.insert(QStringLiteral("background"), QColor::fromRgba(scheme->background_rgba));
     preview.insert(QStringLiteral("foreground"), QColor::fromRgba(scheme->foreground_rgba));
     preview.insert(QStringLiteral("cursor"),     QColor::fromRgba(scheme->cursor_rgba));
-    preview.insert(QStringLiteral("selection"),  QColor::fromRgba(scheme->selection_rgba));
+    const QColor selection_background = QColor::fromRgba(scheme->selection_rgba);
+    preview.insert(QStringLiteral("selection"), selection_background);
+    preview.insert(
+        QStringLiteral("selection_foreground"),
+        term::terminal_selection_foreground_for_background(selection_background));
     preview.insert(QStringLiteral("ansi"),       ansi);
     return preview;
 }
