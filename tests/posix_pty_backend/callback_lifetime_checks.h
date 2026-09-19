@@ -31,8 +31,9 @@ struct Callback_lifetime_audit
     std::atomic_bool        receiver_alive{true};
 };
 
-// Use the shared_ptr atomic functions for libc++ implementations that lack
-// the C++20 atomic<shared_ptr> specialization. Every probe access stays atomic.
+// Protect publication and owning snapshots without holding the probe mutex
+// while entering the audit's callback barrier.
+inline std::mutex callback_lifetime_probe_mutex;
 inline std::shared_ptr<Callback_lifetime_audit> callback_lifetime_probe;
 
 inline void stop_after_callback_snapshot(internal::Native_backend_callback_kind_for_testing kind)
@@ -40,7 +41,11 @@ inline void stop_after_callback_snapshot(internal::Native_backend_callback_kind_
     if (kind != internal::Native_backend_callback_kind_for_testing::OUTPUT) {
         return;
     }
-    auto audit = std::atomic_load(&callback_lifetime_probe);
+    std::shared_ptr<Callback_lifetime_audit> audit;
+    {
+        const std::lock_guard lock(callback_lifetime_probe_mutex);
+        audit = callback_lifetime_probe;
+    }
     if (!audit) {
         return;
     }
@@ -78,7 +83,10 @@ inline bool check_callback_lifetime(
     auto audit = std::make_shared<Callback_lifetime_audit>();
     audit->snapshot_barrier = snapshot_barrier;
     if (snapshot_barrier) {
-        std::atomic_store(&callback_lifetime_probe, audit);
+        {
+            const std::lock_guard lock(callback_lifetime_probe_mutex);
+            callback_lifetime_probe = audit;
+        }
         internal::set_native_backend_callback_snapshot_hook_for_testing(stop_after_callback_snapshot);
     }
     auto receiver = std::make_unique<Callback_receiver_lifetime>(audit);
@@ -170,7 +178,8 @@ inline bool check_callback_lifetime(
     }
     if (snapshot_barrier) {
         internal::set_native_backend_callback_snapshot_hook_for_testing(nullptr);
-        std::atomic_store(&callback_lifetime_probe, std::shared_ptr<Callback_lifetime_audit>{});
+        const std::lock_guard lock(callback_lifetime_probe_mutex);
+        callback_lifetime_probe.reset();
     }
     return ok;
 }
