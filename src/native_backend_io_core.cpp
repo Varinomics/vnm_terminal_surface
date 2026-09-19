@@ -4,12 +4,92 @@
 #include <QDir>
 #include <QProcessEnvironment>
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <utility>
 
 namespace vnm_terminal::internal {
 
+thread_local Native_backend_callback_gate::Invocation*
+    Native_backend_callback_gate::Invocation::s_current = nullptr;
+
+Native_backend_callback_gate::Invocation::Invocation(Native_backend_callback_gate& gate)
+:
+    m_gate(gate)
+{
+    const std::lock_guard lock(m_gate.m_mutex);
+    if (!m_gate.m_accepting) {
+        return;
+    }
+    ++m_gate.m_active_calls;
+    m_admitted = true;
+    m_previous = s_current;
+    s_current  = this;
+}
+
+Native_backend_callback_gate::Invocation::~Invocation()
+{
+    if (!m_admitted) {
+        return;
+    }
+    s_current = m_previous;
+    const std::lock_guard lock(m_gate.m_mutex);
+    --m_gate.m_active_calls;
+    m_gate.m_drained.notify_all();
+}
+
+std::size_t Native_backend_callback_gate::Invocation::current_depth(
+    const Native_backend_callback_gate& gate)
+{
+    std::size_t depth = 0U;
+    for (auto* invocation = s_current; invocation; invocation = invocation->m_previous) {
+        if (&invocation->m_gate == &gate) {
+            ++depth;
+        }
+    }
+    return depth;
+}
+
+void Native_backend_callback_gate::revoke_and_drain()
+{
+    const auto own_depth = Invocation::current_depth(*this);
+    std::unique_lock lock(m_mutex);
+    m_accepting = false;
+    m_drained.wait(lock, [&] { return m_active_calls == own_depth; });
+}
+
+Terminal_backend_callbacks guard_native_backend_callbacks(
+    Terminal_backend_callbacks callbacks,
+    const std::shared_ptr<Native_backend_callback_gate>& gate)
+{
+    Terminal_backend_callbacks guarded;
+    guarded.output_received = [
+            gate,
+            callback = std::move(callbacks.output_received)
+        ](QByteArray bytes)
+        {
+            gate->invoke(callback, std::move(bytes));
+        };
+    guarded.process_exited = [
+            gate,
+            callback = std::move(callbacks.process_exited)
+        ](Terminal_backend_exit exit)
+        {
+            gate->invoke(callback, std::move(exit));
+        };
+    guarded.error_reported = [
+            gate,
+            callback = std::move(callbacks.error_reported)
+        ](Terminal_backend_error error)
+        {
+            gate->invoke(callback, std::move(error));
+        };
+    return guarded;
+}
+
 namespace {
+
+std::atomic<Native_backend_callback_snapshot_hook_for_testing> callback_snapshot_hook{nullptr};
 
 constexpr Terminal_backend_output_delivery_limits k_default_output_delivery_limits{
     k_terminal_default_output_queue_high_water_bytes,
@@ -287,6 +367,7 @@ void report_native_backend_error_with_snapshot(
         callback_snapshot = callbacks;
     }
 
+    observe_native_backend_callback_snapshot_for_testing(Native_backend_callback_kind_for_testing::ERROR);
     report_native_backend_error(callback_snapshot, code, std::move(message));
 }
 
@@ -301,7 +382,22 @@ void deliver_native_backend_output_with_snapshot(
         callback_snapshot = callbacks;
     }
 
+    observe_native_backend_callback_snapshot_for_testing(Native_backend_callback_kind_for_testing::OUTPUT);
     deliver_native_backend_output(callback_snapshot, std::move(bytes));
+}
+
+void set_native_backend_callback_snapshot_hook_for_testing(
+    Native_backend_callback_snapshot_hook_for_testing hook)
+{
+    callback_snapshot_hook.store(hook, std::memory_order_release);
+}
+
+void observe_native_backend_callback_snapshot_for_testing(
+    Native_backend_callback_kind_for_testing kind)
+{
+    if (const auto hook = callback_snapshot_hook.load(std::memory_order_acquire)) {
+        hook(kind);
+    }
 }
 
 void report_native_backend_exit(

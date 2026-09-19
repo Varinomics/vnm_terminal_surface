@@ -1,5 +1,8 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
+#include "callback_lifetime_checks.h"
+#include "foreground_cleanup_checks.h"
+#include "native_session_checks.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/session_contract.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
@@ -1461,6 +1464,45 @@ bool test_destructor_returns_with_running_process(const QString& fixture_path)
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--native-session") {
+        return vnm_terminal::test_helpers::check_native_session_lifecycle(
+            term::make_posix_pty_backend, launch_config(QString::fromLocal8Bit(argv[2]), {})) ? 0 : 1;
+    }
+    if (argc == 4 && std::string_view(argv[1]) == "--foreground-cleanup-shell") {
+        bool control_valid = false;
+        bool report_valid  = false;
+        const int control = QString::fromLocal8Bit(argv[2]).toInt(&control_valid);
+        const int report  = QString::fromLocal8Bit(argv[3]).toInt(&report_valid);
+        if (!control_valid || !report_valid || control < 3 || report < 3 || control == report) {
+            return 2;
+        }
+        return vnm_terminal::test_helpers::run_foreground_cleanup_shell(control, report);
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--foreground-cleanup") {
+        return vnm_terminal::test_helpers::check_foreground_cleanup(
+            QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath()) ? 0 : 1;
+    }
+    if (argc == 2 && (std::string_view(argv[1]) == "--foreground-adopted" ||
+                     std::string_view(argv[1]) == "--foreground-host-eof" ||
+                     std::string_view(argv[1]) == "--foreground-owner-loss")) {
+        using Case = vnm_terminal::test_helpers::Foreground_cleanup_case;
+        const auto scenario = std::string_view(argv[1]) == "--foreground-adopted"
+            ? Case::ADOPTED : std::string_view(argv[1]) == "--foreground-host-eof"
+            ? Case::HOST_EOF : Case::OWNER_LOSS;
+        return vnm_terminal::test_helpers::check_foreground_cleanup(
+            QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath(), scenario) ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--callback-lifetime") {
+        bool ok = vnm_terminal::test_helpers::check_callback_lifetime(
+            term::make_posix_pty_backend(),
+            launch_config(QString::fromLocal8Bit(argv[2]), {QStringLiteral("--hold-open")}), true);
+        ok &= vnm_terminal::test_helpers::check_callback_lifetime(
+            term::make_posix_pty_backend(),
+            launch_config(QString::fromLocal8Bit(argv[2]), {QStringLiteral("--hold-open")}), false);
+        ok &= test_destructor_from_output_callback_returns();
+        ok &= test_destructor_from_process_exited_callback_returns();
+        return ok ? 0 : 1;
+    }
     if (argc != 2) {
         std::cerr << "usage: posix_pty_backend_tests <fixture-executable>\n";
         return 2;
@@ -1469,6 +1511,8 @@ int main(int argc, char** argv)
     const QString fixture_path = QString::fromLocal8Bit(argv[1]);
     bool ok = true;
     ok &= test_launch_output(fixture_path);
+    ok &= vnm_terminal::test_helpers::check_native_session_lifecycle(
+        term::make_posix_pty_backend, launch_config(fixture_path, {}));
     ok &= test_interactive_canvas_fixture(fixture_path);
     ok &= test_missing_working_directory(fixture_path);
     ok &= test_failed_executable(fixture_path);

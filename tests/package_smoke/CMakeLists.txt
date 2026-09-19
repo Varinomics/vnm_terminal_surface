@@ -99,3 +99,14 @@ target_link_libraries(vnm_terminal_surface_package_smoke PRIVATE
 if(WIN32)
     vnm_terminal_deploy_conpty(vnm_terminal_surface_package_smoke)
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    vnm_process_custody_deploy_owner(vnm_terminal_surface_package_smoke)
+    get_target_property(process_owner_imported vnm_framework::vnm_process_custody_owner IMPORTED)
+    if(NOT process_owner_imported)
+        message(FATAL_ERROR "Package smoke must consume the installed process owner")
+    endif()
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/process_owner_$<CONFIG>.cmake"
+        CONTENT
+            "set(source [==[$<TARGET_FILE:vnm_framework::vnm_process_custody_owner>]==])\nset(deployed [==[$<TARGET_FILE_DIR:vnm_terminal_surface_package_smoke>/vnm_process_custody_owner]==])\n")
+endif()

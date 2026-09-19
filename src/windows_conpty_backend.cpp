@@ -11,6 +11,7 @@
 #endif
 
 #include "native_backend_io_core.h"
+#include "native_backend_cleanup_owner.h"
 #include <windows.h>
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
@@ -685,6 +686,31 @@ std::vector<std::byte> initialized_attribute_list_storage(
 class Windows_conpty_backend::Impl
 {
 public:
+    Impl()
+        : m_cleanup(this,
+            [](void* context) noexcept {
+                auto* impl = static_cast<Impl*>(context);
+                wait_for_native_backend_public_calls(impl->call_state());
+                impl->shutdown();
+            },
+            [](void* context) noexcept { delete static_cast<Impl*>(context); })
+    {}
+
+    // This reservation predates native birth. Both failed-start cleanup and
+    // facade destruction use it; neither allocates or creates a thread after
+    // the child exists. No terminal/native completion is published here.
+    void request_deferred_cleanup() noexcept
+    {
+        revoke_callbacks();
+        m_cleanup.request();
+    }
+
+    void release_to_cleanup() noexcept
+    {
+        revoke_callbacks();
+        m_cleanup.release();
+    }
+
     ~Impl()
     {
         shutdown();
@@ -704,7 +730,34 @@ public:
             m_writer_failed,
             m_exit_reason_override == Terminal_exit_reason::INTERRUPTED ||
                 m_interrupt_delivery_exit_code_pending,
+            bool(m_process),
+            m_process_assigned_to_job,
+            m_native_cleanup_settled,
         };
+    }
+
+    bool set_start_fault_for_testing(Windows_conpty_start_fault_for_testing fault)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_start_attempted || m_start_in_progress) {
+            return false;
+        }
+        m_start_fault_for_testing = fault;
+        return true;
+    }
+
+    void set_cleanup_observation_blocked_for_testing(bool blocked)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cleanup_observation_blocked_for_testing = blocked;
+    }
+
+    bool set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_start_attempted || m_start_in_progress) return false;
+        m_cleanup_observation_gate_for_testing = std::move(gate);
+        return true;
     }
 
     Terminal_backend_result start(
@@ -726,6 +779,7 @@ public:
             return precheck.result;
         }
 
+        callbacks = guard_native_backend_callbacks(std::move(callbacks), m_callback_gate);
         Terminal_effective_launch_config effective_config =
             std::move(*precheck.effective_config);
 
@@ -924,30 +978,9 @@ public:
         pty_input_read.reset();
         pty_output_write.reset();
 
-        if (!AssignProcessToJobObject(process_job.get(), process_handle.get())) {
-            const DWORD assign_job_error = GetLastError();
-            TerminateProcess(process_handle.get(), 1U);
-            conpty_api->close(local_conpty);
-            return
-                reject_start(
-                    Terminal_backend_error_code::START_FAILED,
-                    windows_error_message(
-                        QStringLiteral("AssignProcessToJobObject"),
-                        assign_job_error),
-                    true);
-        }
-
-        if (ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
-            const DWORD resume_error = GetLastError();
-            TerminateJobObject(process_job.get(), 1U);
-            conpty_api->close(local_conpty);
-            return
-                reject_start(
-                    Terminal_backend_error_code::START_FAILED,
-                    windows_error_message(QStringLiteral("ResumeThread"), resume_error),
-                    true);
-        }
-
+        // Adopt every native resource before Job assignment or ResumeThread
+        // can fail. A rejected start can still own a suspended/live process.
+        // The ordinary wait worker continues that custody after start returns.
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_api                = *conpty_api;
@@ -958,6 +991,8 @@ public:
             m_output_read        = std::move(pty_output_read);
             m_process_job        = std::move(process_job);
             m_process            = std::move(process_handle);
+            m_process_assigned_to_job = false;
+            m_native_cleanup_settled = false;
             m_running            = true;
             m_start_attempted    = true;
             m_start_in_progress  = false;
@@ -989,6 +1024,38 @@ public:
             m_write_queue.clear();
         }
 
+        QString post_birth_failure;
+        const bool inject_assignment_failure =
+            m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT;
+        if (inject_assignment_failure || !AssignProcessToJobObject(m_process_job.get(), m_process.get())) {
+            const DWORD error = inject_assignment_failure ? ERROR_ACCESS_DENIED : GetLastError();
+            post_birth_failure = windows_error_message(QStringLiteral("AssignProcessToJobObject"), error);
+        }
+        else {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_process_assigned_to_job = true;
+            }
+            const bool inject_resume_failure =
+                m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE;
+            if (inject_resume_failure || ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+                post_birth_failure = windows_error_message(QStringLiteral("ResumeThread"),
+                    inject_resume_failure ? ERROR_ACCESS_DENIED : GetLastError());
+            }
+        }
+        if (!post_birth_failure.isEmpty()) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_stopping = true;
+                m_exit_reason_override = Terminal_exit_reason::FAILED_TO_START;
+            }
+            // An empty Job says nothing about an unassigned suspended root.
+            // Always terminate that exact process handle independently.
+            request_native_process_tree_termination();
+            report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                Terminal_backend_error_code::START_FAILED, post_birth_failure);
+        }
+
         Terminal_backend_result worker_result = start_native_backend_workers(
             call_state(),
             m_reader_thread,
@@ -1012,10 +1079,21 @@ public:
                     m_callbacks,
                     Terminal_backend_error_code::START_FAILED,
                     message);
-                shutdown();
+                request_deferred_cleanup();
                 return backend_reject(Terminal_backend_error_code::START_FAILED, message);
             });
         worker_result.native_dispatch_occurred = true;
+        if (worker_result.code == Terminal_backend_result_code::REJECTED) {
+            // The pre-reserved owner continues native cleanup after this
+            // bounded response. Returning from start is not settlement.
+            worker_result.start_outcome_determinate = false;
+        }
+        if (!post_birth_failure.isEmpty()) {
+            // The logical start failed. Native cleanup is a separate result:
+            // keep the wait worker, Job and process until exact settlement.
+            return backend_start_reject(Terminal_backend_error_code::START_FAILED,
+                std::move(post_birth_failure), true, native_process_tree_settled());
+        }
         return worker_result;
     }
 
@@ -1221,8 +1299,6 @@ public:
 
     void shutdown()
     {
-        HANDLE process     = nullptr;
-        HANDLE process_job = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
@@ -1233,8 +1309,6 @@ public:
             m_stopping         = true;
             m_output_paused    = false;
             m_callbacks        = {};
-            process            = m_process.get();
-            process_job        = m_process_job.get();
         }
 
         m_output_cv.notify_all();
@@ -1242,20 +1316,7 @@ public:
         cancel_blocking_input();
         request_conpty_close();
 
-        bool process_tree_terminated = false;
-        if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
-            process_tree_terminated = TerminateJobObject(process_job, 1U);
-        }
-
-        if (!process_tree_terminated &&
-            process != nullptr &&
-            process != INVALID_HANDLE_VALUE)
-        {
-            DWORD exit_code = 0;
-            if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
-                TerminateProcess(process, 1U);
-            }
-        }
+        request_native_process_tree_termination();
 
         if (!native_backend_reader_finished_within(
                 m_mutex,
@@ -1271,6 +1332,9 @@ public:
             m_wait_thread,
             m_termination_thread);
 
+        // Worker construction can fail before a wait loop exists. This exact
+        // owner still must observe the root and Job before releasing handles.
+        wait_for_native_process_tree_settlement();
         std::lock_guard<std::mutex> lock(m_mutex);
         m_input_write.reset();
         m_output_read.reset();
@@ -1282,51 +1346,19 @@ public:
         m_running = false;
     }
 
-    // Best-effort teardown for the unreachable-in-practice case where the
-    // deferred-shutdown thread cannot be spawned. It must not join or delete: the
-    // worker threads are still running against this Impl, so the Impl is
-    // deliberately leaked (safe: no use-after-free) while the child process tree
-    // is force-terminated so no process is left running.
-    void request_shutdown_without_cleanup() noexcept
+    // Revoke callbacks before the public facade returns. Native termination,
+    // observation and joins belong to the already-reserved cleanup worker.
+    void revoke_callbacks() noexcept
     {
-        HANDLE process     = nullptr;
-        HANDLE process_job = nullptr;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_shutdown_started) {
-                return;
-            }
-
-            m_shutdown_started = true;
-            m_stopping         = true;
-            m_output_paused    = false;
-            m_callbacks        = {};
-            process            = m_process.get();
-            process_job        = m_process_job.get();
+            const std::lock_guard lock(m_mutex);
+            m_stopping = true;
+            m_output_paused = false;
+            m_callbacks = {};
         }
-
         m_output_cv.notify_all();
         m_write_cv.notify_all();
-        cancel_blocking_io();
-        request_conpty_close();
-
-        // Same job-then-root termination shape as shutdown(): the pseudoconsole is
-        // closed and, if the job cannot be terminated, the root process is killed
-        // directly, so leaking the Impl never leaves the child tree running.
-        bool process_tree_terminated = false;
-        if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
-            process_tree_terminated = TerminateJobObject(process_job, 1U);
-        }
-
-        if (!process_tree_terminated &&
-            process != nullptr &&
-            process != INVALID_HANDLE_VALUE)
-        {
-            DWORD exit_code = 0;
-            if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
-                TerminateProcess(process, 1U);
-            }
-        }
+        m_callback_gate->revoke_and_drain();
     }
 
     native_backend_call_state_t call_state()
@@ -1902,7 +1934,19 @@ private:
             return;
         }
 
-        WaitForSingleObject(process, INFINITE);
+        bool wait_error_reported = false;
+        while (WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0) {
+            if (!wait_error_reported) {
+                report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                    Terminal_backend_error_code::TERMINATE_FAILED,
+                    windows_error_message(QStringLiteral("WaitForSingleObject process"), GetLastError()));
+                wait_error_reported = true;
+            }
+            // An observation error is not a native exit. Retain the exact
+            // handle and executor instead of publishing a fabricated final.
+            request_native_process_tree_termination();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
 
         DWORD exit_code = 0U;
         if (!GetExitCodeProcess(process, &exit_code)) {
@@ -1944,8 +1988,9 @@ private:
                 m_reader_finished);
         }
         drain_paused_output_before_exit_report();
+        request_native_process_tree_termination();
+        wait_for_native_process_tree_settlement();
         report_exit_once(Terminal_exit_reason::EXITED, static_cast<int>(exit_code));
-        terminate_process_tree_after_root_exit();
     }
 
     void termination_escalation_loop(
@@ -1998,6 +2043,60 @@ private:
                     Terminal_backend_error_code::TERMINATE_FAILED,
                     windows_error_message(QStringLiteral("TerminateJobObject"), GetLastError()));
             }
+        }
+    }
+
+    void request_native_process_tree_termination() noexcept
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_process_assigned_to_job && m_process_job) {
+            (void)TerminateJobObject(m_process_job.get(), 1U);
+        }
+        // Even a successful Job request cannot replace the root observation,
+        // and a failed assignment means the Job never owned this root at all.
+        if (m_process && WaitForSingleObject(m_process.get(), 0) != WAIT_OBJECT_0) {
+            (void)TerminateProcess(m_process.get(), 1U);
+        }
+    }
+
+    bool native_process_tree_settled()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_cleanup_observation_blocked_for_testing ||
+            (m_cleanup_observation_gate_for_testing &&
+             m_cleanup_observation_gate_for_testing->load(std::memory_order_acquire))) {
+            return false;
+        }
+        if (!m_process) {
+            return true; // No native child was adopted.
+        }
+        if (m_native_cleanup_settled) {
+            return true;
+        }
+        if (WaitForSingleObject(m_process.get(), 0) != WAIT_OBJECT_0) {
+            return false;
+        }
+        if (m_process_assigned_to_job) {
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+            if (!m_process_job || !QueryInformationJobObject(m_process_job.get(),
+                    JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr) ||
+                accounting.ActiveProcesses != 0)
+            {
+                return false;
+            }
+        }
+        m_native_cleanup_settled = true;
+        return true;
+    }
+
+    void wait_for_native_process_tree_settlement()
+    {
+        // A local termination deadline diagnoses non-completion; it does not
+        // release this native obligation. The existing wait/destruction owner
+        // keeps observing the exact handles, including transient query errors.
+        while (!native_process_tree_settled()) {
+            request_native_process_tree_termination();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
 
@@ -2058,6 +2157,8 @@ private:
     std::condition_variable            m_conpty_cv;
     std::condition_variable            m_public_call_cv;
     Terminal_backend_callbacks         m_callbacks;
+    std::shared_ptr<Native_backend_callback_gate> m_callback_gate =
+        std::make_shared<Native_backend_callback_gate>();
     Conpty_api                         m_api;
     HPCON                              m_conpty = nullptr;
     std::shared_ptr<Conpty_window_observer> m_window_observer;
@@ -2067,6 +2168,7 @@ private:
     Unique_handle                      m_process;
     Unique_handle                      m_reader_thread_handle;
     Unique_handle                      m_writer_thread_handle;
+    Native_backend_cleanup_reservation m_cleanup;
     std::thread                        m_reader_thread;
     std::thread                        m_writer_thread;
     std::thread                        m_wait_thread;
@@ -2090,6 +2192,12 @@ private:
     std::size_t                        m_successful_write_count   = 0U;
     std::size_t                        m_failed_write_count       = 0U;
     std::uint64_t                      m_child_output_sequence    = 0U;
+    Windows_conpty_start_fault_for_testing m_start_fault_for_testing =
+        Windows_conpty_start_fault_for_testing::NONE;
+    bool m_cleanup_observation_blocked_for_testing = false;
+    std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
+    bool m_process_assigned_to_job = false;
+    bool                               m_native_cleanup_settled = false;
     bool                               m_running = false;
     bool                               m_start_attempted = false;
     bool                               m_start_in_progress = false;
@@ -2112,14 +2220,9 @@ Windows_conpty_backend::Windows_conpty_backend()
 
 Windows_conpty_backend::~Windows_conpty_backend()
 {
-    // Defer when teardown is reached from a callback or while a public backend
-    // call is still unwinding, so the Impl is not freed under live stack frames.
-    if (m_impl && must_defer_native_backend_destruction(m_impl->call_state())) {
+    if (m_impl) {
         Impl* impl = m_impl.release();
-        defer_native_backend_shutdown_and_delete(
-            impl,
-            impl->call_state(),
-            [impl] { impl->request_shutdown_without_cleanup(); });
+        impl->release_to_cleanup();
     }
 }
 
@@ -2174,6 +2277,21 @@ Windows_conpty_backend::write_state_for_testing()
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->write_state_for_testing();
+}
+
+bool Windows_conpty_backend::set_start_fault_for_testing(Windows_conpty_start_fault_for_testing fault)
+{
+    return m_impl->set_start_fault_for_testing(fault);
+}
+
+void Windows_conpty_backend::set_cleanup_observation_blocked_for_testing(bool blocked)
+{
+    m_impl->set_cleanup_observation_blocked_for_testing(blocked);
+}
+
+bool Windows_conpty_backend::set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate)
+{
+    return m_impl->set_cleanup_observation_gate_for_testing(std::move(gate));
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()

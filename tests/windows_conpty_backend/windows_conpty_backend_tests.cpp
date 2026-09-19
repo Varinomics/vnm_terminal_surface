@@ -1,6 +1,9 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
+#include "../posix_pty_backend/callback_lifetime_checks.h"
+#include "../posix_pty_backend/native_session_checks.h"
 #include "../../src/native_backend_io_core.h"
+#include "../../src/native_backend_cleanup_owner.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
@@ -3669,10 +3672,116 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
     return ok;
 }
 
+
+bool test_facade_hands_off_unconfirmed_native_cleanup(const QString& fixture_path)
+{
+    auto blocked = std::make_shared<std::atomic_bool>(true);
+    struct Observation_release {
+        std::shared_ptr<std::atomic_bool> gate;
+        ~Observation_release() { gate->store(false, std::memory_order_release); }
+    } release{blocked};
+    Backend_capture first_capture;
+    auto first = std::make_unique<term::Windows_conpty_backend>();
+    bool ok = check(first->set_cleanup_observation_gate_for_testing(blocked),
+        "reserve an observation gate that outlives the public facade");
+    ok &= check(first->set_start_fault_for_testing(term::Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT),
+        "arm post-birth unassigned-root failure before native dispatch");
+    const auto result = first->start(launch_config(fixture_path, {QStringLiteral("--quick-exit")}),
+        first_capture.callbacks());
+    ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
+            result.native_dispatch_occurred && !result.start_outcome_determinate,
+        "a born root with unconfirmed cleanup cannot report determinate start failure");
+    ok &= check(first->write_state_for_testing().process_handle_retained && first_capture.exit_count_snapshot() == 0,
+        "the original native handle is retained before handoff");
+    const auto before = std::chrono::steady_clock::now();
+    first.reset();
+    ok &= check(std::chrono::steady_clock::now() - before < std::chrono::milliseconds(250),
+        "destroying the facade does not wait on a negative native observation");
+    ok &= check(!term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(20)),
+        "unconfirmed native cleanup remains owned after facade destruction");
+    {
+        Backend_capture second_capture;
+        term::Windows_conpty_backend second;
+        const auto independent = second.start(launch_config(fixture_path, {QStringLiteral("--quick-exit")}),
+            second_capture.callbacks());
+        ok &= check(independent.code != term::Terminal_backend_result_code::REJECTED && second_capture.wait_for_exit(),
+            "one retained unconfirmed backend does not block another actual ConPTY backend");
+    }
+    ok &= check(first_capture.exit_count_snapshot() == 0,
+        "a deleted facade has not received a fabricated native completion callback");
+    blocked->store(false, std::memory_order_release);
+    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout),
+        "the continuing owner eventually observes native settlement and joins its workers");
+    ok &= check(first_capture.exit_count_snapshot() == 0,
+        "continuing native cleanup does not call a retired receiver");
+    return ok;
+}
+
+bool test_post_birth_failure_keeps_native_custody(const QString& fixture_path)
+{
+    bool ok = true;
+    for (const auto fault : {term::Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT,
+             term::Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE})
+    {
+        Backend_capture capture; // Outlives the backend and every native callback.
+        term::Windows_conpty_backend backend;
+        struct Observation_release
+        {
+            term::Windows_conpty_backend& backend;
+            ~Observation_release() { backend.set_cleanup_observation_blocked_for_testing(false); }
+        } release{backend};
+        ok &= check(backend.set_start_fault_for_testing(fault),
+            "post-birth failure injection is armed before native dispatch");
+        backend.set_cleanup_observation_blocked_for_testing(true);
+        const auto result = backend.start(
+            launch_config(fixture_path, {QStringLiteral("--quick-exit")}), capture.callbacks());
+        ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
+                result.native_dispatch_occurred && !result.start_outcome_determinate,
+            "post-birth rejection does not claim determinate cleanup before observation");
+        const auto state = backend.write_state_for_testing();
+        ok &= check(state.process_handle_retained && !state.native_cleanup_settled,
+            "a rejected start retains the exact process while cleanup is unconfirmed");
+        ok &= check(state.process_assigned_to_job ==
+                (fault == term::Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE),
+            "the empty-Job assignment-failure case remains distinct from an assigned root");
+        ok &= check(capture.exit_count_snapshot() == 0,
+            "termination requests alone cannot publish a completed native exit");
+        backend.set_cleanup_observation_blocked_for_testing(false);
+        ok &= check(capture.wait_for_exit(), "exact native settlement eventually reports failed start");
+        const auto exit = capture.exit_snapshot();
+        ok &= check(exit && exit->reason == term::Terminal_exit_reason::FAILED_TO_START &&
+                capture.exit_count_snapshot() == 1,
+            "both post-birth failure paths publish exactly one failed-start native exit");
+        ok &= check(backend.write_state_for_testing().native_cleanup_settled,
+            "settlement is recorded only after the root and assigned Job are observed empty");
+    }
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--native-session") {
+        bool ok = vnm_terminal::test_helpers::check_native_session_lifecycle(
+            term::make_windows_conpty_backend, launch_config(QString::fromLocal8Bit(argv[2]), {}));
+        ok &= wait_for_console_host_children_to_exit("native session");
+        return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--callback-lifetime") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = vnm_terminal::test_helpers::check_callback_lifetime(
+            term::make_windows_conpty_backend(),
+            launch_config(fixture_path, {QStringLiteral("--hold-open")}), true);
+        ok &= vnm_terminal::test_helpers::check_callback_lifetime(
+            term::make_windows_conpty_backend(),
+            launch_config(fixture_path, {QStringLiteral("--hold-open")}), false);
+        ok &= test_destroy_from_process_exited_callback_on_worker_thread(fixture_path);
+        ok &= wait_for_console_host_children_to_exit("callback lifetime");
+        return ok ? 0 : 1;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--compatibility-window") {
         const QString fixture_path = QString::fromLocal8Bit(argv[2]);
         bool ok = test_compatibility_window_stays_hidden(fixture_path, false);
@@ -3705,6 +3814,13 @@ int main(int argc, char** argv)
         ok &= wait_for_console_host_children_to_exit(test_name);
     };
 
+    run_test("facade hands off unconfirmed native cleanup",
+        test_facade_hands_off_unconfirmed_native_cleanup(fixture_path));
+    run_test("native Terminal_session lifecycle",
+        vnm_terminal::test_helpers::check_native_session_lifecycle(
+            term::make_windows_conpty_backend, launch_config(fixture_path, {})));
+    run_test("post-birth failure retains native custody",
+        test_post_birth_failure_keeps_native_custody(fixture_path));
     run_test("pid parser", test_pid_parser_requires_line_delimiter());
     run_test("progressing output exit wait has absolute bound",
         test_progressing_output_exit_wait_has_absolute_bound());

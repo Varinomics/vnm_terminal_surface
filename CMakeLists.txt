@@ -185,6 +185,10 @@ set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR "${Qt6_VERSION_MAJOR}")
 set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 set(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE
     "${VNM_TERMINAL_SURFACE_BUILD_FULL}")
+set(vnm_terminal_surface_process_custody_required OFF)
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    set(vnm_terminal_surface_process_custody_required ON)
+endif()
 
 add_library(vnm_terminal_lcd_subpixel_policy STATIC
     include/vnm_terminal/internal/lcd_subpixel_policy_platform.h
@@ -351,6 +355,8 @@ add_library(
 
 if(VNM_TERMINAL_SURFACE_BUILD_FULL)
 
+include(cmake/vnm_terminal_process_custody_dependency.cmake)
+
 add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/backend_output_capture.h
     include/vnm_terminal/internal/backend_output_capture_writer.h
@@ -396,6 +402,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/terminal_canvas_export.h
     include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/vnm_terminal_surface.h
+    src/native_backend_cleanup_owner.h
     src/backend_output_capture.cpp
     src/diagnostics/metric_descriptor.h
     src/diagnostics/atlas_metric_descriptors.h
@@ -468,6 +475,9 @@ target_link_libraries(vnm_terminal_surface PRIVATE
     vnm_terminal_surface::vnm_terminal_lcd_subpixel_policy
     vnm_qt_dispatch::vnm_qt_dispatch
 )
+if(vnm_terminal_surface_process_custody_required)
+    target_link_libraries(vnm_terminal_surface PRIVATE vnm_framework::vnm_process_custody)
+endif()
 
 target_compile_definitions(vnm_terminal_surface PUBLIC
     VNM_TERMINAL_PROFILING_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_PROFILING}>

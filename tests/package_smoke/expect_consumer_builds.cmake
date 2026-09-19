@@ -61,7 +61,7 @@ if(NOT EXISTS "${installed_third_party_notices}")
 endif()
 
 set(installed_ubuntu_font_licence
-    "${install_dir}/share/licenses/vnm_terminal_surface/Ubuntu-Font-Licence-1.0.txt")
+    "${install_dir}/share/doc/vnm_fonts/Ubuntu-Font-Licence-1.0.txt")
 if(NOT EXISTS "${installed_ubuntu_font_licence}")
     message(FATAL_ERROR
         "Package smoke expected installed Ubuntu Font Licence at "
@@ -130,6 +130,9 @@ if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
 endif()
 if(DEFINED vnm_msdf_text_dir AND NOT "${vnm_msdf_text_dir}" STREQUAL "")
     list(APPEND configure_args "-Dvnm_msdf_text_DIR=${vnm_msdf_text_dir}")
+endif()
+if(DEFINED vnm_process_custody_dir AND NOT "${vnm_process_custody_dir}" STREQUAL "")
+    list(APPEND configure_args "-Dvnm_process_custody_DIR=${vnm_process_custody_dir}")
 endif()
 list(APPEND configure_args
     "-Dvnm_qt_dispatch_DIR:PATH=${provider_package_dir}"
@@ -248,6 +251,28 @@ if(NOT consumer_build_result EQUAL 0)
         "Package smoke consumer build failed; the installed diagnostics header "
         "or its builders did not link.\n"
         "${consumer_build_stdout}${consumer_build_stderr}")
+endif()
+
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    include("${consumer_binary_dir}/process_owner_${install_config}.cmake")
+    file(REAL_PATH "${source}" owner_source)
+    if(DEFINED imported_process_owner AND NOT "${imported_process_owner}" STREQUAL "")
+        file(REAL_PATH "${imported_process_owner}" expected_owner)
+        if(NOT owner_source STREQUAL expected_owner)
+            message(FATAL_ERROR "Package consumer selected a different installed process owner")
+        endif()
+    else()
+        file(REAL_PATH "${install_dir}" installed_prefix)
+        cmake_path(IS_PREFIX installed_prefix "${owner_source}" NORMALIZE owner_is_installed)
+        if(NOT owner_is_installed)
+            message(FATAL_ERROR "Process owner resolved outside the installed prefix: ${owner_source}")
+        endif()
+    endif()
+    file(SHA256 "${owner_source}" source_hash)
+    file(SHA256 "${deployed}" deployed_hash)
+    if(NOT source_hash STREQUAL deployed_hash)
+        message(FATAL_ERROR "Package consumer did not stage the installed process owner")
+    endif()
 endif()
 
 message(STATUS "Package smoke consumer built against the installed public headers.")

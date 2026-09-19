@@ -3,6 +3,9 @@
 #if defined(__linux__) || defined(__APPLE__)
 
 #include "native_backend_io_core.h"
+#include "native_backend_cleanup_owner.h"
+#include "posix_process_group_custody.h"
+#include "posix_pty_owner.h"
 #include <QDir>
 #include <QFile>
 #include <QProcessEnvironment>
@@ -55,7 +58,6 @@ constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
 // wake pipe with this bound (see wait_for_write_capacity). The cost is one idle
 // wake-up per interval per thread when the terminal is silent.
 constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
-constexpr int k_waitpid_failure_exit_code = -1;
 
 QString posix_error_message(QStringView context, int code)
 {
@@ -147,8 +149,9 @@ struct Queued_write
 
 struct Signal_targets
 {
-    std::array<pid_t, 2>       process_groups{};
-    std::size_t                count = 0U;
+    std::array<std::shared_ptr<Posix_process_group_custody>, 2> process_groups{};
+    std::size_t count = 0U;
+    bool complete = true;
 };
 
 struct Native_launch_data
@@ -486,154 +489,95 @@ int poll_timeout_until(std::optional<std::chrono::steady_clock::time_point> dead
         std::numeric_limits<int>::max()));
 }
 
-void add_signal_target(Signal_targets& targets, pid_t process_group)
-{
-    if (process_group <= 0) {
-        return;
-    }
-
-    for (std::size_t i = 0U; i < targets.count; ++i) {
-        if (targets.process_groups[i] == process_group) {
-            return;
-        }
-    }
-
-    if (targets.count < targets.process_groups.size()) {
-        targets.process_groups[targets.count++] = process_group;
-    }
-}
-
-Signal_targets process_signal_targets(pid_t child_process_group, int master)
+Signal_targets process_signal_targets(
+    const std::shared_ptr<Posix_process_group_custody>& child_group, int master)
 {
     Signal_targets targets;
-    add_signal_target(targets, child_process_group);
-
+    if (!child_group || child_group->identity() <= 1) {
+        return targets;
+    }
+    targets.process_groups[targets.count++] = child_group;
     if (master >= 0) {
         const pid_t foreground_pgid = ::tcgetpgrp(master);
-        if (foreground_pgid > 0) {
-            add_signal_target(targets, foreground_pgid);
+        if (foreground_pgid > 0 && foreground_pgid != child_group->identity()) {
+            auto foreground = Posix_process_group_custody::capture_foreground(
+                foreground_pgid, child_group->identity());
+            if (foreground) {
+                targets.process_groups[targets.count++] = std::move(foreground);
+            }
+            else {
+                // A remembered foreground PGID is not authority to signal it.
+                // Preserve the owned root but diagnose incomplete containment.
+                targets.complete = false;
+            }
         }
     }
-
     return targets;
 }
 
 Signal_targets shutdown_signal_targets(
-    pid_t  child_process_group,
-    int    master,
-    bool   child_reaped,
-    bool   reader_finished)
+    const std::shared_ptr<Posix_process_group_custody>& child_group,
+    int master, bool child_reaped, bool reader_finished)
 {
     if (child_reaped && reader_finished) {
         return {};
     }
-
-    return process_signal_targets(child_process_group, master);
+    return process_signal_targets(child_group, master);
 }
 
-#if defined(__APPLE__)
-std::optional<bool> macos_process_group_has_unterminated_members(pid_t process_group);
-#endif
 
 std::optional<int> send_signal_to_targets(const Signal_targets& targets, int signal_number)
 {
-    const pid_t own_process_group = ::getpgrp();
-    int first_error = 0;
+    int first_error = targets.complete ? 0 : ENOTSUP;
     for (std::size_t i = 0U; i < targets.count; ++i) {
-        const pid_t process_group = targets.process_groups[i];
-        // Never signal our own process group: if the child's process group was
-        // captured before the child established its own session/group (a forkpty
-        // + setsid race), it could equal the parent's group, and kill(-pgid)
-        // would deliver SIGKILL to this process too. Such a target is never a
-        // descendant we need to reap.
-        if (process_group <= 1 || process_group == own_process_group) {
-            continue;
-        }
-
-        if (::kill(-process_group, signal_number) == 0) {
-            continue;
-        }
-
-        const int signal_error = errno;
-        if (signal_error == ESRCH) {
-            continue;
-        }
-
-#if defined(__APPLE__)
-        // A process can commit to exit between the pre-signal activity check
-        // and kill(). macOS may then reject the group signal with EPERM even
-        // though the group has no member that can still execute. Preserve a
-        // genuine permission failure, but treat that completed lifecycle race
-        // like ESRCH.
-        if (signal_error == EPERM) {
-            const std::optional<bool> active_members =
-                macos_process_group_has_unterminated_members(process_group);
-            if (active_members.has_value() && !*active_members) {
-                continue;
-            }
-        }
-#endif
-
-        if (first_error == 0) {
-            first_error = signal_error;
+        const int error = targets.process_groups[i]->signal_group(signal_number);
+        if (error != 0 && error != ESRCH && first_error == 0) {
+            first_error = error;
         }
     }
-
-    if (first_error != 0) {
-        return first_error;
-    }
-
-    return std::nullopt;
+    return first_error == 0 ? std::nullopt : std::optional<int>(first_error);
 }
 
-#if defined(__APPLE__)
-std::optional<bool> macos_process_group_has_unterminated_members(pid_t process_group)
-{
-    int mib[4] = {
-        CTL_KERN,
-        KERN_PROC,
-        KERN_PROC_PGRP,
-        static_cast<int>(process_group),
-    };
 
-    constexpr int k_process_snapshot_attempts = 3;
-    for (int attempt = 0; attempt < k_process_snapshot_attempts; ++attempt) {
-        std::size_t byte_count = 0U;
-        if (::sysctl(mib, 4U, nullptr, &byte_count, nullptr, 0U) < 0) {
-            return std::nullopt;
-        }
-        if (byte_count == 0U) {
-            return false;
-        }
-
-        const std::size_t process_capacity =
-            (byte_count + sizeof(kinfo_proc) - 1U) / sizeof(kinfo_proc);
-        std::vector<kinfo_proc> processes(process_capacity);
-        byte_count = processes.size() * sizeof(kinfo_proc);
-        if (::sysctl(mib, 4U, processes.data(), &byte_count, nullptr, 0U) == 0) {
-            const std::size_t process_count = byte_count / sizeof(kinfo_proc);
-            for (std::size_t i = 0U; i < process_count; ++i) {
-                const extern_proc& process = processes[i].kp_proc;
-                if (process.p_stat != SZOMB && (process.p_flag & P_WEXIT) == 0) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        if (errno != ENOMEM) {
-            return std::nullopt;
-        }
-    }
-
-    return std::nullopt;
-}
-#endif
 
 }
 
 class Posix_pty_backend::Impl
 {
 public:
+    Impl()
+        : m_cleanup(this,
+            [](void* context) noexcept {
+                auto* impl = static_cast<Impl*>(context);
+                wait_for_native_backend_public_calls(impl->call_state());
+                impl->shutdown();
+            },
+            [](void* context) noexcept { delete static_cast<Impl*>(context); },
+            [](void* context) noexcept {
+#if defined(__linux__)
+                return static_cast<Impl*>(context)->m_owner.confirmed();
+#else
+                (void)context;
+                return true;
+#endif
+            })
+    {}
+
+    // This reservation predates native birth. Both failed-start cleanup and
+    // facade destruction use it; neither allocates or creates a thread after
+    // the child exists. No terminal/native completion is published here.
+    void request_deferred_cleanup() noexcept
+    {
+        revoke_callbacks();
+        m_cleanup.request();
+    }
+
+    void release_to_cleanup() noexcept
+    {
+        revoke_callbacks();
+        m_cleanup.release();
+    }
+
     ~Impl()
     {
         shutdown();
@@ -658,6 +602,7 @@ public:
             return precheck.result;
         }
 
+        callbacks = guard_native_backend_callbacks(std::move(callbacks), m_callback_gate);
         Terminal_effective_launch_config effective_config =
             std::move(*precheck.effective_config);
 
@@ -734,6 +679,57 @@ public:
         winsize initial_winsize =
             winsize_from_grid_size(effective_config.initial_grid_size);
         int master_fd = -1;
+#if defined(__linux__)
+        pid_t child_pid = -1;
+        pty_custody::Owner_start_request owner_request;
+        owner_request.mode = pty_custody::Owner_mode::PTY;
+        owner_request.process.executable = native_launch->executable.toStdString();
+        owner_request.process.working_directory = native_launch->working_directory.toStdString();
+        for (const auto& argument : native_launch->argv_bytes) {
+            owner_request.process.argv.emplace_back(argument.toStdString());
+        }
+        for (const auto& variable : native_launch->env_bytes) {
+            owner_request.process.environment.emplace_back(variable.toStdString());
+        }
+        // Preserve the previous exec inheritance contract, but transfer exact
+        // descriptors rather than making remote numeric descriptors authority.
+        for (const auto& name : QDir(QStringLiteral("/proc/self/fd")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
+            bool valid = false;
+            const int fd = name.toInt(&valid);
+            if (valid && fd > 2) {
+                const int flags = ::fcntl(fd, F_GETFD);
+                if (flags >= 0 && (flags & FD_CLOEXEC) == 0) {
+                    owner_request.process.inherited.push_back({fd, fd});
+                }
+            }
+        }
+        owner_request.dimensions.rows = initial_winsize.ws_row;
+        owner_request.dimensions.columns = initial_winsize.ws_col;
+        std::string owner_error;
+        bool owner_started = false;
+        try {
+            owner_started = m_owner.launch(owner_request, &master_fd, &child_pid, &owner_error);
+        }
+        catch (const std::exception& error) {
+            owner_error = error.what();
+        }
+        if (!owner_started) {
+            auto result = reject_start(Terminal_backend_error_code::START_FAILED,
+                QString::fromStdString(owner_error), true);
+            result.start_outcome_determinate = false;
+            request_deferred_cleanup();
+            return result;
+        }
+        Unique_fd master(master_fd);
+        const int nonblocking_result = set_fd_nonblocking(master.get());
+        if (nonblocking_result != 0) {
+            auto result = reject_start(Terminal_backend_error_code::START_FAILED,
+                posix_error_message(QStringLiteral("fcntl PTY nonblocking"), nonblocking_result), true);
+            result.start_outcome_determinate = false;
+            request_deferred_cleanup();
+            return result;
+        }
+#else
         const pid_t child_pid =
             ::forkpty(&master_fd, nullptr, nullptr, &initial_winsize);
         if (child_pid < 0) {
@@ -794,6 +790,7 @@ public:
                     posix_error_message(QStringLiteral("fcntl PTY nonblocking"), nonblocking_result),
                     true);
         }
+#endif
 
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -804,6 +801,9 @@ public:
             m_write_wake_read                    = std::move(write_wake_read);
             m_write_wake_write                   = std::move(write_wake_write);
             m_child_pid                          = child_pid;
+#if !defined(__linux__)
+            m_child_group_custody->adopt_owned_child(child_pid);
+#endif
             // The child makes itself a session/process-group leader (forkpty's
             // login_tty -> setsid, plus the explicit setpgid(0, 0) above), so
             // its process group is its own pid. Use that rather than a racy
@@ -821,6 +821,7 @@ public:
             m_writer_failed                      = false;
             m_startup_aborted                    = false;
             m_child_reaped                       = false;
+            m_child_exit_observed                = false;
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
             m_paused_output_limits =
@@ -854,10 +855,15 @@ public:
                     m_callbacks,
                     Terminal_backend_error_code::START_FAILED,
                     message);
-                shutdown();
+                request_deferred_cleanup();
                 return backend_reject(Terminal_backend_error_code::START_FAILED, message);
             });
         worker_result.native_dispatch_occurred = true;
+        if (worker_result.code == Terminal_backend_result_code::REJECTED) {
+            // The pre-reserved owner continues native cleanup after this
+            // bounded response. Returning from start is not settlement.
+            worker_result.start_outcome_determinate = false;
+        }
         return worker_result;
     }
 
@@ -1005,9 +1011,17 @@ public:
                         QStringLiteral("POSIX PTY interrupt requires a running process"));
             }
 
-            if (::kill(-foreground_pgid, SIGINT) < 0) {
+#if defined(__linux__) && defined(TIOCSIG)
+            if (::ioctl(master, TIOCSIG, SIGINT) < 0) {
                 interrupt_error = errno;
             }
+#else
+            const auto target = foreground_pgid == m_child_group_custody->identity()
+                ? m_child_group_custody
+                : Posix_process_group_custody::capture_foreground(
+                    foreground_pgid, m_child_group_custody->identity());
+            interrupt_error = target ? target->signal_group(SIGINT) : ENOTSUP;
+#endif
         }
 
         if (interrupt_error != 0) {
@@ -1023,8 +1037,7 @@ public:
     Terminal_backend_result terminate()
     {
         pid_t child_pid           = -1;
-        pid_t child_process_group = -1;
-        int master                = -1;
+        Signal_targets targets;
         QByteArray paused_output;
         bool paused_output_delivery_started = false;
         Terminal_termination_policy policy;
@@ -1038,8 +1051,7 @@ public:
             }
 
             child_pid           = m_child_pid;
-            child_process_group = m_child_process_group;
-            master              = m_master.get();
+            targets = process_signal_targets(m_child_group_custody, m_master.get());
             policy              = m_termination_policy;
 
             m_process_stopping     = true;
@@ -1063,10 +1075,19 @@ public:
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
+#if defined(__linux__)
+        std::string error;
+        if (!m_owner.stop(static_cast<int>(policy.graceful_interval.count()), &error)) {
+            return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED,
+                QString::fromStdString(error));
+        }
+        return backend_accept();
+#else
         return start_termination_escalation(
             child_pid,
-            process_signal_targets(child_process_group, master),
+            std::move(targets),
             policy);
+#endif
     }
 
     Terminal_backend_result start_termination_escalation(
@@ -1099,7 +1120,7 @@ public:
     void shutdown()
     {
         pid_t child_pid           = -1;
-        pid_t child_process_group = -1;
+        std::shared_ptr<Posix_process_group_custody> child_custody;
         int master                = -1;
         Signal_targets targets;
         bool child_reaped         = false;
@@ -1119,13 +1140,13 @@ public:
             m_paused_output_delivery_in_progress = false;
             m_callbacks                          = {};
             child_pid                            = m_child_pid;
-            child_process_group                  = m_child_process_group;
+            child_custody                        = m_child_group_custody;
             child_reaped                         = m_child_reaped;
             reader_finished                      = m_reader_finished;
             if (m_master) {
                 master = m_master.get();
                 targets = shutdown_signal_targets(
-                    child_process_group,
+                    child_custody,
                     master,
                     child_reaped,
                     reader_finished);
@@ -1139,7 +1160,7 @@ public:
             }
             else {
                 targets = shutdown_signal_targets(
-                    child_process_group,
+                    child_custody,
                     master,
                     child_reaped,
                     reader_finished);
@@ -1150,6 +1171,10 @@ public:
         m_write_cv.notify_all();
         wake_io_threads();
 
+#if defined(__linux__)
+        std::string owner_error;
+        (void)m_owner.stop(0, &owner_error);
+#else
         (void)send_signal_to_targets(targets, SIGKILL);
 
         // The signal above targets process groups (kill(-pgid)). During the
@@ -1161,9 +1186,10 @@ public:
         // hanging teardown. (The race is timing-dependent and was observed on
         // macOS.) Signal the child PID directly, which always reaches it, so
         // waitpid() returns and the wait thread can be joined.
-        if (!child_reaped && child_pid > 0) {
-            ::kill(child_pid, SIGKILL);
+        if (child_custody) {
+            (void)child_custody->signal_root(SIGKILL);
         }
+#endif
 
         // In ordinary shutdown, close the master before
         // join_native_backend_threads() so a child blocked writing to the slave
@@ -1178,7 +1204,11 @@ public:
             m_writer_thread,
             m_wait_thread,
             m_termination_thread);
+#if defined(__linux__)
+        m_owner.finish();
+#else
         reap_child_if_unreaped(child_pid);
+#endif
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_master.reset();
@@ -1218,56 +1248,17 @@ public:
         };
     }
 
-    void request_shutdown_without_cleanup()
+    void revoke_callbacks() noexcept
     {
-        pid_t child_pid           = -1;
-        pid_t child_process_group = -1;
-        int master                = -1;
-        Signal_targets targets;
-        bool child_reaped         = false;
-        bool reader_finished      = false;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_shutdown_started) {
-                return;
-            }
-
-            m_shutdown_started                   = true;
-            m_stopping                           = true;
-            m_process_stopping                   = true;
-            m_output_paused                      = false;
-            m_paused_output_delivery_in_progress = false;
-            m_callbacks                          = {};
-            child_pid                            = m_child_pid;
-            child_process_group                  = m_child_process_group;
-            child_reaped                         = m_child_reaped;
-            reader_finished                      = m_reader_finished;
-            if (m_master) {
-                master = m_master.get();
-                targets = shutdown_signal_targets(
-                    child_process_group,
-                    master,
-                    child_reaped,
-                    reader_finished);
-            }
-            else {
-                targets = shutdown_signal_targets(
-                    child_process_group,
-                    master,
-                    child_reaped,
-                    reader_finished);
-            }
+            const std::lock_guard lock(m_mutex);
+            m_stopping = true;
+            m_output_paused = false;
+            m_callbacks = {};
         }
-
         m_output_cv.notify_all();
         m_write_cv.notify_all();
-        wake_io_threads();
-
-        (void)send_signal_to_targets(targets, SIGKILL);
-
-        if (!child_reaped && child_pid > 0) {
-            ::kill(child_pid, SIGKILL);
-        }
+        m_callback_gate->revoke_and_drain();
     }
 
 private:
@@ -1449,43 +1440,26 @@ private:
             }
         }
 
-        const int result = waitpid_nointr(child_pid, nullptr, 0);
-        if (result == child_pid || (result < 0 && errno == ECHILD)) {
+        const int result = m_child_group_custody->reap(nullptr);
+        if (result == child_pid) {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_child_reaped = true;
             m_child_pid = -1;
         }
     }
 
-    bool signal_target_active(pid_t process_group)
-    {
-        if (process_group <= 0) {
-            return false;
-        }
-
-#if defined(__APPLE__)
-        const std::optional<bool> active_members =
-            macos_process_group_has_unterminated_members(process_group);
-        if (active_members.has_value()) {
-            return *active_members;
-        }
-#endif
-
-        if (::kill(-process_group, 0) == 0) {
-            return true;
-        }
-
-        return errno == EPERM;
-    }
-
     bool signal_targets_active(const Signal_targets& targets)
     {
+        if (!targets.complete) {
+            return true; // Unconfirmed is not empty.
+        }
         for (std::size_t i = 0U; i < targets.count; ++i) {
-            if (signal_target_active(targets.process_groups[i])) {
+            // Only ESRCH from an exact retained group proves its absence.
+            // Permission/API/identity failures remain pending observations.
+            if (targets.process_groups[i]->signal_group(0) != ESRCH) {
                 return true;
             }
         }
-
         return false;
     }
 
@@ -1589,7 +1563,7 @@ private:
                     break;
                 }
 
-                if (m_child_reaped && !final_drain_deadline.has_value()) {
+                if (m_child_exit_observed && !final_drain_deadline.has_value()) {
                     final_drain_deadline =
                         std::chrono::steady_clock::now() + k_exit_output_drain_timeout;
                 }
@@ -1849,20 +1823,20 @@ private:
             return;
         }
 
-        int status = 0;
-        const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
-        const int reaped_errno = errno;
+#if defined(__linux__)
+        const auto root_exit = m_owner.wait_root();
+        const int wait_error = root_exit ? 0 : ECHILD;
+#else
+        const int wait_error = m_child_group_custody->observe_exit();
+#endif
         const auto reap_time = std::chrono::steady_clock::now();
-        if (reaped != child_pid) {
-            const int wait_error = reaped_errno;
+        if (wait_error != 0) {
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_child_reaped = wait_error == ECHILD;
-                if (m_child_reaped) {
-                    m_child_pid = -1;
-                }
+                // Wait ownership loss is not proof of native settlement.
+                m_child_exit_observed = true;
                 m_process_stopping = true;
                 m_output_paused = false;
                 m_write_queue.clear();
@@ -1892,18 +1866,14 @@ private:
                 m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("waitpid"), wait_error));
-            report_exit_once(
-                Terminal_exit_reason::TERMINATED,
-                k_waitpid_failure_exit_code);
-            return;
+            return; // No fabricated exit or successful-cleanup notification.
         }
 
         QByteArray paused_output;
         bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_child_reaped     = true;
-            m_child_pid        = -1;
+            m_child_exit_observed = true;
             m_process_stopping = true;
             m_output_paused    = false;
             m_post_exit_process_group_cleanup_pending = true;
@@ -1939,38 +1909,56 @@ private:
         // drain window (interruptibly, so shutdown is not delayed).
         wait_out_exit_drain_window(reap_time);
         drain_paused_output_before_exit_report();
-        // Report the child's exit BEFORE reaping leftover descendants. The
-        // descendant must remain observable as alive until the backend reports
-        // the direct child's exit (the contract a consumer relies on); the
-        // process-absent check that follows exit reporting tolerates the kill
-        // landing slightly later. Killing first would race the descendant dead
-        // before the exit is reported -- which on macOS (immediate EOF, no drain
-        // wait) happens fast enough to be observed.
-        report_exit_once(status);
+#if defined(__linux__)
+        // Root exit is not tree emptiness. Only the dedicated owner consumes
+        // workload waits; its explicit receipt controls native settlement.
+        const int status = root_exit->signal != 0
+            ? root_exit->signal : (root_exit->exit_code << 8);
+#else
+        // Keep the owned root waitable until final group signals are issued.
         kill_child_process_group_after_exit_timeout();
+        int status = 0;
+        const pid_t reaped = m_child_group_custody->reap(&status);
+        if (reaped != child_pid) {
+            report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                Terminal_backend_error_code::TERMINATE_FAILED,
+                posix_error_message(QStringLiteral("waitpid final collection"), errno));
+            return;
+        }
+#endif
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_child_reaped = true;
+            m_child_pid = -1;
+        }
+        report_exit_once(status);
+#if defined(__linux__)
+        m_owner.finish();
+        if (!m_owner.confirmed()) {
+            report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                Terminal_backend_error_code::TERMINATE_FAILED,
+                QStringLiteral("PTY cleanup owner lost; descendant settlement is unconfirmed"));
+        }
+#endif
     }
 
     void kill_child_process_group_after_exit_timeout()
     {
-        // Kill any leftover members of the child's process group (e.g. a
-        // backgrounded descendant still holding the PTY slave open) once the
-        // direct child has exited and the exit drain has finished. This must NOT
-        // be gated on the reader having timed out: that gate was a proxy for
-        // "a descendant kept the slave open so the master never EOFed", which
-        // holds on Linux but not on macOS, where the master EOFs as soon as the
-        // session-leader child exits even with a descendant alive. So the reader
-        // finishes via EOF (timed_out == false) and the descendant would leak.
-        // kill(-pgid) is best effort and ignores ESRCH, so a clean exit with no
-        // descendants is a harmless no-op.
+        // Final best-effort signals use retained identities. Neither EOF nor
+        // this signal request certifies that every native descendant settled.
         pid_t child_process_group = -1;
         Signal_targets targets;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             child_process_group = m_child_process_group;
-            targets = process_signal_targets(child_process_group, m_master.get());
+            targets = process_signal_targets(m_child_group_custody, m_master.get());
         }
 
-        (void)send_signal_to_targets(targets, SIGKILL);
+        if (const auto error = send_signal_to_targets(targets, SIGKILL)) {
+            report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                Terminal_backend_error_code::TERMINATE_FAILED,
+                posix_error_message(QStringLiteral("exact process-group cleanup"), *error));
+        }
 
         int master_to_close = -1;
         {
@@ -2005,7 +1993,6 @@ private:
                 m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("SIGTERM"), *term_error));
-            return;
         }
 
         if (wait_for_signal_targets_exit_observed(targets, policy.graceful_interval)) {
@@ -2019,7 +2006,6 @@ private:
                 m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("SIGKILL"), *kill_error));
-            return;
         }
 
         if (wait_for_signal_targets_exit_observed(targets, policy.kill_interval)) {
@@ -2033,17 +2019,27 @@ private:
             QStringLiteral("POSIX PTY process remained active after forced termination"));
     }
 
+    // Allocated before native birth; all queued signals retain this identity.
+#if defined(__linux__)
+    Posix_pty_owner m_owner;
+#endif
+    std::shared_ptr<Posix_process_group_custody> m_child_group_custody =
+        std::make_shared<Posix_process_group_custody>(-1);
+    bool m_child_exit_observed = false;
     std::mutex                          m_mutex;
     std::condition_variable             m_output_cv;
     std::condition_variable             m_write_cv;
     std::condition_variable             m_reader_cv;
     std::condition_variable             m_public_call_cv;
     Terminal_backend_callbacks          m_callbacks;
+    std::shared_ptr<Native_backend_callback_gate> m_callback_gate =
+        std::make_shared<Native_backend_callback_gate>();
     Unique_fd                           m_master;
     Unique_fd                           m_read_wake_read;
     Unique_fd                           m_read_wake_write;
     Unique_fd                           m_write_wake_read;
     Unique_fd                           m_write_wake_write;
+    Native_backend_cleanup_reservation m_cleanup;
     std::thread                         m_reader_thread;
     std::thread                         m_writer_thread;
     std::thread                         m_wait_thread;
@@ -2085,14 +2081,9 @@ Posix_pty_backend::Posix_pty_backend()
 
 Posix_pty_backend::~Posix_pty_backend()
 {
-    // Defer when teardown is reached from a callback or while a public backend
-    // call is still unwinding, so the Impl is not freed under live stack frames.
-    if (m_impl && must_defer_native_backend_destruction(m_impl->call_state())) {
+    if (m_impl) {
         Impl* impl = m_impl.release();
-        defer_native_backend_shutdown_and_delete(
-            impl,
-            impl->call_state(),
-            [impl] { impl->request_shutdown_without_cleanup(); });
+        impl->release_to_cleanup();
     }
 }
 

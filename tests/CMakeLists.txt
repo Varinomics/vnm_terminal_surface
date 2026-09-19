@@ -13,6 +13,45 @@ endif()
 
 find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 find_package(Threads REQUIRED)
+
+add_executable(vnm_terminal_native_backend_cleanup_owner_tests
+    native_backend_cleanup_owner_tests.cpp)
+set_target_properties(vnm_terminal_native_backend_cleanup_owner_tests PROPERTIES AUTOMOC OFF)
+target_include_directories(vnm_terminal_native_backend_cleanup_owner_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(vnm_terminal_native_backend_cleanup_owner_tests PRIVATE Threads::Threads)
+add_test(NAME vnm_terminal_native_backend_cleanup_owner_tests
+    COMMAND vnm_terminal_native_backend_cleanup_owner_tests)
+set_tests_properties(vnm_terminal_native_backend_cleanup_owner_tests PROPERTIES
+    TIMEOUT 30 LABELS "native;shutdown;custody")
+
+
+if(UNIX)
+    add_executable(vnm_terminal_posix_pty_foreground_custody_tests
+        posix_pty_foreground_custody_tests.cpp)
+    set_target_properties(vnm_terminal_posix_pty_foreground_custody_tests PROPERTIES AUTOMOC OFF)
+    target_include_directories(vnm_terminal_posix_pty_foreground_custody_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(vnm_terminal_posix_pty_foreground_custody_tests PRIVATE Threads::Threads)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(vnm_terminal_posix_pty_foreground_custody_tests PRIVATE util)
+    endif()
+    add_test(NAME vnm_terminal_posix_pty_foreground_custody_tests
+        COMMAND vnm_terminal_posix_pty_foreground_custody_tests)
+    set_tests_properties(vnm_terminal_posix_pty_foreground_custody_tests PROPERTIES
+        TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "native;shutdown;custody;pty")
+
+    add_executable(vnm_terminal_posix_process_group_custody_tests
+        posix_process_group_custody/posix_process_group_custody_tests.cpp)
+    set_target_properties(vnm_terminal_posix_process_group_custody_tests PROPERTIES AUTOMOC OFF)
+    target_include_directories(vnm_terminal_posix_process_group_custody_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(vnm_terminal_posix_process_group_custody_tests PRIVATE Threads::Threads)
+    add_test(NAME vnm_terminal_posix_process_group_custody_tests
+        COMMAND vnm_terminal_posix_process_group_custody_tests)
+    set_tests_properties(vnm_terminal_posix_process_group_custody_tests PROPERTIES
+        TIMEOUT 20 LABELS "native;shutdown;custody")
+endif()
 include("${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
 
 function(vnm_terminal_require_qt_plugin_file plugin_target purpose)
@@ -2259,6 +2298,30 @@ set(vnm_terminal_surface_next_version
     "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${vnm_terminal_surface_next_patch}")
 
 add_test(
+    NAME vnm_terminal_process_custody_dependency_tests
+    COMMAND "${CMAKE_COMMAND}"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/process_custody_dependency"
+        "-DDEPENDENCY_MODULE=${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_process_custody_dependency.cmake"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/process_custody_dependency/check_resolution.cmake")
+set_tests_properties(vnm_terminal_process_custody_dependency_tests PROPERTIES
+    LABELS "package;native" TIMEOUT 30)
+
+set(vnm_terminal_custody_package_dir "")
+set(vnm_terminal_custody_imported_owner "")
+set(vnm_terminal_custody_imported OFF)
+if(vnm_terminal_surface_process_custody_required)
+    get_target_property(vnm_terminal_custody_imported
+        vnm_framework::vnm_process_custody IMPORTED)
+endif()
+if(vnm_terminal_custody_imported)
+    set(vnm_terminal_custody_package_dir "${vnm_process_custody_DIR}")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(vnm_terminal_custody_imported_owner
+            "$<TARGET_FILE:vnm_framework::vnm_process_custody_owner>")
+    endif()
+endif()
+
+add_test(
     NAME vnm_terminal_surface_package_consumer_builds
     COMMAND
         "${CMAKE_COMMAND}"
@@ -2277,6 +2340,8 @@ add_test(
         "-Dconsumer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/consumer"
         "-Dqt6_dir=${Qt6_DIR}"
         "-Dvnm_msdf_text_dir=${vnm_msdf_text_DIR}"
+        "-Dvnm_process_custody_dir=${vnm_terminal_custody_package_dir}"
+        "-Dimported_process_owner=${vnm_terminal_custody_imported_owner}"
         -P "${PROJECT_SOURCE_DIR}/tests/package_smoke/expect_consumer_builds.cmake"
 )
 
@@ -2357,4 +2422,7 @@ endif()
 
 foreach(vnm_terminal_test_process_target IN LISTS vnm_terminal_test_process_targets)
     vnm_terminal_configure_test_process(${vnm_terminal_test_process_target})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        vnm_process_custody_deploy_owner(${vnm_terminal_test_process_target})
+    endif()
 endforeach()

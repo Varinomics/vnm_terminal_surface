@@ -22,6 +22,56 @@ namespace vnm_terminal::internal {
 constexpr std::size_t k_native_backend_output_read_chunk_bytes =   16U * 1024U;
 constexpr std::size_t k_native_backend_max_queued_write_bytes  = 1024U * 1024U;
 
+// A callback copy is not admission. Revocation closes this shared gate and
+// drains admitted calls while the native cleanup owner independently retains
+// the backend. Stack-local entries exclude the revoking thread's own callbacks
+// from its drain, including nested calls, without serializing other callbacks.
+class Native_backend_callback_gate
+{
+    class Invocation
+    {
+    public:
+        explicit Invocation(Native_backend_callback_gate& gate);
+        ~Invocation();
+
+        Invocation(const Invocation&) = delete;
+        Invocation& operator=(const Invocation&) = delete;
+
+        bool admitted() const { return m_admitted; }
+        static std::size_t current_depth(const Native_backend_callback_gate& gate);
+
+    private:
+        static thread_local Invocation* s_current;
+        Native_backend_callback_gate& m_gate;
+        Invocation*                   m_previous = nullptr;
+        bool                          m_admitted = false;
+    };
+
+public:
+    template <typename Callback, typename Argument>
+    void invoke(const Callback& callback, Argument&& argument)
+    {
+        Invocation invocation(*this);
+        if (invocation.admitted()) {
+            callback(std::forward<Argument>(argument));
+        }
+    }
+
+    void revoke_and_drain();
+
+private:
+    std::mutex              m_mutex;
+    std::condition_variable m_drained;
+    std::size_t             m_active_calls = 0U;
+    bool                    m_accepting    = true;
+};
+
+// Called before native birth; allocating callback wrappers cannot strand a
+// born process. The wrappers retain the gate through every outstanding copy.
+Terminal_backend_callbacks guard_native_backend_callbacks(
+    Terminal_backend_callbacks callbacks,
+    const std::shared_ptr<Native_backend_callback_gate>& gate);
+
 struct Native_backend_start_gate
 {
     std::mutex& mutex;
@@ -174,31 +224,6 @@ private:
     native_backend_call_state_t m_call_state;
     On_last_call_claim_fn       m_on_last_call_claim;
 };
-
-// Runs impl->shutdown() and deletes impl on a fresh, non-worker thread, after
-// waiting for in-flight public calls to drain, so join_native_backend_threads()
-// can join the worker threads and any public backend call already on the stack
-// can return before the impl is freed. Takes ownership of impl. When the thread
-// cannot be spawned, runs on_spawn_failure instead: the impl is deliberately
-// leaked (safe: no use-after-free) while the backend force-terminates its child
-// process tree.
-template <typename Impl, typename On_spawn_failure_fn>
-void defer_native_backend_shutdown_and_delete(
-    Impl*                        impl,
-    native_backend_call_state_t  call_state,
-    On_spawn_failure_fn&&        on_spawn_failure) noexcept
-{
-    try {
-        std::thread([impl, call_state] {
-            wait_for_native_backend_public_calls(call_state);
-            impl->shutdown();
-            delete impl;
-        }).detach();
-    }
-    catch (...) {
-        on_spawn_failure();
-    }
-}
 
 // Spawns one worker thread that is admitted through the shared startup gate
 // before it runs `loop`: the worker records its id, waits at the gate until the
@@ -371,6 +396,23 @@ void deliver_native_backend_output(
     const Terminal_backend_callbacks&  callbacks,
     QByteArray                         bytes);
 
+enum class Native_backend_callback_kind_for_testing
+{
+    OUTPUT,
+    ERROR,
+    EXIT,
+};
+
+using Native_backend_callback_snapshot_hook_for_testing =
+    void (*)(Native_backend_callback_kind_for_testing);
+
+// Diagnostic scheduling seam: runs after the callback copy and outside the
+// backend mutex. Tests install/remove it only while their backends are idle.
+void set_native_backend_callback_snapshot_hook_for_testing(
+    Native_backend_callback_snapshot_hook_for_testing hook);
+void observe_native_backend_callback_snapshot_for_testing(
+    Native_backend_callback_kind_for_testing kind);
+
 // Snapshots the callbacks under the backend mutex and reports the error through
 // the snapshot, so the report never runs while the lock is held. This was both
 // backends' report_error member, verbatim.
@@ -439,6 +481,7 @@ void deliver_or_buffer_native_backend_output(
         callback_snapshot = callbacks;
     }
 
+    observe_native_backend_callback_snapshot_for_testing(Native_backend_callback_kind_for_testing::OUTPUT);
     deliver_native_backend_output(callback_snapshot, std::move(bytes));
 }
 
@@ -646,6 +689,7 @@ void report_native_backend_exit_once(
         std::lock_guard<std::mutex> lock(exit_publication.mutex);
         callbacks = exit_publication.callbacks;
     }
+    observe_native_backend_callback_snapshot_for_testing(Native_backend_callback_kind_for_testing::EXIT);
     report_native_backend_exit(callbacks, reason, exit_code);
 }
 

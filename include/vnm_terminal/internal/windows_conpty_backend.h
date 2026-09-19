@@ -2,11 +2,19 @@
 
 #include "vnm_terminal/internal/backend_contract.h"
 #include <cstddef>
+#include <atomic>
 #include <memory>
 
 namespace vnm_terminal::internal {
 
 #if defined(_WIN32)
+
+enum class Windows_conpty_start_fault_for_testing
+{
+    NONE,
+    JOB_ASSIGNMENT,
+    THREAD_RESUME_FAILURE,
+};
 
 struct Windows_conpty_backend_write_state_for_testing
 {
@@ -26,6 +34,9 @@ struct Windows_conpty_backend_write_state_for_testing
     // that premise held instead of inferring it from bytes in flight, which
     // are counted per write and so cannot distinguish the two writes.
     bool        interrupt_left_write_queue = false;
+    bool        process_handle_retained = false;
+    bool        process_assigned_to_job = false;
+    bool        native_cleanup_settled = false;
 };
 
 class Windows_conpty_backend final : public Terminal_backend
@@ -54,6 +65,11 @@ public:
     Terminal_backend_result terminate() override;
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing();
+    bool set_start_fault_for_testing(Windows_conpty_start_fault_for_testing fault);
+    void set_cleanup_observation_blocked_for_testing(bool blocked);
+    // The test can release this observation gate after destroying the facade;
+    // it never calls a member through a deleted backend.
+    bool set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate);
 
 private:
     class Impl;
