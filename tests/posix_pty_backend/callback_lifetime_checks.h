@@ -31,14 +31,16 @@ struct Callback_lifetime_audit
     std::atomic_bool        receiver_alive{true};
 };
 
-inline std::atomic<std::shared_ptr<Callback_lifetime_audit>> callback_lifetime_probe;
+// Use the shared_ptr atomic functions for libc++ implementations that lack
+// the C++20 atomic<shared_ptr> specialization. Every probe access stays atomic.
+inline std::shared_ptr<Callback_lifetime_audit> callback_lifetime_probe;
 
 inline void stop_after_callback_snapshot(internal::Native_backend_callback_kind_for_testing kind)
 {
     if (kind != internal::Native_backend_callback_kind_for_testing::OUTPUT) {
         return;
     }
-    auto audit = callback_lifetime_probe.load();
+    auto audit = std::atomic_load(&callback_lifetime_probe);
     if (!audit) {
         return;
     }
@@ -76,7 +78,7 @@ inline bool check_callback_lifetime(
     auto audit = std::make_shared<Callback_lifetime_audit>();
     audit->snapshot_barrier = snapshot_barrier;
     if (snapshot_barrier) {
-        callback_lifetime_probe.store(audit);
+        std::atomic_store(&callback_lifetime_probe, audit);
         internal::set_native_backend_callback_snapshot_hook_for_testing(stop_after_callback_snapshot);
     }
     auto receiver = std::make_unique<Callback_receiver_lifetime>(audit);
@@ -168,7 +170,7 @@ inline bool check_callback_lifetime(
     }
     if (snapshot_barrier) {
         internal::set_native_backend_callback_snapshot_hook_for_testing(nullptr);
-        callback_lifetime_probe.store({});
+        std::atomic_store(&callback_lifetime_probe, std::shared_ptr<Callback_lifetime_audit>{});
     }
     return ok;
 }
