@@ -18330,6 +18330,52 @@ bool test_public_search_api_persists_query_and_navigates(QGuiApplication& app)
     return ok;
 }
 
+bool test_public_search_spinner_keeps_results_visible(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("needle stable\r\nspinner: |")};
+    bool started = false;
+    Scripted_backend* source = start_surface_with_backend(
+        fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+    bool ok = check(started, "public spinner search fixture starts");
+    fixture.surface.set_search_query(QStringLiteral("needle"));
+    ok &= check(pump_until(app, [&fixture] {
+            return fixture.surface.search_result_state() ==
+                VNM_TerminalSurface::Search_result_state::MATCH;
+        }),
+        "public spinner search fixture settles its initial query");
+    bool lost_settled_result = false;
+    QObject::connect(&fixture.surface, &VNM_TerminalSurface::search_changed,
+        &fixture.surface, [&fixture, &lost_settled_result] {
+            lost_settled_result = lost_settled_result ||
+                fixture.surface.search_result_state() != VNM_TerminalSurface::Search_result_state::MATCH ||
+                fixture.surface.search_match_count() != 1 ||
+                fixture.surface.current_search_match() != 1;
+        });
+
+    for (const QByteArray& update : {
+            QByteArrayLiteral("\x1b[2;10H/"),
+            QByteArrayLiteral("\x1b[1;25H-")})
+    {
+        source->emit_output(update);
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const auto snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(fixture.surface.search_result_state() ==
+                VNM_TerminalSurface::Search_result_state::MATCH &&
+                fixture.surface.search_match_count() == 1 &&
+                fixture.surface.current_search_match() == 1 &&
+                snapshot != nullptr && snapshot->search_match_spans.size() == 1,
+            "public spinner publication keeps the count, current match, and highlight visible");
+        pump_events(app);
+    }
+    ok &= check(!lost_settled_result,
+        "spinner refresh never notifies hosts of an empty or pending replacement result");
+    return ok;
+}
+
 class Search_completion_dispatch_pause
 {
 public:
@@ -18725,6 +18771,7 @@ int main(int argc, char** argv)
     ok &= test_notification_burst_uses_durable_channel(app);
     ok &= test_surface_overflow_reports_error_and_exit(app);
     ok &= test_public_search_api_persists_query_and_navigates(app);
+    ok &= test_public_search_spinner_keeps_results_visible(app);
     ok &= test_search_completion_during_surface_destruction(app);
     ok &= test_search_completion_after_session_restart(app);
     ok &= test_invalid_argv_reports_backend_error(app);

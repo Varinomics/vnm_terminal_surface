@@ -35,6 +35,15 @@ Query evaluation runs asynchronously. Submitting a non-empty query publishes
 available only after the completion for the latest query and published-content
 generation is accepted. Rapid edits coalesce, and stale completions are ignored.
 
+Once a query is complete, ordinary active-grid updates refresh its dirty rows
+within the content publication. Counts, navigation, and highlights stay usable
+without an intervening `SEARCHING` state, including when animation adds or
+removes matches. Changed rows are searched again and receive their new proven
+line handles; unchanged matches are retained, not painted from stale content.
+This work is bounded by the active grid and does not scan retained history.
+History changes, buffer changes, resets, and reflow still use the asynchronous
+completion boundary above.
+
 The observable result properties are:
 
 - `searchResultState`: `INACTIVE`, `SOURCE_UNAVAILABLE`, `SEARCHING`,
@@ -60,9 +69,9 @@ buffer has no scrollback.
 ## Source And Provenance Safety
 
 Primary search incrementally maintains a compact corpus of the complete
-retained public row set at proven content-publication boundaries. Query scans
-run away from the GUI thread and do not reconstruct missing history from a
-visible render snapshot. Each match is tied to the active-buffer epoch,
+retained public row set at proven content-publication boundaries. New-query and
+structural source scans run away from the GUI thread and do not reconstruct
+missing history from a visible render snapshot. Each match is tied to the active-buffer epoch,
 retained history handle, and its ordinal within that retained logical line. The
 physical row and columns are refreshed from the new safe corpus after content,
 reflow, eviction, history reset, or buffer changes.

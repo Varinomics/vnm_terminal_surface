@@ -251,6 +251,9 @@ struct Terminal_search_controller::Shared_state
         std::optional<search_match_row_key_t> current_row;
         int                                   current_row_match_ordinal = 0;
         int                                   match_count = 0;
+        int                                   retained_match_count = 0;
+        std::map<std::pair<std::uint64_t, std::uint64_t>, int>
+                                              retained_match_ordinals;
         int                                   current_match_number = 0;
         std::uint64_t                         first_retained_ordinal = 0U;
         std::uint64_t                         end_retained_ordinal = 0U;
@@ -263,6 +266,86 @@ struct Terminal_search_controller::Shared_state
     :
         completion_notifier(std::move(notifier))
     {}
+
+    bool refresh_active_rows(
+        Desired_work                         desired,
+        Terminal_search_source_update&       update)
+    {
+        std::lock_guard<std::mutex> command_lock(command_mutex);
+        if (closed || work_scheduled || !pending_source_updates.empty() ||
+            !worker_matches_valid || update.reset_retained_rows ||
+            update.rescan_all_rows || !update.retained_rows.empty())
+        {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> corpus_lock(corpus_mutex);
+        std::lock_guard<std::mutex> result_lock(result_mutex);
+        const auto& previous = corpus.identity;
+        const auto& next = update.identity;
+        if (!corpus.initialized || result.source_identity != previous ||
+            result.query != desired.query ||
+            result.query_generation != desired.query_generation ||
+            previous.active_buffer != next.active_buffer ||
+            previous.active_buffer_epoch != next.active_buffer_epoch ||
+            previous.row_origin_generation != next.row_origin_generation ||
+            previous.content_basis.grid_reflow_generation !=
+                next.content_basis.grid_reflow_generation ||
+            !grid_sizes_match(previous.grid_size, next.grid_size) ||
+            corpus.first_retained_ordinal != update.first_retained_ordinal ||
+            corpus.end_retained_ordinal != update.end_retained_ordinal)
+        {
+            return false;
+        }
+
+        auto& active_rows = next.active_buffer == Terminal_buffer_id::PRIMARY
+            ? corpus.primary_active_rows
+            : corpus.alternate_active_rows;
+        std::set<int> changed_rows;
+        for (const auto& row : update.active_rows) {
+            if (row.active_grid_row < 0 ||
+                static_cast<std::size_t>(row.active_grid_row) >= active_rows.size())
+            {
+                return false;
+            }
+            changed_rows.insert(row.active_grid_row);
+        }
+        if (update.reset_active_rows && changed_rows.size() != active_rows.size()) {
+            return false;
+        }
+
+        // Idle ownership makes this a bounded publication transaction: neither
+        // stale row handles nor a worker's temporarily detached result escape.
+        const auto refresh_anchor = current_match_for_result(result);
+        desired.work_generation =
+            desired_work_generation.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+        const Search_query_text query = make_search_query_text(desired.query);
+        for (auto& source_row : update.active_rows) {
+            const auto index = static_cast<std::size_t>(source_row.active_grid_row);
+            active_rows[index] = make_search_corpus_row(source_row);
+            const auto& row = active_rows[index];
+            auto spans = search_row(
+                row, query, next.grid_size.columns,
+                desired_work_generation, desired.work_generation);
+            Q_ASSERT(spans.has_value());
+            const search_match_row_key_t key{true, index};
+            if (spans->empty()) {
+                result.matches.erase(key);
+            }
+            else {
+                result.matches.insert_or_assign(key, Search_match_row{
+                    terminal_history_handle_from_retained_identity(
+                        row.retained_line_id, row.content_generation),
+                    std::move(*spans),
+                    0,
+                });
+            }
+        }
+        corpus.identity = next;
+        finish_result(result, desired, refresh_anchor, true);
+        desired_work = std::move(desired);
+        return true;
+    }
 
     void request(
         Desired_work                             desired,
@@ -978,7 +1061,8 @@ private:
     void finish_result(
         Result&                                      completed,
         const Desired_work&                          desired,
-        const std::optional<terminal_search_match_t>& refresh_anchor)
+        const std::optional<terminal_search_match_t>& refresh_anchor,
+        bool                                         active_only = false)
     {
         completed.source_identity = desired.source_identity;
         completed.query = desired.query;
@@ -986,25 +1070,58 @@ private:
         completed.source_revision = desired.source_revision;
         completed.first_retained_ordinal = corpus.first_retained_ordinal;
         completed.end_retained_ordinal = corpus.end_retained_ordinal;
-        completed.match_count = 0;
+        if (!active_only) {
+            completed.retained_match_count = 0;
+            completed.retained_match_ordinals.clear();
+        }
+        completed.match_count = active_only ? completed.retained_match_count : 0;
         std::map<std::pair<std::uint64_t, std::uint64_t>, int> next_match_ordinals;
-        for (auto& [key, row] : completed.matches) {
-            (void)key;
-            int& next_match_ordinal = next_match_ordinals[{
+        const auto first_row = active_only
+            ? completed.matches.lower_bound({true, 0U})
+            : completed.matches.begin();
+        for (auto match_row = first_row; match_row != completed.matches.end(); ++match_row) {
+            auto& [key, row] = *match_row;
+            const auto line = std::pair{
                 row.history_handle.byte_sequence,
                 row.history_handle.content_generation,
-            }];
+            };
+            int* ordinal = nullptr;
+            if (key.active_grid) {
+                auto [position, inserted] = next_match_ordinals.try_emplace(line, 0);
+                if (inserted) {
+                    const auto retained = completed.retained_match_ordinals.find(line);
+                    if (retained != completed.retained_match_ordinals.end()) {
+                        position->second = retained->second;
+                    }
+                }
+                ordinal = &position->second;
+            }
+            else {
+                ordinal = &completed.retained_match_ordinals[line];
+                completed.retained_match_count += static_cast<int>(row.spans.size());
+            }
+            int& next_match_ordinal = *ordinal;
             row.first_match_ordinal_in_retained_line = next_match_ordinal;
             next_match_ordinal += static_cast<int>(row.spans.size());
             completed.match_count += static_cast<int>(row.spans.size());
+        }
+
+        // Active rows follow retained rows, so their changes cannot alter a
+        // retained current match's identity or one-based display index.
+        if (active_only && completed.current_row.has_value() &&
+            !completed.current_row->active_grid)
+        {
+            completed.completion_ready = true;
+            return;
         }
 
         completed.current_row.reset();
         completed.current_row_match_ordinal = 0;
         completed.current_match_number = 0;
         if (refresh_anchor.has_value()) {
-            int number = 0;
-            for (const auto& [key, row] : completed.matches) {
+            int number = active_only ? completed.retained_match_count : 0;
+            for (auto match_row = first_row; match_row != completed.matches.end(); ++match_row) {
+                const auto& [key, row] = *match_row;
                 const int row_match_count = static_cast<int>(row.spans.size());
                 const int match_ordinal =
                     refresh_anchor->identity.match_ordinal_in_retained_line -
@@ -1024,7 +1141,7 @@ private:
             const std::int64_t preferred_public_row = refresh_anchor.has_value()
                 ? refresh_anchor->public_row
                 : desired.preferred_public_row;
-            auto selected = completed.matches.begin();
+            auto selected = first_row;
             while (selected != completed.matches.end() &&
                    public_row_for_key(completed, selected->first) <
                        preferred_public_row)
@@ -1037,8 +1154,11 @@ private:
             completed.current_row = selected->first;
             completed.current_row_match_ordinal = 0;
             int number = 1;
-            for (auto row = completed.matches.begin(); row != selected; ++row) {
-                number += static_cast<int>(row->second.spans.size());
+            if (selected != completed.matches.begin()) {
+                number += active_only ? completed.retained_match_count : 0;
+                for (auto row = first_row; row != selected; ++row) {
+                    number += static_cast<int>(row->second.spans.size());
+                }
             }
             completed.current_match_number = number;
         }
@@ -1144,6 +1264,7 @@ void Terminal_search_controller::set_query(
 
 void Terminal_search_controller::update_source(Terminal_search_source_update update)
 {
+    const bool can_refresh = m_source_available && !m_searching && !m_query.isEmpty();
     m_source_identity = update.identity;
     m_source_revision = update.revision;
     m_source_available = true;
@@ -1158,6 +1279,10 @@ void Terminal_search_controller::update_source(Terminal_search_source_update upd
     desired.source_revision         = m_source_revision;
     desired.preferred_public_row    = m_preferred_public_row;
     desired.source_available        = m_source_available;
+    if (can_refresh && m_shared->refresh_active_rows(desired, update)) {
+        m_searching = false;
+        return;
+    }
     m_shared->request(std::move(desired), std::move(update));
 }
 
@@ -1181,7 +1306,11 @@ bool Terminal_search_controller::process_completion()
 bool Terminal_search_controller::wait_for_completion_for_testing(
     std::chrono::milliseconds timeout)
 {
-    return m_shared->wait_until_idle(timeout) && process_completion();
+    if (!m_shared->wait_until_idle(timeout)) {
+        return false;
+    }
+    return process_completion() ||
+        (!m_searching && m_source_available && !m_query.isEmpty());
 }
 
 bool Terminal_search_controller::wait_for_idle_for_testing(

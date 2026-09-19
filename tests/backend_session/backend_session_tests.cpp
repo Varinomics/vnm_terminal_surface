@@ -18589,6 +18589,76 @@ bool test_terminal_search_refresh_preserves_current_match()
     return ok;
 }
 
+bool test_terminal_search_spinner_refresh_preserves_matches()
+{
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 32};
+    bool ok = check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "spinner search session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("needle stable\r\nspinner: |")),
+        "spinner search fixture publishes a static match");
+    session->set_search_query(QStringLiteral("needle"));
+    ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)),
+        "spinner search fixture completes its initial query");
+    const auto baseline = session->search_result_state();
+    ok &= check(baseline.status == term::Terminal_search_result_status::MATCH &&
+            baseline.match_count == 1 && baseline.current_match == 1,
+        "spinner search fixture has one selected match");
+
+    for (const QByteArray& update : {
+            QByteArrayLiteral("\x1b[2;10H/"),
+            QByteArrayLiteral("\x1b[2;10H-"),
+            QByteArrayLiteral("\x1b[1;25H/"),
+            QByteArrayLiteral("\x1b[1;25H-"),
+            QByteArrayLiteral("\x1b[2J\x1b[Hneedle stable\x1b[2;1Hspinner: |")})
+    {
+        ok &= check(backend->emit_output(update), "spinner update is published");
+        const auto snapshot = session->latest_render_snapshot();
+        ok &= check(session->search_result_state() == baseline,
+            "unrelated and same-row spinner updates preserve the settled match count and index");
+        ok &= check(snapshot.has_value() && snapshot->search_match_spans.size() == 1 &&
+                snapshot->search_match_spans.front().row == 0 &&
+                snapshot->search_match_spans.front().current,
+            "spinner publication preserves the unchanged current match highlight");
+        ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)),
+            "spinner search refresh completes");
+        ok &= check(session->search_result_state() == baseline,
+            "completed spinner refresh keeps the same match count and index");
+    }
+
+    for (const bool add_match : {true, false}) {
+        ok &= check(backend->emit_output(add_match
+                ? QByteArrayLiteral("\x1b[2;1Hneedle")
+                : QByteArrayLiteral("\x1b[2;1Hplain ")),
+            "animated row changes its own match membership");
+        const auto snapshot = session->latest_render_snapshot();
+        const int expected_count = add_match ? 2 : 1;
+        ok &= check(session->search_result_state().status == term::Terminal_search_result_status::MATCH &&
+                session->search_result_state().match_count == expected_count &&
+                snapshot.has_value() && (int)snapshot->search_match_spans.size() == expected_count &&
+                snapshot->search_match_spans.front().row == 0 &&
+                snapshot->search_match_spans.front().current,
+            "changing another row's matches updates the count without blanking the static match");
+        ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)),
+            "animated row match membership refresh completes");
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1Hplain ")),
+        "spinner search fixture replaces the matching text");
+    const auto changed_snapshot = session->latest_render_snapshot();
+    ok &= check(changed_snapshot.has_value() && changed_snapshot->search_match_spans.empty(),
+        "changed matching text does not retain a stale highlight");
+    ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)),
+        "changed matching text finishes reevaluation");
+    ok &= check(session->search_result_state().status == term::Terminal_search_result_status::NO_MATCH &&
+            session->search_result_state().match_count == 0,
+        "changed matching text clears the completed result count");
+    return ok;
+}
+
 bool test_terminal_search_refresh_preserves_manual_viewport()
 {
     std::unique_ptr<term::Terminal_session> session;
@@ -19827,6 +19897,7 @@ int main()
     ok &= test_metrics_driven_resize_interleaves_with_output();
     ok &= test_terminal_search_scrollback_navigation_and_eviction();
     ok &= test_terminal_search_refresh_preserves_current_match();
+    ok &= test_terminal_search_spinner_refresh_preserves_matches();
     ok &= test_terminal_search_refresh_preserves_manual_viewport();
     ok &= test_terminal_search_pending_query_and_newer_viewport_intent();
     ok &= test_terminal_search_pending_query_and_deferred_scroll_order();

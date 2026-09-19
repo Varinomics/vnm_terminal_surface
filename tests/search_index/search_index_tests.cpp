@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "vnm_terminal/internal/terminal_search.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
@@ -90,6 +91,110 @@ bool test_identity_spans_stay_implicit_until_needed()
             text.spans[3] == term::terminal_search_column_span_t{3, 5} &&
             text.spans[4] == term::terminal_search_column_span_t{3, 5},
         "the first non-identity cell backfills exact spans for preceding text");
+    return ok;
+}
+
+term::Terminal_search_source_row search_test_row(
+    std::uint64_t identity,
+    int           active_row,
+    QStringView   text)
+{
+    term::Terminal_search_source_row row;
+    row.retained_line_id = identity;
+    row.content_generation = 1U;
+    row.active_grid_row = active_row;
+    row.text.source_width = 20;
+    for (qsizetype column = 0; column < text.size(); ++column) {
+        row.text.append_cell_text(text.mid(column, 1), static_cast<int>(column),
+            static_cast<int>(column) + 1);
+    }
+    return row;
+}
+
+bool test_active_search_refresh_preserves_retained_prefix_and_navigation()
+{
+    term::Terminal_search_controller search;
+    term::Terminal_search_source_update initial;
+    initial.identity.grid_size = {3, 20};
+    initial.identity.active_buffer_epoch = 1U;
+    initial.revision = 1U;
+    initial.end_retained_ordinal = 1U;
+    initial.reset_retained_rows = true;
+    initial.reset_active_rows = true;
+    initial.retained_rows.push_back(search_test_row(1U, -1, u"aa"));
+    initial.active_rows.push_back(search_test_row(1U, 0, u"a"));
+    initial.active_rows.push_back(search_test_row(2U, 1, u"a"));
+    initial.active_rows.push_back(search_test_row(3U, 2, u"-"));
+    search.update_source(initial);
+    search.set_query(QStringLiteral("a"), 1);
+    bool ok = check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "initial controller search completes");
+    auto current = search.current_match();
+    ok &= check(current.has_value() &&
+        current->identity.match_ordinal_in_retained_line == 2 &&
+        search.result_state().current_match == 3,
+        "active continuation counts matching retained fragments in its identity");
+
+    auto refresh = [&](int row, QStringView text) {
+        term::Terminal_search_source_update update;
+        update.identity = initial.identity;
+        update.identity.content_basis.content_generation = ++initial.revision;
+        update.revision = initial.revision;
+        update.end_retained_ordinal = 1U;
+        update.active_rows.push_back(search_test_row(
+            row == 0 ? 1U : static_cast<std::uint64_t>(row + 1), row, text));
+        search.update_source(std::move(update));
+    };
+    refresh(2, u"aa");
+    ok &= check(search.result_state() == term::terminal_search_result_state_t{
+        term::Terminal_search_result_status::MATCH, 6, 3},
+        "active match insertion immediately preserves exact retained prefix and current index");
+    current = search.current_match();
+    ok &= check(current.has_value() && current->identity.match_ordinal_in_retained_line == 2,
+        "active refresh preserves a shared-line match ordinal");
+    ok &= check(search.select_previous() && search.result_state().current_match == 2,
+        "navigation crosses from active results into retained history immediately");
+    refresh(0, u"-");
+    ok &= check(search.result_state() == term::terminal_search_result_state_t{
+        term::Terminal_search_result_status::MATCH, 5, 2},
+        "active removal cannot change a retained current match index");
+    ok &= check(search.select_next() && search.result_state().current_match == 3,
+        "navigation skips the removed active match");
+    refresh(1, u"-");
+    ok &= check(search.result_state() == term::terminal_search_result_state_t{
+        term::Terminal_search_result_status::MATCH, 4, 3},
+        "removing current active match selects the following row with exact count");
+    refresh(2, u"-");
+    ok &= check(search.result_state() == term::terminal_search_result_state_t{
+        term::Terminal_search_result_status::MATCH, 2, 1},
+        "removing the final active match wraps to the first retained match");
+
+    search.set_query(QStringLiteral("missing"), 0);
+    ok &= check(search.result_state().status == term::Terminal_search_result_status::SEARCHING &&
+        !search.current_match().has_value(),
+        "new queries never expose the prior query's retained or active matches");
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "replacement query completes");
+    refresh(2, u"missing");
+    ok &= check(search.result_state() == term::terminal_search_result_state_t{
+        term::Terminal_search_result_status::MATCH, 1, 1},
+        "same-query refresh can immediately create its first match");
+    refresh(2, u"-");
+    ok &= check(search.result_state() == term::terminal_search_result_state_t{
+        term::Terminal_search_result_status::NO_MATCH, 0, 0},
+        "same-query refresh immediately removes its final match");
+
+    term::Terminal_search_source_update reflow;
+    reflow.identity = initial.identity;
+    reflow.identity.content_basis.grid_reflow_generation = 1U;
+    reflow.revision = ++initial.revision;
+    reflow.end_retained_ordinal = 1U;
+    reflow.rescan_all_rows = true;
+    search.update_source(std::move(reflow));
+    ok &= check(search.result_state().status == term::Terminal_search_result_status::SEARCHING,
+        "structural updates retain the asynchronous publication boundary");
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "structural refresh completes");
     return ok;
 }
 
@@ -325,6 +430,7 @@ int main()
 {
     bool ok = true;
     ok &= test_identity_spans_stay_implicit_until_needed();
+    ok &= test_active_search_refresh_preserves_retained_prefix_and_navigation();
     ok &= test_search_row_text_matches_published_snapshot_rows();
     ok &= test_retained_history_ordinal_range_tracks_appends_and_evictions();
 
