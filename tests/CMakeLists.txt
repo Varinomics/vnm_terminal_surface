@@ -2311,13 +2311,13 @@ set(vnm_terminal_custody_imported_owner "")
 set(vnm_terminal_custody_imported OFF)
 if(vnm_terminal_surface_process_custody_required)
     get_target_property(vnm_terminal_custody_imported
-        vnm_framework::vnm_process_custody IMPORTED)
+        vnm_process_custody::vnm_process_custody IMPORTED)
 endif()
 if(vnm_terminal_custody_imported)
     set(vnm_terminal_custody_package_dir "${vnm_process_custody_DIR}")
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(vnm_terminal_custody_imported_owner
-            "$<TARGET_FILE:vnm_framework::vnm_process_custody_owner>")
+            "$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>")
     endif()
 endif()
 

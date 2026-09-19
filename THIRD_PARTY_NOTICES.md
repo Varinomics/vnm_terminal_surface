@@ -2,6 +2,10 @@
 
 `vnm_terminal_surface` is distributed under the project license in `LICENSE`.
 
+The native process custody library and owner helper in `cpp/process_custody`
+are Copyright © 2026 Varinomics Ltd. and use the same GPL-3.0 license.
+Standalone custody packages include that license and the copyright notice.
+
 ## Qt 6
 
 Qt 6 Core, Gui, and Quick are required. The project uses Qt through either a

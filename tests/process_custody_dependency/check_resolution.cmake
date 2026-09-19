@@ -1,3 +1,18 @@
+get_filename_component(surface_root "${DEPENDENCY_MODULE}/../.." ABSOLUTE)
+foreach(relative_path IN ITEMS
+        CMakeLists.txt
+        cmake/vnm_terminal_process_custody_dependency.cmake
+        cmake/vnm_terminal_surfaceConfig.cmake.in
+        cpp/process_custody/CMakeLists.txt
+        cpp/process_custody/cmake/vnm_process_custody_install.cmake
+        cpp/process_custody/cmake/vnm_process_custody_runtime.cmake
+        cpp/process_custody/cmake/vnm_process_custody-config.cmake.in)
+    file(READ "${surface_root}/${relative_path}" contents)
+    if(contents MATCHES "vnm_framework")
+        message(FATAL_ERROR "Surface custody must be framework-independent: ${relative_path}")
+    endif()
+endforeach()
+
 foreach(mode IN ITEMS existing installed source fallback invalid darwin)
     execute_process(
         COMMAND "${CMAKE_COMMAND}"

@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(vnm_terminal_surface CONFIG REQUIRED)
 
+get_property(package_imports DIRECTORY PROPERTY IMPORTED_TARGETS)
+foreach(package_target IN LISTS package_imports)
+    get_target_property(package_links ${package_target} INTERFACE_LINK_LIBRARIES)
+    if(package_target MATCHES "^vnm_framework::" OR package_links MATCHES "vnm_framework::")
+        message(FATAL_ERROR "The installed surface package introduced a framework dependency")
+    endif()
+endforeach()
+
 if(NOT TARGET vnm_terminal_surface::vnm_terminal_surface_renderer)
     message(FATAL_ERROR
         "vnm_terminal_surface package must export its renderer-only target")
@@ -102,11 +110,11 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     vnm_process_custody_deploy_owner(vnm_terminal_surface_package_smoke)
-    get_target_property(process_owner_imported vnm_framework::vnm_process_custody_owner IMPORTED)
+    get_target_property(process_owner_imported vnm_process_custody::vnm_process_custody_owner IMPORTED)
     if(NOT process_owner_imported)
         message(FATAL_ERROR "Package smoke must consume the installed process owner")
     endif()
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/process_owner_$<CONFIG>.cmake"
         CONTENT
-            "set(source [==[$<TARGET_FILE:vnm_framework::vnm_process_custody_owner>]==])\nset(deployed [==[$<TARGET_FILE_DIR:vnm_terminal_surface_package_smoke>/vnm_process_custody_owner]==])\n")
+            "set(source [==[$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>]==])\nset(deployed [==[$<TARGET_FILE_DIR:vnm_terminal_surface_package_smoke>/vnm_process_custody_owner]==])\n")
 endif()

@@ -23,7 +23,7 @@ find_dependency(Qt6
 if(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE)
     find_dependency(vnm_qt_dispatch 2 CONFIG REQUIRED)
     if(@vnm_terminal_surface_process_custody_required@ AND
-       NOT TARGET vnm_framework::vnm_process_custody)
+       NOT TARGET vnm_process_custody::vnm_process_custody)
         find_dependency(vnm_process_custody CONFIG REQUIRED)
     endif()
 endif()

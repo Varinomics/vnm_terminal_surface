@@ -476,7 +476,7 @@ target_link_libraries(vnm_terminal_surface PRIVATE
     vnm_qt_dispatch::vnm_qt_dispatch
 )
 if(vnm_terminal_surface_process_custody_required)
-    target_link_libraries(vnm_terminal_surface PRIVATE vnm_framework::vnm_process_custody)
+    target_link_libraries(vnm_terminal_surface PRIVATE vnm_process_custody::vnm_process_custody)
 endif()
 
 target_compile_definitions(vnm_terminal_surface PUBLIC
