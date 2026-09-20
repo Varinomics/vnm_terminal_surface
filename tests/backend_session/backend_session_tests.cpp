@@ -4722,6 +4722,9 @@ bool test_selection_line_lease_provenance_capture()
         lease->selected_lines ==
             expected_line_leases_from_snapshot(*source_snapshot, range),
         "line lease descriptors match the source snapshot provenance");
+    ok &= check(lease.has_value() && !lease->selected_lines.empty() &&
+        lease->selected_lines.front().cell_continuity != nullptr,
+        "active selection carries mutation evidence without changing descriptor identity");
     ok &= check(lease.has_value() && lease->selected_lines.size() == 3U,
         "multi-row selection stores one descriptor per selected logical row");
     if (lease.has_value() && lease->selected_lines.size() == 3U) {
@@ -6653,6 +6656,12 @@ bool test_synchronized_hold_follows_multiple_successors_in_one_publication()
             released_lease->selected_lines.front().history_handle.content_generation ==
                 selected_lease->selected_lines.front().history_handle.content_generation,
         "the released hold carries the last handle of the chain, not the first");
+    ok &= check(released_lease.has_value() && selected_lease.has_value() &&
+            !released_lease->selected_lines.empty() && !selected_lease->selected_lines.empty() &&
+            released_lease->selected_lines.front().cell_continuity != nullptr &&
+            released_lease->selected_lines.front().cell_continuity ==
+                selected_lease->selected_lines.front().cell_continuity,
+        "the exact active-to-history successor chain carries the original mutation evidence");
 
     return ok;
 }

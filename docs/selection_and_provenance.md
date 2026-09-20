@@ -83,6 +83,23 @@ representable. The session installs the translated lease
 atomically only after the complete proof succeeds; otherwise it drops the
 visual lease and retains only the immutable payload.
 
+Selections and drag anchors also carry model-owned, gesture-lifetime cell
+continuity tokens for their active rows. A token watches only the selected
+column interval, expanded to complete glyphs; a zero-length press watches its
+anchor glyph. Actual content mutations poison intersecting tokens immediately,
+so overwrite-and-restore is still detected. Changes outside the interval can
+advance the row generation without detaching the selection. Tokens supplement
+the row-identity proof and never authorize a missing or ambiguous row.
+
+The two watch sets are bounded by the active rows covered by the selection and
+its single drag anchor. There are no per-cell history arrays or mutation
+journals. Immutable scrollback needs no watches when selected; a watched row
+moving into history retains its token through the lease. Watches are replaced
+with their owning selection/gesture. They are not stored in history or transcript
+schemas. Exact repaint successors transfer the watch with the same preserved
+generation as their row proof; mutations predating that predecessor remain
+invalidating. Synchronized-output reconciliation uses the same cell proof.
+
 The same rule covers the lifecycle boundaries:
 
 - Primary scrolling and alternate-screen scrolling preserve an attachment

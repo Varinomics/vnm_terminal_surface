@@ -95,6 +95,11 @@ Writable Qt properties:
   never sends Ctrl+C to the child process. Retained `PAYLOAD_ONLY` text remains
   readable through `selected_text()`, but it is not treated as copyable by the
   built-in plain Ctrl+C shortcut.
+  Automatic attachment loss temporarily consumes Ctrl+C for two seconds, or
+  until another deliberate input, focus change, or explicit selection clear.
+  Modifier-only presses do not dismiss that protection. A suppressed press's
+  repeat/release events stay suppressed; a successful copy still retires the
+  selection so the next distinct Ctrl+C can interrupt immediately.
 - `copyOnSelect` controls whether completing a local mouse selection immediately
   copies its plain text to the system clipboard. Empty selections and selections
   whose entire text is exactly one space do not replace the clipboard. It
@@ -419,6 +424,15 @@ There are three clipboard paths:
   or policy-aware clipboard read should install a reader before exposing
   clipboard paste shortcuts. The bundled app uses this hook for both keyboard
   paste and right-click paste.
+  The reader takes `(QObject* context, Clipboard_completion completion)` and
+  returns an idempotent, nonblocking `Clipboard_cancel`. It completes on the
+  GUI thread after returning: empty `QString` is successful empty text, and
+  `std::nullopt` is failure. Cancellation or context destruction suppresses
+  completion. `paste_clipboard_text()` reports request admission, not completed
+  delivery. Intervening input, focus/session changes, reader replacement, and a
+  newer paste invalidate the request. Ordinary child output does not. The Qt
+  fallback is deferred to the event loop but its native read remains on the GUI
+  thread; use an isolated reader when the platform clipboard can block.
 - OSC 52 clipboard writes are mediated by the host. The parser decodes the
   payload and the surface emits
   `clipboard_write_requested(request_id, target_selection, payload)`. The host

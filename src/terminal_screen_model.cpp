@@ -2023,6 +2023,135 @@ Terminal_retained_line_lookup_result Terminal_screen_model::retained_line_lookup
     return result;
 }
 
+void Terminal_screen_model::clear_selection_cell_watch(bool drag_anchor)
+{
+    auto& watches = m_selection_cell_watches[drag_anchor ? 1U : 0U];
+    for (const auto& [id, watch] : watches) {
+        watch->m_intact = false;
+    }
+    watches.clear();
+}
+
+void Terminal_screen_model::watch_selection_cells(
+    terminal_selection_visual_lease_t& lease, bool drag_anchor)
+{
+    clear_selection_cell_watch(drag_anchor);
+    auto& watches = m_selection_cell_watches[drag_anchor ? 1U : 0U];
+    const auto start = normalized_selection_start(lease.selected_range);
+    const auto end   = normalized_selection_end(lease.selected_range);
+    for (auto& line : lease.selected_lines) {
+        line.cell_continuity.reset();
+        const auto lookup = retained_line_lookup(lease.buffer_id, line.history_handle);
+        if (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
+            continue;
+        }
+        const int active_row = lookup.exact_logical_row -
+            (lease.buffer_id == Terminal_buffer_id::PRIMARY ? scrollback_size() : 0);
+        const auto& rows = lease.buffer_id == Terminal_buffer_id::PRIMARY
+            ? primary_active_grid_rows() : alternate_active_grid_rows();
+        // History rows cannot mutate. Only active rows need a gesture-owned watch.
+        if (active_row < 0 || active_row >= (int)rows.size()) {
+            continue;
+        }
+        const auto& row = rows[(std::size_t)active_row];
+        const int logical_row = start.row + line.row_offset;
+        int first = logical_row == start.row ? start.column : 0;
+        int limit = logical_row == end.row ? end.column : lease.grid_size.columns;
+        if (drag_anchor && first == limit) {
+            first = std::clamp(first, 0, (int)row.cells.size() - 1);
+            limit = first + 1;
+        }
+        if (first < 0 || limit > (int)row.cells.size() || first >= limit) {
+            continue;
+        }
+        first = cell_base_column_in_row(row, first);
+        const int last_base = cell_base_column_in_row(row, limit - 1);
+        limit = std::max(limit, last_base + std::max(1, row.cells[(std::size_t)last_base].display_width));
+        auto watch = std::make_shared<Selection_cell_continuity>();
+        watch->m_row_id             = line.history_handle.row_sequence;
+        watch->m_initial_generation = line.history_handle.content_generation;
+        watch->m_first_column       = first;
+        watch->m_end_column         = limit;
+        line.cell_continuity = watch;
+        watches.emplace(watch->m_row_id, std::move(watch));
+    }
+}
+
+void Terminal_screen_model::record_selection_cell_mutation(
+    const Terminal_screen_row& row, int first, int end)
+{
+    for (auto& watches : m_selection_cell_watches) {
+        const auto found = watches.find(row.retained_line_provenance.retained_line_id);
+        if (found == watches.end()) {
+            continue;
+        }
+        auto& watch = *found->second;
+        if (watch.m_intact && first < watch.m_end_column && end > watch.m_first_column) {
+            watch.m_intact = false;
+            watch.m_invalidated_generation = row.retained_line_provenance.content_generation + 1U;
+        }
+    }
+}
+
+void Terminal_screen_model::transfer_selection_cell_watches(
+    std::uint64_t old_id, std::uint64_t new_id, std::uint64_t preserved_generation)
+{
+    for (auto& watches : m_selection_cell_watches) {
+        auto entry = watches.extract(old_id);
+        if (!entry.empty()) {
+            entry.key() = new_id;
+            entry.mapped()->m_row_id = new_id;
+            // An exact repaint successor preserves the predecessor generation.
+            // Discard physical rebuild mutations, but never an earlier mutation
+            // that was already part of the predecessor's content.
+            if (entry.mapped()->m_invalidated_generation > preserved_generation) {
+                entry.mapped()->m_intact = true;
+                entry.mapped()->m_invalidated_generation = 0U;
+            }
+            watches.insert(std::move(entry));
+        }
+    }
+}
+
+Terminal_retained_line_lookup_result Terminal_screen_model::selection_line_lookup(
+    Terminal_buffer_id buffer_id,
+    terminal_history_handle_t& handle,
+    const std::shared_ptr<Selection_cell_continuity>& continuity) const
+{
+    auto lookup = retained_line_lookup(buffer_id, handle);
+    if (!continuity) {
+        return lookup;
+    }
+    if (!continuity->m_intact) {
+        lookup.exact_match = false;
+        lookup.retained_line_content_generation_mismatch = true;
+        lookup.resolution_status = Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH;
+        return lookup;
+    }
+    if (!lookup.retained_line_content_generation_mismatch ||
+        lookup.retained_line_id_match_count != 1 ||
+        continuity->m_row_id != handle.row_sequence ||
+        continuity->m_initial_generation > handle.content_generation)
+    {
+        return lookup;
+    }
+    const auto& index = retained_lookup_index(buffer_id);
+    auto found = index.history_by_row_sequence.find(handle.row_sequence);
+    const retained_lookup_index_entry_t* entry = found != index.history_by_row_sequence.end()
+        ? &found->second : nullptr;
+    if (entry == nullptr) {
+        const auto active = index.active_grid_by_row_sequence.find(handle.row_sequence);
+        if (active != index.active_grid_by_row_sequence.end()) {
+            entry = &active->second;
+        }
+    }
+    if (entry != nullptr && entry->history_handle.content_generation >= handle.content_generation) {
+        handle = entry->history_handle;
+        lookup = retained_line_lookup(buffer_id, handle);
+    }
+    return lookup;
+}
+
 Terminal_selection_attachment_resolution
 Terminal_screen_model::resolve_selection_attachment(
     const terminal_selection_visual_lease_t&  prior_lease,
@@ -2111,9 +2240,10 @@ Terminal_screen_model::resolve_selection_attachment(
         const terminal_selection_line_successor_t* used_successor = nullptr;
         int         expected_successor_old_logical_row = old_logical_row;
         std::size_t successor_hops                     = 0U;
-        Terminal_retained_line_lookup_result lookup = retained_line_lookup(
+        Terminal_retained_line_lookup_result lookup = selection_line_lookup(
             prior_lease.buffer_id,
-            final_handle);
+            final_handle,
+            old_line.cell_continuity);
         // One ingest can accept more than one repaint recovery, and each one
         // replaces the handles the one before it published. A selected line can
         // therefore stand two or more exact replacements away from the handle
@@ -2209,7 +2339,7 @@ Terminal_screen_model::resolve_selection_attachment(
             expected_successor_old_logical_row = successor->final_logical_row;
             used_successor                     = successor;
             final_handle                       = successor->final_handle;
-            lookup = retained_line_lookup(prior_lease.buffer_id, final_handle);
+            lookup = selection_line_lookup(prior_lease.buffer_id, final_handle, old_line.cell_continuity);
         }
 
         if (used_successor != nullptr &&
@@ -2231,7 +2361,7 @@ Terminal_screen_model::resolve_selection_attachment(
         resolution.old_logical_rows.push_back(old_logical_row);
         resolution.final_logical_rows.push_back(lookup.exact_logical_row);
         resolution.row_deltas.push_back(lookup.exact_logical_row - old_logical_row);
-        final_lines.push_back({old_line.row_offset, final_handle});
+        final_lines.push_back({old_line.row_offset, final_handle, old_line.cell_continuity});
     }
 
     const int uniform_delta = resolution.row_deltas.front();
@@ -3389,7 +3519,7 @@ bool Terminal_screen_model::scalar_span_changes_selection_content(
     const Terminal_screen_row& row,
     terminal_grid_position_t   position,
     QStringView                text,
-    int                        display_width) const
+    int                        display_width)
 {
     int first_column = position.column;
     int last_column  = position.column + display_width - 1;
@@ -3410,6 +3540,7 @@ bool Terminal_screen_model::scalar_span_changes_selection_content(
     first_column = std::clamp(first_column, 0, m_config.grid_size.columns - 1);
     last_column  = std::clamp(last_column,  0, m_config.grid_size.columns - 1);
     const int new_span_end_column = position.column + display_width;
+    bool changed = false;
     for (int column = first_column; column <= last_column; ++column) {
 #if VNM_TERMINAL_PROFILING_ENABLED
         if (m_profile_stats.enabled) {
@@ -3435,21 +3566,23 @@ bool Terminal_screen_model::scalar_span_changes_selection_content(
                 row.cells[static_cast<std::size_t>(column)],
                 intended_cell))
         {
-            return true;
+            record_selection_cell_mutation(row, column, column + 1);
+            changed = true;
         }
     }
 
-    return false;
+    return changed;
 }
 
 bool Terminal_screen_model::scalar_span_clear_changes_selection_content(
     const Terminal_screen_row& row,
-    terminal_grid_position_t   position) const
+    terminal_grid_position_t   position)
 {
     const terminal_grid_position_t base_position = cell_base_position(position);
     const Cell&                    base_cell =
         row.cells[static_cast<std::size_t>(base_position.column)];
     const int clear_width = std::max(1, base_cell.display_width);
+    bool changed = false;
 
     for (int width_offset = 0; width_offset < clear_width; ++width_offset) {
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -3461,11 +3594,12 @@ bool Terminal_screen_model::scalar_span_clear_changes_selection_content(
                 row.cells[static_cast<std::size_t>(base_position.column + width_offset)],
                 Cell{}))
         {
-            return true;
+            record_selection_cell_mutation(row, base_position.column, base_position.column + clear_width);
+            changed = true;
         }
     }
 
-    return false;
+    return changed;
 }
 
 void Terminal_screen_model::advance_row_content_generation_if_changed(
@@ -3485,6 +3619,13 @@ void Terminal_screen_model::advance_row_content_generation_if_changed(
             "Terminal_screen_model::advance_row_content_generation_if_changed::compare");
         if (rows_have_same_selection_content(before_cells, row.cells)) {
             return;
+        }
+    }
+    for (std::size_t column = 0; column < row.cells.size(); ++column) {
+        if (column >= before_cells.size() ||
+            !cells_have_same_selection_content(before_cells[column], row.cells[column]))
+        {
+            record_selection_cell_mutation(row, (int)column, (int)column + 1);
         }
     }
     advance_row_content_generation_with_change_flag(row, true);
@@ -4119,6 +4260,13 @@ void Terminal_screen_model::write_printable_ascii_cell_content(
     QChar                      text)
 {
     Cell& cell = row.cells[static_cast<std::size_t>(column)];
+    if ((!m_selection_cell_watches[0].empty() || !m_selection_cell_watches[1].empty()) &&
+        printable_ascii_cell_changes_selection_content(row, column, text))
+    {
+        const int base = cell_base_column_in_row(row, column);
+        record_selection_cell_mutation(row, base,
+            std::max(column + 1, base + std::max(1, row.cells[(std::size_t)base].display_width)));
+    }
     if (cell.wide_continuation ||
         cell.display_width != 1)
     {
@@ -4183,6 +4331,13 @@ void Terminal_screen_model::write_single_width_bmp_cell_content(
     const QString&             text)
 {
     Cell& cell = row.cells[static_cast<std::size_t>(column)];
+    if ((!m_selection_cell_watches[0].empty() || !m_selection_cell_watches[1].empty()) &&
+        single_width_bmp_cell_changes_selection_content(row, column, text[0]))
+    {
+        const int base = cell_base_column_in_row(row, column);
+        record_selection_cell_mutation(row, base,
+            std::max(column + 1, base + std::max(1, row.cells[(std::size_t)base].display_width)));
+    }
     if (cell.wide_continuation ||
         cell.display_width != 1)
     {
@@ -4562,12 +4717,12 @@ void Terminal_screen_model::erase_row_range(int row, int first_column, int last_
                 continue;
             }
 
-            if (!selection_content_changed &&
-                (cell.display_width     != replacement.display_width     ||
+            if (cell.display_width     != replacement.display_width     ||
                  cell.wide_continuation != replacement.wide_continuation ||
                  cell.occupied          != replacement.occupied          ||
-                 cell.text              != replacement.text))
+                 cell.text              != replacement.text)
             {
+                record_selection_cell_mutation(screen_row, clear_column, clear_column + 1);
                 selection_content_changed = true;
             }
             cell = replacement;
@@ -5690,6 +5845,8 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
                 candidate.rows[static_cast<std::size_t>(predecessor_row)].retained_line_provenance;
             target.retained_line_provenance = predecessor_provenance;
             target.retained_line_provenance.retained_line_id = final_retained_line_id;
+            transfer_selection_cell_watches(
+                old_handle.row_sequence, final_retained_line_id, predecessor_provenance.content_generation);
         }
         const terminal_history_handle_t final_handle =
             retained_history_handle_from_provenance(target.retained_line_provenance);
@@ -5843,6 +6000,10 @@ void Terminal_screen_model::accept_primary_repaint_recovery_proposal(
             else {
                 proof.result = Terminal_selection_survivor_proof_result::EXACT;
                 proof.final_logical_row = lookup.exact_logical_row;
+                transfer_selection_cell_watches(
+                    old_handle.row_sequence,
+                    final_handle->row_sequence,
+                    old_handle.content_generation);
                 record_selection_successor({
                     old_handle,
                     *final_handle,

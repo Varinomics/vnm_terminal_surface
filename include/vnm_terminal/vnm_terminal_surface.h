@@ -656,7 +656,14 @@ public:
 
     void set_selection_trace_enabled(bool enabled);
     void set_dirty_row_stats_enabled(bool enabled);
-    void set_clipboard_text_reader(std::function<std::optional<QString>()> reader);
+    using Clipboard_completion = std::function<void(std::optional<QString>)>;
+    using Clipboard_cancel = std::function<void()>;
+    using Clipboard_reader = std::function<Clipboard_cancel(QObject*, Clipboard_completion)>;
+
+    // Completion runs on the GUI thread after the reader returns. Empty text
+    // succeeds; nullopt fails. Cancellation/context destruction suppresses
+    // completion and cleans up without blocking. An empty reader uses Qt's clipboard.
+    void set_clipboard_text_reader(Clipboard_reader reader);
 
     Q_INVOKABLE bool respond_clipboard_write(
         quint64                        request_id,
@@ -706,6 +713,8 @@ public:
     Q_INVOKABLE bool    paste_text(QString text);
     vnm_terminal::Terminal_message_submission_result submit_utf8_message(
         QByteArray message_utf8);
+    // Returns whether the request was admitted, not whether text was pasted.
+    // Intervening input, focus/session changes, or another paste cancel it.
     Q_INVOKABLE bool    paste_clipboard_text();
     /**
      * Re-derives the terminal grid from the current item geometry, resizing the
@@ -995,7 +1004,6 @@ private:
         SKIP_EMPTY_OR_SINGLE_SPACE,
     };
     bool copy_selected_text_to_clipboard(Selection_copy_policy policy);
-    std::optional<QString> read_clipboard_text_for_paste();
     void set_selection_state(Selection_state state);
     void set_search_state(
         QString             query,

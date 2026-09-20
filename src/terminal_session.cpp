@@ -2913,6 +2913,9 @@ void Terminal_session::clear_selection()
                 .arg(selection_trace_content_basis(m_selection_content_basis)));
     }
     m_selection.clear();
+    if (m_screen_model) {
+        m_screen_model->clear_selection_cell_watch();
+    }
     reset_synchronized_selection_continuity_hold();
     if (m_screen_model.has_value()) {
         m_selection_buffer_id = m_screen_model->active_buffer_id();
@@ -3487,6 +3490,7 @@ Terminal_session::begin_selection_drag_provenance(
             {original_position, original_position, Terminal_selection_mode::NORMAL},
             source);
     anchor_lease.selected_lines.push_back({0, *handle});
+    m_screen_model->watch_selection_cells(anchor_lease, true);
     const Terminal_selection_attachment_resolution proof =
         m_screen_model->resolve_selection_attachment(
             anchor_lease,
@@ -3664,6 +3668,9 @@ void Terminal_session::clear_selection_drag_provenance()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_selection_drag_continuity.reset();
+    if (m_screen_model) {
+        m_screen_model->clear_selection_cell_watch(true);
+    }
 }
 
 std::optional<terminal_selection_source_identity_t>
@@ -8167,7 +8174,9 @@ void Terminal_session::accumulate_synchronized_continuity_track(
         return;
     }
 
-    for (terminal_history_handle_t& handle : track.latest_handles) {
+    for (std::size_t line_index = 0; line_index < track.latest_handles.size(); ++line_index) {
+        auto& handle = track.latest_handles[line_index];
+        const auto& cell_continuity = track.original_lease.selected_lines[line_index].cell_continuity;
         // One publication can carry more than one accepted repaint recovery, so
         // the replacement a held handle resolves to may itself have been
         // replaced before the publication was observed. Walking that chain keeps
@@ -8177,7 +8186,7 @@ void Terminal_session::accumulate_synchronized_continuity_track(
         std::size_t successor_hops = 0U;
         for (;;) {
             const Terminal_retained_line_lookup_result current_lookup =
-                m_screen_model->retained_line_lookup(track.original_lease.buffer_id, handle);
+                m_screen_model->selection_line_lookup(track.original_lease.buffer_id, handle, cell_continuity);
             if (current_lookup.exact_match &&
                 current_lookup.retained_line_id_match_count == 1)
             {
@@ -8246,10 +8255,12 @@ void Terminal_session::accumulate_synchronized_continuity_track(
                 return;
             }
 
+            auto final_handle = successor.final_handle;
             const Terminal_retained_line_lookup_result final_lookup =
-                m_screen_model->retained_line_lookup(
+                m_screen_model->selection_line_lookup(
                     track.original_lease.buffer_id,
-                    successor.final_handle);
+                    final_handle,
+                    cell_continuity);
             if (final_lookup.retained_line_id_match_count > 1) {
                 track.failure = Terminal_selection_attachment_resolution_status::
                     DUPLICATE_RESOLUTION;
@@ -8282,7 +8293,7 @@ void Terminal_session::accumulate_synchronized_continuity_track(
                 trace_hold(QStringLiteral("poison-final-missing"));
                 return;
             }
-            handle = successor.final_handle;
+            handle = final_handle;
             break;
         }
     }
@@ -8644,6 +8655,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
     terminal_selection_visual_lease_t lease =
         make_selection_visual_lease(range, *current_source);
     lease.selected_lines = std::move(selected_lines);
+    m_screen_model->watch_selection_cells(lease);
 
     m_selection.set_range(range, proven_selected_text.text, std::move(lease));
     m_selection_buffer_id = current_source->buffer_id;

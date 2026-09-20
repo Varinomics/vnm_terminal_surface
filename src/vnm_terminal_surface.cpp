@@ -2614,7 +2614,10 @@ struct VNM_TerminalSurface::Private
             term::Terminal_mouse_event_kind::PRESS;
         QByteArray                      bytes;
         term::terminal_grid_position_t  position;
+        std::uint64_t                   admission_id = 0U;
     };
+
+    std::uint64_t next_mouse_report_admission_id = 0U;
 
     bool pending_report_session_is_active(
         const Pending_published_mouse_report& report) const
@@ -2664,7 +2667,7 @@ struct VNM_TerminalSurface::Private
 
     Pending_published_mouse_report pending_published_mouse_report(
         term::Terminal_mouse_event_kind               kind,
-        const Published_mouse_report_write_result&    encoded) const
+        const Published_mouse_report_write_result&    encoded)
     {
         Q_ASSERT(session != nullptr);
         Q_ASSERT(encoded.encoded);
@@ -2675,7 +2678,42 @@ struct VNM_TerminalSurface::Private
             kind,
             encoded.bytes,
             *encoded.position,
+            ++next_mouse_report_admission_id,
         };
+    }
+
+    std::optional<Published_mouse_report_attempt> admit_published_mouse_report(
+        VNM_TerminalSurface& surface, const Pending_published_mouse_report& report)
+    {
+        // Publish ordering before invoking host cancellation: the callback may
+        // admit a newer paste or even deliver it through this queue reentrantly.
+        pending_published_mouse_reports.push_back(report);
+        const QPointer<VNM_TerminalSurface> alive(&surface);
+        dismiss_copy_intent();
+        cancel_clipboard_paste();
+        if (!alive || !pending_report_session_is_active(report)) {
+            return std::nullopt;
+        }
+        const auto queued = std::find_if(pending_published_mouse_reports.begin(),
+            pending_published_mouse_reports.end(), [&](const auto& candidate) {
+                return candidate.admission_id == report.admission_id;
+            });
+        if (queued == pending_published_mouse_reports.end()) {
+            // A reentrant newer input already resolved this report.
+            return Published_mouse_report_attempt{
+                Published_mouse_report_attempt_status::WRITTEN, std::nullopt, report.position};
+        }
+        if (force_pending_published_mouse_report_block_for_testing() ||
+            queued != pending_published_mouse_reports.begin())
+        {
+            return Published_mouse_report_attempt{
+                Published_mouse_report_attempt_status::CALLBACKS_PENDING, std::nullopt, report.position};
+        }
+        auto attempt = try_write_pending_published_mouse_report(report);
+        if (attempt.status != Published_mouse_report_attempt_status::CALLBACKS_PENDING) {
+            pending_published_mouse_reports.pop_front();
+        }
+        return attempt;
     }
 
     bool force_pending_published_mouse_report_block_for_testing()
@@ -2707,8 +2745,7 @@ struct VNM_TerminalSurface::Private
         }
 
         std::optional<term::Terminal_session_result> result =
-            report.session->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
-                report.bytes);
+            try_write_encoded_terminal_input(report.bytes);
         if (!result.has_value()) {
             return {
                 Published_mouse_report_attempt_status::CALLBACKS_PENDING,
@@ -2871,6 +2908,55 @@ struct VNM_TerminalSurface::Private
         return render_snapshot != nullptr && !render_snapshot->selection_spans.empty();
     }
 
+    void cancel_clipboard_paste()
+    {
+        ++clipboard_request_generation;
+        auto cancel = std::exchange(clipboard_cancel, {});
+        if (cancel) {
+            cancel();
+        }
+    }
+
+    std::optional<term::Terminal_mouse_event_result> try_write_mouse_motion(
+        term::Terminal_mouse_event event)
+    {
+        const auto result = session->try_write_mouse_event_without_backend_drain_if_callbacks_empty(event);
+        // This synchronous path neither drains callbacks nor delivers GUI
+        // events. Retire paste intent before the caller publishes/notifies,
+        // but only when the session actually routes motion as terminal input.
+        if (result.has_value() && result->handled) {
+            cancel_clipboard_paste();
+            dismiss_copy_intent();
+        }
+        return result;
+    }
+
+    std::optional<term::Terminal_session_result> try_write_encoded_terminal_input(
+        const QByteArray& bytes)
+    {
+        Q_ASSERT(session != nullptr);
+        Q_ASSERT(!bytes.isEmpty());
+        // Delivery is chronology-neutral. A retry may precede a newer paste;
+        // only semantic input admission may invalidate that paste.
+        return session->try_write_user_bytes_without_backend_drain_if_callbacks_empty(bytes);
+    }
+
+    void dismiss_copy_intent()
+    {
+        copy_interrupt_guard_until = {};
+        selection_was_attached = false;
+        copy_key_suppressed = false;
+    }
+
+    void observe_selection_attachment()
+    {
+        const bool attached = has_copyable_selection_attachment();
+        if (selection_was_attached && !attached) {
+            copy_interrupt_guard_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        }
+        selection_was_attached = attached;
+    }
+
     void clear_mouse_wheel_remainders()
     {
         wheel_mouse_angle_remainder = 0.0;
@@ -2910,6 +2996,7 @@ struct VNM_TerminalSurface::Private
 
     void clear_selection_with_sync(VNM_TerminalSurface& surface)
     {
+        dismiss_copy_intent();
         if (session == nullptr) {
             return;
         }
@@ -3027,7 +3114,12 @@ struct VNM_TerminalSurface::Private
     // to, and every answer re-enters sync_from_session through the session call
     // it makes, so without this the delivery would nest once per answer.
     bool                                                   delivering_session_notifications    = false;
-    std::function<std::optional<QString>()>                clipboard_text_reader;
+    Clipboard_reader                                      clipboard_text_reader;
+    Clipboard_cancel                                      clipboard_cancel;
+    std::uint64_t                                         clipboard_request_generation = 0U;
+    std::chrono::steady_clock::time_point                  copy_interrupt_guard_until;
+    bool                                                  selection_was_attached = false;
+    bool                                                  copy_key_suppressed = false;
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
     QTimer                                                 text_area_resize_arbitration_timer;
@@ -3185,6 +3277,7 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
 VNM_TerminalSurface::~VNM_TerminalSurface()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
 
     if (m_interaction_diagnostics_enabled) {
         set_interaction_diagnostics_enabled(false);
@@ -4428,9 +4521,10 @@ void VNM_TerminalSurface::set_dirty_row_stats_enabled(bool enabled)
 }
 
 void VNM_TerminalSurface::set_clipboard_text_reader(
-    std::function<std::optional<QString>()> reader)
+    Clipboard_reader reader)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
     m_private->clipboard_text_reader = std::move(reader);
 }
 
@@ -4682,6 +4776,8 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
 void VNM_TerminalSurface::clear_selection()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
 
     m_private->clear_selection_drag_state();
 
@@ -4758,6 +4854,8 @@ bool VNM_TerminalSurface::search_previous()
 bool VNM_TerminalSurface::paste_text(QString text)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
 
     if (m_private->session == nullptr) {
         return false;
@@ -4801,6 +4899,8 @@ vnm_terminal::Terminal_message_submission_result
 VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
 
     using Outcome = vnm_terminal::Terminal_message_submission_outcome;
     if (message_utf8.isEmpty()) {
@@ -4889,32 +4989,52 @@ VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
     return {Outcome::BACKEND_REJECTED, error};
 }
 
-std::optional<QString> VNM_TerminalSurface::read_clipboard_text_for_paste()
-{
-    Q_ASSERT(thread() == QThread::currentThread());
-
-    if (m_private->clipboard_text_reader) {
-        return m_private->clipboard_text_reader();
-    }
-
-    QClipboard* clipboard = QGuiApplication::clipboard();
-    if (clipboard == nullptr) {
-        return std::nullopt;
-    }
-
-    return clipboard->text(QClipboard::Clipboard);
-}
-
 bool VNM_TerminalSurface::paste_clipboard_text()
 {
     Q_ASSERT(thread() == QThread::currentThread());
-
-    const std::optional<QString> text = read_clipboard_text_for_paste();
-    if (!text.has_value()) {
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
+    if (m_private->session == nullptr || m_private->shutting_down.load()) {
         return false;
     }
-
-    return paste_text(*text);
+    const auto request = m_private->clipboard_request_generation;
+    const auto session = m_private->session_generation;
+    const QPointer<VNM_TerminalSurface> surface(this);
+    Clipboard_completion completion = [surface, request, session](std::optional<QString> text) {
+        if (!surface || surface->m_private->clipboard_request_generation != request ||
+            surface->m_private->session_generation != session)
+        {
+            return;
+        }
+        Q_ASSERT(surface->thread() == QThread::currentThread());
+        surface->m_private->clipboard_cancel = {};
+        ++surface->m_private->clipboard_request_generation;
+        if (text) {
+            (void)surface->paste_text(std::move(*text));
+        }
+    };
+    if (m_private->clipboard_text_reader) {
+        const auto reader = m_private->clipboard_text_reader;
+        auto cancel = reader(this, std::move(completion));
+        if (!surface || surface->m_private->clipboard_request_generation != request) {
+            if (cancel) {
+                cancel();
+            }
+        }
+        else {
+            m_private->clipboard_cancel = std::move(cancel);
+        }
+        return true;
+    }
+    // Qt clipboard access must remain on the GUI thread. Hosts that need an
+    // isolated/native nonblocking read provide the reader above.
+    return vnm::qt::post(this, [surface, request, completion = std::move(completion)]() mutable {
+        if (!surface || surface->m_private->clipboard_request_generation != request) {
+            return;
+        }
+        QClipboard* clipboard = QGuiApplication::clipboard();
+        completion(clipboard ? std::optional<QString>(clipboard->text(QClipboard::Clipboard)) : std::nullopt);
+    }) == vnm::qt::Post_result::QUEUED;
 }
 
 bool VNM_TerminalSurface::scroll_viewport_lines(int line_delta)
@@ -5329,6 +5449,12 @@ void VNM_TerminalSurface::geometryChange(
 void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& value)
 {
     QQuickItem::itemChange(change, value);
+    if (change == ItemActiveFocusHasChanged || change == ItemSceneChange ||
+        change == ItemVisibleHasChanged || change == ItemEnabledHasChanged)
+    {
+        m_private->cancel_clipboard_paste();
+        m_private->dismiss_copy_intent();
+    }
 
     if (change == ItemActiveFocusHasChanged && term::interaction_trace_enabled()) {
         term::record_interaction_trace(
@@ -5416,6 +5542,15 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
 
 bool VNM_TerminalSurface::event(QEvent* event)
 {
+    if (event->type() == QEvent::KeyRelease &&
+        static_cast<QKeyEvent*>(event)->key() == Qt::Key_C && m_private->copy_key_suppressed)
+    {
+        if (!static_cast<QKeyEvent*>(event)->isAutoRepeat()) {
+            m_private->copy_key_suppressed = false;
+        }
+        event->accept();
+        return true;
+    }
     const bool trace_event =
         term::interaction_trace_enabled()             &&
         (event->type() == QEvent::ShortcutOverride    ||
@@ -5447,6 +5582,13 @@ bool VNM_TerminalSurface::event(QEvent* event)
 void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
+    if (!is_plain_copy_shortcut(*event) &&
+        event->key() != Qt::Key_Control && event->key() != Qt::Key_Shift &&
+        event->key() != Qt::Key_Alt && event->key() != Qt::Key_Meta)
+    {
+        m_private->dismiss_copy_intent();
+    }
 
     const std::uint64_t trace_id = term::interaction_trace_enabled()
         ? term::next_interaction_trace_correlation_id()
@@ -5454,6 +5596,15 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
     record_key_interaction_diagnostic("surface", "key-press", *event, trace_id);
 
     if (is_plain_copy_shortcut(*event)) {
+        if (event->isAutoRepeat() && m_private->copy_key_suppressed) {
+            event->accept();
+            return;
+        }
+        m_private->copy_key_suppressed = false;
+        // Resolve pending output before deciding whether Ctrl+C means copy or
+        // interrupt; output can invalidate the attachment during this key.
+        drain_backend_callback_events();
+        m_private->observe_selection_attachment();
         if (m_copy_shortcut_policy ==
             Copy_shortcut_policy::COPY_SELECTION_OR_TERMINAL_INPUT)
         {
@@ -5467,8 +5618,14 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
                 // interrupt again. Retiring it here is also what makes the
                 // documented rule usable: copy, then interrupt.
                 clear_selection();
+                m_private->copy_key_suppressed = true;
                 event->accept();
                 term::record_interaction_trace("surface", "key-route", QStringLiteral("copy"), trace_id);
+                return;
+            }
+            if (std::chrono::steady_clock::now() < m_private->copy_interrupt_guard_until) {
+                m_private->copy_key_suppressed = true;
+                event->accept();
                 return;
             }
         }
@@ -5570,6 +5727,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->dismiss_copy_intent();
     if (term::interaction_trace_enabled()) {
         term::record_interaction_trace(
             "mouse",
@@ -5631,6 +5789,11 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 m_private->cell_metrics,
                 event->position());
         if (hyperlink.has_value()) {
+            const QPointer<VNM_TerminalSurface> alive(this);
+            m_private->cancel_clipboard_paste();
+            if (!alive) {
+                return;
+            }
             m_private->clear_selection_drag_state();
             m_private->hyperlink_activation_target         = *hyperlink;
             m_private->hyperlink_activation_gesture_active = true;
@@ -5666,25 +5829,11 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
             encoded.position,
         };
         if (report.has_value()) {
-            if (m_private->force_pending_published_mouse_report_block_for_testing()) {
-                mouse_write = {
-                    Published_mouse_report_attempt_status::CALLBACKS_PENDING,
-                    std::nullopt,
-                    report->position,
-                };
+            const auto admitted = m_private->admit_published_mouse_report(*this, *report);
+            if (!admitted.has_value()) {
+                return;
             }
-            else
-            if (m_private->pending_published_mouse_reports.empty()) {
-                mouse_write =
-                    m_private->try_write_pending_published_mouse_report(*report);
-            }
-            else {
-                mouse_write = {
-                    Published_mouse_report_attempt_status::CALLBACKS_PENDING,
-                    std::nullopt,
-                    report->position,
-                };
-            }
+            mouse_write = *admitted;
         }
 
         if ((mouse_write.status == Published_mouse_report_attempt_status::WRITTEN ||
@@ -5711,7 +5860,6 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 Published_mouse_report_attempt_status::CALLBACKS_PENDING)
             {
                 Q_ASSERT(report.has_value());
-                m_private->pending_published_mouse_reports.push_back(*report);
                 (void)m_private->retry_pending_published_mouse_reports(*this, true);
                 sync_from_session();
             }
@@ -5751,6 +5899,11 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         }
     }
 
+    const QPointer<VNM_TerminalSurface> alive(this);
+    m_private->cancel_clipboard_paste();
+    if (!alive) {
+        return;
+    }
     if (event->button() == Qt::RightButton) {
         if (paste_clipboard_text()) {
             event->accept();
@@ -5952,7 +6105,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                     ? term::Terminal_mouse_event_kind::MOVE
                     : term::Terminal_mouse_event_kind::DRAG;
             const std::optional<term::Terminal_mouse_event_result> mouse_result =
-                m_private->session->try_write_mouse_event_without_backend_drain_if_callbacks_empty({
+                m_private->try_write_mouse_motion({
                     kind,
                     button,
                     report_position->row,
@@ -6523,24 +6676,11 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         encoded.position,
     };
     if (report.has_value()) {
-        if (m_private->force_pending_published_mouse_report_block_for_testing()) {
-            mouse_write = {
-                Published_mouse_report_attempt_status::CALLBACKS_PENDING,
-                std::nullopt,
-                report->position,
-            };
+        const auto admitted = m_private->admit_published_mouse_report(*this, *report);
+        if (!admitted.has_value()) {
+            return;
         }
-        else
-        if (m_private->pending_published_mouse_reports.empty()) {
-            mouse_write = m_private->try_write_pending_published_mouse_report(*report);
-        }
-        else {
-            mouse_write = {
-                Published_mouse_report_attempt_status::CALLBACKS_PENDING,
-                std::nullopt,
-                report->position,
-            };
-        }
+        mouse_write = *admitted;
     }
     if (mouse_write.status != Published_mouse_report_attempt_status::WRITTEN &&
         mouse_write.status != Published_mouse_report_attempt_status::CALLBACKS_PENDING)
@@ -6574,7 +6714,6 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
     event->accept();
     if (mouse_write.status == Published_mouse_report_attempt_status::CALLBACKS_PENDING) {
         Q_ASSERT(report.has_value());
-        m_private->pending_published_mouse_reports.push_back(*report);
         (void)m_private->retry_pending_published_mouse_reports(*this, true);
         sync_from_session();
     }
@@ -6633,7 +6772,7 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
     }
 
     const std::optional<term::Terminal_mouse_event_result> mouse_result =
-        m_private->session->try_write_mouse_event_without_backend_drain_if_callbacks_empty({
+        m_private->try_write_mouse_motion({
             term::Terminal_mouse_event_kind::MOVE,
             term::Terminal_mouse_button::NONE,
             position->row,
@@ -6673,6 +6812,8 @@ void VNM_TerminalSurface::hoverLeaveEvent(QHoverEvent* event)
 void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
     dismiss_row_timestamp_tooltip();
 
     if (m_wheel_trace_enabled) {
@@ -6980,9 +7121,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             for (int i = 0; i < key_count; ++i) {
                 handled = true;
                 const std::optional<term::Terminal_session_result> write_result =
-                    m_private->session
-                        ->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
-                            key_bytes);
+                    m_private->try_write_encoded_terminal_input(key_bytes);
                 if (!write_result.has_value()) {
                     callbacks_pending = true;
                     break;
@@ -7078,9 +7217,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
                 handled = true;
                 const std::optional<term::Terminal_session_result> write_result =
-                    m_private->session
-                        ->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
-                            mouse_bytes);
+                    m_private->try_write_encoded_terminal_input(mouse_bytes);
                 if (!write_result.has_value()) {
                     callbacks_pending = true;
                     break;
@@ -7354,6 +7491,8 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
 
     const QString commit_text             = terminal_commit_text_from_event(*event);
     const QString preedit_text            = event->preeditString();
@@ -8388,6 +8527,7 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         return;
     }
 
+    m_private->observe_selection_attachment();
     {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::session_state");
 
@@ -8776,6 +8916,8 @@ void VNM_TerminalSurface::report_result_failure(
 
 void VNM_TerminalSurface::reset_session()
 {
+    m_private->cancel_clipboard_paste();
+    m_private->dismiss_copy_intent();
     m_private->synchronized_output_recovery_timer.stop();
     ++m_private->session_generation;
     m_private->clear_pending_published_mouse_reports();

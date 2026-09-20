@@ -14,6 +14,7 @@
 #include <QFile>
 #include <QFontMetricsF>
 #include <QGuiApplication>
+#include <QTimer>
 #include <QHoverEvent>
 #include <QImage>
 #include <QInputMethodEvent>
@@ -12758,6 +12759,288 @@ bool test_no_payload_copy_fallback_states(QGuiApplication& app)
     return ok;
 }
 
+VNM_TerminalSurface::Clipboard_reader clipboard_reader_result(std::optional<QString> text)
+{
+    return [text = std::move(text)](QObject* context, VNM_TerminalSurface::Clipboard_completion completion) {
+        auto cancelled = std::make_shared<bool>(false);
+        QTimer::singleShot(0, context, [cancelled, text, completion = std::move(completion)] {
+            if (!*cancelled) {
+                completion(text);
+            }
+        });
+        return [cancelled] { *cancelled = true; };
+    };
+}
+
+bool test_async_clipboard_intent(QGuiApplication& app)
+{
+    bool ok = true;
+    for (const int action : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}) {
+        auto fixture = std::make_unique<Surface_fixture>();
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        bool started = false;
+        auto* backend_ptr = start_surface_with_backend(fixture->surface, std::move(backend),
+            {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "async clipboard surface starts");
+        fixture->surface.forceActiveFocus();
+        pump_events(app);
+        fixture->surface.set_bracketed_paste_policy(VNM_TerminalSurface::Bracketed_paste_policy::DISABLED);
+        if (action >= 7) {
+            backend_ptr->emit_output(action == 7 || action == 8
+                ? QByteArrayLiteral("\x1b[?1003;1006h")
+                : QByteArrayLiteral("\x1b[?1002;1006h"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture->surface);
+            if (action >= 11) {
+                ok &= send_mouse_event(fixture->surface, QEvent::MouseButtonPress,
+                    point_in_grid_cell(fixture->surface, 0, 0), Qt::LeftButton, Qt::LeftButton,
+                    Qt::NoModifier, true, "tracking drag starts before delayed paste");
+            }
+        }
+        VNM_TerminalSurface::Clipboard_completion pending;
+        int cancels = 0;
+        fixture->surface.set_clipboard_text_reader(
+            [&](QObject*, VNM_TerminalSurface::Clipboard_completion completion) {
+                pending = std::move(completion);
+                return [&] { ++cancels; };
+            });
+        const auto writes = backend_ptr->writes.size();
+        ok &= check(fixture->surface.paste_clipboard_text(), "async clipboard request admitted");
+        ok &= check(backend_ptr->writes.size() == writes, "clipboard admission does not inject text");
+        auto late = pending;
+        switch (action) {
+            case 0:
+                backend_ptr->emit_output(QByteArrayLiteral("ordinary output"));
+                term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture->surface);
+                break;
+            case 1:
+                ok &= send_key(fixture->surface, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"),
+                    "typing cancels pending paste");
+                break;
+            case 2: fixture->surface.setFocus(false); break;
+            case 3:
+                ok &= check(fixture->surface.paste_clipboard_text(), "new paste supersedes previous request");
+                break;
+            case 4:
+                backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+                pump_events(app);
+                backend_ptr = start_surface_with_backend(fixture->surface, std::make_unique<Scripted_backend>(),
+                    {QStringLiteral("replacement-terminal")}, &started);
+                ok &= check(started, "clipboard replacement session starts");
+                break;
+            case 5:
+                fixture.reset();
+                late(QStringLiteral("late"));
+                ok &= check(cancels == 1, "destruction cancels clipboard read exactly once");
+                continue;
+            case 6:
+                fixture->surface.set_clipboard_text_reader({});
+                break;
+            case 7:
+            case 9:
+            case 11:
+                ok &= send_mouse_event(fixture->surface, QEvent::MouseMove,
+                    point_in_grid_cell(fixture->surface, 0, 1), Qt::NoButton,
+                    action == 11 ? Qt::LeftButton : Qt::NoButton,
+                    Qt::NoModifier, action != 9, "delayed paste observes mouse movement routing");
+                break;
+            case 8:
+            case 10:
+                ok &= send_hover_move(fixture->surface, point_in_grid_cell(fixture->surface, 0, 1),
+                    Qt::NoModifier, action == 8, "delayed paste observes hover movement routing");
+                break;
+            case 12:
+            case 13:
+                if (action == 13) {
+                    term::VNM_TerminalSurface_render_bridge::
+                        set_pending_published_mouse_report_block_count_for_testing(fixture->surface, 5);
+                }
+                ok &= send_mouse_event(fixture->surface, QEvent::MouseButtonRelease,
+                    point_in_grid_cell(fixture->surface, 0, 1), Qt::LeftButton, Qt::NoButton,
+                    Qt::NoModifier, true, "tracking release follows delayed paste admission");
+                break;
+            default: break;
+        }
+        const auto before_completion = backend_ptr->writes.size();
+        if (action >= 7) {
+            const QByteArray expected_report = action == 12 ? QByteArrayLiteral("\x1b[<0;2;1m")
+                : action == 11 ? QByteArrayLiteral("\x1b[<32;2;1M")
+                : action == 7 || action == 8 ? QByteArrayLiteral("\x1b[<35;2;1M") : QByteArray{};
+            ok &= check(joined_writes_since(backend_ptr->writes, writes) == expected_report,
+                "only encoded tracking movement writes terminal input before paste completion");
+        }
+        late(QStringLiteral("paste"));
+        if (action == 0 || action == 9 || action == 10) {
+            ok &= check(joined_writes_since(backend_ptr->writes, before_completion) == QByteArrayLiteral("paste"),
+                "ordinary output and non-input pointer movement do not cancel delayed paste");
+            ok &= check(cancels == 0, "successful completion does not invoke cancellation");
+        }
+        else {
+            ok &= check(backend_ptr->writes.size() == before_completion, "cancelled completion cannot inject text");
+            ok &= check(cancels == 1, "intervening action cancels clipboard reader once");
+        }
+        if (action == 3) {
+            pending(QStringLiteral("new"));
+            ok &= check(joined_writes_since(backend_ptr->writes, before_completion) == QByteArrayLiteral("new"),
+                "only latest clipboard request can paste");
+        }
+        fixture->surface.set_clipboard_text_reader({});
+    }
+    return ok;
+}
+
+bool test_async_clipboard_report_chronology(QGuiApplication& app)
+{
+    bool ok = true;
+    for (const int scenario : {0, 1, 2}) {
+        const bool replace_from_cancel = scenario != 0;
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("\x1b[?1002;1006h")};
+        bool started = false;
+        auto* backend_ptr = start_surface_with_backend(fixture.surface, std::move(backend),
+            {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "clipboard report chronology starts");
+        fixture.surface.set_bracketed_paste_policy(VNM_TerminalSurface::Bracketed_paste_policy::DISABLED);
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, 0, 0), Qt::LeftButton, Qt::LeftButton,
+            Qt::NoModifier, true, "chronology establishes tracked press");
+        std::vector<VNM_TerminalSurface::Clipboard_completion> completions;
+        int cancels = 0;
+        fixture.surface.set_clipboard_text_reader(
+            [&](QObject*, VNM_TerminalSurface::Clipboard_completion completion) {
+                completions.push_back(std::move(completion));
+                return [&] {
+                    ++cancels;
+                    if (replace_from_cancel && cancels == 1) {
+                        ok &= check(fixture.surface.paste_clipboard_text(),
+                            "cancel callback admits replacement paste");
+                        if (scenario == 2) {
+                            term::VNM_TerminalSurface_render_bridge::
+                                set_pending_published_mouse_report_block_count_for_testing(fixture.surface, 0);
+                            completions.back()(QStringLiteral("new"));
+                        }
+                    }
+                };
+            });
+        if (replace_from_cancel) {
+            ok &= check(fixture.surface.paste_clipboard_text(), "original paste admitted before release");
+        }
+        const auto writes = backend_ptr->writes.size();
+        term::VNM_TerminalSurface_render_bridge::set_pending_published_mouse_report_block_count_for_testing(
+            fixture.surface, 5);
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+            point_in_grid_cell(fixture.surface, 0, 1), Qt::LeftButton, Qt::NoButton,
+            Qt::NoModifier, true, "chronology admits blocked release");
+        if (scenario != 2) {
+            ok &= check(backend_ptr->writes.size() == writes, "release remains ordering-visible but blocked");
+        }
+        if (!replace_from_cancel) {
+            ok &= check(fixture.surface.paste_clipboard_text(), "new paste follows older blocked report");
+        }
+        ok &= check(cancels == (replace_from_cancel ? 1 : 0), "only paste older than admission is cancelled");
+        term::VNM_TerminalSurface_render_bridge::set_pending_published_mouse_report_block_count_for_testing(
+            fixture.surface, 0);
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        pump_events(app);
+        if (replace_from_cancel) {
+            completions.front()(QStringLiteral("stale"));
+        }
+        if (scenario != 2) {
+            completions.back()(QStringLiteral("new"));
+        }
+        ok &= check(joined_writes_since(backend_ptr->writes, writes) == QByteArrayLiteral("\x1b[<0;2;1mnew"),
+            "older release precedes newer paste without cancelling it");
+        ok &= check(cancels == (replace_from_cancel ? 1 : 0), "delivery never cancels a newer paste");
+        fixture.surface.set_clipboard_text_reader({});
+    }
+    return ok;
+}
+
+bool send_copy_and_expect_no_write(
+    VNM_TerminalSurface& surface, Scripted_backend& backend, const char* message)
+{
+    const auto writes = backend.writes.size();
+    bool ok = send_key(surface, Qt::Key_C, Qt::ControlModifier, {}, message);
+    ok &= check(backend.writes.size() == writes, message);
+    return ok;
+}
+
+bool test_selection_copy_intent_after_output(QGuiApplication& app)
+{
+    bool ok = true;
+    Clipboard_text_guard clipboard_guard;
+    for (const bool drain_before_key : {false, true}) {
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("original                 tail")};
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "copy-intent surface starts");
+        const QPointF start = point_in_grid_cell(fixture.surface, 0, 1);
+        const QPointF end   = point_in_grid_cell(fixture.surface, 0, 4);
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+            start, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true, "copy-intent press");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
+            end, Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true, "copy-intent drag");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+            end, Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true, "copy-intent release");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("rigi"), "copy-intent payload");
+
+        backend_ptr->emit_output(drain_before_key
+            ? QByteArrayLiteral("\x1b[?1h\x1b=\x1b[?2026h\x1b[1;21HX\x1b[?2026l")
+            : QByteArrayLiteral("\x1b[1;21HX"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(snapshot && !snapshot->selection_spans.empty(),
+            "mutation outside selected columns preserves the selection highlight");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[1;3HX\x1b[1;3Hi"));
+        if (drain_before_key) {
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        }
+        const std::size_t writes = backend_ptr->writes.size();
+        ok &= send_key(fixture.surface, Qt::Key_C, Qt::ControlModifier, {}, "copy-intent Ctrl+C");
+        ok &= check(backend_ptr->writes.size() == writes,
+            "automatic selection invalidation must not turn intended copy into ETX");
+        const auto detached = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(detached && detached->selection_spans.empty(),
+            "selected-cell overwrite-and-restore invalidates attachment");
+        if (drain_before_key) {
+            // Provisional interaction timing: the owner adopted a bounded guard;
+            // the precise duration remains subject to user feel confirmation.
+            QThread::msleep(2100);
+            QKeyEvent repeat(QEvent::KeyPress, Qt::Key_C, Qt::ControlModifier, {}, true);
+            QCoreApplication::sendEvent(&fixture.surface, &repeat);
+            ok &= check(repeat.isAccepted() && backend_ptr->writes.size() == writes,
+                "a held suppressed Ctrl+C cannot become an interrupt when the guard expires");
+            QKeyEvent release(QEvent::KeyRelease, Qt::Key_C, Qt::ControlModifier);
+            release.setAccepted(false);
+            QCoreApplication::sendEvent(&fixture.surface, &release);
+            ok &= check(release.isAccepted() && backend_ptr->writes.size() == writes,
+                "release belonging to a suppressed copy is consumed");
+            ok &= send_key_and_expect_write(fixture.surface, *backend_ptr,
+                Qt::Key_C, Qt::ControlModifier, {}, bytes_from_hex("03"),
+                "a fresh Ctrl+C after guard expiry interrupts");
+        }
+        else {
+            ok &= send_key(fixture.surface, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"),
+                "deliberate typing ends the invalidated copy intent");
+            ok &= send_key_and_expect_write(fixture.surface, *backend_ptr,
+                Qt::Key_C, Qt::ControlModifier, {}, bytes_from_hex("03"),
+                "Ctrl+C after deliberate typing interrupts immediately");
+        }
+        fixture.surface.clear_selection();
+        ok &= send_key_and_expect_write(fixture.surface, *backend_ptr,
+            Qt::Key_C, Qt::ControlModifier, {}, bytes_from_hex("03"),
+            "explicit clear allows terminal interrupt");
+    }
+    return ok;
+}
+
 bool test_selection_visual_detach_after_row_mutation(QGuiApplication& app)
 {
     bool ok = true;
@@ -12841,14 +13124,11 @@ bool test_selection_visual_detach_after_row_mutation(QGuiApplication& app)
 
     QGuiApplication::clipboard()->setText(QStringLiteral("mutation-detach-sentinel"),
         QClipboard::Clipboard);
-    ok &= send_key_and_expect_write(
-        fixture.surface,
-        *backend_ptr,
-        Qt::Key_C,
-        Qt::ControlModifier,
-        {},
-        bytes_from_hex("03"),
-        "surface mutation-detach Ctrl+C falls through to terminal input");
+    const auto write_count = backend_ptr->writes.size();
+    ok &= send_key(fixture.surface, Qt::Key_C, Qt::ControlModifier, {},
+        "surface mutation-detach Ctrl+C is consumed");
+    ok &= check(backend_ptr->writes.size() == write_count,
+        "surface mutation-detach Ctrl+C protects the interrupted copy gesture");
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
         QStringLiteral("mutation-detach-sentinel"),
         "surface mutation-detach Ctrl+C leaves retained payload out of the clipboard");
@@ -14364,14 +14644,8 @@ bool test_selection_drag_preserves_payload_after_mid_drag_drift(QGuiApplication&
 
     QGuiApplication::clipboard()->setText(QStringLiteral("mid-drag-detach-sentinel"),
         QClipboard::Clipboard);
-    ok &= send_key_and_expect_write(
-        fixture.surface,
-        *backend_ptr,
-        Qt::Key_C,
-        Qt::ControlModifier,
-        {},
-        bytes_from_hex("03"),
-        "mid-drag payload detach Ctrl+C falls through to terminal input");
+    ok &= send_copy_and_expect_no_write(fixture.surface, *backend_ptr,
+        "mid-drag automatic detachment preserves copy intent");
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
         QStringLiteral("mid-drag-detach-sentinel"),
         "mid-drag payload detach Ctrl+C leaves retained payload out of the clipboard");
@@ -14398,14 +14672,8 @@ bool test_selection_drag_preserves_payload_after_mid_drag_drift(QGuiApplication&
 
     QGuiApplication::clipboard()->setText(QStringLiteral("mid-drag-release-sentinel"),
         QClipboard::Clipboard);
-    ok &= send_key_and_expect_write(
-        fixture.surface,
-        *backend_ptr,
-        Qt::Key_C,
-        Qt::ControlModifier,
-        {},
-        bytes_from_hex("03"),
-        "mid-drag payload detach post-release Ctrl+C falls through to terminal input");
+    ok &= send_copy_and_expect_no_write(fixture.surface, *backend_ptr,
+        "releasing the invalidated selection gesture does not turn copy into interrupt");
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
         QStringLiteral("mid-drag-release-sentinel"),
         "mid-drag payload detach post-release Ctrl+C leaves retained payload out of the clipboard");
@@ -14588,14 +14856,8 @@ bool test_selection_drag_rejects_snapshot_change(QGuiApplication& app)
                 QGuiApplication::clipboard()->setText(
                     QStringLiteral("resize-drag-sentinel"),
                     QClipboard::Clipboard);
-                ok &= send_key_and_expect_write(
-                    fixture.surface,
-                    *backend_ptr,
-                    Qt::Key_C,
-                    Qt::ControlModifier,
-                    {},
-                    bytes_from_hex("03"),
-                    "resize-incompatible payload-only Ctrl+C stays terminal input");
+                ok &= send_copy_and_expect_no_write(fixture.surface, *backend_ptr,
+                    "resize invalidation protects the interrupted copy gesture");
                 ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
                     QStringLiteral("resize-drag-sentinel"),
                     "resize-incompatible payload-only state is not copied through Ctrl+C");
@@ -15397,12 +15659,11 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
         ok &= check(error_codes.empty(),
             "surface paste success path emits no backend_error");
 
-        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
-            return QStringLiteral("reader-paste");
-        });
+        fixture.surface.set_clipboard_text_reader(clipboard_reader_result(QStringLiteral("reader-paste")));
         const std::size_t reader_write_index = backend_ptr->writes.size();
         ok &= check(fixture.surface.paste_clipboard_text(),
             "surface paste_clipboard_text returns true when the reader supplies text");
+        pump_events(app);
         ok &= check(joined_writes_since(backend_ptr->writes, reader_write_index) ==
             framed_paste(QByteArrayLiteral("reader-paste")),
             "surface paste_clipboard_text writes injected clipboard text");
@@ -15411,24 +15672,21 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
         // clipboard the way Windows fills one. Every line break has to leave as
         // a carriage return: a line feed reaches a ConPTY child as Ctrl+Enter,
         // which reordered pasted lines under PSReadLine and merged them in cmd.
-        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
-            return QStringLiteral(
-                "echo STEP-ONE\r\necho STEP-TWO\r\necho STEP-THREE");
-        });
+        fixture.surface.set_clipboard_text_reader(clipboard_reader_result(QStringLiteral(
+            "echo STEP-ONE\r\necho STEP-TWO\r\necho STEP-THREE")));
         const std::size_t multiline_write_index = backend_ptr->writes.size();
         ok &= check(fixture.surface.paste_clipboard_text(),
             "surface paste_clipboard_text accepts a multiline clipboard");
+        pump_events(app);
         ok &= check(joined_writes_since(backend_ptr->writes, multiline_write_index) ==
             framed_paste(QByteArrayLiteral(
                 "echo STEP-ONE\recho STEP-TWO\recho STEP-THREE")),
             "clipboard paste sends one carriage return for every pasted line break");
 
-        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
-            return std::nullopt;
-        });
+        fixture.surface.set_clipboard_text_reader(clipboard_reader_result(std::nullopt));
         const std::size_t blocked_reader_write_count = backend_ptr->writes.size();
-        ok &= check(!fixture.surface.paste_clipboard_text(),
-            "surface paste_clipboard_text returns false when the reader has no text");
+        ok &= check(fixture.surface.paste_clipboard_text(), "clipboard failure is delivered asynchronously");
+        pump_events(app);
         ok &= check(backend_ptr->writes.size() == blocked_reader_write_count,
             "surface paste_clipboard_text writes nothing when the reader has no text");
     }
@@ -15528,9 +15786,7 @@ bool test_right_click_paste_and_mouse_reporting_precedence(QGuiApplication& app)
             &started);
         ok &= check(started, "right-click paste surface starts");
 
-        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
-            return QStringLiteral("reader-right-paste");
-        });
+        fixture.surface.set_clipboard_text_reader(clipboard_reader_result(QStringLiteral("reader-right-paste")));
         fixture.surface.set_bracketed_paste_policy(
             VNM_TerminalSurface::Bracketed_paste_policy::DISABLED);
         const std::size_t write_count = backend_ptr->writes.size();
@@ -15543,6 +15799,7 @@ bool test_right_click_paste_and_mouse_reporting_precedence(QGuiApplication& app)
             Qt::NoModifier,
             true,
             "right-click paste press is accepted");
+        pump_events(app);
         ok &= check(backend_ptr->writes.size() == write_count + 1U,
             "right-click paste writes clipboard text");
         if (backend_ptr->writes.size() > write_count) {
@@ -18618,6 +18875,24 @@ int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
 
+    if (app.arguments().contains(QStringLiteral("--selection-copy-intent-only"))) {
+        return test_selection_copy_intent_after_output(app) ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--clipboard-selection-only"))) {
+        bool ok = test_selection_copy_intent_after_output(app);
+        ok &= test_async_clipboard_intent(app);
+        ok &= test_async_clipboard_report_chronology(app);
+        ok &= test_copy_shortcut_policy(app);
+        ok &= test_selection_drag_composes_synchronized_press_successors(app);
+        ok &= test_no_payload_copy_fallback_states(app);
+        ok &= test_selection_drag_preserves_payload_after_mid_drag_drift(app);
+        ok &= test_selection_drag_rejects_snapshot_change(app);
+        ok &= test_selection_visual_detach_after_row_mutation(app);
+        ok &= test_paste_text_public_method_and_policy(app);
+        ok &= test_right_click_paste_and_mouse_reporting_precedence(app);
+        return ok ? 0 : 1;
+    }
+
     if (app.arguments().contains(QStringLiteral("--search-completion-lifetime-only"))) {
         bool ok = test_search_completion_during_surface_destruction(app);
         ok &= test_search_completion_after_session_restart(app);
@@ -18723,6 +18998,9 @@ int main(int argc, char** argv)
     ok &= test_row_timestamp_tooltip_signal_contract(app);
     ok &= test_selection_drag_and_selected_text(app);
     ok &= test_selection_visual_detach_after_row_mutation(app);
+    ok &= test_selection_copy_intent_after_output(app);
+    ok &= test_async_clipboard_intent(app);
+    ok &= test_async_clipboard_report_chronology(app);
     ok &= test_selection_drag_remaps_live_scrollback_viewport_spans(app);
     ok &= test_selection_drag_survives_unrelated_row_backend_output(app);
     ok &= test_selection_drag_survives_worker_unrelated_row_backend_output(app);

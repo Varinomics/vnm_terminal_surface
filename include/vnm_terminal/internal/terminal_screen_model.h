@@ -18,6 +18,7 @@
 #include <QStringView>
 #include <QtGlobal>
 #include <chrono>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -630,6 +631,12 @@ public:
     Terminal_retained_line_lookup_result retained_line_lookup(
         Terminal_buffer_id             buffer_id,
         terminal_history_handle_t      history_handle) const;
+    void watch_selection_cells(terminal_selection_visual_lease_t& lease, bool drag_anchor = false);
+    void clear_selection_cell_watch(bool drag_anchor = false);
+    Terminal_retained_line_lookup_result selection_line_lookup(
+        Terminal_buffer_id buffer_id,
+        terminal_history_handle_t& handle,
+        const std::shared_ptr<Selection_cell_continuity>& continuity) const;
     Terminal_selection_attachment_resolution resolve_selection_attachment(
         const terminal_selection_visual_lease_t& prior_lease,
         const terminal_selection_source_identity_t& target_source,
@@ -995,6 +1002,9 @@ private:
     bool cells_have_same_selection_content(
         const Cell&                    left,
         const Cell&                    right) const;
+    void record_selection_cell_mutation(const Terminal_screen_row& row, int first, int end);
+    void transfer_selection_cell_watches(
+        std::uint64_t old_id, std::uint64_t new_id, std::uint64_t preserved_generation);
 
     bool rows_have_same_selection_content(
         const std::vector<Cell>&       left,
@@ -1032,11 +1042,11 @@ private:
         const Terminal_screen_row&     row,
         terminal_grid_position_t       position,
         QStringView                    text,
-        int                            display_width) const;
+        int                            display_width);
 
     bool scalar_span_clear_changes_selection_content(
         const Terminal_screen_row&     row,
-        terminal_grid_position_t       position) const;
+        terminal_grid_position_t       position);
 
     std::vector<bool> default_tab_stops(int column_count) const;
     void reset_grid();
@@ -1630,6 +1640,8 @@ private:
     bool                            m_primary_repaint_recovery_episode_active = false;
     primary_repaint_recovery_candidate_t
                                      m_primary_repaint_recovery_candidate;
+    std::array<std::map<std::uint64_t, std::shared_ptr<Selection_cell_continuity>>, 2>
+                                     m_selection_cell_watches;
 };
 
 }

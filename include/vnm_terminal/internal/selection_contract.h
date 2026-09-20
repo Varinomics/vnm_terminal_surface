@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -144,14 +145,36 @@ struct terminal_selection_source_identity_t
     Terminal_viewport_state            viewport_mapping;
 };
 
+class Terminal_screen_model;
+
+// Gesture-lifetime evidence owned by the model, outside stored history and
+// transcript schemas. Absence retains the strict row-generation contract.
+class Selection_cell_continuity
+{
+    friend class Terminal_screen_model;
+    std::uint64_t m_row_id = 0U;
+    std::uint64_t m_initial_generation = 0U;
+    std::uint64_t m_invalidated_generation = 0U;
+    int m_first_column = 0;
+    int m_end_column = 0;
+    bool m_intact = true;
+};
+
 struct terminal_selection_line_lease_t
 {
     int                                row_offset         = 0;
     terminal_history_handle_t          history_handle;
+    std::shared_ptr<Selection_cell_continuity> cell_continuity;
 
     friend bool operator==(
-        const terminal_selection_line_lease_t&,
-        const terminal_selection_line_lease_t&) = default;
+        const terminal_selection_line_lease_t& left,
+        const terminal_selection_line_lease_t& right)
+    {
+        // Descriptor identity is retained provenance. Gesture-owned mutation
+        // evidence is optional and is not part of snapshot descriptor identity.
+        return left.row_offset == right.row_offset &&
+            left.history_handle == right.history_handle;
+    }
 };
 
 struct terminal_selection_visual_lease_t
