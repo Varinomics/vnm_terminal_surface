@@ -140,6 +140,25 @@ void live_group_signal_test()
     require(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "cleanup delivers SIGKILL");
 }
 
+void zero_grace_group_signal_test()
+{
+    // Exercise escalation while exit is in progress, before observing SZOMB.
+    // The bounded repetitions give the native exit/signalling race room to run.
+    for (int iteration = 0; iteration != 64; ++iteration) {
+        Owned_child child;
+        require(child.custody().signal_group(SIGTERM) == 0, "zero-grace group receives SIGTERM");
+        const int escalation = child.custody().signal_group(SIGKILL);
+        require(escalation == 0 || escalation == ESRCH,
+            "zero-grace escalation during native exit is not a permission failure");
+        require(child.custody().observe_exit() == 0, "zero-grace group exits");
+        int status = 0;
+        require(child.custody().reap(&status) == child.pid(), "collect zero-grace owned root");
+        require(WIFSIGNALED(status) &&
+            (WTERMSIG(status) == SIGTERM || WTERMSIG(status) == SIGKILL),
+            "zero-grace termination preserves the actual native exit signal");
+    }
+}
+
 void foreground_identity_test()
 {
     Owned_child first;
@@ -207,6 +226,8 @@ int main()
         owned_root_wait_and_signal_test();
         std::cout << "RUN live group signal\n" << std::flush;
         live_group_signal_test();
+        std::cout << "RUN zero-grace group signal\n" << std::flush;
+        zero_grace_group_signal_test();
         std::cout << "RUN foreground identity\n" << std::flush;
         foreground_identity_test();
         std::cout << "RUN concurrent wait\n" << std::flush;

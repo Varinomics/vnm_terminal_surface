@@ -105,10 +105,10 @@ public:
         }
         const int error = ::kill(-m_pid, signal_number) == 0 ? 0 : errno;
 #if defined(__APPLE__)
-        // XNU killpg1 filters zombies, then reports EPERM when no member was
-        // signalled. The retained wait pins this PGID throughout the snapshot;
-        // only a complete snapshot with no live members can disambiguate EPERM.
-        if (error == EPERM && group_has_only_zombies()) {
+        // XNU killpg1 skips both zombies and processes already hidden from
+        // proc_find during exit, then reports EPERM if no member was signalled.
+        // The retained wait pins this PGID throughout the complete snapshot.
+        if (error == EPERM && group_is_exiting()) {
             return ESRCH;
         }
 #endif
@@ -165,7 +165,7 @@ public:
 
 private:
 #if defined(__APPLE__)
-    bool group_has_only_zombies() const noexcept
+    bool group_is_exiting() const noexcept
     {
         int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PGRP, m_pid};
         std::size_t bytes = 0;
@@ -183,7 +183,10 @@ private:
                 return false;
             }
             for (std::size_t i = 0; i < bytes / sizeof(kinfo_proc); ++i) {
-                if (members[i].kp_proc.p_stat != SZOMB) {
+                // P_WEXIT exposes committed exit before p_stat reaches SZOMB;
+                // zero-grace SIGTERM/SIGKILL escalation can hit that interval.
+                const auto& process = members[i].kp_proc;
+                if (process.p_stat != SZOMB && (process.p_flag & P_WEXIT) == 0) {
                     return false;
                 }
             }
