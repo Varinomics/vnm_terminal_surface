@@ -115,6 +115,9 @@ void owned_root_wait_and_signal_test()
     require(::waitid(P_PID, static_cast<id_t>(child.pid()), &still_waitable,
         WEXITED | WNOWAIT | WNOHANG) == 0 && still_waitable.si_pid == child.pid(),
         "non-consuming observation retains native child identity");
+    const int zombie_group = child.custody().signal_group(SIGKILL);
+    require(zombie_group == 0 || zombie_group == ESRCH,
+        "final cleanup of an unreaped zombie-only group is not a permission failure");
     int status = 0;
     require(child.custody().reap(&status) == child.pid(), "sole consuming wait");
     require(WIFEXITED(status) && WEXITSTATUS(status) == 23, "actual native exit status");
@@ -125,6 +128,16 @@ void owned_root_wait_and_signal_test()
         "late group dispatch cannot acquire a new numeric identity");
     require(child.custody().reap(&status) == -1 && errno == ECHILD,
         "consuming wait is not duplicated");
+}
+
+void live_group_signal_test()
+{
+    Owned_child child;
+    require(child.custody().signal_group(SIGKILL) == 0, "live owned group receives cleanup signal");
+    require(child.custody().observe_exit() == 0, "cleanup signal terminates live owned group");
+    int status = 0;
+    require(child.custody().reap(&status) == child.pid(), "collect signalled owned root");
+    require(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "cleanup delivers SIGKILL");
 }
 
 void foreground_identity_test()
@@ -192,6 +205,8 @@ int main()
     try {
         std::cout << "RUN owned root\n" << std::flush;
         owned_root_wait_and_signal_test();
+        std::cout << "RUN live group signal\n" << std::flush;
+        live_group_signal_test();
         std::cout << "RUN foreground identity\n" << std::flush;
         foreground_identity_test();
         std::cout << "RUN concurrent wait\n" << std::flush;

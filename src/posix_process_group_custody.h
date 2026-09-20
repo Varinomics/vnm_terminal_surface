@@ -16,6 +16,10 @@
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+#include <vector>
 #endif
 
 namespace vnm_terminal::internal {
@@ -99,7 +103,16 @@ public:
         if (!m_wait_owned) {
             return ESTALE;
         }
-        return ::kill(-m_pid, signal_number) == 0 ? 0 : errno;
+        const int error = ::kill(-m_pid, signal_number) == 0 ? 0 : errno;
+#if defined(__APPLE__)
+        // XNU killpg1 filters zombies, then reports EPERM when no member was
+        // signalled. The retained wait pins this PGID throughout the snapshot;
+        // only a complete snapshot with no live members can disambiguate EPERM.
+        if (error == EPERM && group_has_only_zombies()) {
+            return ESRCH;
+        }
+#endif
+        return error;
     }
 
     int signal_root(int signal_number) const noexcept
@@ -151,6 +164,37 @@ public:
     }
 
 private:
+#if defined(__APPLE__)
+    bool group_has_only_zombies() const noexcept
+    {
+        int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PGRP, m_pid};
+        std::size_t bytes = 0;
+        if (::sysctl(query, 4, nullptr, &bytes, nullptr, 0) != 0) {
+            return false;
+        }
+        try {
+            // A growing group makes the second query fail with ENOMEM. Keep
+            // the original permission error rather than trust a partial list.
+            std::vector<kinfo_proc> members(bytes / sizeof(kinfo_proc) + 1);
+            bytes = members.size() * sizeof(kinfo_proc);
+            if (::sysctl(query, 4, members.data(), &bytes, nullptr, 0) != 0 ||
+                bytes % sizeof(kinfo_proc) != 0)
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < bytes / sizeof(kinfo_proc); ++i) {
+                if (members[i].kp_proc.p_stat != SZOMB) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+#endif
+
     Posix_process_group_custody(pid_t process_group, bool wait_owned)
     :
         m_pid(process_group),
