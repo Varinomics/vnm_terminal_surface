@@ -37,6 +37,8 @@ constexpr qsizetype k_bracketed_paste_framing_bytes =
 constexpr int k_win32_vk_return          = 13;
 constexpr int k_win32_scan_return        = 28;
 constexpr int k_win32_shift_pressed      = 0x0010;
+constexpr int k_win32_vk_escape          = 27;
+constexpr int k_win32_scan_escape        = 1;
 #endif
 
 // Stops once the sanitized text is longer than `stop_beyond_units`, so a caller
@@ -183,6 +185,24 @@ QByteArray win32_shift_enter_bytes(const QKeyEvent& event)
         k_win32_shift_pressed,
         std::max(1, event.count()));
 }
+
+QByteArray win32_escape_bytes(const QKeyEvent& event)
+{
+    // ConPTY retains native-input parser state after a Win32 frame. A raw ESC
+    // byte would then be held as a possible prefix of another native frame, so
+    // Escape-equivalent control keys must use the same framing as Escape.
+    const QByteArray escape = win32_input_key_event_bytes(
+        k_win32_vk_escape,
+        k_win32_scan_escape,
+        k_win32_vk_escape,
+        1,
+        0,
+        std::max(1, event.count()));
+    if ((event.modifiers() & Qt::AltModifier) != Qt::NoModifier) {
+        return escape + escape;
+    }
+    return escape;
+}
 #endif
 
 int mouse_modifier_bits(Qt::KeyboardModifiers modifiers)
@@ -317,7 +337,11 @@ QByteArray special_key_bytes(const QKeyEvent& event)
             }
             return alt_prefixed(QByteArray(1, '\x7f'), event);
         case Qt::Key_Escape:
+#if defined(Q_OS_WIN)
+            return win32_escape_bytes(event);
+#else
             return alt_prefixed(QByteArray(1, '\x1b'), event);
+#endif
         default:
             return {};
     }
@@ -540,6 +564,14 @@ QByteArray encode_terminal_key_event(
     if (!ctrl_alt_printable_bytes.isEmpty()) {
         return ctrl_alt_printable_bytes;
     }
+
+#if defined(Q_OS_WIN)
+    if ((event.modifiers() & Qt::ControlModifier) != Qt::NoModifier &&
+        (event.key() == Qt::Key_3 || event.key() == Qt::Key_BracketLeft))
+    {
+        return win32_escape_bytes(event);
+    }
+#endif
 
     const QByteArray control_bytes = control_key_bytes(event);
     if (!control_bytes.isEmpty()) {

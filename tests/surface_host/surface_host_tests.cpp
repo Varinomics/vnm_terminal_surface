@@ -5148,8 +5148,13 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         "Backspace writes DEL");
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Escape, Qt::NoModifier,
+#if defined(Q_OS_WIN)
+        {}, bytes_from_hex("1b5b32373b313b32373b313b303b315f"),
+        "Escape writes native Win32 key record on Windows");
+#else
         {}, bytes_from_hex("1b"),
         "Escape writes ESC");
+#endif
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_A, Qt::ControlModifier,
         {}, bytes_from_hex("01"),
@@ -5172,8 +5177,13 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         "Ctrl+Z writes C0 SUB");
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_BracketLeft, Qt::ControlModifier,
+#if defined(Q_OS_WIN)
+        {}, bytes_from_hex("1b5b32373b313b32373b313b303b315f"),
+        "Ctrl+[ writes native Win32 Escape framing on Windows");
+#else
         {}, bytes_from_hex("1b"),
         "Ctrl+[ writes ESC");
+#endif
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Backslash, Qt::ControlModifier,
         {}, bytes_from_hex("1c"),
@@ -5200,8 +5210,13 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         "Ctrl+2 writes NUL");
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_3, Qt::ControlModifier,
+#if defined(Q_OS_WIN)
+        {}, bytes_from_hex("1b5b32373b313b32373b313b303b315f"),
+        "Ctrl+3 writes native Win32 Escape framing on Windows");
+#else
         {}, bytes_from_hex("1b"),
         "Ctrl+3 writes ESC");
+#endif
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_4, Qt::ControlModifier,
         {}, bytes_from_hex("1c"),

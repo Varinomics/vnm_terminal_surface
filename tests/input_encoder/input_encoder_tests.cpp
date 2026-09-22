@@ -90,8 +90,13 @@ bool test_control_and_altgr()
         "Ctrl+` maps to NUL");
     ok &= check_bytes_equal(
         encode(Qt::Key_3, Qt::ControlModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b32373b313b32373b313b303b315f"),
+        "Ctrl+3 uses native Win32 Escape framing on Windows");
+#else
         bytes_from_hex("1b"),
         "Ctrl+3 maps to ESC");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_4, Qt::ControlModifier),
         bytes_from_hex("1c"),
@@ -192,6 +197,24 @@ bool test_cursor_and_navigation_modes()
         encode(Qt::Key_Return, Qt::AltModifier),
         bytes_from_hex("1b0d"),
         "Alt+Return keeps ESC-prefixed CR");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Escape, Qt::NoModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b32373b313b32373b313b303b315f"),
+        "Escape uses native Win32 framing on Windows");
+#else
+        bytes_from_hex("1b"),
+        "Escape writes ESC");
+#endif
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Escape, Qt::AltModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b32373b313b32373b313b303b315f1b5b32373b313b32373b313b303b315f"),
+        "Alt+Escape uses two native Win32 frames on Windows");
+#else
+        bytes_from_hex("1b1b"),
+        "Alt+Escape prefixes Escape with ESC");
+#endif
 
     term::Terminal_input_mode_state modes;
     ok &= check_bytes_equal(
