@@ -2147,7 +2147,7 @@ bool test_row_content_stamps_survive_grid_resize()
         "blank-only width shrink keeps row content stamps");
 
     // Rewriting rows with identical cells is not new output. This is the
-    // overwrite-style repaint a real ConPTY emits after every resize: hide
+    // overwrite-style repaint the system ConPTY emits after resize: hide
     // cursor, home, per row the text followed by erase-to-end-of-line, then
     // reposition and show the cursor.
     model.ingest(QByteArrayLiteral(
@@ -2165,11 +2165,22 @@ bool test_row_content_stamps_survive_grid_resize()
     ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms,
         "new output on one row leaves sibling row stamps untouched");
 
-    // A width shrink that truncates written cells is a real content change.
+    // Primary-screen reflow moves existing output into wrapped rows; it must
+    // preserve both the text and its arrival time instead of restamping it.
     wait_for_wall_clock_after_ms(rewritten_stamp_ms);
     model.resize({4, 2});
-    ok &= check(active_row_stamp_ms(model, 0) > first_stamp_ms,
-        "width shrink that truncates written cells refreshes the stamp");
+    const term::Terminal_render_snapshot reflowed =
+        model.render_snapshot(request_for_model(model, 132U));
+    ok &= check(row_text(reflowed, 0) == QStringLiteral("on") &&
+        row_text(reflowed, 1) == QStringLiteral("e") &&
+        row_text(reflowed, 2) == QStringLiteral("TW") &&
+        row_text(reflowed, 3) == QStringLiteral("O"),
+        "width shrink preserves written cells across wrapped rows");
+    ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms &&
+        active_row_stamp_ms(model, 1) == first_stamp_ms &&
+        active_row_stamp_ms(model, 2) == rewritten_stamp_ms &&
+        active_row_stamp_ms(model, 3) == rewritten_stamp_ms,
+        "width shrink preserves each source row's output arrival stamp");
 
     return ok;
 }
