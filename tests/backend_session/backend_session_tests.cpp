@@ -7420,11 +7420,11 @@ bool test_selection_spans_reconcile_synchronized_release_policy_matrix()
     const std::array resize_cases = {
         Resize_case{{5, 20}, false, 1, 4,
             term::Terminal_selection_attachment_resolution_status::TRANSLATED},
-        Resize_case{{2, 20}, false, 3, 5,
+        Resize_case{{2, 20}, false, 0, 5,
             term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
         Resize_case{{4, 19}, false, 1, 4,
             term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
-        Resize_case{{2, 20}, true, 3, 5,
+        Resize_case{{2, 20}, true, 0, 5,
             term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
         Resize_case{{4, 19}, true, 1, 4,
             term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
@@ -7551,11 +7551,11 @@ bool test_selection_spans_reconcile_synchronized_text_area_resize_policy_matrix(
     const std::array resize_cases = {
         Resize_case{{5, 20}, false, 1, 4,
             term::Terminal_selection_attachment_resolution_status::TRANSLATED},
-        Resize_case{{2, 20}, false, 3, 5,
+        Resize_case{{2, 20}, false, 0, 5,
             term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
         Resize_case{{4, 19}, false, 1, 4,
             term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
-        Resize_case{{2, 20}, true, 3, 5,
+        Resize_case{{2, 20}, true, 0, 5,
             term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
         Resize_case{{4, 19}, true, 1, 4,
             term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
@@ -7681,7 +7681,7 @@ bool test_selection_and_drag_checkpoint_each_synchronized_text_area_resize()
         term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION,
     };
     const std::array resize_cases = {
-        Resize_case{{2, 20}, 3, 5,
+        Resize_case{{2, 20}, 0, 5,
             term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
         Resize_case{{4, 19}, 1, 4,
             term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
@@ -13576,7 +13576,7 @@ bool test_resize_preserves_primary_scrollback()
         after_resize->grid_size.rows            == 20                       &&
         after_resize->grid_size.columns         == 100                      &&
         after_resize->viewport.visible_rows     == 20                       &&
-        after_resize->viewport.scrollback_rows  == previous_scrollback_rows &&
+        after_resize->viewport.scrollback_rows  == previous_scrollback_rows + 4 &&
         after_resize->viewport.offset_from_tail == 0,
         "resize preserves primary scrollback at tail");
 
@@ -13587,7 +13587,7 @@ bool test_resize_preserves_primary_scrollback()
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
         "resized primary scrollback remains scrollable");
     ok &= check(scrolled.has_value() &&
-        scrolled->viewport.scrollback_rows  == previous_scrollback_rows &&
+        scrolled->viewport.scrollback_rows  == previous_scrollback_rows + 4 &&
         scrolled->viewport.offset_from_tail == 3,
         "resized primary scrollback publishes detached viewport");
 
@@ -13612,8 +13612,8 @@ bool test_resize_preserves_primary_scrollback()
     const std::optional<term::Terminal_render_snapshot> detached_after_resize =
         detached_session->latest_render_snapshot();
     ok &= check(detached_after_resize.has_value() &&
-        detached_after_resize->viewport.scrollback_rows  == detached_scrollback_rows &&
-        detached_after_resize->viewport.offset_from_tail == 4,
+        detached_after_resize->viewport.scrollback_rows  == detached_scrollback_rows + 6 &&
+        detached_after_resize->viewport.offset_from_tail == 10,
         "resize preserves detached primary scrollback offset");
 
     return ok;

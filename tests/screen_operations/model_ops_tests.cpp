@@ -5370,11 +5370,132 @@ bool test_text_area_resize_request_status_classifier()
     return ok;
 }
 
+
+bool test_row_movement_severs_soft_wrap_neighbors()
+{
+    bool ok = true;
+    const std::array<QByteArray, 4> mutations = {
+        QByteArrayLiteral("\x1b[2;1H\x1b[M"),
+        QByteArrayLiteral("\x1b[2;1H\x1b[L"),
+        QByteArrayLiteral("\x1b[2;3r\x1b[S"),
+        QByteArrayLiteral("\x1b[2;3r\x1b[T"),
+    };
+    for (const auto& mutation : mutations) {
+        auto model = make_model(3, 4, 8);
+        model.ingest(QByteArrayLiteral("abcdef\r\ngh"));
+        model.ingest(mutation);
+        model.resize({3, 8});
+        ok &= check(model.row_text(0).trimmed() == QStringLiteral("abcd"),
+            "replacing a soft continuation never joins its predecessor to an unrelated row");
+    }
+    auto outgoing = make_model(4, 4, 8);
+    outgoing.ingest(QByteArrayLiteral("abcdefghij"));
+    outgoing.ingest(QByteArrayLiteral("\x1b[1;2r\x1b[T"));
+    outgoing.resize({4, 8});
+    ok &= check(outgoing.row_text(1).trimmed() == QStringLiteral("abcd") &&
+            outgoing.row_text(2).trimmed() == QStringLiteral("ij"),
+        "region scroll severs the moved row from its discarded continuation");
+    return ok;
+}
+
+bool test_resize_wrap_boundaries_cursor_and_history()
+{
+    bool ok = true;
+    auto soft = make_model(5, 8, 16);
+    soft.ingest(QByteArrayLiteral("abcdefghij\r\nP>"));
+    soft.resize({3, 4});
+    ok &= check(soft.scrollback_size() == 1 &&
+            soft.row_text(0).trimmed() == QStringLiteral("efgh") &&
+            soft.row_text(1).trimmed() == QStringLiteral("ij") &&
+            soft.row_text(2).trimmed() == QStringLiteral("P>"),
+        "narrow resize archives only the prefix needed to keep the prompt visible");
+    const auto metadata = soft.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(metadata.has_value() && metadata->source_width == 4 &&
+            metadata->wrap_state == term::Terminal_retained_row_wrap_state::SOFT_WRAP,
+        "resize-created history seals its new width and continuing boundary");
+    soft.resize({5, 8});
+    ok &= check(soft.scrollback_size() == 1 &&
+            soft.row_text(0).trimmed() == QStringLiteral("efghij") &&
+            soft.row_text(1).trimmed() == QStringLiteral("P>"),
+        "reflow stops at the active/history boundary and growth never pulls history");
+
+    auto hard = make_model(5, 4, 8);
+    hard.ingest(QByteArrayLiteral("abcd\r\nefgh\r\nP>"));
+    hard.resize({5, 8});
+    ok &= check(hard.row_text(0).trimmed() == QStringLiteral("abcd") &&
+            hard.row_text(1).trimmed() == QStringLiteral("efgh") &&
+            hard.cursor_position().row == 2,
+        "full-width hard lines do not become soft wraps during resize");
+
+    auto pending = make_model(3, 4, 8);
+    pending.ingest(QByteArrayLiteral("abcd"));
+    pending.resize({3, 8});
+    pending.ingest(QByteArrayLiteral("e"));
+    ok &= check(pending.row_text(0).trimmed() == QStringLiteral("abcde"),
+        "widening maps the pending-wrap endpoint after the former margin cell");
+    pending.resize({3, 4});
+    pending.ingest(QByteArrayLiteral("f"));
+    ok &= check(pending.row_text(1).trimmed() == QStringLiteral("ef"),
+        "narrowing preserves the insertion point after reflowed text");
+
+    auto saved = make_model(5, 8, 8);
+    saved.ingest(QByteArrayLiteral("abcdefghij\x1b" "7klmno"));
+    saved.resize({5, 5});
+    saved.ingest(QByteArrayLiteral("\x1b" "8X"));
+    ok &= check(saved.row_text(2).trimmed() == QStringLiteral("Xlmno"),
+        "saved cursor follows its logical offset through a primary reflow");
+
+    auto wide = make_model(5, 5, 8);
+    wide.ingest(QByteArrayLiteral("abcd") + bytes_from_hex("e7958c") + QByteArrayLiteral("e"));
+    wide.resize({5, 8});
+    ok &= check(wide.row_text(0).trimmed() == QString::fromUtf8("abcd\xe7\x95\x8c" "e"),
+        "wide wrap padding is not inserted into the reflowed logical line");
+    const auto snapshot = wide.render_snapshot(request_for_model(wide, 110U));
+    ok &= check(term::validate_render_snapshot(snapshot).status == term::Terminal_render_snapshot_status::OK,
+        "reflow preserves valid wide-cell geometry");
+    return ok;
+}
+
+bool test_cmd_wrapped_output_resize_trace()
+{
+    auto model = make_model(12, 40, 32);
+    const QByteArray digits("012345678901234567890123456789012345678901234567890123456789");
+    // Captured from native cmd.exe through the shipped ConPTY runtime. OSC
+    // title updates are omitted; all cursor and text operations are retained.
+    model.ingest(QByteArrayLiteral("\r\nPROMPT>\x1b[2;8Hecho ") + digits +
+        QByteArrayLiteral("\x1b[3;33H\x1b[3;33H\r\n") + digits +
+        QByteArrayLiteral("\r\n\r\nPROMPT>"));
+    bool ok = check(model.cursor_position().row == 6 &&
+            model.row_text(6).trimmed() == QStringLiteral("PROMPT>"),
+        "native cmd trace establishes its prompt below wrapped output");
+    model.resize({12, 60});
+    ok &= check(model.cursor_position().row == 5 &&
+            model.row_text(5).trimmed() == QStringLiteral("PROMPT>"),
+        "widening reflows output and moves the prompt with the native cursor");
+    ok &= check(model.row_text(3) == QString::fromLatin1(digits),
+        "widening preserves all cells of the wrapped output line");
+    model.ingest(QByteArrayLiteral("\x1b[6;8Hhello\x1b[6;13H"));
+    ok &= check(model.row_text(5).trimmed() == QStringLiteral("PROMPT>hello") &&
+            model.cursor_position().row == 5 && model.cursor_position().column == 12,
+        "native input after resize writes beside its prompt");
+    model.resize({4, 60});
+    model.ingest(QByteArrayLiteral("\x1b[4;8H\x1b[J\x1b[4;8Hhello\x1b[4;13H"));
+    ok &= check(model.row_text(3).trimmed() == QStringLiteral("PROMPT>hello"),
+        "height shrink retains the prompt instead of truncating the bottom rows");
+    model.resize({12, 60});
+    ok &= check(model.row_text(3).trimmed() == QStringLiteral("PROMPT>hello"),
+        "height growth keeps the native cursor row rather than pulling history");
+    return ok;
+}
+
 }
 
 int main()
 {
     bool ok = true;
+    ok &= test_row_movement_severs_soft_wrap_neighbors();
+    ok &= test_resize_wrap_boundaries_cursor_and_history();
+    ok &= test_cmd_wrapped_output_resize_trace();
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();

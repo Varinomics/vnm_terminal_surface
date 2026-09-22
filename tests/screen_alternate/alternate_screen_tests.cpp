@@ -336,7 +336,6 @@ bool test_resize_while_alternate_active()
     term::Terminal_screen_model model = make_model(3, 6);
     model.ingest(QByteArrayLiteral("aaaaaa\r\nbbbbbb\r\ncccccc\r\ndddddd"));
     const int     primary_scrollback_size           = model.scrollback_size();
-    const QString expected_primary_top_after_resize = model.row_text(0).left(4);
 
     model.ingest(QByteArrayLiteral("\x1b[?47hALT"));
     term::Terminal_screen_model_result result = model.resize({2, 4});
@@ -369,10 +368,11 @@ bool test_resize_while_alternate_active()
     model.ingest(QByteArrayLiteral("\x1b[?47l"));
     ok &= check(model.active_buffer_id() == term::Terminal_buffer_id::PRIMARY,
         "leave after resize returns to primary buffer");
-    ok &= check(model.scrollback_size() == primary_scrollback_size,
-        "resize preserves primary scrollback storage");
-    ok &= check(model.row_text(0) == expected_primary_top_after_resize,
-        "resize normalizes inactive primary buffer dimensions");
+    ok &= check(model.scrollback_size() == primary_scrollback_size + 4,
+        "resize archives inactive primary prefix to retain its cursor");
+    ok &= check(model.row_text(0) == QStringLiteral("dddd") &&
+        model.row_text(1) == QStringLiteral("dd"),
+        "resize reflows inactive primary buffer around its cursor");
 
     return ok;
 }
@@ -402,7 +402,7 @@ bool test_resize_normalizes_saved_origin_mode_and_noop()
     return ok;
 }
 
-bool test_resize_clears_wide_cells_crossing_right_edge()
+bool test_resize_preserves_primary_wide_cells_crossing_right_edge()
 {
     bool ok = true;
 
@@ -413,8 +413,9 @@ bool test_resize_clears_wide_cells_crossing_right_edge()
 
     term::Terminal_screen_model_result result = model.resize({1, 3});
     ok &= check(result.viewport_changed, "wide shrink reports viewport change");
-    ok &= check(model.row_text(0) == QStringLiteral("AB"),
-        "wide cell crossing new right edge is cleared");
+    ok &= check(model.row_text(0) == QString::fromUtf8("\xe4\xb8\x80") &&
+        model.scrollback_size() == 1,
+        "primary wide cell wraps intact while preceding text enters history");
     ok &= check(snapshot_valid(model, 40U), "wide shrink snapshot validates");
 
     return ok;
@@ -469,7 +470,7 @@ int main()
     ok &= test_decrqm_alternate_modes();
     ok &= test_resize_while_alternate_active();
     ok &= test_resize_normalizes_saved_origin_mode_and_noop();
-    ok &= test_resize_clears_wide_cells_crossing_right_edge();
+    ok &= test_resize_preserves_primary_wide_cells_crossing_right_edge();
     ok &= test_viewport_alternate_screen_policy_hooks();
     return ok ? 0 : 1;
 }

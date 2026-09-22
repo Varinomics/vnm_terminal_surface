@@ -1102,6 +1102,7 @@ void Terminal_screen_model::apply_control_sequence(
                             if (final_byte == 'L') { insert_lines(count); } else
                             if (final_byte == 'S') {
                                 m_pending_wrap = false;
+                                break_soft_wrap_before(m_scroll_bottom + 1);
                                 scroll_up_region(
                                     m_scroll_top,
                                     m_scroll_bottom,
@@ -3299,25 +3300,155 @@ Terminal_screen_model::active_grid_rows() const
     return active_buffer_state().rows;
 }
 
-void Terminal_screen_model::resize_buffer_state(
-    screen_buffer_state_t&             state,
-    terminal_grid_size_t               grid_size)
+void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, int columns)
 {
+    // The packaged ConPTY runtime adopted in September 2026 reflows its active
+    // screen without sending a resize repaint. Padding or clipping our rows leaves
+    // subsequent cursor-addressed output on unrelated text. Reflow the active
+    // primary rows and their cursors together; retained history remains outside
+    // the backend-owned screen and keeps its original source-width projection.
+    const terminal_grid_position_t old_cursor = state.cursor;
+    const saved_cursor_state_t old_saved      = state.saved_cursor;
+    const bool old_pending_wrap              = state.pending_wrap;
+    std::vector<Terminal_screen_row> rows;
+    rows.reserve(state.rows.size());
+    for (std::size_t first = 0; first < state.rows.size();) {
+        std::size_t last = first;
+        while (last + 1U < state.rows.size() && state.rows[last].soft_wrap_columns > 0) {
+            ++last;
+        }
+        std::vector<Cell> cells;
+        std::optional<std::size_t> cursor_offset;
+        std::optional<std::size_t> saved_offset;
+        for (std::size_t index = first; index <= last; ++index) {
+            const Terminal_screen_row& source = state.rows[index];
+            int count = (int)source.cells.size();
+            while (count > 0 && !source.cells[(std::size_t)count - 1U].occupied) {
+                --count;
+            }
+            // Preserve written cells beyond an earlier wide-glyph wrap gap.
+            count = std::max(count, source.soft_wrap_columns);
+            if ((int)index == old_cursor.row) {
+                cursor_offset = cells.size() + old_cursor.column + (old_pending_wrap ? 1U : 0U);
+                count = std::max(count, old_cursor.column + 1);
+            }
+            if (old_saved.valid && (int)index == old_saved.position.row) {
+                saved_offset = cells.size() + old_saved.position.column + (old_saved.pending_wrap ? 1U : 0U);
+                count = std::max(count, old_saved.position.column + 1);
+            }
+            cells.insert(cells.end(), source.cells.begin(), source.cells.begin() + count);
+        }
+
+        // Preserve the identity of a row whose written content does not move.
+        if (first == last && cells.size() <= (std::size_t)columns) {
+            Terminal_screen_row row = std::move(state.rows[first]);
+            row.cells.resize((std::size_t)columns);
+            row.soft_wrap_columns = 0;
+            const int target_row = (int)rows.size();
+            if (cursor_offset.has_value()) {
+                state.cursor = {target_row, std::min((int)*cursor_offset, columns - 1)};
+                state.pending_wrap = *cursor_offset == (std::size_t)columns;
+            }
+            if (saved_offset.has_value()) {
+                state.saved_cursor.position = {target_row, std::min((int)*saved_offset, columns - 1)};
+                state.saved_cursor.pending_wrap = *saved_offset == (std::size_t)columns;
+            }
+            rows.push_back(std::move(row));
+            first = last + 1U;
+            continue;
+        }
+
+        const auto make_row = [&] {
+            Terminal_screen_row row;
+            row.cells.resize((std::size_t)columns);
+            row.retained_line_provenance = state.rows[first].retained_line_provenance;
+            rebase_retained_line_id_preserving_content(row);
+            return row;
+        };
+        Terminal_screen_row row = make_row();
+        int column = 0;
+        const auto map_position = [&](std::size_t offset, int target_column, bool pending_wrap) {
+            if (cursor_offset == offset) {
+                state.cursor       = {(int)rows.size(), target_column};
+                state.pending_wrap = pending_wrap;
+            }
+            if (saved_offset == offset) {
+                state.saved_cursor.position     = {(int)rows.size(), target_column};
+                state.saved_cursor.pending_wrap = pending_wrap;
+            }
+        };
+        for (std::size_t offset = 0; offset < cells.size();) {
+            const int source_width = std::max(1, cells[offset].display_width);
+            const int width        = std::min(source_width, columns);
+            if (column + width > columns) {
+                row.soft_wrap_columns = column;
+                rows.push_back(std::move(row));
+                row = make_row();
+                column = 0;
+            }
+            for (int part = 0; part < source_width; ++part) {
+                map_position(offset + part, column + std::min(part, width - 1), false);
+                if (part < width) {
+                    row.cells[(std::size_t)(column + part)] = cells[offset + part];
+                }
+            }
+            row.cells[(std::size_t)column].display_width = width;
+            column += width;
+            offset += source_width;
+        }
+        map_position(cells.size(), std::min(column, columns - 1), column == columns);
+        rows.push_back(std::move(row));
+        first = last + 1U;
+    }
+    state.rows = std::move(rows);
+}
+
+void Terminal_screen_model::resize_buffer_state(
+    screen_buffer_state_t& state,
+    terminal_grid_size_t   grid_size,
+    bool                   primary)
+{
+    const bool width_changed = state.rows.front().cells.size() != (std::size_t)grid_size.columns;
+    if (primary && width_changed) {
+        reflow_primary_rows(state, grid_size.columns);
+    }
+    else
+    if (width_changed) {
+        state.pending_wrap = false;
+        state.saved_cursor.pending_wrap = false;
+    }
+
+    // Retained history is archival. Resize only the live screen and keep its
+    // cursor visible; growing the screen does not pull archived rows back in.
+    const int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    for (int row = 0; row < prefix_rows; ++row) {
+        if (primary) {
+            append_scrollback_row(state.rows[(std::size_t)row]);
+        }
+    }
+    if (prefix_rows > 0) {
+        state.rows.erase(state.rows.begin(), state.rows.begin() + prefix_rows);
+        state.cursor.row -= prefix_rows;
+        state.saved_cursor.position.row -= prefix_rows;
+    }
     resize_rows(state.rows, grid_size);
     state.cursor.row    = std::clamp(state.cursor.row,    0, grid_size.rows - 1);
     state.cursor.column = std::clamp(state.cursor.column, 0, grid_size.columns - 1);
     if (state.saved_cursor.valid) {
+        const bool saved_row_clamped = state.saved_cursor.position.row < 0 ||
+            state.saved_cursor.position.row >= grid_size.rows;
         state.saved_cursor.position.row =
             std::clamp(state.saved_cursor.position.row, 0, grid_size.rows - 1);
         state.saved_cursor.position.column =
             std::clamp(state.saved_cursor.position.column, 0, grid_size.columns - 1);
-        state.saved_cursor.pending_wrap = false;
-        state.saved_cursor.origin_mode  = false;
+        if (saved_row_clamped) {
+            state.saved_cursor.pending_wrap = false;
+        }
+        state.saved_cursor.origin_mode = false;
     }
     state.scroll_top    = 0;
     state.scroll_bottom = grid_size.rows - 1;
     state.origin_mode   = false;
-    state.pending_wrap  = false;
 }
 
 void Terminal_screen_model::resize_rows(
@@ -3409,6 +3540,7 @@ void Terminal_screen_model::rebase_visible_retained_line_ids_preserving_content(
 void Terminal_screen_model::replace_row_with_erased_retained_line(Terminal_screen_row& row)
 {
     fill_row_with_erased_cells(row.cells);
+    row.soft_wrap_columns = 0;
     replace_retained_line_id(row);
 }
 
@@ -3697,10 +3829,11 @@ bool Terminal_screen_model::apply_grid_resize(
     const terminal_grid_size_t grid_size_before = m_config.grid_size;
     cancel_primary_repaint_recovery_candidate();
     save_active_buffer_state();
-    resize_buffer_state(m_primary_backing.active_grid_state(), grid_size);
-    resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size);
-    m_tab_stops = default_tab_stops(grid_size.columns);
+    // Reflowed prefix rows are sealed into history at their new source width.
     m_config.grid_size = grid_size;
+    resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
+    resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size, false);
+    m_tab_stops = default_tab_stops(grid_size.columns);
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
     if (guard_primary_repaint_recovery) {
@@ -4040,8 +4173,7 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                 ++m_profile_stats.line_wraps_from_text_writes;
             }
 #endif
-            carriage_return();
-            line_feed();
+            wrap_line();
             m_pending_wrap = false;
         }
 
@@ -4134,8 +4266,7 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
                 ++m_profile_stats.line_wraps_from_text_writes;
             }
 #endif
-            carriage_return();
-            line_feed();
+            wrap_line();
             m_pending_wrap = false;
         }
 
@@ -4361,15 +4492,13 @@ void Terminal_screen_model::put_spacing_scalar(QString text, int display_width)
     }
 
     if (m_modes.autowrap && m_pending_wrap) {
-        carriage_return();
-        line_feed();
+        wrap_line();
         m_pending_wrap = false;
     }
 
     if (display_width > m_config.grid_size.columns - m_cursor.column) {
         if (m_modes.autowrap) {
-            carriage_return();
-            line_feed();
+            wrap_line();
         }
         else {
             return;
@@ -4424,9 +4553,9 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
                 screen_row,
                 selection_content_changed);
             mark_dirty(target.row);
-            m_cursor = target;
-            carriage_return();
-            line_feed();
+            m_cursor       = target;
+            m_pending_wrap = false;
+            wrap_line();
             install_cell_span(
                 m_cursor,
                 std::move(combined_text),
@@ -4628,6 +4757,9 @@ void Terminal_screen_model::erase_row_range(int row, int first_column, int last_
     }
 
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+    if (last_column == m_config.grid_size.columns - 1) {
+        screen_row.soft_wrap_columns = 0;
+    }
     const Cell replacement = erased_cell();
     bool       selection_content_changed = false;
 
@@ -4769,6 +4901,7 @@ void Terminal_screen_model::erase_visible_screen()
         else {
             const std::vector<Cell> before_cells = screen_row.cells;
             fill_row_with_erased_cells(screen_row.cells);
+            screen_row.soft_wrap_columns = 0;
             advance_row_content_generation_if_changed(screen_row, before_cells);
         }
     }
@@ -4943,12 +5076,20 @@ void Terminal_screen_model::delete_cells(int count)
     finalize_row_cell_mutation(screen_row, before_cells);
 }
 
+void Terminal_screen_model::break_soft_wrap_before(int row)
+{
+    if (row > 0) {
+        active_grid_rows()[(std::size_t)row - 1U].soft_wrap_columns = 0;
+    }
+}
+
 void Terminal_screen_model::insert_lines(int count)
 {
     if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom) {
         return;
     }
 
+    break_soft_wrap_before(m_cursor.row);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, m_scroll_bottom - m_cursor.row + 1);
     std::move_backward(
@@ -4960,6 +5101,7 @@ void Terminal_screen_model::insert_lines(int count)
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(row)]);
     }
 
+    break_soft_wrap_before(m_scroll_bottom + 1);
     m_pending_wrap = false;
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
@@ -4970,8 +5112,10 @@ void Terminal_screen_model::delete_lines(int count)
         return;
     }
 
+    break_soft_wrap_before(m_cursor.row);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, m_scroll_bottom - m_cursor.row + 1);
+    break_soft_wrap_before(m_scroll_bottom + 1);
     std::move(
         active_grid_rows().begin() + m_cursor.row + count,
         active_grid_rows().begin() + m_scroll_bottom + 1,
@@ -5536,6 +5680,7 @@ void Terminal_screen_model::scroll_up_region(
     bool   append_scrollback,
     int    count)
 {
+    break_soft_wrap_before(top);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, bottom - top + 1);
     std::optional<terminal_hyperlink_identity_by_id_t> active_identity_keys_by_id;
@@ -5583,6 +5728,7 @@ void Terminal_screen_model::scroll_up_region(
 
 void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
 {
+    break_soft_wrap_before(top);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, bottom - top + 1);
     for (int step = 0; step < count; ++step) {
@@ -5593,6 +5739,7 @@ void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(top)]);
     }
 
+    break_soft_wrap_before(bottom + 1);
     mark_dirty_rows(top, bottom);
 }
 
@@ -6132,6 +6279,20 @@ void Terminal_screen_model::carriage_return()
 }
 
 void Terminal_screen_model::line_feed()
+{
+    active_grid_rows()[(std::size_t)m_cursor.row].soft_wrap_columns = 0;
+    advance_row();
+}
+
+void Terminal_screen_model::wrap_line()
+{
+    active_grid_rows()[(std::size_t)m_cursor.row].soft_wrap_columns =
+        m_pending_wrap ? m_config.grid_size.columns : m_cursor.column;
+    carriage_return();
+    advance_row();
+}
+
+void Terminal_screen_model::advance_row()
 {
     mark_cursor_dirty();
     m_pending_wrap = false;
@@ -7310,6 +7471,9 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
     retained_row_record_t record;
     record.row                   = screen_row;
     record.metadata.source_width = m_config.grid_size.columns;
+    record.metadata.wrap_state = screen_row.soft_wrap_columns > 0
+        ? Terminal_retained_row_wrap_state::SOFT_WRAP
+        : Terminal_retained_row_wrap_state::HARD_BOUNDARY;
     if (source != Terminal_retained_line_provenance_source::TERMINAL_STORAGE) {
         rebase_retained_line_id_preserving_content(record.row, source);
     }

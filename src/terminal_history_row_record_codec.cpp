@@ -458,6 +458,8 @@ std::optional<std::uint16_t> wrap_state_code(Terminal_retained_row_wrap_state wr
     switch (wrap_state) {
         case Terminal_retained_row_wrap_state::HARD_BOUNDARY:
             return 0U;
+        case Terminal_retained_row_wrap_state::SOFT_WRAP:
+            return 1U;
     }
 
     return std::nullopt;
@@ -468,6 +470,8 @@ std::optional<Terminal_retained_row_wrap_state> wrap_state_from_code(std::uint16
     switch (code) {
         case 0U:
             return Terminal_retained_row_wrap_state::HARD_BOUNDARY;
+        case 1U:
+            return Terminal_retained_row_wrap_state::SOFT_WRAP;
         default:
             return std::nullopt;
     }

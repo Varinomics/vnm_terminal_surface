@@ -129,6 +129,7 @@ enum class Terminal_retained_row_style_reference
 enum class Terminal_retained_row_wrap_state
 {
     HARD_BOUNDARY,
+    SOFT_WRAP,
 };
 
 struct terminal_retained_row_record_metadata_t
@@ -714,6 +715,9 @@ private:
     {
         std::vector<Cell>                  cells;
         Terminal_retained_line_provenance  retained_line_provenance;
+        // Zero is a hard boundary; otherwise this many cells continue into
+        // the next row. A wide glyph can leave an unused cell at the margin.
+        int                               soft_wrap_columns = 0;
     };
 
     struct retained_row_record_t
@@ -984,7 +988,9 @@ private:
     const screen_buffer_state_t& active_buffer_state() const;
     std::vector<Terminal_screen_row>& active_grid_rows();
     const std::vector<Terminal_screen_row>& active_grid_rows() const;
-    void resize_buffer_state(screen_buffer_state_t& state, terminal_grid_size_t grid_size);
+    void reflow_primary_rows(screen_buffer_state_t& state, int columns);
+    void resize_buffer_state(
+        screen_buffer_state_t& state, terminal_grid_size_t grid_size, bool primary);
     void resize_rows(std::vector<Terminal_screen_row>& rows, terminal_grid_size_t grid_size);
     std::uint64_t next_retained_line_id();
     void replace_retained_line_id(
@@ -1203,6 +1209,8 @@ private:
         Terminal_screen_row&           screen_row,
         const std::vector<Cell>&       before_cells);
 
+    void break_soft_wrap_before(int row);
+
     void insert_lines(
         int                            count);
 
@@ -1309,6 +1317,8 @@ private:
 
     void carriage_return();
     void line_feed();
+    void wrap_line();
+    void advance_row();
     void backspace();
     void horizontal_tab();
     void mark_cursor_dirty();

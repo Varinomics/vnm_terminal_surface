@@ -3760,10 +3760,129 @@ bool test_post_birth_failure_keeps_native_custody(const QString& fixture_path)
     return ok;
 }
 
+
+bool test_native_cmd_resize()
+{
+    auto launch = launch_config(qEnvironmentVariable("ComSpec"),
+        {QStringLiteral("/d"), QStringLiteral("/q"), QStringLiteral("/k"),
+         QStringLiteral("prompt PROMPT$G")});
+    launch.initial_grid_size = {12, 40};
+    std::mutex event_mutex;
+    std::condition_variable event_changed;
+    unsigned event_generation = 0U;
+    term::Terminal_session_config config;
+    config.trace_output_chunk_limit = 1024U;
+    config.backend_event_notifier = [&] {
+        std::lock_guard lock(event_mutex);
+        ++event_generation;
+        event_changed.notify_all();
+    };
+    term::Terminal_session session(term::make_windows_conpty_backend(), config);
+    if (!check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+            "native cmd resize starts"))
+    {
+        return false;
+    }
+    const auto output = [&] {
+        QByteArray bytes;
+        for (const auto& chunk : session.output_chunks()) {
+            bytes += chunk;
+        }
+        return bytes;
+    };
+    const auto wait_for = [&](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        for (;;) {
+            unsigned observed;
+            {
+                std::lock_guard lock(event_mutex);
+                observed = event_generation;
+            }
+            session.process_backend_callback_events();
+            if (predicate()) {
+                return true;
+            }
+            std::unique_lock lock(event_mutex);
+            if (!event_changed.wait_until(lock, deadline, [&] { return event_generation != observed; })) {
+                return false;
+            }
+        }
+    };
+    const auto cursor_row_text = [&] {
+        const auto snapshot = session.latest_render_snapshot();
+        QString text(snapshot->grid_size.columns, QChar(u' '));
+        for (const auto& cell : snapshot->cells) {
+            if (cell.position.row == snapshot->cursor.position.row) {
+                text.replace(cell.position.column, 1, cell.text.to_qstring());
+            }
+        }
+        return text.trimmed();
+    };
+    bool ok = check(wait_for([&] { return output().endsWith("PROMPT>"); }),
+        "native cmd publishes the initial prompt");
+    ok &= check(session.write_user_bytes(
+            "echo 012345678901234567890123456789012345678901234567890123456789\r").code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "native cmd accepts a command with wrapped output");
+    ok &= check(wait_for([&] { return count_occurrences(output(), "\r\nPROMPT>") == 2U; }),
+        "native cmd completes its wrapped output command");
+    ok &= check(session.resize(QSizeF(600, 240), {12, 60}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "native cmd width resize is accepted");
+    ok &= check(session.latest_render_snapshot()->cursor.position.row == 5 &&
+            cursor_row_text() == QStringLiteral("PROMPT>"),
+        "session reflows the native prompt when ConPTY supplies no repaint");
+    ok &= check(session.write_user_bytes("hello").code == term::Terminal_session_result_code::ACCEPTED,
+        "native cmd accepts input after width resize");
+    ok &= check(wait_for([&] { return output().contains("hello"); }),
+        "native cmd echoes input after width resize");
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>hello"),
+        "native cursor and echoed text remain beside the prompt after width resize");
+    ok &= check(session.resize(QSizeF(300, 240), {12, 30}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "native cmd width shrink is accepted");
+    ok &= check(session.write_user_bytes("narrow").code == term::Terminal_session_result_code::ACCEPTED,
+        "native cmd accepts input after width shrink");
+    ok &= check(wait_for([&] { return output().contains("narrow"); }),
+        "native cmd echoes input after width shrink");
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>hellonarrow"),
+        "native input remains attached to its prompt after width shrink");
+    ok &= check(session.resize(QSizeF(300, 80), {4, 30}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "native cmd height shrink is accepted");
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>hellonarrow"),
+        "height shrink retains the native prompt and current input");
+    ok &= check(session.write_user_bytes("world").code == term::Terminal_session_result_code::ACCEPTED,
+        "native cmd accepts input after height shrink");
+    ok &= check(wait_for([&] { return output().contains("world"); }),
+        "native cmd echoes input after height shrink");
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>hellonarrowworld"),
+        "native input remains attached to its prompt after height shrink");
+    ok &= check(session.resize(QSizeF(300, 240), {12, 30}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "native cmd height growth is accepted");
+    ok &= check(session.write_user_bytes("done").code == term::Terminal_session_result_code::ACCEPTED,
+        "native cmd accepts input after height growth");
+    ok &= check(wait_for([&] { return output().contains("done"); }),
+        "native cmd echoes input after height growth");
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>hellonarrowworlddone"),
+        "native input remains attached to its prompt after height growth");
+    ok &= check(session.terminate().code == term::Terminal_session_result_code::ACCEPTED,
+        "native cmd resize session terminates");
+    ok &= check(wait_for([&] { return session.exit_status().has_value(); }),
+        "native cmd resize session reports termination");
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-resize") {
+        bool ok = test_native_cmd_resize();
+        ok &= wait_for_console_host_children_to_exit("native cmd resize");
+        return ok ? 0 : 1;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--native-session") {
         bool ok = vnm_terminal::test_helpers::check_native_session_lifecycle(
             term::make_windows_conpty_backend, launch_config(QString::fromLocal8Bit(argv[2]), {}));
