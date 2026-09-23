@@ -207,8 +207,8 @@ bool test_cursor_and_navigation_modes()
     ok &= check_bytes_equal(
         encode(Qt::Key_Enter, Qt::ShiftModifier | Qt::KeypadModifier),
 #if defined(Q_OS_WIN)
-        bytes_from_hex("1b5b31333b32383b31333b313b31363b315f"),
-        "Shift+keypad Enter writes Win32 key record on Windows");
+        bytes_from_hex("1b5b31333b32383b31333b313b3237323b315f"),
+        "Shift+keypad Enter writes an enhanced Win32 key record on Windows");
 #else
         bytes_from_hex("0a"),
         "Shift+keypad Enter writes LF for multiline terminal prompts");
@@ -293,8 +293,8 @@ bool test_cursor_and_navigation_modes()
     ok &= check_bytes_equal(
         encode(Qt::Key_Backtab, Qt::NoModifier),
 #if defined(Q_OS_WIN)
-        bytes_from_hex("1b5b393b31353b393b313b303b315f"),
-        "Backtab uses a native Win32 key event on Windows");
+        bytes_from_hex("1b5b393b31353b393b313b31363b315f"),
+        "Backtab retains reverse-tab identity without an explicit Shift modifier");
 #else
         bytes_from_hex("1b5b5a"),
         "Backtab writes CSI Z");
@@ -356,6 +356,53 @@ bool test_cursor_and_navigation_modes()
 #endif
 
     return ok;
+}
+
+bool test_windows_native_scan_identity()
+{
+#if defined(Q_OS_WIN)
+    const auto encode_native = [](
+        int key, Qt::KeyboardModifiers modifiers, quint32 scan, quint32 vk,
+        const QString& text, term::Terminal_input_mode_state modes = {})
+    {
+        QKeyEvent event(QEvent::KeyPress, key, modifiers, scan, vk, 0U, text);
+        return term::encode_terminal_key_event(event, modes);
+    };
+
+    bool ok = true;
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Up, Qt::NoModifier, 0xe048U, 38U, {}),
+        QByteArrayLiteral("\x1b[38;72;0;1;256;1_"),
+        "Qt extended scan prefix becomes ENHANCED_KEY, not part of the scan byte");
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Up, Qt::KeypadModifier, 0x48U, 38U, {}),
+        QByteArrayLiteral("\x1b[38;72;0;1;0;1_"),
+        "native NumLock-off keypad Up is not an enhanced navigation key");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Up, Qt::KeypadModifier),
+        QByteArrayLiteral("\x1b[38;72;0;1;0;1_"),
+        "synthetic keypad navigation retains its keypad identity");
+
+    term::Terminal_input_mode_state modes;
+    modes.application_keypad = true;
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Enter, Qt::KeypadModifier, 0xe01cU, 13U,
+            QStringLiteral("\r"), modes),
+        QByteArrayLiteral("\x1b[13;28;13;1;256;1_"),
+        "native application keypad Enter has a scan byte and enhanced identity");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Enter, Qt::KeypadModifier, QStringLiteral("\r"), modes),
+        QByteArrayLiteral("\x1b[13;28;13;1;256;1_"),
+        "synthetic application keypad Enter is enhanced");
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Enter, Qt::KeypadModifier | Qt::ShiftModifier,
+            0xe01cU, 13U, QStringLiteral("\r")),
+        QByteArrayLiteral("\x1b[13;28;13;1;272;1_"),
+        "already-framed Shift+keypad Enter uses the same native scan conversion");
+    return ok;
+#else
+    return true;
+#endif
 }
 
 bool test_keypad_policy()
@@ -1055,6 +1102,7 @@ int main(int argc, char** argv)
     bool ok = true;
     ok &= test_control_and_altgr();
     ok &= test_cursor_and_navigation_modes();
+    ok &= test_windows_native_scan_identity();
     ok &= test_keypad_policy();
     ok &= test_paste_framing_policy();
     ok &= test_paste_sanitization();

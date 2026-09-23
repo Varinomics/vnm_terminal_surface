@@ -1574,11 +1574,11 @@ int run_escape_input_reader(const QString& observation_path)
         return 1;
     }
 
-    std::cout << "escape-input-reader-ready\n" << std::flush;
     QFile observation(observation_path);
     if (!observation.open(QIODevice::WriteOnly | QIODevice::Append)) {
         return 1;
     }
+    std::cout << "escape-input-reader-ready\n" << std::flush;
     for (;;) {
         INPUT_RECORD records[64];
         DWORD        count = 0U;
@@ -1779,7 +1779,9 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
 
     // Native key-event frames must retain key identity for classic console
     // readers, while VT-input readers receive the corresponding VT byte stream.
-    // The split-frame case records the package parser's write-boundary limit.
+    // A fresh parser can consume a one-byte ESC before it knows the sender
+    // supports native frames. The prefix-only case below characterizes that
+    // state; it is not a complete split-frame test.
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "plain Escape reaches a fresh native console reader",
@@ -1788,7 +1790,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         {native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
-        "a split native frame emits ESC and [ as separate key events",
+        "fresh standalone ESC and [ writes become separate native strokes",
         {escape.left(1), escape.mid(1, 1)},
         true,
         {native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0) +
@@ -1908,6 +1910,43 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         {shift_return, shift_f3},
         true,
         {decode_hex("0d"), decode_hex("1b5b313b3252")});
+
+    // Complete the entire first frame, not merely its first two characters.
+    // This characterizes the package's fresh-parser behavior; a runtime that
+    // changes that behavior needs a deliberate expectation update.
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "a fresh three-part first frame is exposed literally to the VT reader",
+        {escape.left(1), escape.mid(1, 1), escape.mid(2)},
+        true,
+        {escape.left(1), escape.mid(1, 1), escape.mid(2)});
+
+    // Once one complete frame has been recognized, test every two-part split
+    // of a COMPLETE subsequent frame. A prefix must produce no observations;
+    // its suffix must complete exactly one frame. Do this in one child per
+    // input mode so this matrix does not multiply process-start/stop overhead.
+    for (const bool vt_reader : {false, true}) {
+        std::vector<QByteArray> writes{escape};
+        const QByteArray observation = vt_reader
+            ? QByteArrayLiteral("\x1b")
+            : native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0);
+        std::vector<QByteArray> observations{observation};
+        for (qsizetype split = 1; split < escape.size(); ++split) {
+            writes.push_back(escape.left(split));
+            observations.emplace_back();
+            writes.push_back(escape.mid(split));
+            observations.push_back(observation);
+        }
+        ok &= run_case(
+            vt_reader ? QStringLiteral("--escape-vt-input-reader")
+                      : QStringLiteral("--escape-input-reader"),
+            vt_reader ? "activated parser preserves every complete-frame split in VT mode"
+                      : "activated parser preserves every complete-frame split in native mode",
+            writes,
+            true,
+            observations);
+    }
+
     return ok;
 }
 

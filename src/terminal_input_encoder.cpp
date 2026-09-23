@@ -41,7 +41,6 @@ constexpr qsizetype k_bracketed_paste_framing_bytes =
 
 #if defined(Q_OS_WIN)
 constexpr int k_win32_vk_return          = 13;
-constexpr int k_win32_scan_return        = 28;
 constexpr int k_win32_shift_pressed      = 0x0010;
 constexpr int k_win32_vk_escape          = 27;
 constexpr int k_win32_scan_escape        = 1;
@@ -175,14 +174,56 @@ QByteArray win32_input_key_event_bytes(
     return bytes;
 }
 
+int windows_key_scan_code(const QKeyEvent& event, int virtual_key)
+{
+    // Qt's Windows mapper stores the E0 prefix in the high byte. Console
+    // records carry the scan byte and ENHANCED_KEY separately.
+    if (event.nativeScanCode() != 0U) {
+        return static_cast<int>(event.nativeScanCode() & 0xffU);
+    }
+    if (virtual_key == VK_PACKET) {
+        return 0;
+    }
+    return static_cast<int>(MapVirtualKeyW(
+        static_cast<UINT>(virtual_key), MAPVK_VK_TO_VSC) & 0xffU);
+}
+
+bool windows_key_uses_enhanced_flag(const QKeyEvent& event, int virtual_key)
+{
+    // A native non-extended scan also distinguishes NumLock-off navigation
+    // from the dedicated navigation cluster, even though their VKs coincide.
+    if (event.nativeScanCode() != 0U) {
+        return (event.nativeScanCode() & 0xff00U) == 0xe000U;
+    }
+
+    const bool keypad = (event.modifiers() & Qt::KeypadModifier) != Qt::NoModifier;
+    switch (virtual_key) {
+        case VK_RETURN:
+            return event.key() == Qt::Key_Enter || keypad;
+        case VK_DIVIDE:
+            return true;
+        case VK_PRIOR:
+        case VK_NEXT:
+        case VK_END:
+        case VK_HOME:
+        case VK_LEFT:
+        case VK_UP:
+        case VK_RIGHT:
+        case VK_DOWN:
+        case VK_INSERT:
+        case VK_DELETE:
+            return !keypad;
+        default:
+            return false;
+    }
+}
+
 QByteArray win32_shift_enter_bytes(const QKeyEvent& event)
 {
     const int virtual_key = event.nativeVirtualKey() != 0U
         ? static_cast<int>(event.nativeVirtualKey())
         : k_win32_vk_return;
-    const int scan_code = event.nativeScanCode() != 0U
-        ? static_cast<int>(event.nativeScanCode())
-        : k_win32_scan_return;
+    const int scan_code = windows_key_scan_code(event, virtual_key);
     const int unicode_character = event.text().isEmpty()
         ? '\r'
         : event.text().front().unicode();
@@ -191,7 +232,9 @@ QByteArray win32_shift_enter_bytes(const QKeyEvent& event)
         scan_code,
         unicode_character,
         1,
-        k_win32_shift_pressed,
+        k_win32_shift_pressed |
+            (windows_key_uses_enhanced_flag(event, virtual_key)
+                ? k_win32_enhanced_key : 0),
         std::max(1, event.count()));
 }
 
@@ -278,26 +321,6 @@ int windows_virtual_key(const QKeyEvent& event)
     }
 }
 
-bool windows_key_uses_enhanced_flag(int virtual_key)
-{
-    switch (virtual_key) {
-        case VK_PRIOR:
-        case VK_NEXT:
-        case VK_END:
-        case VK_HOME:
-        case VK_LEFT:
-        case VK_UP:
-        case VK_RIGHT:
-        case VK_DOWN:
-        case VK_INSERT:
-        case VK_DELETE:
-        case VK_DIVIDE:
-            return true;
-        default:
-            return false;
-    }
-}
-
 QByteArray win32_key_event_bytes(const QKeyEvent& event)
 {
     const int virtual_key = windows_virtual_key(event);
@@ -305,14 +328,11 @@ QByteArray win32_key_event_bytes(const QKeyEvent& event)
         return {};
     }
 
-    const int scan_code = event.nativeScanCode() != 0U
-        ? static_cast<int>(event.nativeScanCode())
-        : virtual_key == VK_PACKET
-            ? 0
-            : static_cast<int>(MapVirtualKeyW(
-                static_cast<UINT>(virtual_key), MAPVK_VK_TO_VSC));
+    const int scan_code = windows_key_scan_code(event, virtual_key);
     int control_key_state = 0;
-    if ((event.modifiers() & Qt::ShiftModifier) != Qt::NoModifier) {
+    if ((event.modifiers() & Qt::ShiftModifier) != Qt::NoModifier ||
+        event.key() == Qt::Key_Backtab)
+    {
         control_key_state |= k_win32_shift_pressed;
     }
     if ((event.modifiers() & Qt::AltModifier) != Qt::NoModifier) {
@@ -321,7 +341,7 @@ QByteArray win32_key_event_bytes(const QKeyEvent& event)
     if ((event.modifiers() & Qt::ControlModifier) != Qt::NoModifier) {
         control_key_state |= k_win32_left_ctrl_pressed;
     }
-    if (windows_key_uses_enhanced_flag(virtual_key)) {
+    if (windows_key_uses_enhanced_flag(event, virtual_key)) {
         control_key_state |= k_win32_enhanced_key;
     }
 
