@@ -1579,6 +1579,8 @@ int run_escape_input_reader(const QString& observation_path)
     bool pending_ack_key_up = false;
     bool pending_ack_completion = false;
     DWORD pending_ack_control_state = 0U;
+    const WORD fallback_f12_scan = static_cast<WORD>(
+        MapVirtualKeyW(VK_F12, MAPVK_VK_TO_VSC) & 0xffU);
     std::cout << "escape-input-reader-ready\n" << std::flush;
     for (;;) {
         INPUT_RECORD records[64];
@@ -1596,7 +1598,7 @@ int run_escape_input_reader(const QString& observation_path)
             const KEY_EVENT_RECORD& key = record.Event.KeyEvent;
             const bool ack_key =
                 key.wVirtualKeyCode == VK_F12 &&
-                key.wVirtualScanCode == 88U &&
+                key.wVirtualScanCode == fallback_f12_scan &&
                 key.wRepeatCount == 1U &&
                 key.uChar.UnicodeChar == 0 &&
                 (key.dwControlKeyState == SHIFT_PRESSED ||
@@ -1792,6 +1794,16 @@ QByteArray native_key_stroke_records(
         native_key_record('U', virtual_key, scan_code, 1, key_up_unicode, state);
 }
 
+QByteArray packet_key_stroke_records(const QByteArray& text)
+{
+    QByteArray records;
+    for (const char character : text) {
+        records += native_key_stroke_records(
+            VK_PACKET, 0, static_cast<unsigned char>(character), 0);
+    }
+    return records;
+}
+
 bool reconstruct_native_record_text(
     const QByteArray& journal, QString& text, int& down_record_count)
 {
@@ -1847,8 +1859,23 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         encoded_key_event(Qt::Key_Escape, Qt::AltModifier);
     const QByteArray up = encoded_key_event(Qt::Key_Up, Qt::NoModifier);
     const QByteArray f12 = encoded_key_event(Qt::Key_F12, Qt::NoModifier);
+    const auto fallback_scan_code = [](UINT virtual_key) {
+        return static_cast<int>(MapVirtualKeyW(
+            virtual_key, MAPVK_VK_TO_VSC) & 0xffU);
+    };
+    const int return_scan = fallback_scan_code(VK_RETURN);
+    const int escape_scan = fallback_scan_code(VK_ESCAPE);
+    const int tab_scan = fallback_scan_code(VK_TAB);
+    const int up_scan = fallback_scan_code(VK_UP);
+    const int f3_scan = fallback_scan_code(VK_F3);
+    const int f12_scan = fallback_scan_code(VK_F12);
+    const int letter_a_scan = fallback_scan_code('A');
+    const int alt_bracket_scan = fallback_scan_code(VK_OEM_4);
     const QByteArray alt_bracket = encoded_key_event(
         Qt::Key_BracketLeft, Qt::AltModifier, QStringLiteral("["));
+    const QByteArray native_alt_bracket = encoded_native_key_event(
+        Qt::Key_BracketLeft, Qt::AltModifier, 0x1aU, VK_OEM_4, 0x00000004U,
+        QStringLiteral("["));
     const QByteArray letter_a = encoded_key_event(
         Qt::Key_A, Qt::ShiftModifier, QStringLiteral("A"));
     const QByteArray shift_f3 = encoded_key_event(Qt::Key_F3, Qt::ShiftModifier);
@@ -1894,20 +1921,52 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     const QByteArray control_shift_tab = encoded_native_key_event(
         Qt::Key_Tab, Qt::ShiftModifier | Qt::ControlModifier,
         0x0fU, VK_TAB, 0x00000003U, QStringLiteral("\t"));
-    const QByteArray alt_shift_tab = encoded_key_event(
-        Qt::Key_Tab, Qt::ShiftModifier | Qt::AltModifier, QStringLiteral("\t"));
+    const QByteArray alt_shift_tab = encoded_native_key_event(
+        Qt::Key_Tab, Qt::ShiftModifier | Qt::AltModifier,
+        0x0fU, VK_TAB, 0x00000005U, QStringLiteral("\t"));
     const QByteArray backtab = encoded_key_event(Qt::Key_Backtab, Qt::NoModifier);
+    const QByteArray control_backtab = encoded_key_event(
+        Qt::Key_Backtab, Qt::ControlModifier, QStringLiteral("\t"));
+    const QByteArray alt_backtab = encoded_key_event(
+        Qt::Key_Backtab, Qt::AltModifier, QStringLiteral("\t"));
+    const QByteArray control_alt_backtab = encoded_key_event(
+        Qt::Key_Backtab, Qt::ControlModifier | Qt::AltModifier, QStringLiteral("\t"));
+    const QByteArray right_alt_x = encoded_native_key_event(
+        Qt::Key_X, Qt::AltModifier, 45U, static_cast<quint32>('X'),
+        0x00000040U, QStringLiteral("x"));
+    const QByteArray both_alt_x = encoded_native_key_event(
+        Qt::Key_X, Qt::AltModifier, 45U, static_cast<quint32>('X'),
+        0x00000044U, QStringLiteral("x"));
+    const QByteArray left_alt_x = encoded_native_key_event(
+        Qt::Key_X, Qt::AltModifier, 45U, static_cast<quint32>('X'),
+        0x00000004U, QStringLiteral("x"));
+    const QByteArray group_switch_right_alt_x = encoded_native_key_event(
+        Qt::Key_X, Qt::AltModifier | Qt::GroupSwitchModifier, 45U,
+        static_cast<quint32>('X'), 0x00000040U, QStringLiteral("x"));
+    const QByteArray control_alt_return = encoded_native_key_event(
+        Qt::Key_Return, Qt::ControlModifier | Qt::AltModifier,
+        0x1cU, VK_RETURN, 0x00000006U, QStringLiteral("\r"));
+    const QByteArray control_alt_return_lf = encoded_native_key_event(
+        Qt::Key_Return, Qt::ControlModifier | Qt::AltModifier,
+        0x1cU, VK_RETURN, 0x00000006U, QStringLiteral("\n"));
+    const QByteArray alt_return = encoded_native_key_event(
+        Qt::Key_Return, Qt::AltModifier,
+        0x1cU, VK_RETURN, 0x00000004U, QStringLiteral("\r"));
     term::Terminal_input_mode_state application_keypad_modes;
     application_keypad_modes.application_keypad = true;
-    const int keypad_comma_scan = static_cast<int>(
-        MapVirtualKeyW(VK_SEPARATOR, MAPVK_VK_TO_VSC) & 0xffU);
-    const int keypad_equal_scan = static_cast<int>(
-        MapVirtualKeyW(VK_OEM_NEC_EQUAL, MAPVK_VK_TO_VSC) & 0xffU);
+    const int keypad_comma_scan = fallback_scan_code(VK_SEPARATOR);
     const QByteArray application_keypad_comma = encoded_key_event(
         Qt::Key_Comma, Qt::KeypadModifier, QStringLiteral(","), application_keypad_modes);
     const QByteArray application_keypad_equal = encoded_key_event(
         Qt::Key_Equal, Qt::KeypadModifier, QStringLiteral("="), application_keypad_modes);
-    const QByteArray native_escape = native_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0);
+    const QByteArray native_application_keypad_equal = encoded_native_key_event(
+        Qt::Key_Equal, Qt::KeypadModifier, 0x59U, VK_OEM_NEC_EQUAL, 0U,
+        QStringLiteral("="));
+    const QByteArray control_alt_return_packet_input =
+        native_key_stroke_bytes(VK_PACKET, 0, 0x1b, 0) +
+        native_key_stroke_bytes(VK_PACKET, 0, '\r', 0);
+    const QByteArray native_escape = native_key_stroke_bytes(
+        VK_ESCAPE, escape_scan, VK_ESCAPE, 0);
     const QByteArray native_alt_escape = native_escape + native_escape;
     const QByteArray barrier_sentinel =
         encoded_key_event(Qt::Key_F12, Qt::ShiftModifier);
@@ -1929,7 +1988,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     QByteArray last_observed_journal;
     bool ok = true;
     ok &= check(shift_return == native_key_stroke_bytes(
-            VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED),
+            VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED),
         "Escape transport probe uses native Win32 Shift+Return framing");
     ok &= check(escape == native_escape,
         "Escape transport probe uses native Win32 Escape framing");
@@ -1940,18 +1999,19 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     ok &= check(alt_escape == native_alt_escape,
         "Escape transport probe frames Alt+Escape as two Escape events");
     ok &= check(alt_bracket == native_key_stroke_bytes(
-            VK_OEM_4, 26, '[', LEFT_ALT_PRESSED),
+            VK_OEM_4, alt_bracket_scan, '[', LEFT_ALT_PRESSED),
         "Escape transport probe uses a balanced native key stroke for Alt+[");
-    ok &= check(letter_a == native_key_stroke_bytes('A', 30, 'A', SHIFT_PRESSED),
+    ok &= check(letter_a == native_key_stroke_bytes(
+            'A', letter_a_scan, 'A', SHIFT_PRESSED),
         "Escape transport probe encodes uppercase A without synthetic Shift key events");
     ok &= check(shift_f3 == native_key_stroke_bytes(
-            VK_F3, 61, 0, SHIFT_PRESSED),
+            VK_F3, f3_scan, 0, SHIFT_PRESSED),
         "Escape transport probe uses a native key frame for Shift+F3");
     ok &= check(barrier_sentinel == native_key_stroke_bytes(
-            VK_F12, 88, 0, SHIFT_PRESSED),
+            VK_F12, f12_scan, 0, SHIFT_PRESSED),
         "Escape transport child-ack barrier uses a framed Shift+F12");
     ok &= check(completion_sentinel == native_key_stroke_bytes(
-            VK_F12, 88, 0, SHIFT_PRESSED | LEFT_CTRL_PRESSED),
+            VK_F12, f12_scan, 0, SHIFT_PRESSED | LEFT_CTRL_PRESSED),
         "Escape transport completion uses a framed Ctrl+Shift+F12");
     if (!ok) {
         return false;
@@ -2090,7 +2150,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "isolated Escape reaches the child after Shift+Return",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
             {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
         },
         Escape_input_delivery::PACED,
@@ -2100,7 +2160,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "coalesced Shift+Return and Escape reach the child",
         {{
             {shift_return + escape},
-            native_key_stroke_records(VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED) +
+            native_key_stroke_records(VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED) +
                 native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0),
         }},
         Escape_input_delivery::PACED,
@@ -2110,7 +2170,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Ctrl+[ reaches the child after Shift+Return",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
             {{control_bracket}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
         },
         Escape_input_delivery::PACED,
@@ -2120,7 +2180,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Ctrl+3 reaches the child after Shift+Return",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
             {{control_three}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
         },
         Escape_input_delivery::PACED,
@@ -2130,7 +2190,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Alt+Escape reaches the child after Shift+Return",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
             {{alt_escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0) +
                 native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
         },
@@ -2141,7 +2201,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "separate Escape presses produce separate balanced native strokes",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
             {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
             {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
         },
@@ -2152,8 +2212,8 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Up reaches the child after Shift+Return",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
-            {{up}, native_key_stroke_records(VK_UP, 72, 0, ENHANCED_KEY)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
+            {{up}, native_key_stroke_records(VK_UP, up_scan, 0, ENHANCED_KEY)},
         },
         Escape_input_delivery::PACED,
         0U);
@@ -2162,8 +2222,8 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "F12 reaches the child after Shift+Return",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
-            {{f12}, native_key_stroke_records(VK_F12, 88, 0, 0)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
+            {{f12}, native_key_stroke_records(VK_F12, f12_scan, 0, 0)},
         },
         Escape_input_delivery::PACED,
         0U);
@@ -2172,11 +2232,19 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Alt+[ and uppercase A remain separate native key events",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
             {{alt_bracket}, native_key_stroke_records(
-                VK_OEM_4, 26, '[', LEFT_ALT_PRESSED)},
-            {{letter_a}, native_key_stroke_records('A', 30, 'A', SHIFT_PRESSED)},
+                VK_OEM_4, alt_bracket_scan, '[', LEFT_ALT_PRESSED)},
+            {{letter_a}, native_key_stroke_records(
+                'A', letter_a_scan, 'A', SHIFT_PRESSED)},
         },
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Alt+[ with explicit native fields retains its physical OEM-4 identity",
+        {{{native_alt_bracket}, native_key_stroke_records(
+            VK_OEM_4, 0x1a, '[', LEFT_ALT_PRESSED)}},
         Escape_input_delivery::PACED,
         0U);
     ok &= run_case(
@@ -2184,8 +2252,8 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Shift+F3 reaches a native reader as an F3 key record",
         {
             {{shift_return}, native_key_stroke_records(
-                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
-            {{shift_f3}, native_key_stroke_records(VK_F3, 61, 0, SHIFT_PRESSED)},
+                VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
+            {{shift_f3}, native_key_stroke_records(VK_F3, f3_scan, 0, SHIFT_PRESSED)},
         },
         Escape_input_delivery::PACED,
         0U);
@@ -2210,7 +2278,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "ordinary unmodified A reaches the native reader as a balanced key stroke",
         {{
             {ordinary_letter},
-            native_key_stroke_records('A', 30, 'a', 0),
+            native_key_stroke_records('A', letter_a_scan, 'a', 0),
         }},
         Escape_input_delivery::PACED,
         0U);
@@ -2219,7 +2287,7 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Alt+A reaches the native reader with the left-Alt state on both records",
         {{
             {ordinary_alt_text},
-            native_key_stroke_records('A', 30, 'a', LEFT_ALT_PRESSED),
+            native_key_stroke_records('A', letter_a_scan, 'a', LEFT_ALT_PRESSED),
         }},
         Escape_input_delivery::PACED,
         0U);
@@ -2294,26 +2362,149 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         QStringLiteral("--escape-input-reader"),
         "plain Tab remains a text key while Shift+Tab and Backtab are balanced",
         {
-            {{plain_tab}, native_key_stroke_records(VK_TAB, 15, '\t', 0, '\t')},
+            {{plain_tab}, native_key_stroke_records(VK_TAB, tab_scan, '\t', 0, '\t')},
             {{shift_tab}, native_key_stroke_records(
-                VK_TAB, 15, '\t', SHIFT_PRESSED)},
+                VK_TAB, tab_scan, '\t', SHIFT_PRESSED)},
             {{backtab}, native_key_stroke_records(
-                VK_TAB, 15, '\t', SHIFT_PRESSED)},
+                VK_TAB, tab_scan, '\t', SHIFT_PRESSED)},
         },
         Escape_input_delivery::PACED,
         0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
-        "application keypad comma and equal retain their distinct native identities",
+        "modified Tab preserves VT sequences; classic readers receive VK_PACKET text",
+        {
+            {{control_shift_tab}, packet_key_stroke_records(decode_hex("1b5b313b365a"))},
+            {{alt_shift_tab}, packet_key_stroke_records(decode_hex("1b5b313b345a"))},
+            {{control_backtab}, packet_key_stroke_records(decode_hex("1b5b313b365a"))},
+            {{alt_backtab}, packet_key_stroke_records(decode_hex("1b5b313b345a"))},
+            {{control_alt_backtab}, packet_key_stroke_records(decode_hex("1b5b313b385a"))},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "normal keypad Equal keeps native identity; application mode prioritizes VT SS3 X",
         {
             {{application_keypad_comma}, native_key_stroke_records(
                 VK_SEPARATOR, keypad_comma_scan, ',', 0)},
-            {{application_keypad_equal}, native_key_stroke_records(
-                VK_OEM_NEC_EQUAL, keypad_equal_scan, '=', 0)},
+            {{native_application_keypad_equal}, native_key_stroke_records(
+                VK_OEM_NEC_EQUAL, 0x59, '=', 0)},
+            {{application_keypad_equal}, packet_key_stroke_records(
+                decode_hex("1b4f58"))},
         },
         Escape_input_delivery::PACED,
         0U);
 
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "VT-first Right-Alt+X gives classic readers Escape then native Right-Alt+X",
+        {{{right_alt_x}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0) +
+            native_key_stroke_records('X', 45, 'x', RIGHT_ALT_PRESSED)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Right-Alt+X produces ESC+x without GroupSwitch",
+        {{{right_alt_x}, decode_hex("1b78")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Right-Alt+X with left Alt held keeps both native modifier states",
+        {{{both_alt_x}, native_key_stroke_records(
+            'X', 45, 'x', LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Right-Alt+X with left Alt held produces exactly one ESC prefix",
+        {{{both_alt_x}, decode_hex("1b78")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Left-Alt+X keeps its native key and modifier",
+        {{{left_alt_x}, native_key_stroke_records('X', 45, 'x', LEFT_ALT_PRESSED)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Left-Alt+X produces ESC+x",
+        {{{left_alt_x}, decode_hex("1b78")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "GroupSwitch right-Alt+X remains committed VK_PACKET text",
+        {{{group_switch_right_alt_x}, native_key_stroke_records(VK_PACKET, 0, 'x', 0)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "GroupSwitch right-Alt+X remains plain text",
+        {{{group_switch_right_alt_x}, QByteArrayLiteral("x")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Ctrl+Alt+Return preserves its native key identity and modifiers",
+        {{{control_alt_return}, native_key_stroke_records(
+            VK_RETURN, 0x1c, '\r', LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "ConPTY maps Ctrl+Alt+Return to ESC+LF",
+        {{{control_alt_return}, decode_hex("1b0a")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Ctrl+Alt+Return with LF text preserves native fields",
+        {{{control_alt_return_lf}, native_key_stroke_records(
+            VK_RETURN, 0x1c, '\n', LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "ConPTY maps Ctrl+Alt+Return with LF text to ESC+LF",
+        {{{control_alt_return_lf}, decode_hex("1b0a")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Alt+Return preserves native VK_RETURN and Alt state",
+        {{{alt_return}, native_key_stroke_records(
+            VK_RETURN, 0x1c, '\r', LEFT_ALT_PRESSED)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Alt+Return remains ESC+CR",
+        {{{alt_return}, decode_hex("1b0d")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "packet Ctrl+Alt+Return can emit ESC+CR for VT input",
+        {{{control_alt_return_packet_input}, decode_hex("1b0d")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "packet Ctrl+Alt+Return loses native VK_RETURN identity",
+        {{{control_alt_return_packet_input},
+            native_key_stroke_records(VK_PACKET, 0, 0x1b, 0) +
+                native_key_stroke_records(VK_PACKET, 0, '\r', 0)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "application-keypad Equal yields SS3 X in VT input",
+        {{{application_keypad_equal}, decode_hex("1b4f58")}},
+        Escape_input_delivery::PACED,
+        0U);
     // Keep ordinary Alt's legacy prefix distinct from committed AltGr text.
     // A compressed multi-unit Alt event is one Escape stroke followed by all
     // committed text units.
@@ -2359,6 +2550,9 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             {{backtab}, decode_hex("1b5b5a")},
             {{control_shift_tab}, decode_hex("1b5b313b365a")},
             {{alt_shift_tab}, decode_hex("1b5b313b345a")},
+            {{control_backtab}, decode_hex("1b5b313b365a")},
+            {{alt_backtab}, decode_hex("1b5b313b345a")},
+            {{control_alt_backtab}, decode_hex("1b5b313b385a")},
         },
         Escape_input_delivery::PACED,
         0U);
@@ -2441,10 +2635,10 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
 
     const std::vector<Escape_input_transaction> native_queue_workload{
         {{shift_return}, native_key_stroke_records(
-            VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            VK_RETURN, return_scan, VK_RETURN, SHIFT_PRESSED)},
         {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
-        {{up}, native_key_stroke_records(VK_UP, 72, 0, ENHANCED_KEY)},
-        {{f12}, native_key_stroke_records(VK_F12, 88, 0, 0)},
+        {{up}, native_key_stroke_records(VK_UP, up_scan, 0, ENHANCED_KEY)},
+        {{f12}, native_key_stroke_records(VK_F12, f12_scan, 0, 0)},
     };
     const std::vector<Escape_input_transaction> vt_queue_workload{
         {{shift_return}, decode_hex("0d")},

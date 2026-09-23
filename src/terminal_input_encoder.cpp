@@ -175,6 +175,7 @@ enum class Windows_native_input_operation
     WINDOWS_OP_SHIFT_RETURN,
     WINDOWS_OP_COMMITTED_TEXT,
     WINDOWS_OP_ALT_TEXT,
+    WINDOWS_OP_NATIVE_ALT_KEY_TEXT,
     WINDOWS_OP_VT_SEQUENCE,
 };
 
@@ -478,6 +479,25 @@ QByteArray win32_alt_text_strokes(const QKeyEvent& event)
     return win32_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0) + committed_text;
 }
 
+QByteArray win32_native_alt_key_text_strokes(const QKeyEvent& event)
+{
+    const QByteArray native_key = win32_key_event_strokes(event);
+    if (native_key.isEmpty()) {
+        return {};
+    }
+
+    // ConPTY does not apply the VT Alt prefix to a native right-Alt-only
+    // record. An explicit Escape restores VT semantics while keeping that
+    // record's native identity intact. When left Alt is also held, ConPTY
+    // supplies the prefix itself, so avoid sending a duplicate Escape.
+    // Classic readers observe the explicit Escape as a separate key; the
+    // right-Alt-only policy deliberately prioritizes VT ESC+text semantics.
+    if ((event.nativeModifiers() & k_qt_win_alt_left) != 0U) {
+        return native_key;
+    }
+    return win32_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0) + native_key;
+}
+
 QByteArray win32_vt_sequence_strokes(const QByteArray& bytes)
 {
     // Packet strokes preserve the computed VT bytes without exposing an ESC
@@ -549,7 +569,11 @@ int modifier_parameter(const QKeyEvent& event)
 {
     int parameter = 1;
     const Qt::KeyboardModifiers modifiers = event.modifiers();
-    if ((modifiers & Qt::ShiftModifier)   != Qt::NoModifier) { parameter += 1; }
+    if (event.key() == Qt::Key_Backtab ||
+        (modifiers & Qt::ShiftModifier) != Qt::NoModifier)
+    {
+        parameter += 1;
+    }
     if ((modifiers & Qt::AltModifier)     != Qt::NoModifier) { parameter += 2; }
     if ((modifiers & Qt::ControlModifier) != Qt::NoModifier) { parameter += 4; }
     return parameter;
@@ -611,6 +635,15 @@ QByteArray special_key_bytes(const QKeyEvent& event)
                 return QByteArray(1, '\n');
 #endif
             }
+#if defined(Q_OS_WIN)
+            if (terminal_modifiers(event) ==
+                (Qt::ControlModifier | Qt::AltModifier))
+            {
+                // The native VK_RETURN path preserves the key record, and this
+                // selector fallback matches ConPTY's measured ESC+LF result.
+                return alt_prefixed(QByteArray(1, '\n'), event);
+            }
+#endif
             return alt_prefixed(QByteArray(1, '\r'), event);
         case Qt::Key_Tab:
             if ((event.modifiers() & Qt::ShiftModifier) != Qt::NoModifier) {
@@ -817,8 +850,12 @@ Encoded_key_event encode_terminal_key_event_bytes(
     if (modes.application_keypad) {
         const QByteArray keypad_bytes = application_keypad_bytes(event);
         if (!keypad_bytes.isEmpty()) {
+            // Keep application-keypad Equal's SS3 X VT sequence intact through
+            // ConPTY; classic readers intentionally receive VK_PACKET text.
             return {keypad_bytes,
-                Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+                event.key() == Qt::Key_Equal
+                    ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+                    : Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
         }
     }
 
@@ -828,6 +865,9 @@ Encoded_key_event encode_terminal_key_event_bytes(
         if ((event.key() == Qt::Key_Tab || event.key() == Qt::Key_Backtab) &&
             navigation_bytes != QByteArrayLiteral("\x1b[Z"))
         {
+            // Preserve modified Tab's parameterized VT sequence through ConPTY.
+            // Native VK_TAB records are rewritten there and lose the modifier
+            // distinctions; classic readers consequently receive VK_PACKET text.
             return {navigation_bytes,
                 Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE};
         }
@@ -902,9 +942,19 @@ Encoded_key_event encode_terminal_key_event_bytes(
 
     const bool group_switch =
         (event.modifiers() & Qt::GroupSwitchModifier) != Qt::NoModifier;
+    bool native_right_alt_chord = false;
+#if defined(Q_OS_WIN)
+    native_right_alt_chord =
+        (event.modifiers() & Qt::AltModifier) != Qt::NoModifier &&
+        !group_switch &&
+        event.nativeVirtualKey() != 0U &&
+        event.nativeVirtualKey() != VK_PACKET &&
+        event.text().size() == 1 &&
+        (event.nativeModifiers() & k_qt_win_alt_right) != 0U;
+#endif
     const bool ordinary_alt_text =
         (event.modifiers() & Qt::AltModifier) != Qt::NoModifier &&
-        (event.text().size() > 1
+        (native_right_alt_chord || event.text().size() > 1
 #if defined(Q_OS_WIN)
             || windows_virtual_key(event) == VK_PACKET
 #endif
@@ -916,6 +966,12 @@ Encoded_key_event encode_terminal_key_event_bytes(
         return {
             event.text().toUtf8(),
             Windows_native_input_operation::WINDOWS_OP_COMMITTED_TEXT,
+        };
+    }
+    if (native_right_alt_chord) {
+        return {
+            text_bytes,
+            Windows_native_input_operation::WINDOWS_OP_NATIVE_ALT_KEY_TEXT,
         };
     }
     if (ordinary_alt_text) {
@@ -966,6 +1022,14 @@ QByteArray encode_terminal_key_event(
                 !packet_strokes.isEmpty())
             {
                 return packet_strokes;
+            }
+            break;
+        case Windows_native_input_operation::WINDOWS_OP_NATIVE_ALT_KEY_TEXT:
+            if (const QByteArray native_alt_key_strokes =
+                    win32_native_alt_key_text_strokes(event);
+                !native_alt_key_strokes.isEmpty())
+            {
+                return native_alt_key_strokes;
             }
             break;
         case Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE:

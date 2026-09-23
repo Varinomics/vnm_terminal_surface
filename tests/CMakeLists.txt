@@ -2110,7 +2110,7 @@ if(WIN32)
     )
     set_tests_properties(vnm_terminal_windows_conpty_escape_transport PROPERTIES
         LABELS "conformance;windows;conpty;input;escape"
-        TIMEOUT 180
+        TIMEOUT 300
     )
 
     add_test(
