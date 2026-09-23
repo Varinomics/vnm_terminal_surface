@@ -18,6 +18,7 @@ namespace {
 using vnm_terminal::test_helpers::check;
 
 constexpr std::size_t k_header_bytes = 100U;
+constexpr std::size_t k_header_version_offset = 4U;
 constexpr std::size_t k_header_payload_bytes_offset = 12U;
 constexpr std::size_t k_header_record_bytes_offset = 16U;
 constexpr std::size_t k_header_flags_offset = 20U;
@@ -114,6 +115,24 @@ term::Terminal_history_row_cell make_wide_continuation(
     return cell;
 }
 
+term::terminal_retained_line_content_origin_span_t make_origin_span(
+    int                                            first_column,
+    int                                            cell_count,
+    std::uint64_t                                  retained_line_id,
+    std::uint64_t                                  content_generation,
+    term::Terminal_retained_line_provenance_source source,
+    qint64                                         content_stamp_ms,
+    bool                                           content_stamp_is_unambiguous = true)
+{
+    term::Terminal_retained_line_provenance origin;
+    origin.retained_line_id = retained_line_id;
+    origin.content_generation = content_generation;
+    origin.source = source;
+    origin.content_stamp_ms = content_stamp_ms;
+    origin.content_stamp_is_unambiguous = content_stamp_is_unambiguous;
+    return {first_column, cell_count, origin};
+}
+
 term::Terminal_history_row_record make_base_record(
     std::uint64_t                                  retained_line_id,
     std::uint64_t                                  content_generation,
@@ -155,6 +174,33 @@ bool cells_equal(
         left.hyperlink_id      == right.hyperlink_id;
 }
 
+bool origin_spans_equal(
+    const std::vector<term::terminal_retained_line_content_origin_span_t>& left,
+    const std::vector<term::terminal_retained_line_content_origin_span_t>& right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        const auto& left_span = left[index];
+        const auto& right_span = right[index];
+        if (left_span.first_column != right_span.first_column ||
+            left_span.cell_count != right_span.cell_count ||
+            left_span.origin.retained_line_id != right_span.origin.retained_line_id ||
+            left_span.origin.content_generation != right_span.origin.content_generation ||
+            left_span.origin.source != right_span.origin.source ||
+            left_span.origin.content_stamp_ms != right_span.origin.content_stamp_ms ||
+            left_span.origin.content_stamp_is_unambiguous !=
+                right_span.origin.content_stamp_is_unambiguous)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool records_equal(
     const term::Terminal_history_row_record& left,
     const term::Terminal_history_row_record& right)
@@ -170,7 +216,10 @@ bool records_equal(
         left.provenance.retained_line_id   == right.provenance.retained_line_id &&
         left.provenance.content_generation == right.provenance.content_generation &&
         left.provenance.content_stamp_ms   == right.provenance.content_stamp_ms &&
+        left.provenance.content_stamp_is_unambiguous ==
+            right.provenance.content_stamp_is_unambiguous &&
         left.provenance.source             == right.provenance.source &&
+        origin_spans_equal(left.content_origin_spans, right.content_origin_spans) &&
         left.hyperlink_identity_keys       == right.hyperlink_identity_keys &&
         left.metadata.source_width         == right.metadata.source_width &&
         left.metadata.style_reference      == right.metadata.style_reference &&
@@ -473,6 +522,113 @@ bool test_generic_compact_default_ascii_after_blank_round_trip()
         "generic compact ASCII opcode after a blank round-trips with provenance stamp");
     ok &= check(payload_kind(payload_bytes(ring, append)) == k_payload_kind_generic_compact,
         "generic compact blank-prefix ASCII fixture uses payload kind 0");
+
+    return ok;
+}
+
+bool test_ambiguous_provenance_and_origin_spans_round_trip()
+{
+    bool ok = true;
+    term::Terminal_history_ring ring({4096U, 4096U});
+
+    term::Terminal_history_row_record record = make_base_record(
+        201U,
+        211U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        4);
+    record.provenance.content_stamp_ms = 0;
+    record.provenance.content_stamp_is_unambiguous = false;
+    for (const QChar character : QStringLiteral("ABCD")) {
+        record.cells.push_back(make_cell(QString(character), 1, true));
+    }
+    record.content_origin_spans = {
+        make_origin_span(
+            0,
+            1,
+            51U,
+            61U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+            1000),
+        make_origin_span(
+            1,
+            3,
+            52U,
+            62U,
+            term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+            0,
+            false),
+    };
+
+    term::Terminal_history_row_record_append_result append;
+    const term::Terminal_history_row_record_decode_result decoded =
+        append_and_decode(ring, record, make_identity(21U, 201U), append);
+    ok &= check(append.status == term::Terminal_history_row_record_codec_status::OK,
+        "mixed-origin row encodes with an ambiguous row stamp");
+    ok &= check(decoded.status == term::Terminal_history_row_record_codec_status::OK,
+        "mixed-origin row decodes with an ambiguous row stamp");
+    ok &= check(records_equal(decoded.record, record),
+        "prefix payload round-trips row ambiguity and each source span exactly");
+    ok &= check(payload_kind(payload_bytes(ring, append)) ==
+            k_payload_kind_prefix_plain_ascii,
+        "origin-span metadata does not disable the prefix plain-ASCII cell encoding");
+
+    const term::Terminal_history_ring_read_scope prefix_read =
+        ring.read_record(append.commit.byte_sequence);
+    const std::vector<std::byte> prefix_payload = payload_bytes(ring, append);
+
+    std::vector<std::byte> excessive_span_count = prefix_payload;
+    write_le_u32(excessive_span_count, k_header_bytes, 5U);
+    const term::Terminal_history_row_record_decode_result excessive_span_count_failure =
+        decode_mutated_payload(prefix_read, excessive_span_count);
+    ok &= check(excessive_span_count_failure.status ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode bounds the encoded origin-span count before materializing the table");
+
+    std::vector<std::byte> truncated_span_count(
+        prefix_payload.begin(),
+        prefix_payload.begin() + static_cast<std::ptrdiff_t>(k_header_bytes + 3U));
+    refresh_payload_size_fields(truncated_span_count);
+    const term::Terminal_history_row_record_decode_result truncated_span_count_failure =
+        decode_mutated_payload(prefix_read, truncated_span_count);
+    ok &= check(truncated_span_count_failure.status ==
+            term::Terminal_history_row_record_codec_status::TRUNCATED_RECORD,
+        "decode reports a truncated origin-span count instead of reserving from it");
+
+    std::vector<std::byte> trailing_prefix_byte = prefix_payload;
+    trailing_prefix_byte.push_back(static_cast<std::byte>('E'));
+    refresh_payload_size_fields(trailing_prefix_byte);
+    const term::Terminal_history_row_record_decode_result trailing_prefix_failure =
+        decode_mutated_payload(prefix_read, trailing_prefix_byte);
+    ok &= check(trailing_prefix_failure.status ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode rejects prefix bytes beyond the source row width after its span table");
+
+    term::Terminal_history_row_record generic_record = make_base_record(
+        202U,
+        212U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        4);
+    generic_record.provenance.content_stamp_is_unambiguous = false;
+    generic_record.cells = record.cells;
+    generic_record.cells[0].text = QString::fromUtf8("\xc3\xa9");
+    generic_record.content_origin_spans = record.content_origin_spans;
+    const term::Terminal_history_row_record_append_result generic_append =
+        term::encode_terminal_history_row_record_to_ring(
+            ring,
+            generic_record,
+            make_identity(21U, 202U));
+    const term::Terminal_history_ring_read_scope generic_read =
+        ring.read_record(generic_append.commit.byte_sequence);
+    const term::Terminal_history_row_record_decode_result generic_decoded =
+        term::decode_terminal_history_row_record(generic_read, generic_append.history_handle);
+    ok &= check(generic_append.status == term::Terminal_history_row_record_codec_status::OK &&
+            generic_decoded.status == term::Terminal_history_row_record_codec_status::OK,
+        "generic compact payload encodes and decodes mixed-origin metadata");
+    ok &= check(records_equal(generic_decoded.record, generic_record),
+        "generic payload preserves row ambiguity and source spans exactly");
+    ok &= check(payload_kind(payload_bytes(ring, generic_append)) ==
+            k_payload_kind_generic_compact,
+        "non-ASCII mixed-origin row uses the generic compact cell encoding");
 
     return ok;
 }
@@ -1421,8 +1577,16 @@ bool test_header_and_handle_validation_failures()
             term::Terminal_history_row_record_codec_status::INVALID_HEADER,
         "decode rejects a row-record header magic failure");
 
+    std::vector<std::byte> bad_version = payload;
+    write_le_u16(bad_version, k_header_version_offset, 3U);
+    const term::Terminal_history_row_record_decode_result version_failure =
+        decode_mutated_payload(read, bad_version);
+    ok &= check(version_failure.status ==
+            term::Terminal_history_row_record_codec_status::INVALID_HEADER,
+        "decode rejects the previous payload layout instead of defaulting absent provenance");
+
     std::vector<std::byte> bad_flags = payload;
-    write_le_u32(bad_flags, k_header_flags_offset, 0x10U);
+    write_le_u32(bad_flags, k_header_flags_offset, 0x40U);
     const term::Terminal_history_row_record_decode_result flags_failure =
         decode_mutated_payload(read, bad_flags);
     ok &= check(flags_failure.status ==
@@ -1559,6 +1723,7 @@ int main()
     ok &= test_prefix_plain_ascii_rows_use_prefix_payload();
     ok &= test_extended_styles_hyperlinks_and_wide_cells_round_trip();
     ok &= test_generic_compact_default_ascii_after_blank_round_trip();
+    ok &= test_ambiguous_provenance_and_origin_spans_round_trip();
     ok &= test_self_contained_tables_are_required();
     ok &= test_style_payload_canonicality_is_required();
     ok &= test_encode_rejects_malformed_cell_states();

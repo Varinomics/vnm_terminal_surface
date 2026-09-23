@@ -7798,6 +7798,7 @@ Terminal_history_row_record Terminal_screen_model::history_row_record_from_retai
 {
     Terminal_history_row_record history_record;
     history_record.provenance = retained_record.row.retained_line_provenance;
+    history_record.content_origin_spans = retained_record.row.content_origin_spans;
     history_record.style_table = retained_record.style_table;
     history_record.hyperlink_identity_keys = retained_record.hyperlink_identity_keys;
     history_record.metadata = retained_record.metadata;
@@ -7823,6 +7824,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
 {
     retained_row_record_t retained_record;
     retained_record.row.retained_line_provenance = history_record.provenance;
+    retained_record.row.content_origin_spans = history_record.content_origin_spans;
     retained_record.style_table = history_record.style_table;
     retained_record.hyperlink_identity_keys = history_record.hyperlink_identity_keys;
     retained_record.metadata = history_record.metadata;

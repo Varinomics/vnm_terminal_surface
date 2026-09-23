@@ -59,6 +59,8 @@ struct Terminal_history_row_record
                                    style_table;
     Terminal_retained_line_provenance
                                    provenance;
+    std::vector<terminal_retained_line_content_origin_span_t>
+                                   content_origin_spans;
     std::map<Terminal_hyperlink_id, QByteArray>
                                    hyperlink_identity_keys;
     terminal_retained_row_record_metadata_t

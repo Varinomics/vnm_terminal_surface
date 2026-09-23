@@ -2394,6 +2394,87 @@ bool test_mixed_source_row_provenance_survives_reflow_round_trip()
     return ok;
 }
 
+bool test_mixed_reflow_origin_spans_survive_scrollback_materialization()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(3, 4);
+    (void)model.ingest(QByteArrayLiteral("abcdefgh"));
+
+    term::Terminal_retained_line_provenance first_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    term::Terminal_retained_line_provenance second_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    first_source.content_stamp_ms = 1000;
+    second_source.content_stamp_ms = 2000;
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        0,
+        first_source);
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        1,
+        second_source);
+
+    (void)model.resize({3, 3});
+    const term::Terminal_retained_line_provenance live_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    const std::vector<term::terminal_retained_line_content_origin_span_t> live_origins =
+        model.retained_line_content_origin_spans_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    ok &= check(live_provenance.content_stamp_ms == 0 &&
+            !live_provenance.content_stamp_is_unambiguous &&
+            live_origins.size() == 2U &&
+            live_origins[0].first_column == 0 &&
+            live_origins[0].cell_count == 1 &&
+            live_origins[0].origin.retained_line_id == first_source.retained_line_id &&
+            live_origins[0].origin.content_generation == first_source.content_generation &&
+            live_origins[0].origin.source == first_source.source &&
+            live_origins[0].origin.content_stamp_ms == 1000 &&
+            live_origins[1].first_column == 1 &&
+            live_origins[1].cell_count == 2 &&
+            live_origins[1].origin.retained_line_id == second_source.retained_line_id &&
+            live_origins[1].origin.content_generation == second_source.content_generation &&
+            live_origins[1].origin.source == second_source.source &&
+            live_origins[1].origin.content_stamp_ms == 2000,
+        "narrow reflow creates a mixed row with two exact source spans");
+
+    (void)model.ingest(QByteArrayLiteral("\x1b[3;1H\n\n"));
+    ok &= check(model.scrollback_size() == 2,
+        "scrolling the mixed row off the grid appends it to retained history");
+    const term::Terminal_retained_line_provenance restored_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    ok &= check(restored_provenance.content_stamp_ms == 0 &&
+            !restored_provenance.content_stamp_is_unambiguous,
+        "decoded scrollback row keeps its ambiguous row-level timestamp");
+
+    const std::vector<term::terminal_retained_line_content_origin_span_t> restored_origins =
+        model.retained_line_content_origin_spans_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    bool origins_match = restored_origins.size() == live_origins.size();
+    for (std::size_t index = 0U;
+         origins_match && index < live_origins.size();
+         ++index)
+    {
+        const auto& expected = live_origins[index];
+        const auto& actual = restored_origins[index];
+        origins_match =
+            actual.first_column == expected.first_column &&
+            actual.cell_count == expected.cell_count &&
+            actual.origin.retained_line_id == expected.origin.retained_line_id &&
+            actual.origin.content_generation == expected.origin.content_generation &&
+            actual.origin.source == expected.origin.source &&
+            actual.origin.content_stamp_ms == expected.origin.content_stamp_ms &&
+            actual.origin.content_stamp_is_unambiguous ==
+                expected.origin.content_stamp_is_unambiguous;
+    }
+    ok &= check(origins_match,
+        "history decode/materialization preserves every source span and timestamp exactly");
+
+    return ok;
+}
+
 bool test_primary_one_column_reflow_restores_wide_glyph_and_cursors()
 {
     bool ok = true;
@@ -2599,6 +2680,7 @@ int main()
     ok &= test_exact_limit_escape_prefix_stays_pending();
     ok &= test_primary_soft_wrap_reflow_preserves_source_row_stamps();
     ok &= test_mixed_source_row_provenance_survives_reflow_round_trip();
+    ok &= test_mixed_reflow_origin_spans_survive_scrollback_materialization();
     ok &= test_primary_one_column_reflow_restores_wide_glyph_and_cursors();
     ok &= test_wide_glyph_written_at_one_column_keeps_natural_width();
     ok &= test_reflow_origin_spans_are_cleared_on_mutation_and_replacement();
