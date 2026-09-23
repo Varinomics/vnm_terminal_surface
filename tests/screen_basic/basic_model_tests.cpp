@@ -1,7 +1,10 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
+#include <QColor>
+#include <QSizeF>
 #include <QString>
 #include <cstdint>
 #include <cstdlib>
@@ -9,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include <variant>
+#include <vector>
 
 namespace term = vnm_terminal::internal;
 
@@ -495,6 +499,90 @@ bool test_oversize_retained_history_row_is_discarded()
     (void)model.ingest(QByteArrayLiteral("after\r\n"));
     ok &= check(model.scrollback_size() == 2,
         "retained history continues accepting rows after an oversize discard");
+    return ok;
+}
+
+bool test_retained_history_row_cell_fields_round_trip()
+{
+    bool ok = true;
+    const QByteArray wide_glyph = bytes_from_hex("e4b880");
+    term::Terminal_screen_model model = make_model(1, 5);
+    const QByteArray payload =
+        QByteArrayLiteral("\x1b]8;id=first;https://first.example\x1b\\")
+        + QByteArrayLiteral("\x1b[31mA\x1b[32mB")
+        + QByteArrayLiteral("\x1b]8;id=second;https://second.example\x1b\\")
+        + wide_glyph
+        + QByteArrayLiteral("\x1b[0m\x1b]8;;\x1b\\\r\n");
+    (void)model.ingest(payload);
+
+    ok &= check(model.scrollback_size() == 1,
+        "history-cell fixture scrolls the source row into retained storage");
+    const std::optional<std::vector<term::terminal_retained_history_cell_state_for_testing_t>>
+        restored = model.retained_history_row_cells_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    ok &= check(restored.has_value() && restored->size() == 5U,
+        "history-cell fixture decodes every source column from the retained row");
+    if (!restored.has_value() || restored->size() != 5U) {
+        return false;
+    }
+
+    const auto& first = (*restored)[0];
+    const auto& second = (*restored)[1];
+    const auto& wide = (*restored)[2];
+    const auto& continuation = (*restored)[3];
+    const auto& blank = (*restored)[4];
+    ok &= check(first.text == QStringLiteral("A") &&
+            first.text_category == term::Terminal_render_cell_text_category::PRINTABLE_ASCII &&
+            first.display_width == 1 && first.natural_display_width == 1 &&
+            !first.wide_continuation && first.occupied &&
+            first.style_id != term::k_default_terminal_style_id &&
+            first.hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "history round trip preserves first-cell text, widths, occupancy, style, and link");
+    ok &= check(second.text == QStringLiteral("B") && second.display_width == 1 &&
+            second.natural_display_width == 1 && !second.wide_continuation &&
+            second.occupied && second.style_id != first.style_id &&
+            second.hyperlink_id == first.hyperlink_id,
+        "history round trip keeps distinct style and hyperlink references in their fields");
+    ok &= check(wide.text == QString::fromUtf8(wide_glyph) &&
+            wide.text_category == term::Terminal_render_cell_text_category::NON_ASCII &&
+            wide.display_width == 2 && wide.natural_display_width == 2 &&
+            !wide.wide_continuation && wide.occupied &&
+            wide.style_id == second.style_id &&
+            wide.hyperlink_id != second.hyperlink_id,
+        "history round trip reconstructs wide natural width and preserves independent metadata");
+    ok &= check(continuation.text.isEmpty() &&
+            continuation.text_category == term::Terminal_render_cell_text_category::EMPTY &&
+            continuation.display_width == 0 && continuation.natural_display_width == 0 &&
+            continuation.wide_continuation && continuation.occupied &&
+            continuation.style_id == wide.style_id &&
+            continuation.hyperlink_id == wide.hyperlink_id,
+        "history round trip preserves continuation, occupancy, style, and hyperlink fields");
+    ok &= check(blank.text == QStringLiteral(" ") && blank.display_width == 1 &&
+            blank.natural_display_width == 1 && !blank.wide_continuation &&
+            !blank.occupied && blank.style_id == term::k_default_terminal_style_id &&
+            blank.hyperlink_id == term::k_no_terminal_hyperlink_id,
+        "history round trip leaves the unused default cell unoccupied and unlinked");
+
+    term::Terminal_render_snapshot_request request;
+    request.sequence = 104U;
+    request.viewport.active_buffer = term::Terminal_buffer_id::PRIMARY;
+    request.viewport.visible_rows = 1;
+    request.viewport.offset_from_tail = 1;
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(request);
+    const term::Terminal_render_cell* rendered_second =
+        snapshot_cell_at_position(snapshot, 0, 1);
+    const term::Terminal_render_cell* rendered_wide =
+        snapshot_cell_at_position(snapshot, 0, 2);
+    const term::Terminal_render_cell* rendered_continuation =
+        snapshot_cell_at_position(snapshot, 0, 3);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+            rendered_second != nullptr && rendered_wide != nullptr &&
+            rendered_continuation != nullptr && rendered_wide->display_width == 2 &&
+            rendered_continuation->wide_continuation &&
+            rendered_second->hyperlink_id != rendered_wide->hyperlink_id,
+        "render projection publishes the round-tripped wide cell and distinct row metadata");
     return ok;
 }
 
@@ -2185,6 +2273,650 @@ bool test_exact_limit_escape_prefix_stays_pending()
     return ok;
 }
 
+bool test_primary_soft_wrap_reflow_preserves_source_row_stamps()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(4, 4);
+    (void)model.ingest(QByteArrayLiteral("abcdefgh"));
+
+    term::Terminal_retained_line_provenance first_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    term::Terminal_retained_line_provenance second_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    first_source.content_stamp_ms  = 1000;
+    second_source.content_stamp_ms = 2000;
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        0,
+        first_source);
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        1,
+        second_source);
+
+    (void)model.resize({4, 2});
+    const qint64 expected_stamps[] = {1000, 1000, 2000, 2000};
+    const QString expected_rows[] = {
+        QStringLiteral("ab"),
+        QStringLiteral("cd"),
+        QStringLiteral("ef"),
+        QStringLiteral("gh"),
+    };
+    for (int row = 0; row < 4; ++row) {
+        const term::Terminal_retained_line_provenance provenance =
+            model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                row);
+        ok &= check(provenance.content_stamp_ms == expected_stamps[row],
+            "reflowed rows retain the stamp of their source row");
+        ok &= check(model.row_text(row).trimmed() == expected_rows[row],
+            "reflowed row text stays in source order");
+    }
+    ok &= check(model.cursor_position().row == 3 && model.cursor_position().column == 1,
+        "narrow reflow keeps the cursor after the final source cell");
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(100U);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "source-stamped narrow reflow produces a valid render snapshot");
+    ok &= check(snapshot.visible_line_provenance.size() == 4U &&
+            snapshot.visible_line_provenance[0].content_stamp_ms == 1000 &&
+            snapshot.visible_line_provenance[1].content_stamp_ms == 1000 &&
+            snapshot.visible_line_provenance[2].content_stamp_ms == 2000 &&
+            snapshot.visible_line_provenance[3].content_stamp_ms == 2000,
+        "render projection keeps each reflowed row's source stamp");
+    return ok;
+}
+
+bool test_mixed_source_row_provenance_survives_reflow_round_trip()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(3, 4);
+    (void)model.ingest(QByteArrayLiteral("abcdefgh"));
+
+    term::Terminal_retained_line_provenance first_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    term::Terminal_retained_line_provenance second_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    first_source.content_stamp_ms  = 1000;
+    second_source.content_stamp_ms = 2000;
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        0,
+        first_source);
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        1,
+        second_source);
+
+    (void)model.resize({3, 3});
+    ok &= check(model.row_text(0).trimmed() == QStringLiteral("abc") &&
+            model.row_text(1).trimmed() == QStringLiteral("def") &&
+            model.row_text(2).trimmed() == QStringLiteral("gh"),
+        "three-column reflow places the source-row boundary inside the middle row");
+    ok &= check(model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                1).content_stamp_ms == 0,
+        "a row with multiple source stamps does not claim one source timestamp");
+    const term::Terminal_retained_line_provenance mixed_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    ok &= check(!mixed_provenance.content_stamp_is_unambiguous,
+        "mixed-origin row marks its row-level timestamp as ambiguous");
+    const std::vector<term::terminal_retained_line_content_origin_span_t> mixed_origins =
+        model.retained_line_content_origin_spans_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    ok &= check(mixed_origins.size() == 2U &&
+            mixed_origins[0].first_column == 0 && mixed_origins[0].cell_count == 1 &&
+            mixed_origins[0].origin.retained_line_id == first_source.retained_line_id &&
+            mixed_origins[0].origin.content_stamp_ms == 1000 &&
+            mixed_origins[1].first_column == 1 && mixed_origins[1].cell_count == 2 &&
+            mixed_origins[1].origin.retained_line_id == second_source.retained_line_id &&
+            mixed_origins[1].origin.content_stamp_ms == 2000,
+        "mixed-origin row retains exact source provenance for each column range");
+    const term::Terminal_render_snapshot mixed_snapshot = model.render_snapshot(101U);
+    ok &= check(term::validate_render_snapshot(mixed_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+            mixed_snapshot.visible_line_provenance.size() == 3U &&
+            mixed_snapshot.visible_line_provenance[1].content_stamp_ms == 0,
+        "render projection suppresses a timestamp when a row has mixed origins");
+
+    (void)model.resize({3, 4});
+    ok &= check(model.row_text(0).trimmed() == QStringLiteral("abcd") &&
+            model.row_text(1).trimmed() == QStringLiteral("efgh"),
+        "widening reflow restores the original source-row text boundaries");
+    ok &= check(model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                0).content_stamp_ms == 1000 &&
+            model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                1).content_stamp_ms == 2000,
+        "widening reflow recovers each source stamp after a mixed-origin row");
+    return ok;
+}
+
+bool test_mixed_reflow_origin_spans_survive_scrollback_materialization()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(3, 4);
+    (void)model.ingest(QByteArrayLiteral("abcdefgh"));
+
+    term::Terminal_retained_line_provenance first_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    term::Terminal_retained_line_provenance second_source =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    first_source.content_stamp_ms = 1000;
+    second_source.content_stamp_ms = 2000;
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        0,
+        first_source);
+    model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        1,
+        second_source);
+
+    (void)model.resize({3, 3});
+    const term::Terminal_retained_line_provenance live_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    const std::vector<term::terminal_retained_line_content_origin_span_t> live_origins =
+        model.retained_line_content_origin_spans_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    ok &= check(live_provenance.content_stamp_ms == 0 &&
+            !live_provenance.content_stamp_is_unambiguous &&
+            live_origins.size() == 2U &&
+            live_origins[0].first_column == 0 &&
+            live_origins[0].cell_count == 1 &&
+            live_origins[0].origin.retained_line_id == first_source.retained_line_id &&
+            live_origins[0].origin.content_generation == first_source.content_generation &&
+            live_origins[0].origin.source == first_source.source &&
+            live_origins[0].origin.content_stamp_ms == 1000 &&
+            live_origins[1].first_column == 1 &&
+            live_origins[1].cell_count == 2 &&
+            live_origins[1].origin.retained_line_id == second_source.retained_line_id &&
+            live_origins[1].origin.content_generation == second_source.content_generation &&
+            live_origins[1].origin.source == second_source.source &&
+            live_origins[1].origin.content_stamp_ms == 2000,
+        "narrow reflow creates a mixed row with two exact source spans");
+
+    (void)model.ingest(QByteArrayLiteral("\x1b[3;1H\n\n"));
+    ok &= check(model.scrollback_size() == 2,
+        "scrolling the mixed row off the grid appends it to retained history");
+    const term::Terminal_retained_line_provenance restored_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    ok &= check(restored_provenance.content_stamp_ms == 0 &&
+            !restored_provenance.content_stamp_is_unambiguous,
+        "decoded scrollback row keeps its ambiguous row-level timestamp");
+
+    const std::vector<term::terminal_retained_line_content_origin_span_t> restored_origins =
+        model.retained_line_content_origin_spans_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    bool origins_match = restored_origins.size() == live_origins.size();
+    for (std::size_t index = 0U;
+         origins_match && index < live_origins.size();
+         ++index)
+    {
+        const auto& expected = live_origins[index];
+        const auto& actual = restored_origins[index];
+        origins_match =
+            actual.first_column == expected.first_column &&
+            actual.cell_count == expected.cell_count &&
+            actual.origin.retained_line_id == expected.origin.retained_line_id &&
+            actual.origin.content_generation == expected.origin.content_generation &&
+            actual.origin.source == expected.origin.source &&
+            actual.origin.content_stamp_ms == expected.origin.content_stamp_ms &&
+            actual.origin.content_stamp_is_unambiguous ==
+                expected.origin.content_stamp_is_unambiguous;
+    }
+    ok &= check(origins_match,
+        "history decode/materialization preserves every source span and timestamp exactly");
+
+    return ok;
+}
+
+bool test_primary_one_column_reflow_restores_wide_glyph_and_cursors()
+{
+    bool ok = true;
+    const QByteArray wide_glyph = bytes_from_hex("e4b880");
+    term::Terminal_screen_model model = make_model(3, 2);
+    (void)model.ingest(
+        wide_glyph + QByteArrayLiteral("\x1b" "7B\x1b[3;1H"));
+    ok &= check(model.row_text(0).trimmed() == QString::fromUtf8(wide_glyph) &&
+            model.row_text(1).trimmed() == QStringLiteral("B"),
+        "wide glyph followed by text begins on the next source row");
+
+    (void)model.resize({3, 1});
+    const term::Terminal_render_snapshot narrow_snapshot = model.render_snapshot(101U);
+    const term::Terminal_render_cell* narrow_cell =
+        snapshot_cell_at_position(narrow_snapshot, 0, 0);
+    ok &= check(model.row_text(0).trimmed() == QString::fromUtf8(wide_glyph),
+        "one-column reflow keeps the wide glyph text");
+    ok &= check(narrow_cell != nullptr && narrow_cell->display_width == 1 &&
+            !narrow_cell->wide_continuation,
+        "one-column render projection represents the clipped glyph as one cell");
+    ok &= check(model.cursor_position().row == 2 && model.cursor_position().column == 0,
+        "one-column reflow keeps the live cursor on its independently addressed row");
+    ok &= check(term::validate_render_snapshot(narrow_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "one-column wide-glyph projection remains a valid snapshot");
+
+    (void)model.resize({3, 2});
+    ok &= check(model.row_text(0).trimmed() == QString::fromUtf8(wide_glyph),
+        "widening does not duplicate or discard the wide glyph text");
+    ok &= check(model.row_text(1).trimmed() == QStringLiteral("B"),
+        "widening does not skip text after a virtual continuation cell");
+    ok &= check(model.cursor_position().row == 2 && model.cursor_position().column == 0,
+        "widening preserves the live cursor row and column");
+    const term::Terminal_render_snapshot wide_snapshot = model.render_snapshot(102U);
+    const term::Terminal_render_cell* wide_base =
+        snapshot_cell_at_position(wide_snapshot, 0, 0);
+    const term::Terminal_render_cell* wide_continuation =
+        snapshot_cell_at_position(wide_snapshot, 0, 1);
+    ok &= check(wide_base != nullptr && wide_base->display_width == 2 &&
+            !wide_base->wide_continuation,
+        "widened render projection restores the wide glyph base width");
+    ok &= check(wide_continuation != nullptr && wide_continuation->wide_continuation,
+        "widened render projection restores the continuation cell");
+    ok &= check(term::validate_render_snapshot(wide_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "widened wide-glyph projection remains a valid snapshot");
+
+    term::Terminal_render_options render_options;
+    render_options.default_background = QColor(9, 12, 16);
+    render_options.default_foreground = QColor(196, 230, 201);
+    render_options.cursor_color       = QColor(255, 255, 255);
+    const term::Terminal_render_frame frame = term::build_terminal_render_frame(
+        &wide_snapshot,
+        QSizeF(160.0, 100.0),
+        {10.0, 20.0, 14.0, 6.0},
+        render_options,
+        true);
+    const term::Terminal_render_text_run* wide_run = nullptr;
+    const term::Terminal_render_text_run* following_run = nullptr;
+    bool continuation_run_found = false;
+    for (const term::Terminal_render_text_run& run : frame.text_runs) {
+        if (run.row == 0 && run.column == 0) {
+            wide_run = &run;
+        }
+        if (run.row == 0 && run.column == 1) {
+            continuation_run_found = true;
+        }
+        if (run.row == 1 && run.column == 0) {
+            following_run = &run;
+        }
+    }
+    ok &= check(wide_run != nullptr && wide_run->text == QString::fromUtf8(wide_glyph) &&
+            wide_run->rect.width() == 20.0 && !continuation_run_found,
+        "render frame projects one restored wide-glyph run across two cells");
+    ok &= check(following_run != nullptr && following_run->text == QStringLiteral("B"),
+        "render frame retains the text following the restored wide glyph");
+
+    (void)model.ingest(QByteArrayLiteral("\x1b" "8"));
+    ok &= check(model.cursor_position().row == 0 && model.cursor_position().column == 1,
+        "saved cursor returns to the logical position after the wide glyph");
+    (void)model.ingest(QByteArrayLiteral("X"));
+    ok &= check(model.row_text(0).trimmed() == QString::fromUtf8(wide_glyph) &&
+            model.row_text(1).trimmed() == QStringLiteral("X"),
+        "restored pending-wrap state places following text on the next row");
+    return ok;
+}
+
+bool test_wide_glyph_written_at_one_column_keeps_natural_width()
+{
+    bool ok = true;
+    const QByteArray wide_glyph = bytes_from_hex("e4b880");
+    term::Terminal_screen_model model = make_model(2, 1);
+    (void)model.ingest(wide_glyph);
+
+    const term::Terminal_render_snapshot narrow_snapshot = model.render_snapshot(103U);
+    const term::Terminal_render_cell* narrow_cell =
+        snapshot_cell_at_position(narrow_snapshot, 0, 0);
+    ok &= check(narrow_cell != nullptr && narrow_cell->display_width == 1 &&
+            !narrow_cell->wide_continuation,
+        "a wide glyph written on a one-column grid projects as one visible cell");
+
+    (void)model.resize({2, 2});
+    const term::Terminal_render_snapshot wide_snapshot = model.render_snapshot(104U);
+    const term::Terminal_render_cell* wide_base =
+        snapshot_cell_at_position(wide_snapshot, 0, 0);
+    const term::Terminal_render_cell* wide_continuation =
+        snapshot_cell_at_position(wide_snapshot, 0, 1);
+    ok &= check(wide_base != nullptr && wide_base->display_width == 2 &&
+            wide_continuation != nullptr && wide_continuation->wide_continuation,
+        "a wide glyph written at one column regains its base and continuation on expansion");
+    ok &= check(model.row_text(0).trimmed() == QString::fromUtf8(wide_glyph) &&
+            term::validate_render_snapshot(wide_snapshot).status ==
+                term::Terminal_render_snapshot_status::OK,
+        "one-column-origin wide glyph remains single text in a valid expanded snapshot");
+    return ok;
+}
+
+
+bool test_one_column_wide_glyph_reaches_retained_history()
+{
+    bool ok = true;
+    const std::vector<QByteArray> glyphs = {
+        bytes_from_hex("e4b880"),
+        bytes_from_hex("e29da4efb88f"),
+    };
+    for (const QByteArray& glyph : glyphs) {
+        for (int scenario = 0; scenario < 3; ++scenario) {
+            term::Terminal_screen_model model = make_model(1, scenario == 2 ? 1 : 2);
+            try {
+                if (scenario == 1) {
+                    model = make_model(2, 2);
+                    (void)model.ingest(glyph + QByteArrayLiteral("\x1b[2;1H"));
+                    (void)model.resize({1, 1});
+                }
+                else {
+                    (void)model.ingest(glyph);
+                    if (scenario == 0) {
+                        (void)model.resize({1, 1});
+                    }
+                    (void)model.ingest(QByteArrayLiteral("X"));
+                }
+            }
+            catch (const std::exception& error) {
+                std::cerr << "FAIL: clipped-wide history scenario " << scenario
+                    << ": " << error.what() << '\n';
+                ok = false;
+                continue;
+            }
+            ok &= check(model.scrollback_size() == 1,
+                "clipped wide row is archived during resize or subsequent scrolling");
+            model.discard_retained_lookup_cache_for_testing();
+            const auto cells = model.retained_history_row_cells_for_testing(
+                term::Terminal_buffer_id::PRIMARY, 0);
+            ok &= check(cells.has_value() && cells->size() == 1,
+                "one-column retained row materializes after lookup-cache discard");
+            if (!cells.has_value() || cells->size() != 1) {
+                continue;
+            }
+            const auto& cell = cells->front();
+            ok &= check(cell.text == QString::fromUtf8(glyph) && cell.occupied &&
+                    !cell.wide_continuation && cell.display_width == 1 &&
+                    cell.natural_display_width == 2,
+                "retained materialization preserves clipped text and natural width");
+            const auto metadata = model.retained_row_record_metadata_for_testing(
+                term::Terminal_buffer_id::PRIMARY, 0);
+            ok &= check(metadata.has_value() && metadata->source_width == 1,
+                "archived clipped row retains its physical source width");
+        }
+    }
+    return ok;
+}
+
+bool test_no_autowrap_wide_variation_glyph_reaches_retained_history()
+{
+    bool ok = true;
+    const QString heart_with_emoji_presentation = QString::fromUtf8(
+        "\xe2\x9d\xa4\xef\xb8\x8f");
+    term::Terminal_screen_model model = make_model(1, 4);
+    try {
+        (void)model.ingest(
+            QByteArrayLiteral("\x1b[?7l") + QByteArrayLiteral("abc") +
+            heart_with_emoji_presentation.toUtf8() + QByteArrayLiteral("\n"));
+    }
+    catch (const std::exception& error) {
+        std::cerr << "FAIL: wider no-autowrap clipped glyph archiving threw: "
+            << error.what() << '\n';
+        ok = false;
+    }
+
+    ok &= check(model.scrollback_size() == 1,
+        "wider no-autowrap clipped wide row reaches retained history");
+    model.discard_retained_lookup_cache_for_testing();
+    const auto cells = model.retained_history_row_cells_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(cells.has_value() && cells->size() == 4,
+        "right-margin clipped glyph materializes from retained history");
+    if (!cells.has_value() || cells->size() != 4) {
+        return false;
+    }
+    const auto& clipped = cells->back();
+    ok &= check(clipped.text == heart_with_emoji_presentation && clipped.occupied &&
+            !clipped.wide_continuation && clipped.display_width == 1 &&
+            clipped.natural_display_width == 2,
+        "right-margin retained cell preserves its natural wide-glyph width");
+    const auto metadata = model.retained_row_record_metadata_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(metadata.has_value() && metadata->source_width == 4,
+        "right-margin clipped row retains its multi-column source width");
+    return ok;
+}
+
+bool test_no_autowrap_clipped_wide_glyph_survives_dch_history()
+{
+    bool ok = true;
+    const QString heart_with_emoji_presentation = QString::fromUtf8(
+        "\xe2\x9d\xa4\xef\xb8\x8f");
+    for (int delete_count = 1; delete_count <= 3; ++delete_count) {
+        const QByteArray delete_sequence = delete_count == 1
+            ? QByteArrayLiteral("\x1b[H\x1b[P")
+            : QByteArrayLiteral("\x1b[H\x1b[") +
+                QByteArray::number(delete_count) + QByteArrayLiteral("P");
+        term::Terminal_screen_model model = make_model(1, 4);
+        try {
+            (void)model.ingest(
+                QByteArrayLiteral("\x1b[?7l") + QByteArrayLiteral("abc") +
+                heart_with_emoji_presentation.toUtf8());
+            (void)model.ingest(delete_sequence);
+        }
+        catch (const std::exception& error) {
+            std::cerr << "FAIL: clipped-wide DCH setup threw: "
+                << error.what() << '\n';
+            ok = false;
+            continue;
+        }
+
+        const int heart_column = 3 - delete_count;
+        const term::Terminal_render_snapshot before_retention =
+            model.render_snapshot(110U + static_cast<std::uint64_t>(delete_count));
+        const term::Terminal_render_cell* clipped = snapshot_cell_at_position(
+            before_retention, 0, heart_column);
+        ok &= check(clipped != nullptr &&
+                clipped->text == heart_with_emoji_presentation &&
+                clipped->display_width == 1 && !clipped->wide_continuation,
+            "DCH moves the clipped glyph while it remains one physical cell");
+        term::Terminal_screen_model reflow_model = make_model(1, 4);
+        (void)reflow_model.ingest(
+            QByteArrayLiteral("\x1b[?7l") + QByteArrayLiteral("abc") +
+            heart_with_emoji_presentation.toUtf8());
+        (void)reflow_model.ingest(delete_sequence);
+        (void)reflow_model.resize({1, 5});
+        const term::Terminal_render_snapshot reflow_snapshot =
+            reflow_model.render_snapshot(120U + static_cast<std::uint64_t>(delete_count));
+        const term::Terminal_render_cell* reflowed_heart = snapshot_cell_at_position(
+            reflow_snapshot, 0, heart_column);
+        const term::Terminal_render_cell* reflowed_continuation =
+            snapshot_cell_at_position(reflow_snapshot, 0, heart_column + 1);
+        ok &= check(reflowed_heart != nullptr &&
+                reflowed_heart->text == heart_with_emoji_presentation &&
+                reflowed_heart->display_width == 2 &&
+                !reflowed_heart->wide_continuation &&
+                reflowed_continuation != nullptr &&
+                reflowed_continuation->wide_continuation,
+            "resizing after DCH restores the clipped glyph's natural two-cell span");
+
+        std::vector<QString> expected_cells(4U, QStringLiteral(" "));
+        if (delete_count == 1) {
+            expected_cells[0] = QStringLiteral("b");
+            expected_cells[1] = QStringLiteral("c");
+        }
+        else
+        if (delete_count == 2) {
+            expected_cells[0] = QStringLiteral("c");
+        }
+        expected_cells[static_cast<std::size_t>(heart_column)] =
+            heart_with_emoji_presentation;
+
+        QString expected_row_text;
+        for (const QString& cell_text : expected_cells) {
+            if (cell_text != QStringLiteral(" ")) {
+                expected_row_text += cell_text;
+            }
+        }
+        ok &= check(model.row_text(0).trimmed() == expected_row_text,
+            "DCH leaves the expected surviving row text before retention");
+
+        bool retained_without_throw = true;
+        try {
+            (void)model.ingest(QByteArrayLiteral("\n"));
+        }
+        catch (const std::exception& error) {
+            std::cerr << "FAIL: clipped-wide DCH row retention threw: "
+                << error.what() << '\n';
+            retained_without_throw = false;
+        }
+        ok &= check(retained_without_throw,
+            "DCH-shifted clipped-wide row can be archived without throwing");
+        if (!retained_without_throw) {
+            continue;
+        }
+
+        ok &= check(model.scrollback_size() == 1,
+            "DCH-shifted row enters retained history");
+        model.discard_retained_lookup_cache_for_testing();
+        const auto cells = model.retained_history_row_cells_for_testing(
+            term::Terminal_buffer_id::PRIMARY, 0);
+        ok &= check(cells.has_value() && cells->size() == 4U,
+            "DCH-shifted row materializes after retained lookup-cache discard");
+        if (!cells.has_value() || cells->size() != 4U) {
+            continue;
+        }
+
+        for (std::size_t column = 0U; column < expected_cells.size(); ++column) {
+            const auto& cell = cells->at(column);
+            const bool expected_occupied =
+                expected_cells[column] != QStringLiteral(" ");
+            ok &= check(cell.text == expected_cells[column] &&
+                    cell.display_width == 1 &&
+                    cell.natural_display_width ==
+                        (static_cast<int>(column) == heart_column ? 2 : 1) &&
+                    cell.occupied == expected_occupied &&
+                    !cell.wide_continuation,
+                "retained DCH row preserves each physical cell and clipped natural width");
+        }
+    }
+    return ok;
+}
+
+
+bool test_reflow_cursors_do_not_insert_a_wide_wrap_margin()
+{
+    bool ok = true;
+    const QByteArray wide_glyph = bytes_from_hex("e4b8ad");
+    const QString joined_text =
+        QStringLiteral("abc") + QString::fromUtf8(wide_glyph) + QStringLiteral("x");
+    for (const bool saved_cursor : {false, true}) {
+        for (const bool live_cursor_in_gap : {false, true}) {
+            term::Terminal_screen_model model = make_model(4, 4);
+            (void)model.ingest(QByteArrayLiteral("abc"));
+            if (saved_cursor) {
+                (void)model.ingest(QByteArrayLiteral("\x1b" "7"));
+            }
+            (void)model.ingest(wide_glyph + QByteArrayLiteral("x"));
+            (void)model.ingest(live_cursor_in_gap
+                ? QByteArrayLiteral("\x1b[1;4H")
+                : QByteArrayLiteral("\x1b[3;1H"));
+            (void)model.resize({4, 6});
+            ok &= check(model.row_text(0).trimmed() == joined_text &&
+                    model.row_text(1).trimmed().isEmpty(),
+                "cursor in unused wide-wrap margin does not insert a content cell");
+            if (live_cursor_in_gap) {
+                ok &= check(model.cursor_position().row == 0 &&
+                        model.cursor_position().column == 3,
+                    "live gap cursor maps to the boundary before the wide glyph");
+            }
+            if (saved_cursor) {
+                (void)model.ingest(QByteArrayLiteral("\x1b" "8"));
+                ok &= check(model.cursor_position().row == 0 &&
+                        model.cursor_position().column == 3,
+                    "saved gap cursor restores before the wide glyph");
+            }
+            // Cursor boundaries must survive creating and removing the gap again.
+            (void)model.resize({4, 4});
+            (void)model.resize({4, 6});
+            ok &= check(model.row_text(0).trimmed() == joined_text &&
+                    model.row_text(1).trimmed().isEmpty(),
+                "repeat narrow/wide reflow does not manufacture a margin cell");
+        }
+    }
+
+    term::Terminal_screen_model written_margin = make_model(4, 4);
+    (void)written_margin.ingest(QByteArrayLiteral("abc") + wide_glyph +
+        QByteArrayLiteral("x\x1b[1;4HZ\x1b[3;1H"));
+    (void)written_margin.resize({4, 7});
+    ok &= check(written_margin.row_text(0).trimmed() ==
+            QStringLiteral("abcZ") + QString::fromUtf8(wide_glyph) + QStringLiteral("x"),
+        "real content written beyond an old early-wrap cut is retained");
+    return ok;
+}
+
+bool test_reflow_origin_spans_are_cleared_on_mutation_and_replacement()
+{
+    bool ok = true;
+    const auto stamp_source_rows = [](term::Terminal_screen_model& model)
+    {
+        (void)model.ingest(QByteArrayLiteral("abcdefgh"));
+        term::Terminal_retained_line_provenance first_source =
+            model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                0);
+        term::Terminal_retained_line_provenance second_source =
+            model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                1);
+        first_source.content_stamp_ms  = 1000;
+        second_source.content_stamp_ms = 2000;
+        model.set_active_grid_retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            first_source);
+        model.set_active_grid_retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1,
+            second_source);
+        (void)model.resize({4, 3});
+    };
+
+    term::Terminal_screen_model mutated_model = make_model(4, 4);
+    stamp_source_rows(mutated_model);
+    ok &= check(mutated_model.retained_line_content_origin_spans_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                1).size() == 2U,
+        "mixed reflow row starts with two source-origin spans");
+    (void)mutated_model.ingest(QByteArrayLiteral("\x1b[2;2HX"));
+    const term::Terminal_retained_line_provenance mutated_provenance =
+        mutated_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    ok &= check(mutated_model.row_text(1).trimmed() == QStringLiteral("dXf") &&
+            mutated_model.retained_line_content_origin_spans_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                1).empty() &&
+            mutated_provenance.content_stamp_ms > 0 &&
+            mutated_provenance.content_stamp_is_unambiguous,
+        "content mutation replaces old reflow spans with the row's new stamp");
+
+    term::Terminal_screen_model replaced_model = make_model(4, 4);
+    stamp_source_rows(replaced_model);
+    (void)replaced_model.ingest(QByteArrayLiteral("\x1b[2;1H\x1b[L"));
+    const term::Terminal_retained_line_provenance replaced_provenance =
+        replaced_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            1);
+    ok &= check(replaced_model.retained_line_content_origin_spans_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                1).empty() &&
+            replaced_provenance.content_stamp_ms == 0 &&
+            replaced_provenance.content_stamp_is_unambiguous,
+        "fresh replacement row has no stale content-origin spans");
+    return ok;
+}
+
 }
 
 int main()
@@ -2193,6 +2925,7 @@ int main()
     ok &= test_config_validation();
     ok &= test_retained_history_capacity_override();
     ok &= test_oversize_retained_history_row_is_discarded();
+    ok &= test_retained_history_row_cell_fields_round_trip();
     ok &= test_structural_action_retention_can_be_disabled();
     ok &= test_printable_controls_wrap_and_scrollback();
     ok &= test_printable_ascii_span_semantics();
@@ -2208,5 +2941,15 @@ int main()
     ok &= test_escape_intermediates_do_not_leak();
     ok &= test_bounded_escape_intermediate_recovery();
     ok &= test_exact_limit_escape_prefix_stays_pending();
+    ok &= test_primary_soft_wrap_reflow_preserves_source_row_stamps();
+    ok &= test_mixed_source_row_provenance_survives_reflow_round_trip();
+    ok &= test_mixed_reflow_origin_spans_survive_scrollback_materialization();
+    ok &= test_primary_one_column_reflow_restores_wide_glyph_and_cursors();
+    ok &= test_wide_glyph_written_at_one_column_keeps_natural_width();
+    ok &= test_one_column_wide_glyph_reaches_retained_history();
+    ok &= test_no_autowrap_wide_variation_glyph_reaches_retained_history();
+    ok &= test_no_autowrap_clipped_wide_glyph_survives_dch_history();
+    ok &= test_reflow_cursors_do_not_insert_a_wide_wrap_margin();
+    ok &= test_reflow_origin_spans_are_cleared_on_mutation_and_replacement();
     return ok ? 0 : 1;
 }

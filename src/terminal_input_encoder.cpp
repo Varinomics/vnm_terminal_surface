@@ -4,6 +4,12 @@
 #include <QKeyEvent>
 #include <Qt>
 #include <QtGlobal>
+#if defined(Q_OS_WIN)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -34,9 +40,31 @@ constexpr qsizetype k_bracketed_paste_framing_bytes =
     k_bracketed_paste_begin_bytes + k_bracketed_paste_end_bytes;
 
 #if defined(Q_OS_WIN)
-constexpr int k_win32_vk_return          = 13;
-constexpr int k_win32_scan_return        = 28;
-constexpr int k_win32_shift_pressed      = 0x0010;
+constexpr int k_win32_right_alt_pressed    = 0x0001;
+constexpr int k_win32_left_alt_pressed     = 0x0002;
+constexpr int k_win32_right_ctrl_pressed   = 0x0004;
+constexpr int k_win32_left_ctrl_pressed    = 0x0008;
+constexpr int k_win32_shift_pressed       = 0x0010;
+constexpr int k_win32_numlock_on          = 0x0020;
+constexpr int k_win32_scrolllock_on       = 0x0040;
+constexpr int k_win32_capslock_on         = 0x0080;
+constexpr int k_win32_enhanced_key        = 0x0100;
+constexpr int k_win32_lock_state_mask     =
+    k_win32_numlock_on | k_win32_scrolllock_on | k_win32_capslock_on;
+
+// QWindowsKeyMapper's nativeModifiers layout in Qt 6.11. Keep this mapping
+// local to events that actually carry native metadata; synthetic events use
+// their Qt modifier flags and never sample global keyboard state.
+constexpr quint32 k_qt_win_shift_left      = 0x00000001U;
+constexpr quint32 k_qt_win_control_left    = 0x00000002U;
+constexpr quint32 k_qt_win_alt_left        = 0x00000004U;
+constexpr quint32 k_qt_win_shift_right     = 0x00000010U;
+constexpr quint32 k_qt_win_control_right   = 0x00000020U;
+constexpr quint32 k_qt_win_alt_right       = 0x00000040U;
+constexpr quint32 k_qt_win_caps_lock       = 0x00000100U;
+constexpr quint32 k_qt_win_num_lock        = 0x00000200U;
+constexpr quint32 k_qt_win_scroll_lock     = 0x00000400U;
+constexpr quint32 k_qt_win_extended_key    = 0x01000000U;
 #endif
 
 // Stops once the sanitized text is longer than `stop_beyond_units`, so a caller
@@ -65,8 +93,8 @@ QString sanitize_paste_text(QString text, qsizetype stop_beyond_units)
         // which put each pasted line above the one before it and ran the
         // pasted sequence backwards; cmd.exe has no line-editor binding for it
         // and merged the whole paste into a single command line. Shift+Enter
-        // taught the same lesson for a single key - see
-        // win32_shift_enter_bytes().
+        // taught the same lesson for a single key, so Windows uses a native
+        // Shift+Return operation while preserving the established VT byte.
         if (code == u'\r' || code == u'\n') {
             sanitized.append(QChar(u'\r'));
             if (code == u'\r' &&
@@ -139,6 +167,25 @@ QByteArray csi_tilde(int first_parameter, int modifier_parameter = 0)
     return bytes;
 }
 
+enum class Windows_native_input_operation
+{
+    WINDOWS_OP_NONE,
+    WINDOWS_OP_NATIVE_KEY_STROKES,
+    WINDOWS_OP_ESCAPE_EQUIVALENT,
+    WINDOWS_OP_SHIFT_RETURN,
+    WINDOWS_OP_COMMITTED_TEXT,
+    WINDOWS_OP_ALT_TEXT,
+    WINDOWS_OP_NATIVE_ALT_KEY_TEXT,
+    WINDOWS_OP_VT_SEQUENCE,
+};
+
+struct Encoded_key_event
+{
+    QByteArray                       bytes;
+    Windows_native_input_operation  windows_operation =
+        Windows_native_input_operation::WINDOWS_OP_NONE;
+};
+
 #if defined(Q_OS_WIN)
 QByteArray win32_input_key_event_bytes(
     int  virtual_key,
@@ -164,26 +211,318 @@ QByteArray win32_input_key_event_bytes(
     return bytes;
 }
 
-QByteArray win32_shift_enter_bytes(const QKeyEvent& event)
+QByteArray win32_key_stroke_bytes(
+    int virtual_key, int scan_code, int unicode_character, int control_key_state)
 {
-    const int virtual_key = event.nativeVirtualKey() != 0U
-        ? static_cast<int>(event.nativeVirtualKey())
-        : k_win32_vk_return;
-    const int scan_code = event.nativeScanCode() != 0U
-        ? static_cast<int>(event.nativeScanCode())
-        : k_win32_scan_return;
-    const int unicode_character = event.text().isEmpty()
-        ? '\r'
-        : event.text().front().unicode();
     return win32_input_key_event_bytes(
-        virtual_key,
-        scan_code,
-        unicode_character,
-        1,
-        k_win32_shift_pressed,
-        std::max(1, event.count()));
+            virtual_key, scan_code, unicode_character, 1, control_key_state, 1) +
+        win32_input_key_event_bytes(
+            virtual_key, scan_code, 0, 0, control_key_state, 1);
+}
+
+int windows_key_scan_code(const QKeyEvent& event, int virtual_key)
+{
+    // Qt's Windows mapper stores the E0 prefix in the high byte. Console
+    // records carry the scan byte and ENHANCED_KEY separately.
+    if (event.nativeScanCode() != 0U) {
+        return static_cast<int>(event.nativeScanCode() & 0xffU);
+    }
+    if (virtual_key == VK_PACKET) {
+        return 0;
+    }
+    return static_cast<int>(MapVirtualKeyW(
+        static_cast<UINT>(virtual_key), MAPVK_VK_TO_VSC) & 0xffU);
+}
+
+bool windows_key_uses_enhanced_flag(const QKeyEvent& event, int virtual_key)
+{
+    const bool native_extended =
+        (event.nativeModifiers() & k_qt_win_extended_key) != 0U;
+    const bool scan_extended = event.nativeScanCode() != 0U &&
+        (event.nativeScanCode() & 0xff00U) == 0xe000U;
+    if (event.nativeModifiers() != 0U || event.nativeScanCode() != 0U) {
+        return native_extended || scan_extended;
+    }
+
+    const bool keypad = (event.modifiers() & Qt::KeypadModifier) != Qt::NoModifier;
+    switch (virtual_key) {
+        case VK_RETURN:
+            return event.key() == Qt::Key_Enter || keypad;
+        case VK_DIVIDE:
+            return true;
+        case VK_PRIOR:
+        case VK_NEXT:
+        case VK_END:
+        case VK_HOME:
+        case VK_LEFT:
+        case VK_UP:
+        case VK_RIGHT:
+        case VK_DOWN:
+        case VK_INSERT:
+        case VK_DELETE:
+            return !keypad;
+        default:
+            return false;
+    }
+}
+
+int windows_control_key_state(const QKeyEvent& event, int virtual_key)
+{
+    int control_key_state = 0;
+    const quint32 native_modifiers = event.nativeModifiers();
+    if (native_modifiers != 0U) {
+        if ((native_modifiers & (k_qt_win_shift_left | k_qt_win_shift_right)) != 0U) {
+            control_key_state |= k_win32_shift_pressed;
+        }
+        if ((native_modifiers & k_qt_win_control_left) != 0U) {
+            control_key_state |= k_win32_left_ctrl_pressed;
+        }
+        if ((native_modifiers & k_qt_win_control_right) != 0U) {
+            control_key_state |= k_win32_right_ctrl_pressed;
+        }
+        if ((native_modifiers & k_qt_win_alt_left) != 0U) {
+            control_key_state |= k_win32_left_alt_pressed;
+        }
+        if ((native_modifiers & k_qt_win_alt_right) != 0U) {
+            control_key_state |= k_win32_right_alt_pressed;
+        }
+        if ((native_modifiers & k_qt_win_caps_lock) != 0U) {
+            control_key_state |= k_win32_capslock_on;
+        }
+        if ((native_modifiers & k_qt_win_num_lock) != 0U) {
+            control_key_state |= k_win32_numlock_on;
+        }
+        if ((native_modifiers & k_qt_win_scroll_lock) != 0U) {
+            control_key_state |= k_win32_scrolllock_on;
+        }
+    }
+    else {
+        const Qt::KeyboardModifiers modifiers = event.modifiers();
+        if ((modifiers & Qt::ShiftModifier) != Qt::NoModifier) {
+            control_key_state |= k_win32_shift_pressed;
+        }
+        if ((modifiers & Qt::AltModifier) != Qt::NoModifier) {
+            control_key_state |= k_win32_left_alt_pressed;
+        }
+        if ((modifiers & Qt::GroupSwitchModifier) != Qt::NoModifier) {
+            control_key_state |= k_win32_right_alt_pressed;
+        }
+        if ((modifiers & Qt::ControlModifier) != Qt::NoModifier) {
+            control_key_state |= k_win32_left_ctrl_pressed;
+        }
+    }
+
+    if (event.key() == Qt::Key_Backtab) {
+        control_key_state |= k_win32_shift_pressed;
+    }
+    if (windows_key_uses_enhanced_flag(event, virtual_key)) {
+        control_key_state |= k_win32_enhanced_key;
+    }
+    return control_key_state;
+}
+
+QByteArray win32_escape_strokes(const QKeyEvent& event)
+{
+    const QByteArray escape = win32_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0);
+    if ((event.modifiers() & Qt::AltModifier) != Qt::NoModifier) {
+        return escape + escape;
+    }
+    return escape;
+}
+
+int windows_virtual_key(const QKeyEvent& event)
+{
+    if (event.nativeVirtualKey() != 0U) {
+        return static_cast<int>(event.nativeVirtualKey());
+    }
+
+    const int key = event.key();
+    if ((event.modifiers() & Qt::KeypadModifier) != Qt::NoModifier) {
+        if (key >= Qt::Key_0 && key <= Qt::Key_9) {
+            return VK_NUMPAD0 + key - Qt::Key_0;
+        }
+        switch (key) {
+            case Qt::Key_Period:  return VK_DECIMAL;
+            case Qt::Key_Minus:   return VK_SUBTRACT;
+            case Qt::Key_Comma:   return VK_SEPARATOR;
+            case Qt::Key_Plus:    return VK_ADD;
+            case Qt::Key_Asterisk: return VK_MULTIPLY;
+            case Qt::Key_Slash:   return VK_DIVIDE;
+            case Qt::Key_Equal:   return VK_OEM_NEC_EQUAL;
+            default:              break;
+        }
+    }
+
+    if ((key >= Qt::Key_A && key <= Qt::Key_Z) ||
+        (key >= Qt::Key_0 && key <= Qt::Key_9))
+    {
+        return key;
+    }
+
+    switch (key) {
+        case Qt::Key_Backspace:    return VK_BACK;
+        case Qt::Key_Tab:
+        case Qt::Key_Backtab:      return VK_TAB;
+        case Qt::Key_Return:
+        case Qt::Key_Enter:        return VK_RETURN;
+        case Qt::Key_Escape:       return VK_ESCAPE;
+        case Qt::Key_Space:        return VK_SPACE;
+        case Qt::Key_PageUp:       return VK_PRIOR;
+        case Qt::Key_PageDown:     return VK_NEXT;
+        case Qt::Key_End:          return VK_END;
+        case Qt::Key_Home:         return VK_HOME;
+        case Qt::Key_Left:         return VK_LEFT;
+        case Qt::Key_Up:           return VK_UP;
+        case Qt::Key_Right:        return VK_RIGHT;
+        case Qt::Key_Down:         return VK_DOWN;
+        case Qt::Key_Insert:       return VK_INSERT;
+        case Qt::Key_Delete:       return VK_DELETE;
+        case Qt::Key_BracketLeft:  return VK_OEM_4;
+        case Qt::Key_Backslash:    return VK_OEM_5;
+        case Qt::Key_BracketRight: return VK_OEM_6;
+        case Qt::Key_Semicolon:    return VK_OEM_1;
+        case Qt::Key_Apostrophe:   return VK_OEM_7;
+        case Qt::Key_Comma:        return VK_OEM_COMMA;
+        case Qt::Key_Period:       return VK_OEM_PERIOD;
+        case Qt::Key_Slash:        return VK_OEM_2;
+        case Qt::Key_QuoteLeft:    return VK_OEM_3;
+        case Qt::Key_Minus:        return VK_OEM_MINUS;
+        case Qt::Key_Underscore:   return VK_OEM_MINUS;
+        case Qt::Key_Equal:        return VK_OEM_PLUS;
+        default:
+            if (key >= Qt::Key_F1 && key <= Qt::Key_F24) {
+                return VK_F1 + key - Qt::Key_F1;
+            }
+            return event.text().isEmpty() ? 0 : VK_PACKET;
+    }
+}
+
+QByteArray win32_key_event_strokes(const QKeyEvent& event)
+{
+    const int virtual_key = windows_virtual_key(event);
+    if (virtual_key == 0) {
+        return {};
+    }
+
+    int control_key_state = windows_control_key_state(event, virtual_key);
+    QString text = event.text();
+    if (text.isEmpty()) {
+        if (virtual_key == VK_BACK) {
+            text.append((control_key_state &
+                (k_win32_left_ctrl_pressed | k_win32_right_ctrl_pressed)) != 0
+                    ? QChar(u'\b') : QChar(u'\x7f'));
+        }
+        else if (virtual_key == VK_TAB) {
+            text.append(QChar(u'\t'));
+        }
+        else if (virtual_key == VK_RETURN) {
+            text.append(QChar(u'\r'));
+        }
+        else if (virtual_key == VK_ESCAPE) {
+            text.append(QChar(u'\x1b'));
+        }
+    }
+
+    if (text.isEmpty()) {
+        return win32_key_stroke_bytes(
+            virtual_key,
+            windows_key_scan_code(event, virtual_key),
+            0,
+            control_key_state);
+    }
+
+    QByteArray bytes;
+    const bool packet_payload = text.size() > 1 || virtual_key == VK_PACKET;
+    for (qsizetype index = 0; index < text.size(); ++index) {
+        const int unit_virtual_key = packet_payload ? VK_PACKET : virtual_key;
+        const int unit_scan_code = packet_payload
+            ? 0
+            : windows_key_scan_code(event, virtual_key);
+        bytes += win32_key_stroke_bytes(
+            unit_virtual_key,
+            unit_scan_code,
+            text.at(index).unicode(),
+            control_key_state);
+    }
+    return bytes;
+}
+
+QByteArray win32_committed_text_strokes(const QKeyEvent& event)
+{
+    const QString text = event.text();
+    if (text.isEmpty()) {
+        return {};
+    }
+
+    const int control_key_state =
+        windows_control_key_state(event, VK_PACKET) & k_win32_lock_state_mask;
+    QByteArray bytes;
+    for (const QChar character : text) {
+        bytes += win32_key_stroke_bytes(
+            VK_PACKET,
+            0,
+            character.unicode(),
+            control_key_state);
+    }
+    return bytes;
+}
+
+QByteArray win32_alt_text_strokes(const QKeyEvent& event)
+{
+    const QByteArray committed_text = win32_committed_text_strokes(event);
+    if (committed_text.isEmpty()) {
+        return {};
+    }
+
+    // ConPTY emits VK_PACKET Unicode before applying its Alt-prefix handling.
+    // Send one explicit Escape before committed text, regardless of its length.
+    return win32_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0) + committed_text;
+}
+
+QByteArray win32_native_alt_key_text_strokes(const QKeyEvent& event)
+{
+    const QByteArray native_key = win32_key_event_strokes(event);
+    if (native_key.isEmpty()) {
+        return {};
+    }
+
+    // ConPTY does not apply the VT Alt prefix to a native right-Alt-only
+    // record. An explicit Escape restores VT semantics while keeping that
+    // record's native identity intact. When left Alt is also held, ConPTY
+    // supplies the prefix itself, so avoid sending a duplicate Escape.
+    // Classic readers observe the explicit Escape as a separate key; the
+    // right-Alt-only policy deliberately prioritizes VT ESC+text semantics.
+    if ((event.nativeModifiers() & k_qt_win_alt_left) != 0U) {
+        return native_key;
+    }
+    return win32_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0) + native_key;
+}
+
+QByteArray win32_vt_sequence_strokes(const QByteArray& bytes)
+{
+    // Packet strokes preserve the computed VT bytes without exposing an ESC
+    // prefix to ConPTY's native-input parser as a partial Win32 frame.
+    QByteArray strokes;
+    for (qsizetype index = 0; index < bytes.size(); ++index) {
+        strokes += win32_key_stroke_bytes(
+            VK_PACKET, 0, static_cast<unsigned char>(bytes.at(index)), 0);
+    }
+    return strokes;
 }
 #endif
+
+bool windows_alt_chord_uses_vt_sequence_input(const QKeyEvent& event)
+{
+#if defined(Q_OS_WIN)
+    const Qt::KeyboardModifiers modifiers = event.modifiers();
+    return (modifiers & Qt::GroupSwitchModifier) != Qt::NoModifier ||
+        ((modifiers & Qt::AltModifier) != Qt::NoModifier &&
+            (event.nativeModifiers() & k_qt_win_alt_right) != 0U);
+#else
+    static_cast<void>(event);
+    return false;
+#endif
+}
 
 int mouse_modifier_bits(Qt::KeyboardModifiers modifiers)
 {
@@ -243,7 +582,11 @@ int modifier_parameter(const QKeyEvent& event)
 {
     int parameter = 1;
     const Qt::KeyboardModifiers modifiers = event.modifiers();
-    if ((modifiers & Qt::ShiftModifier)   != Qt::NoModifier) { parameter += 1; }
+    if (event.key() == Qt::Key_Backtab ||
+        (modifiers & Qt::ShiftModifier) != Qt::NoModifier)
+    {
+        parameter += 1;
+    }
     if ((modifiers & Qt::AltModifier)     != Qt::NoModifier) { parameter += 2; }
     if ((modifiers & Qt::ControlModifier) != Qt::NoModifier) { parameter += 4; }
     return parameter;
@@ -298,13 +641,22 @@ QByteArray special_key_bytes(const QKeyEvent& event)
         case Qt::Key_Enter:
             if (terminal_modifiers(event) == Qt::ShiftModifier) {
 #if defined(Q_OS_WIN)
-                // ConPTY consumers that use Win32 console input need the Shift
-                // modifier preserved as a KEY_EVENT_RECORD, not normalized to LF.
-                return win32_shift_enter_bytes(event);
+                // The native operation below carries Shift while preserving
+                // the established Windows VT-input carriage-return byte.
+                return QByteArray(1, '\r');
 #else
                 return QByteArray(1, '\n');
 #endif
             }
+#if defined(Q_OS_WIN)
+            if (terminal_modifiers(event) ==
+                (Qt::ControlModifier | Qt::AltModifier))
+            {
+                // The native VK_RETURN path preserves the key record, and this
+                // selector fallback matches ConPTY's measured ESC+LF result.
+                return alt_prefixed(QByteArray(1, '\n'), event);
+            }
+#endif
             return alt_prefixed(QByteArray(1, '\r'), event);
         case Qt::Key_Tab:
             if ((event.modifiers() & Qt::ShiftModifier) != Qt::NoModifier) {
@@ -500,6 +852,173 @@ QByteArray ctrl_alt_printable_text_bytes(const QKeyEvent& event)
     return text.toUtf8();
 }
 
+Encoded_key_event encode_terminal_key_event_bytes(
+    const QKeyEvent&           event,
+    Terminal_input_mode_state  modes)
+{
+    if (event.type() != QEvent::KeyPress) {
+        return {};
+    }
+    const bool preserve_alt_vt_bytes = windows_alt_chord_uses_vt_sequence_input(event);
+
+    if (modes.application_keypad) {
+        const QByteArray keypad_bytes = application_keypad_bytes(event);
+        if (!keypad_bytes.isEmpty()) {
+            // Keep application-keypad Equal's SS3 X VT sequence intact through
+            // ConPTY; Right-Alt keypad operations use the same byte-preserving
+            // path. Classic readers intentionally receive VK_PACKET text.
+            return {keypad_bytes,
+                event.key() == Qt::Key_Equal || preserve_alt_vt_bytes
+                    ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+                    : Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+        }
+    }
+
+    const QByteArray navigation_bytes =
+        navigation_key_bytes(event, modes.application_cursor_keys);
+    if (!navigation_bytes.isEmpty()) {
+        const bool modified_tab =
+            (event.key() == Qt::Key_Tab || event.key() == Qt::Key_Backtab) &&
+            navigation_bytes != QByteArrayLiteral("\x1b[Z");
+        if (preserve_alt_vt_bytes || modified_tab)
+        {
+            // Preserve modified Tab and Right-Alt VT sequences through ConPTY.
+            // Native key records lose these modifier distinctions there;
+            // classic readers consequently receive VK_PACKET text.
+            return {navigation_bytes,
+                Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE};
+        }
+        return {navigation_bytes,
+            Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+    }
+
+    const QByteArray arrow_bytes = arrow_key_bytes(event, modes.application_cursor_keys);
+    if (!arrow_bytes.isEmpty()) {
+        return {arrow_bytes, preserve_alt_vt_bytes
+            ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+            : Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+    }
+
+    const QByteArray function_bytes = function_key_bytes(event);
+    if (!function_bytes.isEmpty()) {
+        return {function_bytes, preserve_alt_vt_bytes
+            ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+            : Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+    }
+
+    const QByteArray special_bytes = special_key_bytes(event);
+    if (!special_bytes.isEmpty()) {
+        if (event.key() == Qt::Key_Escape) {
+            return {special_bytes, preserve_alt_vt_bytes
+                ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+                : Windows_native_input_operation::WINDOWS_OP_ESCAPE_EQUIVALENT};
+        }
+        if ((event.key() == Qt::Key_Return || event.key() == Qt::Key_Enter) &&
+            terminal_modifiers(event) == Qt::ShiftModifier)
+        {
+            return {special_bytes, preserve_alt_vt_bytes
+                ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+                : Windows_native_input_operation::WINDOWS_OP_SHIFT_RETURN};
+        }
+        if (preserve_alt_vt_bytes) {
+            return {special_bytes,
+                Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE};
+        }
+        if ((event.modifiers() & Qt::AltModifier) != Qt::NoModifier) {
+            return {special_bytes,
+                Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+        }
+        return {special_bytes};
+    }
+
+    const QByteArray ctrl_alt_printable_bytes = ctrl_alt_printable_text_bytes(event);
+    if (!ctrl_alt_printable_bytes.isEmpty()) {
+        return {
+            ctrl_alt_printable_bytes,
+            Windows_native_input_operation::WINDOWS_OP_COMMITTED_TEXT,
+        };
+    }
+
+#if defined(Q_OS_WIN)
+    if ((event.modifiers() & Qt::ControlModifier) != Qt::NoModifier &&
+        (event.key() == Qt::Key_3 || event.key() == Qt::Key_BracketLeft))
+    {
+        const QByteArray control_bytes = control_key_bytes(event);
+        if (preserve_alt_vt_bytes) {
+            return {
+                alt_prefixed(control_bytes, event),
+                Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE,
+            };
+        }
+        return {
+            control_bytes,
+            Windows_native_input_operation::WINDOWS_OP_ESCAPE_EQUIVALENT,
+        };
+    }
+#endif
+
+    const QByteArray control_bytes = control_key_bytes(event);
+    if (!control_bytes.isEmpty()) {
+        const QByteArray bytes = alt_prefixed(control_bytes, event);
+        const bool preserve_alt_prefixed_control_bytes =
+            preserve_alt_vt_bytes ||
+            (event.modifiers() & Qt::AltModifier) != Qt::NoModifier;
+        return {
+            bytes,
+            preserve_alt_prefixed_control_bytes
+                ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
+                : Windows_native_input_operation::WINDOWS_OP_NONE,
+        };
+    }
+
+    const QByteArray text_bytes = printable_text_bytes(event);
+    if (text_bytes.isEmpty()) {
+        return {};
+    }
+
+    const bool group_switch =
+        (event.modifiers() & Qt::GroupSwitchModifier) != Qt::NoModifier;
+    bool native_right_alt_chord = false;
+#if defined(Q_OS_WIN)
+    native_right_alt_chord =
+        (event.modifiers() & Qt::AltModifier) != Qt::NoModifier &&
+        !group_switch &&
+        event.nativeVirtualKey() != 0U &&
+        event.nativeVirtualKey() != VK_PACKET &&
+        event.text().size() == 1 &&
+        (event.nativeModifiers() & k_qt_win_alt_right) != 0U;
+#endif
+    const bool ordinary_alt_text =
+        (event.modifiers() & Qt::AltModifier) != Qt::NoModifier &&
+        (native_right_alt_chord || event.text().size() > 1
+#if defined(Q_OS_WIN)
+            || windows_virtual_key(event) == VK_PACKET
+#endif
+        );
+    if (group_switch) {
+        // AltGr/GroupSwitch text is committed text, even when Qt also reports
+        // AltModifier or native AltRight. Do not turn it into ESC-prefixed Alt
+        // text while it passes through ConPTY's VT-input parser.
+        return {
+            event.text().toUtf8(),
+            Windows_native_input_operation::WINDOWS_OP_COMMITTED_TEXT,
+        };
+    }
+    if (native_right_alt_chord) {
+        return {
+            text_bytes,
+            Windows_native_input_operation::WINDOWS_OP_NATIVE_ALT_KEY_TEXT,
+        };
+    }
+    if (ordinary_alt_text) {
+        return {text_bytes, Windows_native_input_operation::WINDOWS_OP_ALT_TEXT};
+    }
+
+    // Text-bearing QKeyEvents are represented as one native stroke per UTF-16
+    // unit. The operation tag, rather than inspecting for an ESC prefix, keeps
+    // terminal bytes and native key records distinct until this final choice.
+    return {text_bytes, Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
+}
 }
 
 QByteArray encode_terminal_key_event(
@@ -508,45 +1027,54 @@ QByteArray encode_terminal_key_event(
 {
     VNM_TERMINAL_PROFILE_SCOPE("encode_terminal_key_event");
 
-    if (modes.application_keypad) {
-        const QByteArray keypad_bytes = application_keypad_bytes(event);
-        if (!keypad_bytes.isEmpty()) {
-            return keypad_bytes;
-        }
+    const Encoded_key_event encoded = encode_terminal_key_event_bytes(event, modes);
+#if defined(Q_OS_WIN)
+    switch (encoded.windows_operation) {
+        case Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES:
+            if (const QByteArray native_key_strokes = win32_key_event_strokes(event);
+                !native_key_strokes.isEmpty())
+            {
+                return native_key_strokes;
+            }
+            break;
+        case Windows_native_input_operation::WINDOWS_OP_ESCAPE_EQUIVALENT:
+            return win32_escape_strokes(event);
+        case Windows_native_input_operation::WINDOWS_OP_SHIFT_RETURN:
+            if (const QByteArray native_key_strokes = win32_key_event_strokes(event);
+                !native_key_strokes.isEmpty())
+            {
+                return native_key_strokes;
+            }
+            break;
+        case Windows_native_input_operation::WINDOWS_OP_COMMITTED_TEXT:
+            if (const QByteArray packet_strokes = win32_committed_text_strokes(event);
+                !packet_strokes.isEmpty())
+            {
+                return packet_strokes;
+            }
+            break;
+        case Windows_native_input_operation::WINDOWS_OP_ALT_TEXT:
+            if (const QByteArray packet_strokes = win32_alt_text_strokes(event);
+                !packet_strokes.isEmpty())
+            {
+                return packet_strokes;
+            }
+            break;
+        case Windows_native_input_operation::WINDOWS_OP_NATIVE_ALT_KEY_TEXT:
+            if (const QByteArray native_alt_key_strokes =
+                    win32_native_alt_key_text_strokes(event);
+                !native_alt_key_strokes.isEmpty())
+            {
+                return native_alt_key_strokes;
+            }
+            break;
+        case Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE:
+            return win32_vt_sequence_strokes(encoded.bytes);
+        case Windows_native_input_operation::WINDOWS_OP_NONE:
+            break;
     }
-
-    const QByteArray navigation_bytes =
-        navigation_key_bytes(event, modes.application_cursor_keys);
-    if (!navigation_bytes.isEmpty()) {
-        return navigation_bytes;
-    }
-
-    const QByteArray arrow_bytes = arrow_key_bytes(event, modes.application_cursor_keys);
-    if (!arrow_bytes.isEmpty()) {
-        return arrow_bytes;
-    }
-
-    const QByteArray function_bytes = function_key_bytes(event);
-    if (!function_bytes.isEmpty()) {
-        return function_bytes;
-    }
-
-    const QByteArray special_bytes = special_key_bytes(event);
-    if (!special_bytes.isEmpty()) {
-        return special_bytes;
-    }
-
-    const QByteArray ctrl_alt_printable_bytes = ctrl_alt_printable_text_bytes(event);
-    if (!ctrl_alt_printable_bytes.isEmpty()) {
-        return ctrl_alt_printable_bytes;
-    }
-
-    const QByteArray control_bytes = control_key_bytes(event);
-    if (!control_bytes.isEmpty()) {
-        return alt_prefixed(control_bytes, event);
-    }
-
-    return printable_text_bytes(event);
+#endif
+    return encoded.bytes;
 }
 
 QByteArray encode_terminal_mouse_event(

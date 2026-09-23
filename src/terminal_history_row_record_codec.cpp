@@ -17,13 +17,23 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::uint32_t k_row_record_magic = 0x56524852U;
-constexpr std::uint16_t k_row_record_version = 3U;
+// Row payloads live only in the model-owned in-memory ring. A version change
+// rejects stale layouts; no persisted-history migration is implied.
+constexpr std::uint16_t k_row_record_version = 4U;
 constexpr std::uint16_t k_row_record_kind_row = 1U;
 constexpr std::uint32_t k_row_record_header_bytes = 100U;
 constexpr std::uint32_t k_payload_kind_mask = 0x0fU;
+constexpr std::uint32_t k_row_record_flag_ambiguous_content_stamp = 0x10U;
+constexpr std::uint32_t k_row_record_flag_content_origin_spans = 0x20U;
+constexpr std::uint32_t k_row_record_known_flags_mask =
+    k_payload_kind_mask |
+    k_row_record_flag_ambiguous_content_stamp |
+    k_row_record_flag_content_origin_spans;
 constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
 constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
 constexpr std::size_t k_encoded_style_bytes = 16U;
+constexpr std::size_t k_encoded_content_origin_span_bytes = 35U;
+constexpr std::size_t k_content_origin_span_count_bytes = 4U;
 
 constexpr std::uint8_t k_opcode_default_blank = 0x00U;
 constexpr std::uint8_t k_opcode_wide_continuation = 0x01U;
@@ -630,6 +640,107 @@ bool read_header(Byte_reader& reader, row_record_header_t& header)
         reader.read_u16(header.style_count);
 }
 
+bool write_content_origin_span_table(
+    Byte_writer&                    writer,
+    const Terminal_history_row_record& record)
+{
+    if (record.content_origin_spans.empty()) {
+        return true;
+    }
+
+    if (!writer.write_u32(static_cast<std::uint32_t>(record.content_origin_spans.size()))) {
+        return false;
+    }
+
+    for (const terminal_retained_line_content_origin_span_t& span :
+        record.content_origin_spans)
+    {
+        const std::optional<std::uint16_t> source =
+            provenance_source_code(span.origin.source);
+        if (!writer.write_u32(static_cast<std::uint32_t>(span.first_column)) ||
+            !writer.write_u32(static_cast<std::uint32_t>(span.cell_count)) ||
+            !writer.write_u64(span.origin.retained_line_id) ||
+            !writer.write_u64(span.origin.content_generation) ||
+            !writer.write_u16(source.value()) ||
+            !writer.write_u64(static_cast<std::uint64_t>(span.origin.content_stamp_ms)) ||
+            !writer.write_u8(span.origin.content_stamp_is_unambiguous ? 1U : 0U))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+Terminal_history_row_record_codec_status read_content_origin_span_table(
+    Byte_reader&                    reader,
+    const row_record_header_t&       header,
+    Terminal_history_row_record&     record)
+{
+    if ((header.flags & k_row_record_flag_content_origin_spans) == 0U) {
+        return Terminal_history_row_record_codec_status::OK;
+    }
+
+    std::uint32_t span_count = 0U;
+    if (!reader.read_u32(span_count)) {
+        return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+    }
+    if (span_count == 0U || span_count > header.cell_count) {
+        return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+
+    record.content_origin_spans.reserve(span_count);
+    std::uint64_t previous_end = 0U;
+    for (std::uint32_t index = 0U; index < span_count; ++index) {
+        std::uint32_t first_column = 0U;
+        std::uint32_t cell_count = 0U;
+        std::uint64_t retained_line_id = 0U;
+        std::uint64_t content_generation = 0U;
+        std::uint16_t source_code = 0U;
+        std::uint64_t content_stamp_ms = 0U;
+        std::uint8_t content_stamp_is_unambiguous = 0U;
+        if (!reader.read_u32(first_column) ||
+            !reader.read_u32(cell_count) ||
+            !reader.read_u64(retained_line_id) ||
+            !reader.read_u64(content_generation) ||
+            !reader.read_u16(source_code) ||
+            !reader.read_u64(content_stamp_ms) ||
+            !reader.read_u8(content_stamp_is_unambiguous))
+        {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+
+        const std::optional<Terminal_retained_line_provenance_source> source =
+            provenance_source_from_code(source_code);
+        const std::uint64_t span_end =
+            static_cast<std::uint64_t>(first_column) + cell_count;
+        if (!source.has_value()) {
+            return Terminal_history_row_record_codec_status::INVALID_ENUM;
+        }
+        if (cell_count == 0U || span_end > header.cell_count ||
+            static_cast<std::uint64_t>(first_column) < previous_end ||
+            content_stamp_is_unambiguous > 1U)
+        {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+
+        record.content_origin_spans.push_back({
+            static_cast<int>(first_column),
+            static_cast<int>(cell_count),
+            {
+                retained_line_id,
+                content_generation,
+                *source,
+                static_cast<qint64>(content_stamp_ms),
+                content_stamp_is_unambiguous != 0U,
+            },
+        });
+        previous_end = span_end;
+    }
+
+    return Terminal_history_row_record_codec_status::OK;
+}
+
 bool write_table_length(Byte_writer& writer, std::uint32_t byte_count)
 {
     const std::uint8_t width_code = shortest_width_code(byte_count);
@@ -744,10 +855,23 @@ Terminal_history_row_record_codec_status validate_cell_text(
 
     const Terminal_utf8_width_result width =
         measure_utf8_width(QByteArrayView(text_bytes.constData(), text_bytes.size()));
-    if (width.status != Terminal_unicode_width_status::OK ||
-        width.cells != cell.display_width)
-    {
+    if (width.status != Terminal_unicode_width_status::OK) {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+
+    if (width.cells != cell.display_width) {
+        // Editing can move a no-autowrap glyph away from the right margin
+        // without changing its one-cell physical representation. Accept only
+        // that bounded width-two glyph, not an arbitrary mismatch or two
+        // unrelated narrow characters squeezed into one cell.
+        const bool clipped_wide_glyph = cell.display_width == 1 && width.cells == 2 &&
+            std::count_if(width.codepoints.begin(), width.codepoints.end(),
+                [](const Terminal_codepoint_width& codepoint) {
+                    return codepoint.cells > 0;
+                }) == 1;
+        if (!clipped_wide_glyph) {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
     }
 
     return Terminal_history_row_record_codec_status::OK;
@@ -918,6 +1042,55 @@ Terminal_history_row_record_codec_status validate_and_measure_tables(
     return Terminal_history_row_record_codec_status::OK;
 }
 
+Terminal_history_row_record_codec_status validate_and_measure_content_origin_spans(
+    const Terminal_history_row_record& record,
+    std::size_t&                       encoded_bytes)
+{
+    encoded_bytes = 0U;
+    const std::size_t span_count = record.content_origin_spans.size();
+    if (span_count == 0U) {
+        return Terminal_history_row_record_codec_status::OK;
+    }
+    if (span_count > record.cells.size()) {
+        return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+    if (!count_fits_u32(span_count)) {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+
+    std::uint64_t previous_end = 0U;
+    for (const terminal_retained_line_content_origin_span_t& span :
+        record.content_origin_spans)
+    {
+        if (span.first_column < 0 || span.cell_count <= 0) {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+        if (!provenance_source_code(span.origin.source).has_value()) {
+            return Terminal_history_row_record_codec_status::INVALID_ENUM;
+        }
+
+        const std::uint64_t first_column =
+            static_cast<std::uint64_t>(span.first_column);
+        const std::uint64_t span_end = first_column +
+            static_cast<std::uint64_t>(span.cell_count);
+        if (span_end > record.cells.size() || first_column < previous_end) {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+        previous_end = span_end;
+    }
+
+    if (!checked_multiply(
+            span_count,
+            k_encoded_content_origin_span_bytes,
+            encoded_bytes) ||
+        !checked_add(encoded_bytes, k_content_origin_span_count_bytes))
+    {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+
+    return Terminal_history_row_record_codec_status::OK;
+}
+
 bool try_prepare_prefix_plain_ascii_stream(
     const Terminal_history_row_record& record,
     Encoded_record_parts&              parts,
@@ -1015,6 +1188,16 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
 
     parts = {};
     std::size_t payload_bytes = k_row_record_header_bytes;
+    std::size_t content_origin_span_bytes = 0U;
+    const Terminal_history_row_record_codec_status origin_span_status =
+        validate_and_measure_content_origin_spans(record, content_origin_span_bytes);
+    if (origin_span_status != Terminal_history_row_record_codec_status::OK) {
+        return origin_span_status;
+    }
+    if (!checked_add(payload_bytes, content_origin_span_bytes)) {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+
     if (try_prepare_prefix_plain_ascii_stream(record, parts, payload_bytes)) {
         if (!size_fits_u32(payload_bytes)) {
             return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
@@ -1025,6 +1208,9 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
     }
 
     payload_bytes = k_row_record_header_bytes;
+    if (!checked_add(payload_bytes, content_origin_span_bytes)) {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
     const Terminal_history_row_record_codec_status table_status =
         validate_and_measure_tables(record, payload_bytes);
     if (table_status != Terminal_history_row_record_codec_status::OK) {
@@ -1328,6 +1514,12 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     header.payload_bytes = static_cast<std::uint32_t>(target.size());
     header.record_bytes = record_bytes;
     header.flags = parts.payload_kind;
+    if (!record.provenance.content_stamp_is_unambiguous) {
+        header.flags |= k_row_record_flag_ambiguous_content_stamp;
+    }
+    if (!record.content_origin_spans.empty()) {
+        header.flags |= k_row_record_flag_content_origin_spans;
+    }
     header.epoch = identity.epoch;
     header.byte_sequence = byte_sequence;
     header.row_sequence = identity.row_sequence;
@@ -1346,6 +1538,10 @@ Terminal_history_row_record_codec_status write_row_record_payload(
 
     Byte_writer writer(target);
     if (!write_header(writer, header)) {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+
+    if (!write_content_origin_span_table(writer, record)) {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
 
@@ -1408,7 +1604,7 @@ Terminal_history_row_record_codec_status validate_header(
         return Terminal_history_row_record_codec_status::INVALID_HEADER;
     }
 
-    if ((header.flags & ~k_payload_kind_mask) != 0U ||
+    if ((header.flags & ~k_row_record_known_flags_mask) != 0U ||
         !payload_kind_is_supported(payload_kind_from_flags(header.flags)))
     {
         return Terminal_history_row_record_codec_status::INVALID_HEADER;
@@ -1432,7 +1628,8 @@ Terminal_history_row_record_codec_status validate_header(
 }
 
 Terminal_history_row_record_codec_status validate_payload_counts(
-    const row_record_header_t& header)
+    const row_record_header_t& header,
+    std::span<const std::byte> payload)
 {
     const std::uint32_t payload_kind = payload_kind_from_flags(header.flags);
     if (header.source_width == 0U ||
@@ -1450,7 +1647,40 @@ Terminal_history_row_record_codec_status validate_payload_counts(
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
 
+    std::size_t content_origin_span_table_bytes = 0U;
+    if ((header.flags & k_row_record_flag_content_origin_spans) != 0U) {
+        Byte_reader span_count_reader(payload.subspan(k_row_record_header_bytes));
+        std::uint32_t span_count = 0U;
+        if (!span_count_reader.read_u32(span_count)) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+        if (span_count == 0U || span_count > header.cell_count) {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+
+        std::size_t span_record_bytes = 0U;
+        content_origin_span_table_bytes = k_content_origin_span_count_bytes;
+        if (!checked_multiply(
+                static_cast<std::size_t>(span_count),
+                k_encoded_content_origin_span_bytes,
+                span_record_bytes) ||
+            !checked_add(content_origin_span_table_bytes, span_record_bytes))
+        {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+
+        const std::size_t available_span_table_bytes =
+            payload.size() - k_row_record_header_bytes;
+        if (content_origin_span_table_bytes > available_span_table_bytes) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+    }
+
     std::size_t minimum_payload_bytes = k_row_record_header_bytes;
+    if (!checked_add(minimum_payload_bytes, content_origin_span_table_bytes))
+    {
+        return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
     std::size_t style_bytes = 0U;
     if (!checked_multiply(header.style_count, k_encoded_style_bytes, style_bytes) ||
         !checked_add(minimum_payload_bytes, style_bytes))
@@ -1475,10 +1705,13 @@ Terminal_history_row_record_codec_status validate_payload_counts(
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
 
-    if (payload_kind == k_payload_kind_prefix_plain_ascii &&
-        header.payload_bytes - minimum_payload_bytes > header.source_width)
-    {
-        return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    if (payload_kind == k_payload_kind_prefix_plain_ascii) {
+        std::size_t maximum_payload_bytes = minimum_payload_bytes;
+        if (!checked_add(maximum_payload_bytes, header.source_width) ||
+            header.payload_bytes > maximum_payload_bytes)
+        {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
     }
 
     return Terminal_history_row_record_codec_status::OK;
@@ -1794,7 +2027,11 @@ Terminal_history_row_record_codec_status read_cell_stream(
             }
 
             const Terminal_history_row_record_codec_status status =
-                read_extended_cell(reader, header, cell, encoded_text);
+                read_extended_cell(
+                    reader,
+                    header,
+                    cell,
+                    encoded_text);
             if (status != Terminal_history_row_record_codec_status::OK) {
                 return status;
             }
@@ -2008,7 +2245,7 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
         return result;
     }
 
-    result.status = validate_payload_counts(header);
+    result.status = validate_payload_counts(header, payload_view.payload);
     if (result.status != Terminal_history_row_record_codec_status::OK) {
         return result;
     }
@@ -2031,9 +2268,16 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
         *provenance,
         static_cast<qint64>(header.content_stamp_ms),
     };
+    record.provenance.content_stamp_is_unambiguous =
+        (header.flags & k_row_record_flag_ambiguous_content_stamp) == 0U;
     record.metadata.source_width = static_cast<int>(header.source_width);
     record.metadata.style_reference = *style;
     record.metadata.wrap_state = *wrap;
+
+    result.status = read_content_origin_span_table(reader, header, record);
+    if (result.status != Terminal_history_row_record_codec_status::OK) {
+        return result;
+    }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE(

@@ -457,6 +457,8 @@ public:
     void set_scrollback_buffer_size_mib(int size_mib);
     int minimum_scrollback_buffer_size_mib() const;
     int maximum_scrollback_buffer_size_mib() const;
+    // The homogeneous prefix-ASCII estimate excludes provenance-span tables.
+    // After reflow, retained rows can use more bytes, so this is an upper estimate.
     int estimated_scrollback_lines() const;
 
     // Interaction diagnostics use one bounded process-global trace writer.

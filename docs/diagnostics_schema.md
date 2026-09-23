@@ -67,11 +67,17 @@ content.
 
 ### Prefix plain ASCII estimate block
 
-Contract version `2` projects homogeneous full-width rows eligible for the
-prefix-plain-ASCII codec. It uses the live ring byte budget, current model
-width, exact encoded record size including ring overhead, and the codec-owned
-target of 205,000 rows. Styled, linked, non-ASCII, or otherwise generic-compact
-rows may consume more bytes.
+Retention-estimate contract version `3` projects homogeneous full-width rows
+eligible for the prefix-plain-ASCII codec, with no provenance-span table. It
+uses the live ring byte budget, current model width, the exact encoded record
+size for that no-span baseline including ring overhead, and the codec-owned
+target of 205,000 rows. The estimate does not infer a provenance-span count
+from width.
+After reflow, rows may carry variable-size provenance-span tables; therefore
+`retained_rows` and `max_columns_at_target_rows` are optimistic upper
+projections for post-reflow histories, not retention guarantees. Styled,
+linked, non-ASCII, or otherwise generic-compact rows may also consume more
+bytes.
 
 JSON path: `retained_history.prefix_plain_ascii_estimate`. TEXT header:
 `prefix_plain_ascii_estimate`.

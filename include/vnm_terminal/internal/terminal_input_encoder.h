@@ -46,6 +46,11 @@ struct Terminal_mouse_event
     Qt::KeyboardModifiers      modifiers = Qt::NoModifier;
 };
 
+// Encodes a press-oriented surface key event. On Windows, when the operation
+// is represented as a native console key, each accepted press is a balanced
+// logical stroke (down then up); auto-repeat KeyPress events are separate
+// strokes, and KeyRelease events produce no additional input. This does not
+// model a physical key held across separate Qt events.
 QByteArray encode_terminal_key_event(
     const QKeyEvent&               event,
     Terminal_input_mode_state      modes);
