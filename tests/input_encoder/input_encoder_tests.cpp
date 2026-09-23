@@ -409,8 +409,13 @@ bool test_cursor_and_navigation_modes()
     ok &= check_bytes_equal(
         encode(Qt::Key_Tab, Qt::ShiftModifier | Qt::ControlModifier, QStringLiteral("\t")),
 #if defined(Q_OS_WIN)
-        bytes_from_hex("1b5b393b31353b393b313b32343b315f"),
-        "Ctrl+Shift+Tab uses a native Win32 key event on Windows");
+        win32_key_stroke(VK_PACKET, 0, 0x1b, 0) +
+            win32_key_stroke(VK_PACKET, 0, '[', 0) +
+            win32_key_stroke(VK_PACKET, 0, '1', 0) +
+            win32_key_stroke(VK_PACKET, 0, ';', 0) +
+            win32_key_stroke(VK_PACKET, 0, '6', 0) +
+            win32_key_stroke(VK_PACKET, 0, 'Z', 0),
+        "Ctrl+Shift+Tab carries distinct CSI 1;6 Z through packet strokes");
 #else
         bytes_from_hex("1b5b313b365a"),
         "Ctrl+Shift+Tab writes CSI 1;6 Z");
@@ -418,8 +423,13 @@ bool test_cursor_and_navigation_modes()
     ok &= check_bytes_equal(
         encode(Qt::Key_Tab, Qt::ShiftModifier | Qt::AltModifier, QStringLiteral("\t")),
 #if defined(Q_OS_WIN)
-        bytes_from_hex("1b5b393b31353b393b313b31383b315f"),
-        "Alt+Shift+Tab uses a native Win32 key event on Windows");
+        win32_key_stroke(VK_PACKET, 0, 0x1b, 0) +
+            win32_key_stroke(VK_PACKET, 0, '[', 0) +
+            win32_key_stroke(VK_PACKET, 0, '1', 0) +
+            win32_key_stroke(VK_PACKET, 0, ';', 0) +
+            win32_key_stroke(VK_PACKET, 0, '4', 0) +
+            win32_key_stroke(VK_PACKET, 0, 'Z', 0),
+        "Alt+Shift+Tab carries distinct CSI 1;4 Z through packet strokes");
 #else
         bytes_from_hex("1b5b313b345a"),
         "Alt+Shift+Tab writes CSI 1;4 Z");
@@ -625,8 +635,9 @@ bool test_windows_balanced_input_semantics()
             0U,
             0x00000004U,
             QStringLiteral("x")),
-        win32_key_stroke(VK_PACKET, 0, 'x', LEFT_ALT_PRESSED),
-        "single text-only Alt input uses a packet stroke with the Alt state");
+        win32_key_stroke(VK_ESCAPE, 1, VK_ESCAPE, 0) +
+            win32_key_stroke(VK_PACKET, 0, 'x', 0),
+        "single text-only Alt input carries an explicit Escape before committed text");
 
     ok &= check_bytes_equal(
         encode_native(
@@ -656,8 +667,13 @@ bool test_windows_balanced_input_semantics()
             VK_TAB,
             0x00000003U,
             QStringLiteral("\t")),
-        win32_key_stroke(VK_TAB, 0x0f, '\t', SHIFT_PRESSED | LEFT_CTRL_PRESSED),
-        "Ctrl+Shift+Tab keeps both native modifier bits");
+        win32_key_stroke(VK_PACKET, 0, 0x1b, 0) +
+            win32_key_stroke(VK_PACKET, 0, '[', 0) +
+            win32_key_stroke(VK_PACKET, 0, '1', 0) +
+            win32_key_stroke(VK_PACKET, 0, ';', 0) +
+            win32_key_stroke(VK_PACKET, 0, '6', 0) +
+            win32_key_stroke(VK_PACKET, 0, 'Z', 0),
+        "Ctrl+Shift+Tab carries the distinct CSI 1;6 Z bytes through native framing");
     ok &= check_bytes_equal(
         encode_native(
             Qt::Key_Backtab,

@@ -175,6 +175,7 @@ enum class Windows_native_input_operation
     WINDOWS_OP_SHIFT_RETURN,
     WINDOWS_OP_COMMITTED_TEXT,
     WINDOWS_OP_ALT_TEXT,
+    WINDOWS_OP_VT_SEQUENCE,
 };
 
 struct Encoded_key_event
@@ -472,11 +473,21 @@ QByteArray win32_alt_text_strokes(const QKeyEvent& event)
         return {};
     }
 
-    // A compressed Alt event has no single physical key identity to retain.
-    // Represent terminal Alt semantics as one Escape stroke followed by the
-    // complete committed UTF-16 payload, rather than asking the console to
-    // decode raw UTF-8 or repeating Alt for each text unit.
+    // ConPTY emits VK_PACKET Unicode before applying its Alt-prefix handling.
+    // Send one explicit Escape before committed text, regardless of its length.
     return win32_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0) + committed_text;
+}
+
+QByteArray win32_vt_sequence_strokes(const QByteArray& bytes)
+{
+    // Packet strokes preserve the computed VT bytes without exposing an ESC
+    // prefix to ConPTY's native-input parser as a partial Win32 frame.
+    QByteArray strokes;
+    for (qsizetype index = 0; index < bytes.size(); ++index) {
+        strokes += win32_key_stroke_bytes(
+            VK_PACKET, 0, static_cast<unsigned char>(bytes.at(index)), 0);
+    }
+    return strokes;
 }
 #endif
 
@@ -814,6 +825,12 @@ Encoded_key_event encode_terminal_key_event_bytes(
     const QByteArray navigation_bytes =
         navigation_key_bytes(event, modes.application_cursor_keys);
     if (!navigation_bytes.isEmpty()) {
+        if ((event.key() == Qt::Key_Tab || event.key() == Qt::Key_Backtab) &&
+            navigation_bytes != QByteArrayLiteral("\x1b[Z"))
+        {
+            return {navigation_bytes,
+                Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE};
+        }
         return {navigation_bytes,
             Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
     }
@@ -885,9 +902,13 @@ Encoded_key_event encode_terminal_key_event_bytes(
 
     const bool group_switch =
         (event.modifiers() & Qt::GroupSwitchModifier) != Qt::NoModifier;
-    const bool multi_unit_alt_text =
+    const bool ordinary_alt_text =
         (event.modifiers() & Qt::AltModifier) != Qt::NoModifier &&
-        event.text().size() > 1;
+        (event.text().size() > 1
+#if defined(Q_OS_WIN)
+            || windows_virtual_key(event) == VK_PACKET
+#endif
+        );
     if (group_switch) {
         // AltGr/GroupSwitch text is committed text, even when Qt also reports
         // AltModifier or native AltRight. Do not turn it into ESC-prefixed Alt
@@ -897,7 +918,7 @@ Encoded_key_event encode_terminal_key_event_bytes(
             Windows_native_input_operation::WINDOWS_OP_COMMITTED_TEXT,
         };
     }
-    if (multi_unit_alt_text) {
+    if (ordinary_alt_text) {
         return {text_bytes, Windows_native_input_operation::WINDOWS_OP_ALT_TEXT};
     }
 
@@ -947,6 +968,8 @@ QByteArray encode_terminal_key_event(
                 return packet_strokes;
             }
             break;
+        case Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE:
+            return win32_vt_sequence_strokes(encoded.bytes);
         case Windows_native_input_operation::WINDOWS_OP_NONE:
             break;
     }

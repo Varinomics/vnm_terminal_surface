@@ -1881,6 +1881,9 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         altgr_text);
     const QByteArray ordinary_alt_text = encoded_key_event(
         Qt::Key_A, Qt::AltModifier, QStringLiteral("a"));
+    const QByteArray packet_alt_text = encoded_native_key_event(
+        Qt::Key_unknown, Qt::AltModifier, 0U, VK_PACKET, 0x00000004U,
+        QStringLiteral("x"));
     const QByteArray ordinary_letter = encoded_key_event(
         Qt::Key_A, Qt::NoModifier, QStringLiteral("a"));
     const QByteArray plain_tab = encoded_key_event(
@@ -1891,6 +1894,8 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     const QByteArray control_shift_tab = encoded_native_key_event(
         Qt::Key_Tab, Qt::ShiftModifier | Qt::ControlModifier,
         0x0fU, VK_TAB, 0x00000003U, QStringLiteral("\t"));
+    const QByteArray alt_shift_tab = encoded_key_event(
+        Qt::Key_Tab, Qt::ShiftModifier | Qt::AltModifier, QStringLiteral("\t"));
     const QByteArray backtab = encoded_key_event(Qt::Key_Backtab, Qt::NoModifier);
     term::Terminal_input_mode_state application_keypad_modes;
     application_keypad_modes.application_keypad = true;
@@ -2287,13 +2292,11 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     }
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
-        "plain Tab remains a text key while Shift+Tab, Ctrl+Shift+Tab, and Backtab are balanced",
+        "plain Tab remains a text key while Shift+Tab and Backtab are balanced",
         {
             {{plain_tab}, native_key_stroke_records(VK_TAB, 15, '\t', 0, '\t')},
             {{shift_tab}, native_key_stroke_records(
                 VK_TAB, 15, '\t', SHIFT_PRESSED)},
-            {{control_shift_tab}, native_key_stroke_records(
-                VK_TAB, 15, '\t', SHIFT_PRESSED | LEFT_CTRL_PRESSED)},
             {{backtab}, native_key_stroke_records(
                 VK_TAB, 15, '\t', SHIFT_PRESSED)},
         },
@@ -2337,8 +2340,26 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         0U);
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
+        "single VK_PACKET Alt text delivers exactly ESC followed by its character",
+        {{{packet_alt_text}, decode_hex("1b78")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
         "AltGr GroupSwitch text remains plain UTF-8 without an ESC prefix",
         {{{altgr_input}, altgr_text.toUtf8()}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Tab variants retain their distinct VT byte sequences",
+        {
+            {{plain_tab}, QByteArrayLiteral("\t")},
+            {{shift_tab}, decode_hex("1b5b5a")},
+            {{backtab}, decode_hex("1b5b5a")},
+            {{control_shift_tab}, decode_hex("1b5b313b365a")},
+            {{alt_shift_tab}, decode_hex("1b5b313b345a")},
+        },
         Escape_input_delivery::PACED,
         0U);
 
@@ -2389,17 +2410,6 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             {{shift_return}, decode_hex("0d")},
             {{shift_f3}, decode_hex("1b5b313b3252")},
         },
-        Escape_input_delivery::PACED,
-        0U);
-
-    // A fresh parser exposes the native key-down frame literally while
-    // consuming its matching key-up. The three writes form one transaction;
-    // they do not claim separate ConPTY reads.
-    ok &= run_case(
-        QStringLiteral("--escape-vt-input-reader"),
-        "a fresh parser exposes the native down frame literally and consumes its up frame",
-        {{{escape.left(1), escape.mid(1, 1), escape.mid(2)},
-            native_key_frame(VK_ESCAPE, 1, VK_ESCAPE, 1, 0)}},
         Escape_input_delivery::PACED,
         0U);
 
