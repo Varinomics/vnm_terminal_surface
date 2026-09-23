@@ -6,6 +6,12 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#if defined(Q_OS_WIN)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace term = vnm_terminal::internal;
 
@@ -35,7 +41,35 @@ bool check_bytes_equal(const QByteArray& actual, const QByteArray& expected, con
 
 QByteArray bytes_from_hex(const char* hex)
 {
-    return QByteArray::fromHex(QByteArray(hex));
+    QByteArray bytes = QByteArray::fromHex(QByteArray(hex));
+#if defined(Q_OS_WIN)
+    if (!bytes.startsWith(QByteArrayLiteral("\x1b["))) {
+        return bytes;
+    }
+
+    // Historical expected-frame literals describe key-down records. Expand
+    // only those complete W32IM fixtures to the balanced stroke contract.
+    QByteArray balanced;
+    qsizetype offset = 0;
+    while (offset < bytes.size()) {
+        const qsizetype frame_end = bytes.indexOf('_', offset);
+        if (frame_end < 0) {
+            return bytes;
+        }
+        const QByteArray frame = bytes.mid(offset, frame_end - offset + 1);
+        const QList<QByteArray> fields = frame.mid(2, frame.size() - 3).split(';');
+        if (fields.size() != 6 || fields[3] != QByteArrayLiteral("1")) {
+            return bytes;
+        }
+        balanced += frame;
+        balanced += QByteArrayLiteral("\x1b[") + fields[0] + ';' + fields[1] +
+            ";0;0;" + fields[4] + ";1_";
+        offset = frame_end + 1;
+    }
+    return balanced;
+#else
+    return bytes;
+#endif
 }
 
 QByteArray framed_paste(QByteArray body)
@@ -55,6 +89,56 @@ QByteArray encode(
     QKeyEvent event(QEvent::KeyPress, key, modifiers, text);
     return term::encode_terminal_key_event(event, modes);
 }
+
+#if defined(Q_OS_WIN)
+QByteArray win32_input_event(
+    int virtual_key, int scan_code, int unicode_character, int key_down, int control_key_state)
+{
+    QByteArray bytes = QByteArrayLiteral("\x1b[");
+    bytes += QByteArray::number(virtual_key);
+    bytes += ';';
+    bytes += QByteArray::number(scan_code);
+    bytes += ';';
+    bytes += QByteArray::number(unicode_character);
+    bytes += ';';
+    bytes += QByteArray::number(key_down);
+    bytes += ';';
+    bytes += QByteArray::number(control_key_state);
+    bytes += ";1_";
+    return bytes;
+}
+
+QByteArray win32_key_stroke(
+    int virtual_key, int scan_code, int unicode_character, int control_key_state)
+{
+    return win32_input_event(virtual_key, scan_code, unicode_character, 1, control_key_state) +
+        win32_input_event(virtual_key, scan_code, 0, 0, control_key_state);
+}
+
+QByteArray encode_native(
+    int key,
+    Qt::KeyboardModifiers modifiers,
+    quint32 scan_code,
+    quint32 virtual_key,
+    quint32 native_modifiers,
+    const QString& text,
+    bool auto_repeat = false,
+    quint16 count = 1,
+    term::Terminal_input_mode_state modes = {})
+{
+    QKeyEvent event(
+        QEvent::KeyPress,
+        key,
+        modifiers,
+        scan_code,
+        virtual_key,
+        native_modifiers,
+        text,
+        auto_repeat,
+        count);
+    return term::encode_terminal_key_event(event, modes);
+}
+#endif
 
 QByteArray sgr_mouse_report(int button_code, int row, int column, char final_byte)
 {
@@ -151,8 +235,13 @@ bool test_control_and_altgr()
             Qt::Key_E,
             Qt::ControlModifier | Qt::AltModifier,
             QString::fromUtf8("\xe2\x82\xac")),
+#if defined(Q_OS_WIN)
+        win32_key_stroke(VK_PACKET, 0, 0x20ac, 0),
+        "Ctrl+Alt committed text uses a Unicode packet without ESC or chord modifiers");
+#else
         bytes_from_hex("e282ac"),
         "Ctrl+Alt printable text preserves UTF-8 layout text");
+#endif
     ok &= check_bytes_equal(
         encode(
             Qt::Key_C,
@@ -361,44 +450,286 @@ bool test_cursor_and_navigation_modes()
 bool test_windows_native_scan_identity()
 {
 #if defined(Q_OS_WIN)
-    const auto encode_native = [](
-        int key, Qt::KeyboardModifiers modifiers, quint32 scan, quint32 vk,
-        const QString& text, term::Terminal_input_mode_state modes = {})
-    {
-        QKeyEvent event(QEvent::KeyPress, key, modifiers, scan, vk, 0U, text);
-        return term::encode_terminal_key_event(event, modes);
-    };
-
     bool ok = true;
     ok &= check_bytes_equal(
-        encode_native(Qt::Key_Up, Qt::NoModifier, 0xe048U, 38U, {}),
-        QByteArrayLiteral("\x1b[38;72;0;1;256;1_"),
+        encode_native(Qt::Key_Up, Qt::NoModifier, 0xe048U, VK_UP, 0U, {}),
+        win32_key_stroke(VK_UP, 72, 0, ENHANCED_KEY),
         "Qt extended scan prefix becomes ENHANCED_KEY, not part of the scan byte");
     ok &= check_bytes_equal(
-        encode_native(Qt::Key_Up, Qt::KeypadModifier, 0x48U, 38U, {}),
-        QByteArrayLiteral("\x1b[38;72;0;1;0;1_"),
+        encode_native(Qt::Key_Up, Qt::KeypadModifier, 0x48U, VK_UP, 0U, {}),
+        win32_key_stroke(VK_UP, 72, 0, 0),
         "native NumLock-off keypad Up is not an enhanced navigation key");
     ok &= check_bytes_equal(
         encode(Qt::Key_Up, Qt::KeypadModifier),
-        QByteArrayLiteral("\x1b[38;72;0;1;0;1_"),
+        win32_key_stroke(VK_UP, MapVirtualKeyW(VK_UP, MAPVK_VK_TO_VSC), 0, 0),
         "synthetic keypad navigation retains its keypad identity");
 
     term::Terminal_input_mode_state modes;
     modes.application_keypad = true;
     ok &= check_bytes_equal(
-        encode_native(Qt::Key_Enter, Qt::KeypadModifier, 0xe01cU, 13U,
-            QStringLiteral("\r"), modes),
-        QByteArrayLiteral("\x1b[13;28;13;1;256;1_"),
+        encode_native(Qt::Key_Enter, Qt::KeypadModifier, 0xe01cU, VK_RETURN,
+            0U, QStringLiteral("\r"), false, 1, modes),
+        win32_key_stroke(VK_RETURN, 28, '\r', ENHANCED_KEY),
         "native application keypad Enter has a scan byte and enhanced identity");
     ok &= check_bytes_equal(
         encode(Qt::Key_Enter, Qt::KeypadModifier, QStringLiteral("\r"), modes),
-        QByteArrayLiteral("\x1b[13;28;13;1;256;1_"),
+        win32_key_stroke(VK_RETURN, MapVirtualKeyW(VK_RETURN, MAPVK_VK_TO_VSC), '\r',
+            ENHANCED_KEY),
         "synthetic application keypad Enter is enhanced");
     ok &= check_bytes_equal(
         encode_native(Qt::Key_Enter, Qt::KeypadModifier | Qt::ShiftModifier,
-            0xe01cU, 13U, QStringLiteral("\r")),
-        QByteArrayLiteral("\x1b[13;28;13;1;272;1_"),
+            0xe01cU, VK_RETURN, 0U, QStringLiteral("\r")),
+        win32_key_stroke(VK_RETURN, 28, '\r', ENHANCED_KEY | SHIFT_PRESSED),
         "already-framed Shift+keypad Enter uses the same native scan conversion");
+    return ok;
+#else
+    return true;
+#endif
+}
+
+bool test_windows_balanced_input_semantics()
+{
+#if defined(Q_OS_WIN)
+    bool ok = true;
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Up,
+            Qt::ControlModifier,
+            0xe048U,
+            VK_UP,
+            0x01000220U,
+            {}),
+        win32_key_stroke(
+            VK_UP,
+            0x48,
+            0,
+            RIGHT_CTRL_PRESSED | NUMLOCK_ON | ENHANCED_KEY),
+        "Qt 6.11 0x01000220 preserves right Ctrl, NumLock, and ExtendedKey exactly");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_F3,
+            Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier,
+            0x3dU,
+            VK_F3,
+            0x00000770U,
+            {}),
+        win32_key_stroke(
+            VK_F3,
+            0x3d,
+            0,
+            SHIFT_PRESSED | RIGHT_CTRL_PRESSED | RIGHT_ALT_PRESSED |
+                CAPSLOCK_ON | NUMLOCK_ON | SCROLLLOCK_ON),
+        "Qt 6.11 right-side modifiers and every lock bit reach the native state");
+
+    const QString compressed_bmp = QString::fromUtf8("\xc3\xa9x");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_A,
+            Qt::NoModifier,
+            0x1eU,
+            'A',
+            0U,
+            compressed_bmp,
+            false,
+            2),
+        win32_key_stroke(VK_PACKET, 0, 0x00e9, 0) +
+            win32_key_stroke(VK_PACKET, 0, 'x', 0),
+        "compressed multi-unit non-packet BMP text uses ordered packets without multiplying count");
+
+    const QString supplementary = QString::fromUtf8("\xf0\x9f\x98\x80");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_A,
+            Qt::NoModifier,
+            0x1eU,
+            'A',
+            0U,
+            supplementary,
+            false,
+            2),
+        win32_key_stroke(VK_PACKET, 0, 0xd83d, 0) +
+            win32_key_stroke(VK_PACKET, 0, 0xde00, 0),
+        "supplementary non-packet text keeps both surrogate units in one packet-only payload");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_unknown,
+            Qt::NoModifier,
+            0U,
+            0U,
+            0U,
+            QStringLiteral("xy"),
+            false,
+            2),
+        win32_key_stroke(VK_PACKET, 0, 'x', 0) +
+            win32_key_stroke(VK_PACKET, 0, 'y', 0),
+        "VK_PACKET text emits each unit once even when event.count is two");
+
+    const QString altgr_character = QString::fromUtf8("\xe2\x82\xac");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_unknown,
+            Qt::AltModifier | Qt::GroupSwitchModifier,
+            0U,
+            VK_PACKET,
+            0x00000040U,
+            altgr_character),
+        win32_key_stroke(VK_PACKET, 0, 0x20ac, 0),
+        "GroupSwitch AltGr is committed VK_PACKET text without physical Alt state");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_At,
+            Qt::ControlModifier | Qt::AltModifier,
+            0U,
+            VK_PACKET,
+            0x00000060U,
+            QStringLiteral("@")),
+        win32_key_stroke(VK_PACKET, 0, '@', 0),
+        "right-Ctrl plus right-Alt committed text does not become an ESC chord");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_A,
+            Qt::AltModifier,
+            0x1eU,
+            'A',
+            0x00000004U,
+            QStringLiteral("a")),
+        win32_key_stroke('A', 0x1e, 'a', LEFT_ALT_PRESSED),
+        "ordinary Alt+text remains a distinct ESC-prefixed native stroke");
+
+    const QString compressed_alt_text = QString::fromUtf8("\xc3\xa9x");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_A,
+            Qt::AltModifier,
+            0x1eU,
+            'A',
+            0x00000004U,
+            compressed_alt_text,
+            false,
+            2),
+        win32_key_stroke(VK_ESCAPE, 1, VK_ESCAPE, 0) +
+            win32_key_stroke(VK_PACKET, 0, 0x00e9, 0) +
+            win32_key_stroke(VK_PACKET, 0, 'x', 0),
+        "compressed ordinary Alt text uses one Escape then all committed packet units");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_unknown,
+            Qt::AltModifier,
+            0U,
+            0U,
+            0x00000004U,
+            QStringLiteral("x")),
+        win32_key_stroke(VK_PACKET, 0, 'x', LEFT_ALT_PRESSED),
+        "single text-only Alt input uses a packet stroke with the Alt state");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Tab,
+            Qt::NoModifier,
+            0x0fU,
+            VK_TAB,
+            0U,
+            QStringLiteral("\t")),
+        QByteArrayLiteral("\t"),
+        "plain Tab stays distinct from native reverse Tab");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Tab,
+            Qt::ShiftModifier,
+            0x0fU,
+            VK_TAB,
+            0x00000001U,
+            QStringLiteral("\t")),
+        win32_key_stroke(VK_TAB, 0x0f, '\t', SHIFT_PRESSED),
+        "Shift+Tab carries Shift and retains the established reverse-Tab VT operation");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Tab,
+            Qt::ShiftModifier | Qt::ControlModifier,
+            0x0fU,
+            VK_TAB,
+            0x00000003U,
+            QStringLiteral("\t")),
+        win32_key_stroke(VK_TAB, 0x0f, '\t', SHIFT_PRESSED | LEFT_CTRL_PRESSED),
+        "Ctrl+Shift+Tab keeps both native modifier bits");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Backtab,
+            Qt::NoModifier,
+            0U,
+            0U,
+            0U,
+            {}),
+        win32_key_stroke(
+            VK_TAB,
+            MapVirtualKeyW(VK_TAB, MAPVK_VK_TO_VSC),
+            '\t',
+            SHIFT_PRESSED),
+        "synthetic Backtab adds Shift without consulting physical key state");
+
+    term::Terminal_input_mode_state keypad_modes;
+    keypad_modes.application_keypad = true;
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Comma,
+            Qt::KeypadModifier,
+            0x53U,
+            0U,
+            0U,
+            QStringLiteral(","),
+            false,
+            1,
+            keypad_modes),
+        win32_key_stroke(VK_SEPARATOR, 0x53, ',', 0),
+        "keypad comma uses VK_SEPARATOR instead of ordinary OEM comma fallback");
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Equal,
+            Qt::KeypadModifier,
+            0x59U,
+            0U,
+            0U,
+            QStringLiteral("="),
+            false,
+            1,
+            keypad_modes),
+        win32_key_stroke(VK_OEM_NEC_EQUAL, 0x59, '=', 0),
+        "keypad equal uses VK_OEM_NEC_EQUAL instead of ordinary OEM plus fallback");
+
+    QKeyEvent repeated_key(
+        QEvent::KeyPress,
+        Qt::Key_Up,
+        Qt::NoModifier,
+        0xe048U,
+        VK_UP,
+        0x01000000U,
+        {},
+        true,
+        4);
+    ok &= check_bytes_equal(
+        term::encode_terminal_key_event(repeated_key, {}),
+        win32_key_stroke(VK_UP, 0x48, 0, ENHANCED_KEY),
+        "one compressed auto-repeat event is one logical down/up stroke");
+
+    QKeyEvent released_key(
+        QEvent::KeyRelease,
+        Qt::Key_Up,
+        Qt::NoModifier,
+        0xe048U,
+        VK_UP,
+        0x01000000U,
+        {});
+    ok &= check_bytes_equal(
+        term::encode_terminal_key_event(released_key, {}),
+        {},
+        "KeyRelease does not create another stroke in the press-oriented contract");
+
     return ok;
 #else
     return true;
@@ -427,8 +758,17 @@ bool test_keypad_policy()
             Qt::KeypadModifier | Qt::ShiftModifier,
             QStringLiteral("5"),
             modes),
+#if defined(Q_OS_WIN)
+        win32_key_stroke(
+            VK_NUMPAD5,
+            MapVirtualKeyW(VK_NUMPAD5, MAPVK_VK_TO_VSC),
+            '5',
+            SHIFT_PRESSED),
+        "modified keypad digit preserves text in a balanced native key stroke");
+#else
         bytes_from_hex("35"),
         "modified keypad digit falls through to printable text");
+#endif
     ok &= check_bytes_equal(
         encode(
             Qt::Key_Plus,
@@ -1103,6 +1443,7 @@ int main(int argc, char** argv)
     ok &= test_control_and_altgr();
     ok &= test_cursor_and_navigation_modes();
     ok &= test_windows_native_scan_identity();
+    ok &= test_windows_balanced_input_semantics();
     ok &= test_keypad_policy();
     ok &= test_paste_framing_policy();
     ok &= test_paste_sanitization();

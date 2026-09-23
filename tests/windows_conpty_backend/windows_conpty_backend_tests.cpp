@@ -1541,19 +1541,16 @@ int run_paste_input_reader(const QString& output_path)
     }
 }
 
-bool wait_for_file_size(const QString& path, qint64 size)
+bool flush_escape_reader_and_ack(
+    QFile& observation, std::string_view reader_name, std::size_t& ack_count)
 {
-    const auto deadline =
-        std::chrono::steady_clock::now() + k_wait_timeout;
-    do {
-        if (QFileInfo(path).size() >= size) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!observation.flush()) {
+        return false;
     }
-    while (std::chrono::steady_clock::now() < deadline);
 
-    return false;
+    ++ack_count;
+    std::cout << reader_name << "-ack[" << ack_count << "]\n" << std::flush;
+    return std::cout.good();
 }
 
 int run_escape_input_reader(const QString& observation_path)
@@ -1578,6 +1575,10 @@ int run_escape_input_reader(const QString& observation_path)
     if (!observation.open(QIODevice::WriteOnly | QIODevice::Append)) {
         return 1;
     }
+    std::size_t ack_count = 0U;
+    bool pending_ack_key_up = false;
+    bool pending_ack_completion = false;
+    DWORD pending_ack_control_state = 0U;
     std::cout << "escape-input-reader-ready\n" << std::flush;
     for (;;) {
         INPUT_RECORD records[64];
@@ -1593,6 +1594,45 @@ int run_escape_input_reader(const QString& observation_path)
             }
 
             const KEY_EVENT_RECORD& key = record.Event.KeyEvent;
+            const bool ack_key =
+                key.wVirtualKeyCode == VK_F12 &&
+                key.wVirtualScanCode == 88U &&
+                key.wRepeatCount == 1U &&
+                key.uChar.UnicodeChar == 0 &&
+                (key.dwControlKeyState == SHIFT_PRESSED ||
+                    key.dwControlKeyState == (SHIFT_PRESSED | LEFT_CTRL_PRESSED));
+            if (ack_key && key.bKeyDown)
+            {
+                if (pending_ack_key_up) {
+                    return 1;
+                }
+                pending_ack_key_up = true;
+                pending_ack_completion =
+                    key.dwControlKeyState == (SHIFT_PRESSED | LEFT_CTRL_PRESSED);
+                pending_ack_control_state = key.dwControlKeyState;
+                continue;
+            }
+            if (pending_ack_key_up)
+            {
+                if (!ack_key || key.bKeyDown ||
+                    key.dwControlKeyState != pending_ack_control_state)
+                {
+                    return 1;
+                }
+                const bool completion = pending_ack_completion;
+                pending_ack_key_up = false;
+                pending_ack_completion = false;
+                if (!flush_escape_reader_and_ack(
+                        observation, "escape-input-reader", ack_count))
+                {
+                    return 1;
+                }
+                if (completion) {
+                    return 0;
+                }
+                continue;
+            }
+
             std::ostringstream line;
             line << (key.bKeyDown ? 'D' : 'U')
                 << " vk=" << key.wVirtualKeyCode
@@ -1613,7 +1653,8 @@ int run_escape_vt_input_reader(const QString& observation_path)
     HANDLE input      = GetStdHandle(STD_INPUT_HANDLE);
     DWORD  input_mode = 0U;
     if (input == INVALID_HANDLE_VALUE ||
-        !GetConsoleMode(input, &input_mode))
+        !GetConsoleMode(input, &input_mode) ||
+        !SetConsoleCP(CP_UTF8))
     {
         return 1;
     }
@@ -1630,6 +1671,11 @@ int run_escape_vt_input_reader(const QString& observation_path)
     if (!observation.open(QIODevice::WriteOnly | QIODevice::Append)) {
         return 1;
     }
+    const QByteArray barrier_sentinel = decode_hex("1b5b32343b327e");
+    const QByteArray completion_sentinel = decode_hex("1b5b32343b367e");
+    const qsizetype sentinel_size = barrier_sentinel.size();
+    QByteArray pending;
+    std::size_t ack_count = 0U;
     std::cout << "escape-vt-input-reader-ready\n" << std::flush;
     for (;;) {
         char  bytes[64];
@@ -1638,20 +1684,80 @@ int run_escape_vt_input_reader(const QString& observation_path)
             return 1;
         }
 
-        if (observation.write(bytes, static_cast<qint64>(count)) !=
-                static_cast<qint64>(count) ||
-            !observation.flush())
-        {
+        pending.append(bytes, static_cast<qsizetype>(count));
+        const qsizetype barrier_offset = pending.indexOf(barrier_sentinel);
+        const qsizetype completion_offset = pending.indexOf(completion_sentinel);
+        const bool completion = completion_offset >= 0 &&
+            (barrier_offset < 0 || completion_offset < barrier_offset);
+        const qsizetype sentinel_offset = completion
+            ? completion_offset
+            : barrier_offset;
+        if (sentinel_offset >= 0) {
+            const QByteArray& sentinel = completion
+                ? completion_sentinel
+                : barrier_sentinel;
+            if (sentinel_offset + sentinel.size() != pending.size()) {
+                return 1;
+            }
+            const QByteArray observed = pending.left(sentinel_offset);
+            if ((!observed.isEmpty() && observation.write(observed) != observed.size()) ||
+                !flush_escape_reader_and_ack(
+                    observation, "escape-vt-input-reader", ack_count))
+            {
+                return 1;
+            }
+            pending.clear();
+            if (completion) {
+                return 0;
+            }
+            continue;
+        }
+
+        const qsizetype safe_byte_count = pending.size() - sentinel_size + 1;
+        if (safe_byte_count > 0) {
+            if (observation.write(pending.constData(), safe_byte_count) != safe_byte_count) {
+                return 1;
+            }
+            pending.remove(0, safe_byte_count);
+        }
+        if (observation.error() != QFileDevice::NoError) {
             return 1;
         }
     }
 }
 
 QByteArray encoded_key_event(
-    int key, Qt::KeyboardModifiers modifiers, const QString& text = {})
+    int key,
+    Qt::KeyboardModifiers modifiers,
+    const QString& text = {},
+    term::Terminal_input_mode_state modes = {})
 {
     QKeyEvent event(QEvent::KeyPress, key, modifiers, text);
-    return term::encode_terminal_key_event(event, {});
+    return term::encode_terminal_key_event(event, modes);
+}
+
+QByteArray encoded_native_key_event(
+    int key,
+    Qt::KeyboardModifiers modifiers,
+    quint32 native_scan_code,
+    quint32 native_virtual_key,
+    quint32 native_modifiers,
+    const QString& text,
+    bool auto_repeat = false,
+    quint16 count = 1,
+    term::Terminal_input_mode_state modes = {})
+{
+    const QKeyEvent event(
+        QEvent::KeyPress,
+        key,
+        modifiers,
+        native_scan_code,
+        native_virtual_key,
+        native_modifiers,
+        text,
+        auto_repeat,
+        count);
+    return term::encode_terminal_key_event(event, modes);
 }
 
 QByteArray native_key_record(
@@ -1662,6 +1768,71 @@ QByteArray native_key_record(
         " repeat=" + QByteArray::number(repeat) +
         " unicode=" + QByteArray::number(unicode) +
         " state=" + QByteArray::number(state) + '\n';
+}
+
+QByteArray native_key_frame(
+    int virtual_key, int scan_code, int unicode, int key_down, int state)
+{
+    return QByteArrayLiteral("\x1b[") + QByteArray::number(virtual_key) + ';' +
+        QByteArray::number(scan_code) + ';' + QByteArray::number(unicode) + ';' +
+        QByteArray::number(key_down) + ';' + QByteArray::number(state) + ";1_";
+}
+
+QByteArray native_key_stroke_bytes(
+    int virtual_key, int scan_code, int unicode, int state)
+{
+    return native_key_frame(virtual_key, scan_code, unicode, 1, state) +
+        native_key_frame(virtual_key, scan_code, 0, 0, state);
+}
+
+QByteArray native_key_stroke_records(
+    int virtual_key, int scan_code, int unicode, int state, int key_up_unicode = 0)
+{
+    return native_key_record('D', virtual_key, scan_code, 1, unicode, state) +
+        native_key_record('U', virtual_key, scan_code, 1, key_up_unicode, state);
+}
+
+bool reconstruct_native_record_text(
+    const QByteArray& journal, QString& text, int& down_record_count)
+{
+    text.clear();
+    down_record_count = 0;
+    qsizetype line_start = 0;
+    while (line_start < journal.size()) {
+        const qsizetype line_end = journal.indexOf('\n', line_start);
+        if (line_end < 0) {
+            return false;
+        }
+        const QList<QByteArray> fields =
+            journal.mid(line_start, line_end - line_start).split(' ');
+        if (fields.size() != 6 ||
+            (fields[0] != QByteArrayLiteral("D") &&
+                fields[0] != QByteArrayLiteral("U")) ||
+            !fields[3].startsWith(QByteArrayLiteral("repeat=")) ||
+            !fields[4].startsWith(QByteArrayLiteral("unicode=")))
+        {
+            return false;
+        }
+
+        bool repeat_ok = false;
+        bool unicode_ok = false;
+        const int repeat = fields[3].mid(7).toInt(&repeat_ok);
+        const int unicode = fields[4].mid(8).toInt(&unicode_ok);
+        if (!repeat_ok || !unicode_ok || repeat < 1 ||
+            unicode < 0 || unicode > 0xffff)
+        {
+            return false;
+        }
+
+        if (fields[0] == QByteArrayLiteral("D")) {
+            ++down_record_count;
+            for (int index = 0; index < repeat && unicode != 0; ++index) {
+                text.append(QChar(static_cast<ushort>(unicode)));
+            }
+        }
+        line_start = line_end + 1;
+    }
+    return true;
 }
 
 bool test_escape_transport_after_native_shift_return(const QString& executable_path)
@@ -1681,12 +1852,79 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     const QByteArray letter_a = encoded_key_event(
         Qt::Key_A, Qt::ShiftModifier, QStringLiteral("A"));
     const QByteArray shift_f3 = encoded_key_event(Qt::Key_F3, Qt::ShiftModifier);
-    const QByteArray native_escape =
-        decode_hex("1b5b32373b313b32373b313b303b315f");
+    const QByteArray right_control_up = encoded_native_key_event(
+        Qt::Key_Up,
+        Qt::ControlModifier,
+        0xe048U,
+        VK_UP,
+        0x01000220U,
+        {});
+    const QString compressed_bmp = QString::fromUtf8("\xc3\xa9x");
+    const QByteArray compressed_bmp_input = encoded_native_key_event(
+        Qt::Key_A, Qt::NoModifier, 0x1eU, 'A', 0U, compressed_bmp, false, 2);
+    const QByteArray compressed_alt_input = encoded_native_key_event(
+        Qt::Key_A, Qt::AltModifier, 0x1eU, 'A', 0x00000004U,
+        compressed_bmp, false, 2);
+    const QString supplementary = QString::fromUtf8("\xf0\x9f\x98\x80");
+    const QByteArray supplementary_input = encoded_native_key_event(
+        Qt::Key_A, Qt::NoModifier, 0x1eU, 'A', 0U, supplementary, false, 2);
+    const QString packet_text = QStringLiteral("xy");
+    const QByteArray packet_text_input = encoded_native_key_event(
+        Qt::Key_unknown, Qt::NoModifier, 0U, VK_PACKET, 0U, packet_text, false, 4);
+    const QString altgr_text = QString::fromUtf8("\xe2\x82\xac");
+    const QByteArray altgr_input = encoded_native_key_event(
+        Qt::Key_unknown,
+        Qt::AltModifier | Qt::GroupSwitchModifier,
+        0U,
+        VK_PACKET,
+        0x00000040U,
+        altgr_text);
+    const QByteArray ordinary_alt_text = encoded_key_event(
+        Qt::Key_A, Qt::AltModifier, QStringLiteral("a"));
+    const QByteArray ordinary_letter = encoded_key_event(
+        Qt::Key_A, Qt::NoModifier, QStringLiteral("a"));
+    const QByteArray plain_tab = encoded_key_event(
+        Qt::Key_Tab, Qt::NoModifier, QStringLiteral("\t"));
+    const QByteArray shift_tab = encoded_native_key_event(
+        Qt::Key_Tab, Qt::ShiftModifier, 0x0fU, VK_TAB, 0x00000001U,
+        QStringLiteral("\t"));
+    const QByteArray control_shift_tab = encoded_native_key_event(
+        Qt::Key_Tab, Qt::ShiftModifier | Qt::ControlModifier,
+        0x0fU, VK_TAB, 0x00000003U, QStringLiteral("\t"));
+    const QByteArray backtab = encoded_key_event(Qt::Key_Backtab, Qt::NoModifier);
+    term::Terminal_input_mode_state application_keypad_modes;
+    application_keypad_modes.application_keypad = true;
+    const int keypad_comma_scan = static_cast<int>(
+        MapVirtualKeyW(VK_SEPARATOR, MAPVK_VK_TO_VSC) & 0xffU);
+    const int keypad_equal_scan = static_cast<int>(
+        MapVirtualKeyW(VK_OEM_NEC_EQUAL, MAPVK_VK_TO_VSC) & 0xffU);
+    const QByteArray application_keypad_comma = encoded_key_event(
+        Qt::Key_Comma, Qt::KeypadModifier, QStringLiteral(","), application_keypad_modes);
+    const QByteArray application_keypad_equal = encoded_key_event(
+        Qt::Key_Equal, Qt::KeypadModifier, QStringLiteral("="), application_keypad_modes);
+    const QByteArray native_escape = native_key_stroke_bytes(VK_ESCAPE, 1, VK_ESCAPE, 0);
     const QByteArray native_alt_escape = native_escape + native_escape;
+    const QByteArray barrier_sentinel =
+        encoded_key_event(Qt::Key_F12, Qt::ShiftModifier);
+    const QByteArray completion_sentinel = encoded_key_event(
+        Qt::Key_F12, Qt::ShiftModifier | Qt::ControlModifier);
 
+    struct Escape_input_transaction
+    {
+        std::vector<QByteArray> writes;
+        QByteArray expected_observation;
+    };
+
+    enum class Escape_input_delivery
+    {
+        PACED,
+        QUEUE_BURST,
+    };
+
+    QByteArray last_observed_journal;
     bool ok = true;
-    ok &= check(shift_return == decode_hex("1b5b31333b32383b31333b313b31363b315f"),
+    ok &= check(shift_return == native_key_stroke_bytes(
+            VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED),
         "Escape transport probe uses native Win32 Shift+Return framing");
     ok &= check(escape == native_escape,
         "Escape transport probe uses native Win32 Escape framing");
@@ -1696,12 +1934,20 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         "Escape transport probe uses native framing for Ctrl+3");
     ok &= check(alt_escape == native_alt_escape,
         "Escape transport probe frames Alt+Escape as two Escape events");
-    ok &= check(alt_bracket == decode_hex("1b5b3231393b32363b39313b313b323b315f"),
-        "Escape transport probe uses a native key frame for Alt+[");
-    ok &= check(letter_a == QByteArrayLiteral("A"),
-        "Escape transport probe encodes A as one printable byte");
-    ok &= check(shift_f3 == decode_hex("1b5b3131343b36313b303b313b31363b315f"),
+    ok &= check(alt_bracket == native_key_stroke_bytes(
+            VK_OEM_4, 26, '[', LEFT_ALT_PRESSED),
+        "Escape transport probe uses a balanced native key stroke for Alt+[");
+    ok &= check(letter_a == native_key_stroke_bytes('A', 30, 'A', SHIFT_PRESSED),
+        "Escape transport probe encodes uppercase A without synthetic Shift key events");
+    ok &= check(shift_f3 == native_key_stroke_bytes(
+            VK_F3, 61, 0, SHIFT_PRESSED),
         "Escape transport probe uses a native key frame for Shift+F3");
+    ok &= check(barrier_sentinel == native_key_stroke_bytes(
+            VK_F12, 88, 0, SHIFT_PRESSED),
+        "Escape transport child-ack barrier uses a framed Shift+F12");
+    ok &= check(completion_sentinel == native_key_stroke_bytes(
+            VK_F12, 88, 0, SHIFT_PRESSED | LEFT_CTRL_PRESSED),
+        "Escape transport completion uses a framed Ctrl+Shift+F12");
     if (!ok) {
         return false;
     }
@@ -1709,10 +1955,11 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     const auto run_case = [&] (
         const QString&                               reader_mode,
         const char*                                  name,
-        const std::vector<QByteArray>&               writes,
-        bool                                         pause_between_writes,
-        const std::vector<QByteArray>& expected_observations)
+        const std::vector<Escape_input_transaction>& transactions,
+        Escape_input_delivery                        delivery,
+        std::size_t                                  priming_transaction_count)
     {
+        last_observed_journal.clear();
         QTemporaryDir observation_directory;
         if (!check(observation_directory.isValid(),
                 "Escape transport observation directory is created")) {
@@ -1736,42 +1983,90 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             reader_mode == QStringLiteral("--escape-vt-input-reader")
                 ? QByteArrayLiteral("escape-vt-input-reader-ready")
                 : QByteArrayLiteral("escape-input-reader-ready");
-        case_ok &= check(capture.wait_for_output(child_ready_marker),
+        const bool child_ready = capture.wait_for_output(child_ready_marker);
+        case_ok &= check(child_ready,
             "Escape transport reader reaches its ready marker");
-        QByteArray expected_so_far;
-        for (std::size_t write_index = 0U; write_index < writes.size(); ++write_index) {
-            const term::Terminal_backend_result write_result =
-                backend->write(writes[write_index]);
-            case_ok &= check(
-                write_result.code == term::Terminal_backend_result_code::ACCEPTED,
-                "Escape transport probe accepts encoded input");
-            expected_so_far += expected_observations[write_index];
-
-            const bool size_reached = wait_for_file_size(
-                observation_path, expected_so_far.size());
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            QFile observed_file(observation_path);
-            const bool read_ok = observed_file.open(QIODevice::ReadOnly);
-            const QByteArray actual = read_ok ? observed_file.readAll() : QByteArray();
-            if (!size_reached || !read_ok || actual != expected_so_far) {
-                std::cerr << name << " expected="
-                    << expected_so_far.toHex(' ').constData() << " actual="
-                    << actual.toHex(' ').constData() << '\n';
+        const bool vt_reader = reader_mode == QStringLiteral("--escape-vt-input-reader");
+        const QByteArray ack_prefix = vt_reader
+            ? QByteArrayLiteral("escape-vt-input-reader-ack[")
+            : QByteArrayLiteral("escape-input-reader-ack[");
+        QByteArray expected_journal;
+        std::size_t ack_count = 0U;
+        const auto send_sentinel_and_wait = [&](const QByteArray& sentinel) {
+            const term::Terminal_backend_result write_result = backend->write(sentinel);
+            if (!check(write_result.code == term::Terminal_backend_result_code::ACCEPTED,
+                    "Escape transport probe queues a complete child-ack frame"))
+            {
+                return false;
             }
-            case_ok &= check(size_reached && read_ok && actual == expected_so_far,
-                name);
 
-            if (pause_between_writes && write_index + 1U < writes.size()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            ++ack_count;
+            const QByteArray marker =
+                ack_prefix + QByteArray::number(static_cast<qulonglong>(ack_count)) + ']';
+            const bool acknowledged = capture.wait_for_output(marker);
+            case_ok &= check(acknowledged,
+                "Escape transport child flushes its journal before acknowledging input");
+            return acknowledged;
+        };
+        bool transactions_complete = child_ready;
+        for (std::size_t transaction_index = 0U;
+             transaction_index < transactions.size() && transactions_complete;
+             ++transaction_index)
+        {
+            const Escape_input_transaction& transaction = transactions[transaction_index];
+            for (const QByteArray& write : transaction.writes) {
+                const term::Terminal_backend_result write_result = backend->write(write);
+                if (!check(write_result.code == term::Terminal_backend_result_code::ACCEPTED,
+                        "Escape transport probe accepts encoded input"))
+                {
+                    transactions_complete = false;
+                    break;
+                }
+            }
+            if (!transactions_complete) {
+                break;
+            }
+
+            expected_journal += transaction.expected_observation;
+            const bool acknowledge_transaction =
+                delivery == Escape_input_delivery::PACED ||
+                transaction_index < priming_transaction_count;
+            if (acknowledge_transaction && !send_sentinel_and_wait(barrier_sentinel)) {
+                transactions_complete = false;
             }
         }
 
-        const term::Terminal_backend_result terminated = backend->terminate();
-        case_ok &= check(
-            terminated.code == term::Terminal_backend_result_code::ACCEPTED,
-            "Escape transport reader accepts termination");
-        case_ok &= check(capture.wait_for_exit(),
-            "Escape transport reader exits after termination");
+        bool completion_acknowledged = false;
+        if (transactions_complete && !transactions.empty()) {
+            completion_acknowledged = send_sentinel_and_wait(completion_sentinel);
+        }
+        case_ok &= check(completion_acknowledged,
+            "Escape transport reader acknowledges the complete workload and exits");
+
+        bool child_exited = completion_acknowledged && capture.wait_for_exit();
+        if (!child_exited) {
+            const term::Terminal_backend_result terminated = backend->terminate();
+            const bool termination_started =
+                terminated.code == term::Terminal_backend_result_code::ACCEPTED ||
+                capture.exit_snapshot().has_value();
+            case_ok &= check(termination_started,
+                "Escape transport failure cleanup can stop the reader");
+            child_exited = capture.wait_for_exit();
+        }
+        case_ok &= check(child_exited,
+            "Escape transport reader exits before the final journal comparison");
+        if (child_exited) {
+            QFile observed_file(observation_path);
+            const bool read_ok = observed_file.open(QIODevice::ReadOnly);
+            const QByteArray actual = read_ok ? observed_file.readAll() : QByteArray();
+            last_observed_journal = actual;
+            if (!read_ok || actual != expected_journal) {
+                std::cerr << name << " expected="
+                    << expected_journal.toHex(' ').constData() << " actual="
+                    << actual.toHex(' ').constData() << '\n';
+            }
+            case_ok &= check(read_ok && actual == expected_journal, name);
+        }
         case_ok &= check_no_backend_errors(capture,
             "Escape transport probe produces no backend errors");
         return case_ok;
@@ -1779,172 +2074,395 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
 
     // Native key-event frames must retain key identity for classic console
     // readers, while VT-input readers receive the corresponding VT byte stream.
-    // A fresh parser can consume a one-byte ESC before it knows the sender
-    // supports native frames. The prefix-only case below characterizes that
-    // state; it is not a complete split-frame test.
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "plain Escape reaches a fresh native console reader",
-        {escape},
-        false,
-        {native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
-    ok &= run_case(
-        QStringLiteral("--escape-input-reader"),
-        "fresh standalone ESC and [ writes become separate native strokes",
-        {escape.left(1), escape.mid(1, 1)},
-        true,
-        {native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0) +
-                native_key_record('U', VK_ESCAPE, 1, 1, VK_ESCAPE, 0),
-            native_key_record('D', VK_OEM_4, 26, 1, '[', 0) +
-                native_key_record('U', VK_OEM_4, 26, 1, '[', 0)});
+        {{{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)}},
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "isolated Escape reaches the child after Shift+Return",
-        {shift_return, escape},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "coalesced Shift+Return and Escape reach the child",
-        {shift_return + escape},
-        false,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED) +
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+        {{
+            {shift_return + escape},
+            native_key_stroke_records(VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED) +
+                native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Ctrl+[ reaches the child after Shift+Return",
-        {shift_return, control_bracket},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{control_bracket}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Ctrl+3 reaches the child after Shift+Return",
-        {shift_return, control_three},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{control_three}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Alt+Escape reaches the child after Shift+Return",
-        {shift_return, alt_escape},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0) +
-                native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{alt_escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0) +
+                native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
-        "separate Escape presses produce separate down-only records",
-        {shift_return, escape, escape},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0),
-            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+        "separate Escape presses produce separate balanced native strokes",
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+            {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Up reaches the child after Shift+Return",
-        {shift_return, up},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_UP, 72, 1, 0, ENHANCED_KEY)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{up}, native_key_stroke_records(VK_UP, 72, 0, ENHANCED_KEY)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "F12 reaches the child after Shift+Return",
-        {shift_return, f12},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_F12, 88, 1, 0, 0)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{f12}, native_key_stroke_records(VK_F12, 88, 0, 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Alt+[ and uppercase A remain separate native key events",
-        {shift_return, alt_bracket, letter_a},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_OEM_4, 26, 1, '[', LEFT_ALT_PRESSED),
-            native_key_record('D', VK_SHIFT, 42, 1, 0, SHIFT_PRESSED) +
-                native_key_record('D', 'A', 30, 1, 'A', SHIFT_PRESSED) +
-                native_key_record('U', 'A', 30, 1, 'A', SHIFT_PRESSED) +
-                native_key_record('U', VK_SHIFT, 42, 1, 0, 0)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{alt_bracket}, native_key_stroke_records(
+                VK_OEM_4, 26, '[', LEFT_ALT_PRESSED)},
+            {{letter_a}, native_key_stroke_records('A', 30, 'A', SHIFT_PRESSED)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Shift+F3 reaches a native reader as an F3 key record",
-        {shift_return, shift_f3},
-        true,
-        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
-            native_key_record('D', VK_F3, 61, 1, 0, SHIFT_PRESSED)});
+        {
+            {{shift_return}, native_key_stroke_records(
+                VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+            {{shift_f3}, native_key_stroke_records(VK_F3, 61, 0, SHIFT_PRESSED)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+
+    // Observe complete native strokes and their state bits through the exact
+    // packaged ConPTY reader, not merely the encoder's private frame bytes.
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "right-Ctrl Up preserves NumLock, extended-key state, and matching key-up",
+        {{
+            {right_control_up},
+            native_key_stroke_records(
+                VK_UP,
+                72,
+                0,
+                RIGHT_CTRL_PRESSED | NUMLOCK_ON | ENHANCED_KEY),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "ordinary unmodified A reaches the native reader as a balanced key stroke",
+        {{
+            {ordinary_letter},
+            native_key_stroke_records('A', 30, 'a', 0),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Alt+A reaches the native reader with the left-Alt state on both records",
+        {{
+            {ordinary_alt_text},
+            native_key_stroke_records('A', 30, 'a', LEFT_ALT_PRESSED),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "compressed BMP text is ordered VK_PACKET strokes, independent of event count",
+        {{
+            {compressed_bmp_input},
+            native_key_stroke_records(VK_PACKET, 0, 0x00e9, 0) +
+                native_key_stroke_records(VK_PACKET, 0, 'x', 0),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
+    {
+        QString reconstructed_text;
+        int down_record_count = 0;
+        const bool reconstructed = reconstruct_native_record_text(
+            last_observed_journal, reconstructed_text, down_record_count);
+        ok &= check(reconstructed && reconstructed_text == compressed_bmp &&
+                down_record_count == 2,
+            "native reader reconstructs compressed BMP text in record order");
+    }
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "supplementary text preserves both UTF-16 packet records in order",
+        {{
+            {supplementary_input},
+            native_key_stroke_records(VK_PACKET, 0, 0xd83d, 0) +
+                native_key_stroke_records(VK_PACKET, 0, 0xde00, 0),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
+    {
+        QString reconstructed_text;
+        int down_record_count = 0;
+        const bool reconstructed = reconstruct_native_record_text(
+            last_observed_journal, reconstructed_text, down_record_count);
+        ok &= check(reconstructed && reconstructed_text == supplementary &&
+                down_record_count == 2,
+            "native reader reconstructs a supplementary character from ordered surrogates");
+    }
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "packet text does not multiply UTF-16 units by event.count",
+        {{
+            {packet_text_input},
+            native_key_stroke_records(VK_PACKET, 0, 'x', 0) +
+                native_key_stroke_records(VK_PACKET, 0, 'y', 0),
+        }},
+        Escape_input_delivery::PACED,
+        0U);
+
+    // GroupSwitch/AltGr is committed text, not ordinary Alt+text. The native
+    // reader verifies the actual package's Unicode records; the VT reader
+    // below separately verifies the legacy plain-text byte stream.
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "AltGr text reaches a native reader as committed VK_PACKET Unicode",
+        {{{altgr_input}, native_key_stroke_records(VK_PACKET, 0, 0x20ac, 0)}},
+        Escape_input_delivery::PACED,
+        0U);
+    {
+        QString reconstructed_text;
+        int down_record_count = 0;
+        const bool reconstructed = reconstruct_native_record_text(
+            last_observed_journal, reconstructed_text, down_record_count);
+        ok &= check(reconstructed && reconstructed_text == altgr_text &&
+                down_record_count == 1,
+            "native consumer reconstructs exactly one committed AltGr character");
+    }
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "plain Tab remains a text key while Shift+Tab, Ctrl+Shift+Tab, and Backtab are balanced",
+        {
+            {{plain_tab}, native_key_stroke_records(VK_TAB, 15, '\t', 0, '\t')},
+            {{shift_tab}, native_key_stroke_records(
+                VK_TAB, 15, '\t', SHIFT_PRESSED)},
+            {{control_shift_tab}, native_key_stroke_records(
+                VK_TAB, 15, '\t', SHIFT_PRESSED | LEFT_CTRL_PRESSED)},
+            {{backtab}, native_key_stroke_records(
+                VK_TAB, 15, '\t', SHIFT_PRESSED)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "application keypad comma and equal retain their distinct native identities",
+        {
+            {{application_keypad_comma}, native_key_stroke_records(
+                VK_SEPARATOR, keypad_comma_scan, ',', 0)},
+            {{application_keypad_equal}, native_key_stroke_records(
+                VK_OEM_NEC_EQUAL, keypad_equal_scan, '=', 0)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+
+    // Keep ordinary Alt's legacy prefix distinct from committed AltGr text.
+    // A compressed multi-unit Alt event is one Escape stroke followed by all
+    // committed text units.
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "compressed ordinary Alt text keeps one Escape before all Unicode units",
+        {{{compressed_alt_input},
+            native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0) +
+                native_key_stroke_records(VK_PACKET, 0, 0x00e9, 0) +
+                native_key_stroke_records(VK_PACKET, 0, 'x', 0)}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "compressed ordinary Alt text preserves ESC and the complete UTF-8 payload",
+        {{{compressed_alt_input}, decode_hex("1bc3a978")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "ordinary Alt+A retains the legacy ESC-prefixed VT byte",
+        {{{ordinary_alt_text}, decode_hex("1b61")}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "AltGr GroupSwitch text remains plain UTF-8 without an ESC prefix",
+        {{{altgr_input}, altgr_text.toUtf8()}},
+        Escape_input_delivery::PACED,
+        0U);
 
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "plain Escape reaches a VT reader",
-        {escape},
-        false,
-        {decode_hex("1b")});
+        {{{escape}, decode_hex("1b")}},
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "Alt+Escape maps to two ESC bytes for VT input",
-        {alt_escape},
-        false,
-        {decode_hex("1b1b")});
+        {{{alt_escape}, decode_hex("1b1b")}},
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "isolated Escape reaches a VT reader after Shift+Return",
-        {shift_return, escape},
-        true,
-        {decode_hex("0d"), decode_hex("1b")});
+        {
+            {{shift_return}, decode_hex("0d")},
+            {{escape}, decode_hex("1b")},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "Up reaches a VT reader after Shift+Return",
-        {shift_return, up},
-        true,
-        {decode_hex("0d"), decode_hex("1b5b41")});
+        {
+            {{shift_return}, decode_hex("0d")},
+            {{up}, decode_hex("1b5b41")},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "Alt+[ followed by A forms the standard VT Up sequence",
-        {shift_return, alt_bracket, letter_a},
-        true,
-        {decode_hex("0d"), decode_hex("1b5b"), decode_hex("41")});
+        {
+            {{shift_return}, decode_hex("0d")},
+            {{alt_bracket}, decode_hex("1b5b")},
+            {{letter_a}, decode_hex("41")},
+        },
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "Shift+F3 reaches a VT reader as its CPR-like sequence",
-        {shift_return, shift_f3},
-        true,
-        {decode_hex("0d"), decode_hex("1b5b313b3252")});
+        {
+            {{shift_return}, decode_hex("0d")},
+            {{shift_f3}, decode_hex("1b5b313b3252")},
+        },
+        Escape_input_delivery::PACED,
+        0U);
 
-    // Complete the entire first frame, not merely its first two characters.
-    // This characterizes the package's fresh-parser behavior; a runtime that
-    // changes that behavior needs a deliberate expectation update.
+    // A fresh parser exposes the native key-down frame literally while
+    // consuming its matching key-up. The three writes form one transaction;
+    // they do not claim separate ConPTY reads.
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
-        "a fresh three-part first frame is exposed literally to the VT reader",
-        {escape.left(1), escape.mid(1, 1), escape.mid(2)},
-        true,
-        {escape.left(1), escape.mid(1, 1), escape.mid(2)});
+        "a fresh parser exposes the native down frame literally and consumes its up frame",
+        {{{escape.left(1), escape.mid(1, 1), escape.mid(2)},
+            native_key_frame(VK_ESCAPE, 1, VK_ESCAPE, 1, 0)}},
+        Escape_input_delivery::PACED,
+        0U);
 
-    // Once one complete frame has been recognized, test every two-part split
-    // of a COMPLETE subsequent frame. A prefix must produce no observations;
-    // its suffix must complete exactly one frame. Do this in one child per
-    // input mode so this matrix does not multiply process-start/stop overhead.
+    // A complete priming frame is acknowledged before any split frame. Each
+    // split's prefix and suffix stay in one transaction; only the completed
+    // journal is asserted, not parser state between the two writes.
     for (const bool vt_reader : {false, true}) {
-        std::vector<QByteArray> writes{escape};
         const QByteArray observation = vt_reader
             ? QByteArrayLiteral("\x1b")
-            : native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0);
-        std::vector<QByteArray> observations{observation};
+            : native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0);
+        std::vector<Escape_input_transaction> transactions{
+            {{escape}, observation},
+        };
         for (qsizetype split = 1; split < escape.size(); ++split) {
-            writes.push_back(escape.left(split));
-            observations.emplace_back();
-            writes.push_back(escape.mid(split));
-            observations.push_back(observation);
+            transactions.push_back({
+                {escape.left(split), escape.mid(split)},
+                observation,
+            });
         }
         ok &= run_case(
             vt_reader ? QStringLiteral("--escape-vt-input-reader")
                       : QStringLiteral("--escape-input-reader"),
             vt_reader ? "activated parser preserves every complete-frame split in VT mode"
                       : "activated parser preserves every complete-frame split in native mode",
-            writes,
-            true,
-            observations);
+            transactions,
+            Escape_input_delivery::PACED,
+            0U);
+    }
+
+    const std::vector<Escape_input_transaction> native_queue_workload{
+        {{shift_return}, native_key_stroke_records(
+            VK_RETURN, 28, VK_RETURN, SHIFT_PRESSED)},
+        {{escape}, native_key_stroke_records(VK_ESCAPE, 1, VK_ESCAPE, 0)},
+        {{up}, native_key_stroke_records(VK_UP, 72, 0, ENHANCED_KEY)},
+        {{f12}, native_key_stroke_records(VK_F12, 88, 0, 0)},
+    };
+    const std::vector<Escape_input_transaction> vt_queue_workload{
+        {{shift_return}, decode_hex("0d")},
+        {{escape}, decode_hex("1b")},
+        {{up}, decode_hex("1b5b41")},
+        {{f12}, decode_hex("1b5b32347e")},
+    };
+    for (const bool vt_reader : {false, true}) {
+        const QString reader_mode = vt_reader
+            ? QStringLiteral("--escape-vt-input-reader")
+            : QStringLiteral("--escape-input-reader");
+        const std::vector<Escape_input_transaction>& workload = vt_reader
+            ? vt_queue_workload
+            : native_queue_workload;
+        ok &= run_case(
+            reader_mode,
+            vt_reader ? "paced VT input transactions acknowledge each complete frame"
+                      : "paced native input transactions acknowledge each complete frame",
+            workload,
+            Escape_input_delivery::PACED,
+            0U);
+        ok &= run_case(
+            reader_mode,
+            vt_reader ? "unpaced VT queue burst drains before its final acknowledgment"
+                      : "unpaced native queue burst drains before its final acknowledgment",
+            workload,
+            Escape_input_delivery::QUEUE_BURST,
+            1U);
     }
 
     return ok;

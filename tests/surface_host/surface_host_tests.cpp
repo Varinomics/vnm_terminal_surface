@@ -1023,6 +1023,34 @@ bool send_key(
     return check(event.isAccepted(), message);
 }
 
+#if defined(Q_OS_WIN)
+QByteArray expected_synthetic_key_event_bytes(
+    int                             key,
+    Qt::KeyboardModifiers           modifiers,
+    const QString&                  text,
+    term::Terminal_input_mode_state modes = {})
+{
+    const QKeyEvent event(QEvent::KeyPress, key, modifiers, text);
+    return term::encode_terminal_key_event(event, modes);
+}
+
+std::vector<QByteArray> expected_synthetic_key_event_chunks(
+    std::initializer_list<int>      keys,
+    term::Terminal_input_mode_state modes = {})
+{
+    std::vector<QByteArray> chunks;
+    chunks.reserve(keys.size());
+    for (const int key : keys) {
+        chunks.push_back(expected_synthetic_key_event_bytes(
+            key,
+            Qt::NoModifier,
+            {},
+            modes));
+    }
+    return chunks;
+}
+#endif
+
 bool send_window_key_and_expect_write(
     VNM_TerminalSurface&   surface,
     QQuickWindow&          window,
@@ -1031,7 +1059,8 @@ bool send_window_key_and_expect_write(
     Qt::KeyboardModifiers  modifiers,
     const QString&         text,
     const QByteArray&      expected,
-    const char*            message)
+    const char*            message,
+    term::Terminal_input_mode_state modes = {})
 {
     surface.forceActiveFocus();
     const std::size_t write_count = backend.writes.size();
@@ -1040,7 +1069,18 @@ bool send_window_key_and_expect_write(
     bool ok  = check(event.isAccepted(), message);
     ok      &= check(backend.writes.size() == write_count + 1U, message);
     if (backend.writes.size() > write_count) {
+#if defined(Q_OS_WIN)
+        // The encoder suite owns the wire-format oracle. This host-level check
+        // verifies that the same synthetic event and terminal mode reach the
+        // backend without surface-side rewriting.
+        Q_UNUSED(expected);
+        const QByteArray expected_wire =
+            term::encode_terminal_key_event(event, modes);
+        ok &= check_bytes_equal(backend.writes.back(), expected_wire, message);
+#else
+        Q_UNUSED(modes);
         ok &= check_bytes_equal(backend.writes.back(), expected, message);
+#endif
     }
     return ok;
 }
@@ -1052,13 +1092,22 @@ bool send_key_and_expect_write(
     Qt::KeyboardModifiers  modifiers,
     const QString&         text,
     const QByteArray&      expected,
-    const char*            message)
+    const char*            message,
+    term::Terminal_input_mode_state modes = {})
 {
     const std::size_t write_count = backend.writes.size();
     bool ok = send_key(surface, key, modifiers, text, message);
     ok &= check(backend.writes.size() == write_count + 1U, message);
     if (backend.writes.size() > write_count) {
+#if defined(Q_OS_WIN)
+        Q_UNUSED(expected);
+        const QByteArray expected_wire =
+            expected_synthetic_key_event_bytes(key, modifiers, text, modes);
+        ok &= check_bytes_equal(backend.writes.back(), expected_wire, message);
+#else
+        Q_UNUSED(modes);
         ok &= check_bytes_equal(backend.writes.back(), expected, message);
+#endif
     }
     return ok;
 }
@@ -5264,11 +5313,22 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         "unencoded key event does not write backend bytes");
 
     const std::size_t prompt_write_index = backend_ptr->writes.size();
+#if defined(Q_OS_WIN)
+    std::vector<QByteArray> expected_prompt_chunks;
+    expected_prompt_chunks.push_back(expected_synthetic_key_event_bytes(
+        Qt::Key_Left, Qt::NoModifier, {}));
+    expected_prompt_chunks.push_back(expected_synthetic_key_event_bytes(
+        Qt::Key_Backspace, Qt::NoModifier, {}));
+#endif
     ok &= send_key(fixture.surface, Qt::Key_Left, Qt::NoModifier, {},
         "prompt path Left is accepted");
     ok &= send_key(fixture.surface, Qt::Key_Backspace, Qt::NoModifier, {},
         "prompt path Backspace is accepted");
     for (const QChar ch : QStringLiteral("term")) {
+#if defined(Q_OS_WIN)
+        expected_prompt_chunks.push_back(expected_synthetic_key_event_bytes(
+            ch.toUpper().unicode(), Qt::NoModifier, QString(ch)));
+#endif
         ok &= send_key(
             fixture.surface,
             ch.toUpper().unicode(),
@@ -5276,12 +5336,24 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
             QString(ch),
             "prompt path printable key is accepted");
     }
+#if defined(Q_OS_WIN)
+    expected_prompt_chunks.push_back(expected_synthetic_key_event_bytes(
+        Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r")));
+#endif
     ok &= send_key(fixture.surface, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"),
         "prompt path Return is accepted");
+#if defined(Q_OS_WIN)
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        prompt_write_index,
+        expected_prompt_chunks,
+        "prompt editing path forwards each encoded synthetic key event");
+#else
     ok &= check_bytes_equal(
         joined_writes_since(backend_ptr->writes, prompt_write_index),
         bytes_from_hex("1b5b447f7465726d0d"),
         "prompt editing path writes exact byte stream");
+#endif
     ok &= check(backend_error_count == 0,
         "keyboard printable success path emits no backend_error");
 
@@ -7728,6 +7800,10 @@ bool test_page_keys_fall_through_on_alternate_screen(QGuiApplication& app)
 bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
 {
     bool ok = true;
+#if defined(Q_OS_WIN)
+    term::Terminal_input_mode_state application_cursor_modes;
+    application_cursor_modes.application_cursor_keys = true;
+#endif
 
     {
         Surface_fixture fixture;
@@ -7808,14 +7884,21 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "drained alternate-screen transition affects future wheel routing");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> expected_cursor_up_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             drained_alternate_wheel_index,
-            {
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-            },
+            expected_cursor_up_chunks,
             "future alternate-screen wheel writes cursor-up input after normal drain");
     }
 
@@ -7849,14 +7932,21 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "plain wheel up on alternate screen falls back to terminal input");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> expected_cursor_up_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             wheel_up_index,
-            {
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-            },
+            expected_cursor_up_chunks,
             "plain wheel up on alternate screen writes cursor-up input");
 
         const std::size_t partial_wheel_index = backend_ptr->writes.size();
@@ -7900,14 +7990,21 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             80,
             true,
             "second post-toggle high-resolution wheel fragment completes a fresh step");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_fragment_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> expected_fragment_cursor_up_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             partial_wheel_index,
-            {
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-            },
+            expected_fragment_cursor_up_chunks,
             "alternate-screen high-resolution wheel fragments write after a fresh full step");
 
         const std::size_t wheel_down_index = backend_ptr->writes.size();
@@ -7917,14 +8014,21 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             -120,
             true,
             "plain wheel down on alternate screen sends terminal input");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_cursor_down_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Down, Qt::Key_Down, Qt::Key_Down });
+#else
+        const std::vector<QByteArray> expected_cursor_down_chunks = {
+            QByteArrayLiteral("\x1b[B"),
+            QByteArrayLiteral("\x1b[B"),
+            QByteArrayLiteral("\x1b[B"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             wheel_down_index,
-            {
-                QByteArrayLiteral("\x1b[B"),
-                QByteArrayLiteral("\x1b[B"),
-                QByteArrayLiteral("\x1b[B"),
-            },
+            expected_cursor_down_chunks,
             "plain wheel down on alternate screen writes cursor-down input");
 
         backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1h"));
@@ -7946,14 +8050,22 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "drained application-cursor mode affects future alternate-screen wheel");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_application_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up },
+                application_cursor_modes);
+#else
+        const std::vector<QByteArray> expected_application_cursor_up_chunks = {
+            QByteArrayLiteral("\x1bOA"),
+            QByteArrayLiteral("\x1bOA"),
+            QByteArrayLiteral("\x1bOA"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             drained_application_cursor_index,
-            {
-                QByteArrayLiteral("\x1bOA"),
-                QByteArrayLiteral("\x1bOA"),
-                QByteArrayLiteral("\x1bOA"),
-            },
+            expected_application_cursor_up_chunks,
             "future alternate-screen wheel input honors drained application-cursor mode");
 
         backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1007l"));
@@ -7975,14 +8087,22 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "plain wheel after drained DEC 1007 reset still uses fallback input");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_reset_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up },
+                application_cursor_modes);
+#else
+        const std::vector<QByteArray> expected_reset_cursor_up_chunks = {
+            QByteArrayLiteral("\x1bOA"),
+            QByteArrayLiteral("\x1bOA"),
+            QByteArrayLiteral("\x1bOA"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             drained_alternate_scroll_reset_index,
-            {
-                QByteArrayLiteral("\x1bOA"),
-                QByteArrayLiteral("\x1bOA"),
-                QByteArrayLiteral("\x1bOA"),
-            },
+            expected_reset_cursor_up_chunks,
             "plain wheel after drained DEC 1007 reset writes application-cursor input");
 
         fixture.surface.set_wheel_event_policy(
@@ -8069,14 +8189,21 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             40,
             true,
             "third local-first alternate-screen wheel fragment writes input");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_local_first_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> expected_local_first_cursor_up_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             partial_wheel_index,
-            {
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-            },
+            expected_local_first_cursor_up_chunks,
             "local-first alternate-screen fragments are not lost to local scroll");
     }
 
@@ -8106,10 +8233,18 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "alternate-screen page-wheel policy accepts wheel up");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_page_up_chunks =
+            expected_synthetic_key_event_chunks({ Qt::Key_PageUp });
+#else
+        const std::vector<QByteArray> expected_page_up_chunks = {
+            QByteArrayLiteral("\x1b[5~"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             wheel_up_index,
-            { QByteArrayLiteral("\x1b[5~") },
+            expected_page_up_chunks,
             "alternate-screen page-wheel policy writes PageUp input");
 
         const std::size_t wheel_down_index = backend_ptr->writes.size();
@@ -8119,10 +8254,18 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             -120,
             true,
             "alternate-screen page-wheel policy accepts wheel down");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_page_down_chunks =
+            expected_synthetic_key_event_chunks({ Qt::Key_PageDown });
+#else
+        const std::vector<QByteArray> expected_page_down_chunks = {
+            QByteArrayLiteral("\x1b[6~"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             wheel_down_index,
-            { QByteArrayLiteral("\x1b[6~") },
+            expected_page_down_chunks,
             "alternate-screen page-wheel policy writes PageDown input");
 
         const int first_pixel_fragment = std::max(
@@ -8150,10 +8293,18 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             0,
             true,
             "second alternate-screen page-wheel pixel fragment completes one page key");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_pixel_page_up_chunks =
+            expected_synthetic_key_event_chunks({ Qt::Key_PageUp });
+#else
+        const std::vector<QByteArray> expected_pixel_page_up_chunks = {
+            QByteArrayLiteral("\x1b[5~"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             pixel_wheel_index,
-            { QByteArrayLiteral("\x1b[5~") },
+            expected_pixel_page_up_chunks,
             "alternate-screen page-wheel pixel fragments write after one cell-height step");
     }
 
@@ -8193,10 +8344,18 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "page-policy legacy non-SGR mouse wheel is accepted");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_legacy_page_up_chunks =
+            expected_synthetic_key_event_chunks({ Qt::Key_PageUp });
+#else
+        const std::vector<QByteArray> expected_legacy_page_up_chunks = {
+            QByteArrayLiteral("\x1b[5~"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             page_policy_wheel_index,
-            { QByteArrayLiteral("\x1b[5~") },
+            expected_legacy_page_up_chunks,
             "page-policy legacy non-SGR mouse wheel writes PageUp input");
     }
 
@@ -8942,10 +9101,18 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             120,
             true,
             "page-policy alternate-screen mouse wheel is accepted");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_page_policy_chunks =
+            expected_synthetic_key_event_chunks({ Qt::Key_PageUp });
+#else
+        const std::vector<QByteArray> expected_page_policy_chunks = {
+            QByteArrayLiteral("\x1b[5~"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             page_policy_wheel_index,
-            { QByteArrayLiteral("\x1b[5~") },
+            expected_page_policy_chunks,
             "page-policy alternate-screen wheel sends PageUp before SGR mouse");
     }
 
@@ -9435,10 +9602,18 @@ bool test_wheel_input_stops_after_post_barrier_callbacks_become_pending(
         240,
         true,
         "alternate-screen page wheel accepts multi-step input");
+#if defined(Q_OS_WIN)
+    const std::vector<QByteArray> expected_page_up_chunks =
+        expected_synthetic_key_event_chunks({ Qt::Key_PageUp });
+#else
+    const std::vector<QByteArray> expected_page_up_chunks = {
+        QByteArrayLiteral("\x1b[5~"),
+    };
+#endif
     ok &= check_write_chunks_equal(
         backend_ptr->writes,
         wheel_write_index,
-        { QByteArrayLiteral("\x1b[5~") },
+        expected_page_up_chunks,
         "alternate-screen page wheel stops after callback becomes pending");
 
     const std::shared_ptr<const term::Terminal_render_snapshot> post_wheel_snapshot =
@@ -9799,13 +9974,22 @@ bool test_pending_mouse_report_preserves_following_key_input(QGuiApplication& ap
             Qt::NoModifier,
             QStringLiteral("x"),
             "single pending mouse/key preservation key is accepted");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_mouse_then_key_chunks = {
+            sgr_mouse_report(0, 0, 1, 'M'),
+            expected_synthetic_key_event_bytes(
+                Qt::Key_X, Qt::NoModifier, QStringLiteral("x")),
+        };
+#else
+        const std::vector<QByteArray> expected_mouse_then_key_chunks = {
+            sgr_mouse_report(0, 0, 1, 'M'),
+            QByteArrayLiteral("x"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             write_index,
-            {
-                sgr_mouse_report(0, 0, 1, 'M'),
-                QByteArrayLiteral("x"),
-            },
+            expected_mouse_then_key_chunks,
             "single pending mouse/key preservation writes mouse before following key");
     }
 
@@ -9865,10 +10049,20 @@ bool test_pending_mouse_report_preserves_following_key_input(QGuiApplication& ap
             Qt::NoModifier,
             QStringLiteral("x"),
             "multi pending mouse/key preservation key is accepted while mouse is blocked");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_pending_key_chunks = {
+            expected_synthetic_key_event_bytes(
+                Qt::Key_X, Qt::NoModifier, QStringLiteral("x")),
+        };
+#else
+        const std::vector<QByteArray> expected_pending_key_chunks = {
+            QByteArrayLiteral("x"),
+        };
+#endif
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             write_index,
-            { QByteArrayLiteral("x") },
+            expected_pending_key_chunks,
             "multi pending mouse/key preservation cancels the stale mouse queue and writes the key");
     }
 
@@ -16827,6 +17021,8 @@ bool test_keyboard_cursor_modes(QGuiApplication& app)
         { QStringLiteral("scripted-terminal") },
         &started);
     ok &= check(started, "keyboard cursor mode surface starts");
+    term::Terminal_input_mode_state application_cursor_modes;
+    application_cursor_modes.application_cursor_keys = true;
 
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Up, Qt::NoModifier,
@@ -16849,11 +17045,13 @@ bool test_keyboard_cursor_modes(QGuiApplication& app)
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Left, Qt::NoModifier,
         {}, bytes_from_hex("1b4f44"),
-        "application cursor Left drains pending mode output and writes SS3 D");
+        "application cursor Left drains pending mode output and writes SS3 D",
+        application_cursor_modes);
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Left, Qt::ShiftModifier,
         {}, bytes_from_hex("1b5b313b3244"),
-        "modified Left ignores application cursor mode");
+        "modified Left ignores application cursor mode",
+        application_cursor_modes);
     ok &= check(backend_error_count == 0,
         "keyboard cursor success path emits no backend_error");
 
@@ -17044,7 +17242,12 @@ bool test_keyboard_keypad_modes(QGuiApplication& app)
         ok &= send_key_and_expect_write(
             fixture.surface, *backend_ptr, key_case.key, Qt::KeypadModifier,
             key_case.text, bytes_from_hex(key_case.expected_hex),
-            key_case.message);
+            key_case.message,
+            [] {
+                term::Terminal_input_mode_state modes;
+                modes.application_keypad = true;
+                return modes;
+            }());
     }
 
     backend_ptr->emit_output(QByteArrayLiteral("\x1b>"));
@@ -17065,7 +17268,12 @@ bool test_keyboard_keypad_modes(QGuiApplication& app)
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_5, Qt::KeypadModifier,
         QStringLiteral("5"), bytes_from_hex("1b4f75"),
-        "DECNKM set makes keypad digit application encoded");
+        "DECNKM set makes keypad digit application encoded",
+        [] {
+            term::Terminal_input_mode_state modes;
+            modes.application_keypad = true;
+            return modes;
+        }());
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[?66l"));
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_5, Qt::KeypadModifier,
@@ -17076,7 +17284,12 @@ bool test_keyboard_keypad_modes(QGuiApplication& app)
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_5, Qt::KeypadModifier,
         QStringLiteral("5"), bytes_from_hex("1b4f75"),
-        "DECNKM under synchronized output still applies immediately to input");
+        "DECNKM under synchronized output still applies immediately to input",
+        [] {
+            term::Terminal_input_mode_state modes;
+            modes.application_keypad = true;
+            return modes;
+        }());
 
     ok &= check(backend_error_count == 0,
         "keyboard keypad success path emits no backend_error");
