@@ -433,10 +433,45 @@ bool test_prefix_plain_ascii_rows_use_prefix_payload()
         estimate.record_bytes == budget_append.commit.record_bytes &&
         estimate.target_rows == term::k_terminal_history_retention_target_rows &&
         estimate.max_columns_at_target_rows == 0U,
-        "prefix plain-ASCII retention estimate owns its version, target, and byte arithmetic");
+        "no-span prefix-ASCII retention estimate matches the exact baseline row size");
     ok &= check(payload_kind(payload_bytes(budget_ring, budget_append)) ==
             k_payload_kind_prefix_plain_ascii,
         "149-column budget row uses prefix plain ASCII payload kind 1");
+
+    term::Terminal_history_ring multi_span_ring({4096U, 4096U});
+    term::Terminal_history_row_record multi_span_budget = make_base_record(
+        15U,
+        21U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        149);
+    multi_span_budget.cells = budget.cells;
+    multi_span_budget.content_origin_spans = {
+        make_origin_span(
+            0,
+            74,
+            15U,
+            21U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+            1000),
+        make_origin_span(
+            74,
+            75,
+            16U,
+            22U,
+            term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+            2000),
+    };
+    const term::Terminal_history_row_record_append_result multi_span_append =
+        term::encode_terminal_history_row_record_to_ring(
+            multi_span_ring,
+            multi_span_budget,
+            make_identity(3U, 15U));
+    ok &= check(
+        multi_span_append.status == term::Terminal_history_row_record_codec_status::OK &&
+            multi_span_append.payload_kind ==
+                term::Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII &&
+            multi_span_append.commit.record_bytes > estimate.record_bytes,
+        "valid multi-span prefix-ASCII row exceeds the no-span baseline estimate");
 
     return ok;
 }

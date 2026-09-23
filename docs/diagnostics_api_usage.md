@@ -44,7 +44,10 @@ exported include directories and asserts the public headers are present
   scheduling counters.
 - `append_retained_history_metrics_json(surface, out)` fills `out` with live
   ring measurements, compaction counters, and the nested codec-owned
-  `prefix_plain_ascii_estimate` value.
+  `prefix_plain_ascii_estimate` value. Retention-estimate contract version 3
+  uses an exact homogeneous prefix-ASCII baseline without provenance-span tables;
+  `retained_rows` and `max_columns_at_target_rows` are optimistic upper
+  projections after reflow, when rows may carry variable-size span tables.
 
 The caller owns the surrounding document and chooses the enclosing keys; the
 first-party app nests these under `"qsg_atlas"`,

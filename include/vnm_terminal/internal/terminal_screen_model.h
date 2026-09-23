@@ -516,7 +516,10 @@ struct terminal_screen_model_style_table_stats_t
     std::uint64_t              reclaimed_styles    = 0U;
 };
 
-constexpr std::uint32_t k_terminal_history_retention_estimate_contract_version = 2U;
+// Retention-estimate contract v3 models homogeneous full-width prefix-ASCII
+// rows without a provenance-span table. Its record size is exact only for
+// that baseline; post-reflow row-count projections are optimistic upper bounds.
+constexpr std::uint32_t k_terminal_history_retention_estimate_contract_version = 3U;
 constexpr std::uint64_t k_terminal_history_retention_target_rows = 205000U;
 
 struct terminal_history_prefix_plain_ascii_retention_estimate_t
