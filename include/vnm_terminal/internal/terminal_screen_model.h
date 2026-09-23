@@ -112,13 +112,26 @@ struct Terminal_retained_line_provenance
     Terminal_retained_line_provenance_source source =
         Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
     // Wall-clock time of the last content change (ms since epoch). Zero means
-    // the line has never carried written content, so hosts can distinguish
-    // real output from blank fill. Stamped wherever content_generation
-    // advances; reset only when a row becomes fresh blank fill
+    // either never-written content or that no single timestamp describes all
+    // contributing source cells; content_stamp_is_unambiguous distinguishes
+    // those cases. Stamped wherever content_generation advances; reset only
+    // when a row becomes fresh blank fill
     // (replace_retained_line_id). Identity-only rebases must preserve it
     // (rebase_retained_line_id_preserving_content): renaming a line does not
     // make its content never-written.
     qint64                                   content_stamp_ms   = 0;
+    // A reflowed physical row can contain cells from source rows with
+    // different stamps. In that case content_stamp_ms is zero because no
+    // single row-level timestamp is truthful; exact origins live on the row's
+    // content-origin spans.
+    bool                                     content_stamp_is_unambiguous = true;
+};
+
+struct terminal_retained_line_content_origin_span_t
+{
+    int                               first_column = 0;
+    int                               cell_count   = 0;
+    Terminal_retained_line_provenance origin;
 };
 
 enum class Terminal_retained_row_style_reference
@@ -139,6 +152,19 @@ struct terminal_retained_row_record_metadata_t
         Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
     Terminal_retained_row_wrap_state      wrap_state =
         Terminal_retained_row_wrap_state::HARD_BOUNDARY;
+};
+
+struct terminal_retained_history_cell_state_for_testing_t
+{
+    QString                              text;
+    Terminal_render_cell_text_category  text_category =
+        Terminal_render_cell_text_category::PRINTABLE_ASCII;
+    int                                  display_width = 1;
+    int                                  natural_display_width = 1;
+    bool                                 wide_continuation = false;
+    bool                                 occupied = false;
+    Terminal_style_id                    style_id = k_default_terminal_style_id;
+    Terminal_hyperlink_id                hyperlink_id = k_no_terminal_hyperlink_id;
 };
 
 struct Terminal_retained_line_lookup_result
@@ -669,12 +695,20 @@ public:
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
+    std::vector<terminal_retained_line_content_origin_span_t>
+        retained_line_content_origin_spans_for_testing(
+            Terminal_buffer_id         buffer_id,
+            int                        logical_row) const;
     void set_active_grid_retained_line_provenance_for_testing(
         Terminal_buffer_id                    buffer_id,
         int                                   active_grid_row,
         Terminal_retained_line_provenance     provenance);
     std::optional<terminal_retained_row_record_metadata_t>
         retained_row_record_metadata_for_testing(
+            Terminal_buffer_id         buffer_id,
+            int                        logical_row) const;
+    std::optional<std::vector<terminal_retained_history_cell_state_for_testing_t>>
+        retained_history_row_cells_for_testing(
             Terminal_buffer_id         buffer_id,
             int                        logical_row) const;
     void set_next_hyperlink_id_for_testing(Terminal_hyperlink_id id);
@@ -709,12 +743,15 @@ private:
         bool                           occupied          = false;
         Terminal_style_id              style_id          = k_default_terminal_style_id;
         Terminal_hyperlink_id          hyperlink_id      = k_no_terminal_hyperlink_id;
+        int                            natural_display_width = 1;
     };
 
     struct Terminal_screen_row
     {
         std::vector<Cell>                  cells;
         Terminal_retained_line_provenance  retained_line_provenance;
+        std::vector<terminal_retained_line_content_origin_span_t>
+                                            content_origin_spans;
         // Zero is a hard boundary; otherwise this many cells continue into
         // the next row. A wide glyph can leave an unused cell at the margin.
         int                               soft_wrap_columns = 0;
@@ -1048,7 +1085,8 @@ private:
         const Terminal_screen_row&     row,
         terminal_grid_position_t       position,
         QStringView                    text,
-        int                            display_width);
+        int                            display_width,
+        int                            natural_display_width);
 
     bool scalar_span_clear_changes_selection_content(
         const Terminal_screen_row&     row,
@@ -1152,13 +1190,15 @@ private:
         terminal_grid_position_t       position,
         QString                        text,
         int                            display_width,
+        int                            natural_display_width,
         Terminal_style_id              style_id,
         Terminal_hyperlink_id          hyperlink_id);
 
     void place_cell_text(
         terminal_grid_position_t       position,
         QString                        text,
-        int                            display_width);
+        int                            display_width,
+        int                            natural_display_width);
 
     void clear_cell_span(
         terminal_grid_position_t       position);
