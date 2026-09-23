@@ -4,6 +4,7 @@
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/interaction_trace.h"
+#include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
@@ -44,6 +45,13 @@ namespace {
 using vnm_terminal::test_helpers::check;
 using vnm_terminal::test_helpers::decode_hex;
 using vnm_terminal::test_helpers::recovery_disabled_primary_backing_session_config;
+
+QByteArray expected_encoded_key_event_bytes(const QKeyEvent& event)
+{
+    return term::encode_terminal_key_event(
+        event,
+        term::Terminal_input_mode_state{});
+}
 
 QByteArray recovered_backend_output_capture_bytes(
     const vnm_terminal::Backend_output_capture_config& config)
@@ -4216,13 +4224,14 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
         Qt::Key_X,
         Qt::NoModifier,
         QStringLiteral("x"));
+    const QByteArray expected_key_bytes = expected_encoded_key_event_bytes(key_event);
     const term::Terminal_key_event_result key_result =
         session->write_key_event(key_event);
     ok &= check(key_result.handled &&
         key_result.result.code == term::Terminal_session_result_code::ACCEPTED,
         "blocked detach resize accepts input");
-    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
-        "blocked detach resize writes input bytes");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == expected_key_bytes,
+        "blocked detach resize forwards encoded key event");
 
     const term::Terminal_session_result resize_result =
         session->resize(QSizeF(120.0, 80.0), {4, 12});
@@ -13200,13 +13209,14 @@ bool test_selection_only_synchronized_hold_keeps_held_output_unpublished()
         Qt::Key_X,
         Qt::NoModifier,
         QStringLiteral("x"));
+    const QByteArray expected_key_bytes = expected_encoded_key_event_bytes(key_event);
     const term::Terminal_key_event_result key_result =
         session->write_key_event(key_event);
     ok &= check(key_result.handled &&
         key_result.result.code == term::Terminal_session_result_code::ACCEPTED,
         "selection-only synchronized hold accepts input");
-    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
-        "selection-only synchronized hold writes input bytes");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == expected_key_bytes,
+        "selection-only synchronized hold forwards encoded key event");
     ok &= check(session->render_snapshot_generation() == selected_generation,
         "selection-only synchronized hold keeps held output unpublished after input");
 
@@ -13256,6 +13266,7 @@ bool test_pre_input_queued_output_drains_during_input_without_echo()
         Qt::Key_X,
         Qt::NoModifier,
         QStringLiteral("x"));
+    const QByteArray expected_key_bytes = expected_encoded_key_event_bytes(key_event);
     const term::Terminal_key_event_result key_result =
         session->write_key_event(key_event);
     const std::optional<term::Terminal_render_snapshot> snapshot_after_input =
@@ -13264,8 +13275,8 @@ bool test_pre_input_queued_output_drains_during_input_without_echo()
     ok &= check(key_result.handled &&
         key_result.result.code == term::Terminal_session_result_code::ACCEPTED,
         "pre-input queued output accepts input");
-    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
-        "pre-input queued output writes key without echo");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == expected_key_bytes,
+        "pre-input queued output forwards encoded key event without echo");
     ok &= check(snapshot_after_input.has_value() &&
         snapshot_contains_text(*snapshot_after_input, QStringLiteral("ready")) &&
         !snapshot_contains_text(*snapshot_after_input, QStringLiteral("readyx")) &&
