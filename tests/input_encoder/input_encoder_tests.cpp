@@ -139,8 +139,13 @@ bool test_control_and_altgr()
         "Ctrl+K maps to VT for shell line editing");
     ok &= check_bytes_equal(
         encode(Qt::Key_Backspace, Qt::ControlModifier | Qt::AltModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b383b31343b383b313b31303b315f"),
+        "Ctrl+Alt+Backspace writes a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b08"),
         "Ctrl+Alt+Backspace prefixes BS with ESC");
+#endif
     ok &= check_bytes_equal(
         encode(
             Qt::Key_E,
@@ -153,16 +158,31 @@ bool test_control_and_altgr()
             Qt::Key_C,
             Qt::ControlModifier | Qt::AltModifier,
             QString(QChar(0x0003))),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b36373b34363b333b313b31303b315f"),
+        "Ctrl+Alt platform C0 text uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b03"),
         "Ctrl+Alt platform C0 text falls through to Alt-prefixed control");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Left, Qt::ControlModifier | Qt::AltModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b33373b37353b303b313b3236363b315f"),
+        "Ctrl+Alt navigation uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b313b3744"),
         "Ctrl+Alt navigation keeps modifier-aware arrow encoding");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_F5, Qt::ControlModifier | Qt::AltModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b3131363b36333b303b313b31303b315f"),
+        "Ctrl+Alt function key uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b31353b377e"),
         "Ctrl+Alt function key keeps modifier-aware function encoding");
+#endif
 
     return ok;
 }
@@ -195,8 +215,13 @@ bool test_cursor_and_navigation_modes()
 #endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Return, Qt::AltModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b31333b32383b31333b313b323b315f"),
+        "Alt+Return uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b0d"),
         "Alt+Return keeps ESC-prefixed CR");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Escape, Qt::NoModifier),
 #if defined(Q_OS_WIN)
@@ -210,7 +235,7 @@ bool test_cursor_and_navigation_modes()
         encode(Qt::Key_Escape, Qt::AltModifier),
 #if defined(Q_OS_WIN)
         bytes_from_hex("1b5b32373b313b32373b313b303b315f1b5b32373b313b32373b313b303b315f"),
-        "Alt+Escape uses two native Win32 frames on Windows");
+        "Alt+Escape uses two native Escape key events on Windows");
 #else
         bytes_from_hex("1b1b"),
         "Alt+Escape prefixes Escape with ESC");
@@ -219,47 +244,116 @@ bool test_cursor_and_navigation_modes()
     term::Terminal_input_mode_state modes;
     ok &= check_bytes_equal(
         encode(Qt::Key_Home, Qt::NoModifier, {}, modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b33363b37313b303b313b3235363b315f"),
+        "normal Home uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b48"),
         "normal Home writes CSI H");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_End, Qt::NoModifier, {}, modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b33353b37393b303b313b3235363b315f"),
+        "normal End uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b46"),
         "normal End writes CSI F");
+#endif
 
     modes.application_cursor_keys  = true;
     ok                            &= check_bytes_equal(
         encode(Qt::Key_Home, Qt::NoModifier, {}, modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b33363b37313b303b313b3235363b315f"),
+        "application cursor Home uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b4f48"),
         "application cursor Home writes SS3 H");
+#endif
     ok                            &= check_bytes_equal(
         encode(Qt::Key_End, Qt::NoModifier, {}, modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b33353b37393b303b313b3235363b315f"),
+        "application cursor End uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b4f46"),
         "application cursor End writes SS3 F");
+#endif
     ok                            &= check_bytes_equal(
         encode(Qt::Key_Home, Qt::ShiftModifier, {}, modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b33363b37313b303b313b3237323b315f"),
+        "modified Home uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b313b3248"),
         "modified Home keeps CSI modifier form in application cursor mode");
+#endif
 
     ok &= check_bytes_equal(
         encode(Qt::Key_Backtab, Qt::NoModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b393b31353b393b313b303b315f"),
+        "Backtab uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b5a"),
         "Backtab writes CSI Z");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Backtab, Qt::ShiftModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b393b31353b393b313b31363b315f"),
+        "Shift+Backtab uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b5a"),
         "Shift+Backtab writes CSI Z");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Tab, Qt::ShiftModifier, QStringLiteral("\t")),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b393b31353b393b313b31363b315f"),
+        "Shift+Tab uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b5a"),
         "Shift+Tab writes CSI Z");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Tab, Qt::ShiftModifier | Qt::ControlModifier, QStringLiteral("\t")),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b393b31353b393b313b32343b315f"),
+        "Ctrl+Shift+Tab uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b313b365a"),
         "Ctrl+Shift+Tab writes CSI 1;6 Z");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Tab, Qt::ShiftModifier | Qt::AltModifier, QStringLiteral("\t")),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b393b31353b393b313b31383b315f"),
+        "Alt+Shift+Tab uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b5b313b345a"),
         "Alt+Shift+Tab writes CSI 1;4 Z");
+#endif
+
+    ok &= check_bytes_equal(
+        encode(Qt::Key_BracketLeft, Qt::AltModifier, QStringLiteral("[")),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b3231393b32363b39313b313b323b315f"),
+        "Alt+[ uses a native Win32 key event on Windows");
+#else
+        bytes_from_hex("1b5b"),
+        "Alt+[ uses the terminal Alt-prefix convention");
+#endif
+    ok &= check_bytes_equal(
+        encode(Qt::Key_F3, Qt::ShiftModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b3131343b36313b303b313b31363b315f"),
+        "Shift+F3 uses a native Win32 key event on Windows");
+#else
+        bytes_from_hex("1b5b313b3252"),
+        "Shift+F3 uses the modified function-key sequence");
+#endif
 
     return ok;
 }
@@ -273,8 +367,13 @@ bool test_keypad_policy()
 
     ok &= check_bytes_equal(
         encode(Qt::Key_5, Qt::KeypadModifier, QStringLiteral("5"), modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b3130313b37363b35333b313b303b315f"),
+        "application keypad digit uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b4f75"),
         "unmodified application keypad digit uses SS3 encoding");
+#endif
     ok &= check_bytes_equal(
         encode(
             Qt::Key_5,
@@ -289,8 +388,13 @@ bool test_keypad_policy()
             Qt::KeypadModifier | Qt::AltModifier,
             QStringLiteral("+"),
             modes),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b3130373b37383b34333b313b323b315f"),
+        "modified keypad operator uses a native Win32 key event on Windows");
+#else
         bytes_from_hex("1b2b"),
         "modified keypad operator preserves Alt printable behavior");
+#endif
 
     return ok;
 }

@@ -1541,7 +1541,22 @@ int run_paste_input_reader(const QString& output_path)
     }
 }
 
-int run_escape_input_reader()
+bool wait_for_file_size(const QString& path, qint64 size)
+{
+    const auto deadline =
+        std::chrono::steady_clock::now() + k_wait_timeout;
+    do {
+        if (QFileInfo(path).size() >= size) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+
+    return false;
+}
+
+int run_escape_input_reader(const QString& observation_path)
 {
     HANDLE input      = GetStdHandle(STD_INPUT_HANDLE);
     DWORD  input_mode = 0U;
@@ -1560,7 +1575,10 @@ int run_escape_input_reader()
     }
 
     std::cout << "escape-input-reader-ready\n" << std::flush;
-    std::size_t escape_count = 0U;
+    QFile observation(observation_path);
+    if (!observation.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        return 1;
+    }
     for (;;) {
         INPUT_RECORD records[64];
         DWORD        count = 0U;
@@ -1570,46 +1588,27 @@ int run_escape_input_reader()
 
         for (DWORD index = 0U; index < count; ++index) {
             const INPUT_RECORD& record = records[index];
-            if (record.EventType != KEY_EVENT || !record.Event.KeyEvent.bKeyDown) {
+            if (record.EventType != KEY_EVENT) {
                 continue;
             }
 
             const KEY_EVENT_RECORD& key = record.Event.KeyEvent;
-            std::string             label;
-            if (key.wVirtualKeyCode == VK_RETURN &&
-                (key.dwControlKeyState & SHIFT_PRESSED) != 0U)
-            {
-                label = "escape-input-shift-return";
-            }
-            else
-            if (key.wVirtualKeyCode == VK_ESCAPE) {
-                ++escape_count;
-                label = "escape-input-escape-" + std::to_string(escape_count);
-            }
-            else
-            if (key.wVirtualKeyCode == VK_UP) {
-                label = "escape-input-up";
-            }
-            else
-            if (key.wVirtualKeyCode == VK_F12) {
-                label = "escape-input-f12";
-            }
-            else {
-                label = "escape-input-other";
-            }
-
             std::ostringstream line;
-            line << label
+            line << (key.bKeyDown ? 'D' : 'U')
                 << " vk=" << key.wVirtualKeyCode
                 << " scan=" << key.wVirtualScanCode
+                << " repeat=" << key.wRepeatCount
                 << " unicode=" << static_cast<unsigned int>(key.uChar.UnicodeChar)
                 << " state=" << key.dwControlKeyState;
-            std::cout << line.str() << '\n' << std::flush;
+            const QByteArray bytes = QByteArray::fromStdString(line.str()) + '\n';
+            if (observation.write(bytes) != bytes.size() || !observation.flush()) {
+                return 1;
+            }
         }
     }
 }
 
-int run_escape_vt_input_reader()
+int run_escape_vt_input_reader(const QString& observation_path)
 {
     HANDLE input      = GetStdHandle(STD_INPUT_HANDLE);
     DWORD  input_mode = 0U;
@@ -1627,6 +1626,10 @@ int run_escape_vt_input_reader()
         return 1;
     }
 
+    QFile observation(observation_path);
+    if (!observation.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        return 1;
+    }
     std::cout << "escape-vt-input-reader-ready\n" << std::flush;
     for (;;) {
         char  bytes[64];
@@ -1635,18 +1638,30 @@ int run_escape_vt_input_reader()
             return 1;
         }
 
-        for (DWORD index = 0U; index < count; ++index) {
-            const QByteArray byte_hex = QByteArray(1, bytes[index]).toHex();
-            std::cout << "escape-vt-byte-" << byte_hex.constData()
-                << '\n' << std::flush;
+        if (observation.write(bytes, static_cast<qint64>(count)) !=
+                static_cast<qint64>(count) ||
+            !observation.flush())
+        {
+            return 1;
         }
     }
 }
 
-QByteArray encoded_key_event(int key, Qt::KeyboardModifiers modifiers)
+QByteArray encoded_key_event(
+    int key, Qt::KeyboardModifiers modifiers, const QString& text = {})
 {
-    QKeyEvent event(QEvent::KeyPress, key, modifiers);
+    QKeyEvent event(QEvent::KeyPress, key, modifiers, text);
     return term::encode_terminal_key_event(event, {});
+}
+
+QByteArray native_key_record(
+    char action, int virtual_key, int scan_code, int repeat, int unicode, int state)
+{
+    return QByteArray(1, action) + " vk=" + QByteArray::number(virtual_key) +
+        " scan=" + QByteArray::number(scan_code) +
+        " repeat=" + QByteArray::number(repeat) +
+        " unicode=" + QByteArray::number(unicode) +
+        " state=" + QByteArray::number(state) + '\n';
 }
 
 bool test_escape_transport_after_native_shift_return(const QString& executable_path)
@@ -1661,6 +1676,11 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         encoded_key_event(Qt::Key_Escape, Qt::AltModifier);
     const QByteArray up = encoded_key_event(Qt::Key_Up, Qt::NoModifier);
     const QByteArray f12 = encoded_key_event(Qt::Key_F12, Qt::NoModifier);
+    const QByteArray alt_bracket = encoded_key_event(
+        Qt::Key_BracketLeft, Qt::AltModifier, QStringLiteral("["));
+    const QByteArray letter_a = encoded_key_event(
+        Qt::Key_A, Qt::ShiftModifier, QStringLiteral("A"));
+    const QByteArray shift_f3 = encoded_key_event(Qt::Key_F3, Qt::ShiftModifier);
     const QByteArray native_escape =
         decode_hex("1b5b32373b313b32373b313b303b315f");
     const QByteArray native_alt_escape = native_escape + native_escape;
@@ -1675,29 +1695,35 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     ok &= check(control_three == native_escape,
         "Escape transport probe uses native framing for Ctrl+3");
     ok &= check(alt_escape == native_alt_escape,
-        "Escape transport probe uses two native frames for Alt+Escape");
+        "Escape transport probe frames Alt+Escape as two Escape events");
+    ok &= check(alt_bracket == decode_hex("1b5b3231393b32363b39313b313b323b315f"),
+        "Escape transport probe uses a native key frame for Alt+[");
+    ok &= check(letter_a == QByteArrayLiteral("A"),
+        "Escape transport probe encodes A as one printable byte");
+    ok &= check(shift_f3 == decode_hex("1b5b3131343b36313b303b313b31363b315f"),
+        "Escape transport probe uses a native key frame for Shift+F3");
     if (!ok) {
         return false;
     }
-
-    const QByteArray ready_marker = QByteArrayLiteral("escape-input-reader-ready");
-    const QByteArray shift_marker = QByteArrayLiteral("escape-input-shift-return");
-    const QByteArray escape_marker = QByteArrayLiteral("escape-input-escape-1");
-    const QByteArray second_escape_marker = QByteArrayLiteral("escape-input-escape-2");
-    const QByteArray up_marker = QByteArrayLiteral("escape-input-up");
-    const QByteArray f12_marker = QByteArrayLiteral("escape-input-f12");
 
     const auto run_case = [&] (
         const QString&                               reader_mode,
         const char*                                  name,
         const std::vector<QByteArray>&               writes,
-        const std::vector<std::vector<QByteArray>>& expected_markers,
-        bool                                         pause_between_writes)
+        bool                                         pause_between_writes,
+        const std::vector<QByteArray>& expected_observations)
     {
+        QTemporaryDir observation_directory;
+        if (!check(observation_directory.isValid(),
+                "Escape transport observation directory is created")) {
+            return false;
+        }
+        const QString observation_path =
+            observation_directory.filePath(QStringLiteral("observed.bin"));
         Backend_capture capture;
         std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
         const term::Terminal_backend_result started = backend->start(
-            launch_config(executable_path, {reader_mode}),
+            launch_config(executable_path, {reader_mode, observation_path}),
             capture.callbacks());
         bool case_ok = check(
             started.code == term::Terminal_backend_result_code::ACCEPTED,
@@ -1709,24 +1735,31 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         const QByteArray child_ready_marker =
             reader_mode == QStringLiteral("--escape-vt-input-reader")
                 ? QByteArrayLiteral("escape-vt-input-reader-ready")
-                : ready_marker;
+                : QByteArrayLiteral("escape-input-reader-ready");
         case_ok &= check(capture.wait_for_output(child_ready_marker),
             "Escape transport reader reaches its ready marker");
+        QByteArray expected_so_far;
         for (std::size_t write_index = 0U; write_index < writes.size(); ++write_index) {
             const term::Terminal_backend_result write_result =
                 backend->write(writes[write_index]);
             case_ok &= check(
                 write_result.code == term::Terminal_backend_result_code::ACCEPTED,
                 "Escape transport probe accepts encoded input");
-            for (const QByteArray& marker : expected_markers[write_index]) {
-                const bool marker_seen = capture.wait_for_output_within(
-                    marker, std::chrono::seconds(2));
-                if (!marker_seen) {
-                    std::cerr << name << " output="
-                        << capture.output_snapshot().toHex(' ').constData() << '\n';
-                }
-                case_ok &= check(marker_seen, name);
+            expected_so_far += expected_observations[write_index];
+
+            const bool size_reached = wait_for_file_size(
+                observation_path, expected_so_far.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            QFile observed_file(observation_path);
+            const bool read_ok = observed_file.open(QIODevice::ReadOnly);
+            const QByteArray actual = read_ok ? observed_file.readAll() : QByteArray();
+            if (!size_reached || !read_ok || actual != expected_so_far) {
+                std::cerr << name << " expected="
+                    << expected_so_far.toHex(' ').constData() << " actual="
+                    << actual.toHex(' ').constData() << '\n';
             }
+            case_ok &= check(size_reached && read_ok && actual == expected_so_far,
+                name);
 
             if (pause_between_writes && write_index + 1U < writes.size()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1744,78 +1777,137 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         return case_ok;
     };
 
+    // Native key-event frames must retain key identity for classic console
+    // readers, while VT-input readers receive the corresponding VT byte stream.
+    // The split-frame case records the package parser's write-boundary limit.
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "plain Escape reaches a fresh native console reader",
         {escape},
-        {{escape_marker}},
-        false);
+        false,
+        {native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "a split native frame emits ESC and [ as separate key events",
+        {escape.left(1), escape.mid(1, 1)},
+        true,
+        {native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0) +
+                native_key_record('U', VK_ESCAPE, 1, 1, VK_ESCAPE, 0),
+            native_key_record('D', VK_OEM_4, 26, 1, '[', 0) +
+                native_key_record('U', VK_OEM_4, 26, 1, '[', 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "isolated Escape reaches the child after Shift+Return",
         {shift_return, escape},
-        {{shift_marker}, {escape_marker}},
-        true);
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "coalesced Shift+Return and Escape reach the child",
         {shift_return + escape},
-        {{shift_marker, escape_marker}},
-        false);
+        false,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED) +
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Ctrl+[ reaches the child after Shift+Return",
         {shift_return, control_bracket},
-        {{shift_marker}, {escape_marker}},
-        true);
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Ctrl+3 reaches the child after Shift+Return",
         {shift_return, control_three},
-        {{shift_marker}, {escape_marker}},
-        true);
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Alt+Escape reaches the child after Shift+Return",
         {shift_return, alt_escape},
-        {{shift_marker}, {escape_marker, second_escape_marker}},
-        true);
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0) +
+                native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "separate Escape presses produce separate down-only records",
+        {shift_return, escape, escape},
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0),
+            native_key_record('D', VK_ESCAPE, 1, 1, VK_ESCAPE, 0)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "Up reaches the child after Shift+Return",
         {shift_return, up},
-        {{shift_marker}, {up_marker}},
-        true);
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_UP, 72, 1, 0, ENHANCED_KEY)});
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "F12 reaches the child after Shift+Return",
         {shift_return, f12},
-        {{shift_marker}, {f12_marker}},
-        true);
-
-    const QByteArray vt_escape_marker = QByteArrayLiteral("escape-vt-byte-1b");
-    const QByteArray vt_return_marker = QByteArrayLiteral("escape-vt-byte-0d");
-    const QByteArray vt_left_bracket_marker = QByteArrayLiteral("escape-vt-byte-5b");
-    const QByteArray vt_up_marker = QByteArrayLiteral("escape-vt-byte-41");
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_F12, 88, 1, 0, 0)});
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Alt+[ and uppercase A remain separate native key events",
+        {shift_return, alt_bracket, letter_a},
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_OEM_4, 26, 1, '[', LEFT_ALT_PRESSED),
+            native_key_record('D', VK_SHIFT, 42, 1, 0, SHIFT_PRESSED) +
+                native_key_record('D', 'A', 30, 1, 'A', SHIFT_PRESSED) +
+                native_key_record('U', 'A', 30, 1, 'A', SHIFT_PRESSED) +
+                native_key_record('U', VK_SHIFT, 42, 1, 0, 0)});
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Shift+F3 reaches a native reader as an F3 key record",
+        {shift_return, shift_f3},
+        true,
+        {native_key_record('D', VK_RETURN, 28, 1, VK_RETURN, SHIFT_PRESSED),
+            native_key_record('D', VK_F3, 61, 1, 0, SHIFT_PRESSED)});
 
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "plain Escape reaches a VT reader",
         {escape},
-        {{vt_escape_marker}},
-        false);
+        false,
+        {decode_hex("1b")});
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Alt+Escape maps to two ESC bytes for VT input",
+        {alt_escape},
+        false,
+        {decode_hex("1b1b")});
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "isolated Escape reaches a VT reader after Shift+Return",
         {shift_return, escape},
-        {{vt_return_marker}, {vt_escape_marker}},
-        true);
+        true,
+        {decode_hex("0d"), decode_hex("1b")});
     ok &= run_case(
         QStringLiteral("--escape-vt-input-reader"),
         "Up reaches a VT reader after Shift+Return",
         {shift_return, up},
-        {{vt_return_marker}, {vt_escape_marker, vt_left_bracket_marker, vt_up_marker}},
-        true);
+        true,
+        {decode_hex("0d"), decode_hex("1b5b41")});
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Alt+[ followed by A forms the standard VT Up sequence",
+        {shift_return, alt_bracket, letter_a},
+        true,
+        {decode_hex("0d"), decode_hex("1b5b"), decode_hex("41")});
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Shift+F3 reaches a VT reader as its CPR-like sequence",
+        {shift_return, shift_f3},
+        true,
+        {decode_hex("0d"), decode_hex("1b5b313b3252")});
     return ok;
 }
 
@@ -4198,11 +4290,11 @@ int main(int argc, char** argv)
     if (argc == 3 && std::string_view(argv[1]) == "--paste-input-reader") {
         return run_paste_input_reader(QString::fromLocal8Bit(argv[2]));
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--escape-input-reader") {
-        return run_escape_input_reader();
+    if (argc == 3 && std::string_view(argv[1]) == "--escape-input-reader") {
+        return run_escape_input_reader(QString::fromLocal8Bit(argv[2]));
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--escape-vt-input-reader") {
-        return run_escape_vt_input_reader();
+    if (argc == 3 && std::string_view(argv[1]) == "--escape-vt-input-reader") {
+        return run_escape_vt_input_reader(QString::fromLocal8Bit(argv[2]));
     }
     if (argc == 2 && std::string_view(argv[1]) == "--escape-input-transport") {
         bool ok = test_escape_transport_after_native_shift_return(
