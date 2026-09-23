@@ -5249,8 +5249,8 @@ int main(int argc, char** argv)
     run_test("compatibility window forced close", test_compatibility_window_stays_hidden(fixture_path, true));
     run_test("Unicode paste preserves console input",
         test_unicode_paste_preserves_console_input(QString::fromLocal8Bit(argv[0])));
-    run_test("Escape transport after native Shift+Return",
-        test_escape_transport_after_native_shift_return(QString::fromLocal8Bit(argv[0])));
+    // Escape transport has a dedicated CTest entry; keep it out of this
+    // aggregate suite so it is not run twice, including in the ASan target.
     run_test("terminal child starts with default error mode",
         test_terminal_child_starts_with_default_error_mode(reporter_path));
     run_test("resize storm reports final shell size",
