@@ -142,6 +142,9 @@ struct Terminal_backend_result
     std::optional<Terminal_backend_error>  error;
     bool                                   native_dispatch_occurred = false;
     bool                                   start_outcome_determinate = true;
+    // A rejected stop may already have revoked native input and begun cleanup.
+    // Only a noncommitting rejection allows the session to restore readiness.
+    bool                                   stop_committed = false;
 };
 
 struct Terminal_backend_resize_request
@@ -186,6 +189,14 @@ inline Terminal_backend_result backend_reject(
         Terminal_backend_result_code::REJECTED,
         Terminal_backend_error{code, std::move(message)},
     };
+}
+
+inline Terminal_backend_result backend_stop_error(QString message)
+{
+    Terminal_backend_result result = backend_reject(
+        Terminal_backend_error_code::TERMINATE_FAILED, std::move(message));
+    result.stop_committed = true;
+    return result;
 }
 
 inline Terminal_backend_result backend_start_reject(

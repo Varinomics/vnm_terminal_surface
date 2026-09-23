@@ -273,6 +273,12 @@ public:
         }
 
         ++terminate_count;
+        if (terminate_result.has_value()) {
+            if (terminate_result->stop_committed) {
+                running = false;
+            }
+            return *terminate_result;
+        }
         running = false;
         if (exit_on_terminate) {
             m_callbacks.process_exited({term::Terminal_exit_reason::TERMINATED, 0});
@@ -345,6 +351,7 @@ public:
     int                        fail_output_pause_request_number = 0;
     int                        interrupt_count                  = 0;
     int                        terminate_count                  = 0;
+    std::optional<term::Terminal_backend_result> terminate_result;
     std::vector<QByteArray>    outputs_before_start_failure;
     std::vector<QByteArray>    outputs_during_start;
     std::vector<QByteArray>    outputs_during_write;
@@ -19725,11 +19732,66 @@ bool test_exit_failed_start_and_double_stop()
     return ok;
 }
 
+bool test_stop_failure_preserves_commitment_and_prior_geometry()
+{
+    bool ok = true;
+    for (const bool committed : {false, true}) {
+        for (const bool geometry_in_sync : {false, true}) {
+            std::unique_ptr<term::Terminal_session> session;
+            Scripted_backend* backend = make_session(session);
+            backend->exit_on_terminate = false;
+            ok &= check(session->start(valid_launch_config()).code ==
+                term::Terminal_session_result_code::ACCEPTED,
+                "stop-failure fixture starts");
+            if (!geometry_in_sync) {
+                backend->fail_resize = true;
+                ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;3;5t")),
+                    "stop-failure fixture attempts a rejected native resize");
+            }
+            ok &= check(session->backend_geometry_in_sync() == geometry_in_sync,
+                "stop-failure fixture has the intended prior geometry state");
+            backend->terminate_result = committed
+                ? term::backend_stop_error(QStringLiteral("controlled post-commit failure"))
+                : term::backend_reject(term::Terminal_backend_error_code::TERMINATE_FAILED,
+                      QStringLiteral("controlled admission rejection"));
+            ok &= check(session->terminate().code == term::Terminal_session_result_code::BACKEND_REJECTED,
+                "stop failure remains observable");
+            ok &= check(session->backend_ready() == !committed,
+                "committed stop failure cannot restore readiness");
+            ok &= check(session->backend_geometry_in_sync() == (!committed && geometry_in_sync),
+                "only noncommitting rejection restores the exact prior geometry state");
+            ok &= check(!session->exit_status().has_value(),
+                "stop failure cannot fabricate a child exit");
+            if (committed) {
+                ok &= check(session->write_user_bytes(QByteArrayLiteral("after stop")).code ==
+                    term::Terminal_session_result_code::INVALID_STATE,
+                    "input remains revoked after committed stop failure");
+                ok &= check(session->terminate().code == term::Terminal_session_result_code::INVALID_STATE,
+                    "committed stop cannot dispatch twice");
+                ok &= check(backend->terminate_count == 1, "one native stop commitment");
+                backend->emit_exit({term::Terminal_exit_reason::TERMINATED, 0});
+                ok &= check(session->exit_status().has_value(), "authentic native exit settles stop");
+            }
+            else {
+                ok &= check(session->write_user_bytes(QByteArrayLiteral("retry input")).code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+                    "noncommitting rejection leaves input available");
+                backend->terminate_result.reset();
+                ok &= check(session->terminate().code == term::Terminal_session_result_code::ACCEPTED,
+                    "noncommitting rejection leaves stop retry available");
+                backend->emit_exit({term::Terminal_exit_reason::TERMINATED, 0});
+            }
+        }
+    }
+    return ok;
+}
+
 }
 
 int main()
 {
     bool ok = true;
+    ok &= test_stop_failure_preserves_commitment_and_prior_geometry();
     ok &= test_start_callback_ordering_and_output();
     ok &= test_backend_output_capture_file();
     ok &= test_backend_output_capture_open_failure_reports_backend_error();

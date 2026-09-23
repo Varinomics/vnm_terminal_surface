@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "bounded_render_retry.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_atlas_font_bytes.h"
 #include "vnm_terminal/internal/qsg_atlas_warm_set.h"
@@ -12,6 +13,7 @@
 #endif
 
 #include <QCryptographicHash>
+#include <QDebug>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QGlyphRun>
@@ -25,6 +27,7 @@
 #include <QTextOption>
 #include <QThread>
 #include <QThreadPool>
+#include <QTimer>
 #include <QTransform>
 #include <QtGui/private/qfontengine_p.h>
 #include <QtGui/private/qrawfont_p.h>
@@ -51,6 +54,14 @@
 
 namespace vnm_terminal::internal {
 
+class Atlas_retry_completion final : public QObject
+{
+    Q_OBJECT
+
+signals:
+    void retry_requested(quint64 epoch, quint64 serial, int delay_ms);
+};
+
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 class Msdf_atlas_completion final : public QObject
 {
@@ -63,6 +74,7 @@ signals:
 
 namespace {
 
+std::atomic_bool s_fail_rect_buffer_create = false;
 std::atomic<std::uint64_t> s_fail_resource_prepare_snapshot_sequence = 0U;
 std::atomic<std::uint64_t> s_fail_msdf_resource_prepare_snapshot_sequence = 0U;
 std::atomic<std::uint64_t> s_fail_msdf_text_buffer_update_snapshot_sequence = 0U;
@@ -2157,6 +2169,38 @@ public:
     :
         m_recorder(std::move(recorder))
     {
+        // As with the atlas completion relay, establish the receiver connection
+        // during GUI synchronization. Later render work never submits through a
+        // raw GUI pointer; Qt scopes the timer to the receiver's lifetime.
+        m_retry_completion = std::make_shared<Atlas_retry_completion>();
+        const auto schedule_retry = [
+                retry      = m_retry,
+                context    = update_request.context,
+                invalidate = update_request.invalidate
+            ](quint64 epoch, quint64 serial, int delay_ms)
+            {
+                const Bounded_render_retry::ticket_t ticket{epoch, serial, delay_ms};
+                if (!retry->current(ticket)) {
+                    return;
+                }
+                if (delay_ms < 0) {
+                    if (retry->consume(ticket)) {
+                        qWarning("vnm_terminal: atlas preparation retry budget exhausted; "
+                                 "waiting for new content or resource invalidation");
+                    }
+                    return;
+                }
+                const auto retry_frame = [retry, ticket, invalidate] {
+                    if (retry->consume(ticket) && invalidate) {
+                        invalidate();
+                    }
+                };
+                QTimer::singleShot(delay_ms, context, retry_frame);
+            };
+        QObject::connect(
+            m_retry_completion.get(), &Atlas_retry_completion::retry_requested,
+            update_request.context, schedule_retry, Qt::QueuedConnection);
+        m_retry_completion->moveToThread(nullptr);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         // updatePaintNode holds GUI synchronization here. Qt owns receiver
         // disconnection after this point; a worker never submits through a raw
@@ -2167,14 +2211,13 @@ public:
             update_request.context, update_request.invalidate,
             Qt::QueuedConnection);
         m_msdf_completion->moveToThread(nullptr);
-#else
-        Q_UNUSED(update_request);
 #endif
     }
 
     ~Qsg_atlas_render_node() override
     {
-        releaseResources();
+        m_retry->close();
+        release_gpu_resources();
     }
 
     void set_frame(
@@ -2182,6 +2225,20 @@ public:
         std::shared_ptr<Qsg_atlas_recorder>
                                                 recorder)
     {
+        // Capture sequence changes on every retry and cannot replenish the
+        // finite budget. Only new source/geometry/font ownership does that.
+        if (frame.snapshot               != m_pending_frame.snapshot               ||
+            frame.publication_generation != m_pending_frame.publication_generation ||
+            frame.ownership_generation   != m_pending_frame.ownership_generation   ||
+            frame.canvas_frame_generation != m_pending_frame.canvas_frame_generation ||
+            frame.font_epoch             != m_pending_frame.font_epoch             ||
+            frame.font                   != m_pending_frame.font                   ||
+            frame.logical_size           != m_pending_frame.logical_size           ||
+            frame.device_pixel_ratio     != m_pending_frame.device_pixel_ratio     ||
+            frame.logical_dpi            != m_pending_frame.logical_dpi)
+        {
+            m_retry->reset();
+        }
         m_pending_frame = std::move(frame);
         m_frame    = m_pending_frame;
         m_recorder = std::move(recorder);
@@ -2498,6 +2555,12 @@ public:
                 prepare_result.warm_lazy,
                 prepared_generation_committed);
         }
+        if (prepared_generation_committed) {
+            m_retry->reset();
+        }
+        else {
+            request_prepare_retry();
+        }
         if (!prepared_generation_committed && m_have_committed_frame) {
             m_frame = m_committed_frame;
         }
@@ -2569,6 +2632,27 @@ public:
 
     void releaseResources() override
     {
+        // External scenegraph invalidation opens a fresh resource epoch. Failed
+        // allocation rollback uses release_gpu_resources and keeps its budget.
+        m_retry->reset();
+        release_gpu_resources();
+        m_resource_rhi = nullptr;
+        m_render_pass_serialized_format.clear();
+        m_render_target_samples = 0;
+        request_prepare_retry();
+    }
+
+private:
+    void request_prepare_retry()
+    {
+        if (const auto ticket = m_retry->failed()) {
+            emit m_retry_completion->retry_requested(
+                ticket->epoch, ticket->serial, ticket->delay_ms);
+        }
+    }
+
+    void release_gpu_resources()
+    {
         discard_pending_glyph_resources();
         delete_resource(m_stencil_msdf_text_pipeline);
         delete_resource(m_msdf_text_pipeline);
@@ -2590,9 +2674,6 @@ public:
         delete_resource(m_vertex_buffer);
         delete_resource(m_msdf_text_atlas_texture);
         delete_resource(m_coverage_texture);
-        m_resource_rhi                  = nullptr;
-        m_render_pass_serialized_format.clear();
-        m_render_target_samples         = 0;
         m_rect_instance_buffer_size      = 0U;
         m_glyph_instance_buffer_size     = 0U;
         m_msdf_text_instance_buffer_size = 0U;
@@ -2998,20 +3079,21 @@ private:
             m_uniform_buffer == nullptr ||
             m_invert_uniform_buffer == nullptr)
         {
-            releaseResources();
+            release_gpu_resources();
             return false;
         }
-        if (!m_vertex_buffer->create() ||
+        if (s_fail_rect_buffer_create.load(std::memory_order_relaxed) ||
+            !m_vertex_buffer->create() ||
             !m_uniform_buffer->create() ||
             !m_invert_uniform_buffer->create())
         {
-            releaseResources();
+            release_gpu_resources();
             return false;
         }
 
         m_rect_shader_resources = rhi->newShaderResourceBindings();
         if (m_rect_shader_resources == nullptr) {
-            releaseResources();
+            release_gpu_resources();
             return false;
         }
         m_rect_shader_resources->setBindings({
@@ -3025,7 +3107,7 @@ private:
                 m_invert_uniform_buffer),
         });
         if (!m_rect_shader_resources->create()) {
-            releaseResources();
+            release_gpu_resources();
             return false;
         }
 
@@ -3038,7 +3120,7 @@ private:
             render_pass_descriptor,
             true);
         if (m_rect_pipeline == nullptr || m_stencil_rect_pipeline == nullptr) {
-            releaseResources();
+            release_gpu_resources();
             return false;
         }
 
@@ -6843,6 +6925,9 @@ private:
     }
 
     Captured_atlas_frame                     m_frame;
+    std::shared_ptr<Bounded_render_retry>     m_retry =
+        std::make_shared<Bounded_render_retry>();
+    std::shared_ptr<Atlas_retry_completion>   m_retry_completion;
     Captured_atlas_frame                     m_pending_frame;
     Captured_atlas_frame                     m_committed_frame;
     bool                                     m_have_committed_frame = false;
@@ -7027,6 +7112,11 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
         has_msdf_text_draw_passes &&
         msdf_prepare_resource_attempted &&
         msdf_prepare_resource_failed;
+}
+
+void qsg_atlas_fail_rect_buffer_create_for_testing(bool fail)
+{
+    s_fail_rect_buffer_create.store(fail, std::memory_order_relaxed);
 }
 
 void qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(

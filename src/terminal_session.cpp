@@ -5211,14 +5211,20 @@ Terminal_session_result Terminal_session::process_terminate_command(
                 QStringLiteral("terminate requires a live backend")));
     }
 
-    m_stop_requested          = true;
-    m_stop_requested_sequence = command.sequence;
-    m_backend_ready           = false;
+    const bool backend_was_ready    = m_backend_ready;
+    const bool geometry_was_in_sync = m_backend_geometry_in_sync;
+    m_stop_requested           = true;
+    m_stop_requested_sequence  = command.sequence;
+    m_backend_ready            = false;
+    m_backend_geometry_in_sync = false;
     const Terminal_backend_result backend_result = m_backend->terminate();
     if (is_backend_rejection(backend_result)) {
-        m_stop_requested          = false;
-        m_stop_requested_sequence = 0U;
-        m_backend_ready           = true;
+        if (!backend_result.stop_committed) {
+            m_stop_requested           = false;
+            m_stop_requested_sequence  = 0U;
+            m_backend_ready            = backend_was_ready;
+            m_backend_geometry_in_sync = geometry_was_in_sync;
+        }
         if (!m_backend_error_queued_during_command) {
             record_backend_error(command.sequence, *backend_result.error);
         }

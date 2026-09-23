@@ -325,6 +325,8 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
     bool msdf_prepare_resource_attempted,
     bool msdf_prepare_resource_failed);
 
+void qsg_atlas_fail_rect_buffer_create_for_testing(bool fail);
+
 void qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
     std::uint64_t sequence);
 

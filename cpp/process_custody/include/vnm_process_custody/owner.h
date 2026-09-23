@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <chrono>
+#endif
+
 namespace vnm::process_custody {
 
 enum class Owner_mode : std::uint32_t { COMMAND, PTY };
@@ -50,6 +54,15 @@ struct Owner_event
 // The helper establishes its subreaper before acknowledging workload birth.
 inline constexpr std::size_t k_owner_message_bytes = 64 * 1024; // socket record, not complete request
 bool send_owner_start(Duplex_channel& channel, const Owner_start_request& request, std::string* error);
+// Linux PTY startup sends one request as multiple SEQPACKET records. The
+// caller supplies a nonblocking channel and serializes writers; this operation
+// retries only the unsent record under one absolute deadline. Parent handles
+// remain borrowed, and a failed partial request must be abandoned, not replayed.
+#if defined(__linux__)
+#define VNM_PROCESS_CUSTODY_HAS_OWNER_START_DEADLINE 1
+bool send_owner_start_until(Duplex_channel& channel, const Owner_start_request& request,
+    std::chrono::steady_clock::time_point deadline, std::string* error);
+#endif
 bool send_owner_stop(Duplex_channel& channel, int grace_ms, std::string* error);
 bool send_owner_resize(Duplex_channel& channel, Pty_dimensions dimensions, std::string* error);
 

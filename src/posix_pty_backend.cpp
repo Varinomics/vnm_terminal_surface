@@ -1078,8 +1078,7 @@ public:
 #if defined(__linux__)
         std::string error;
         if (!m_owner.stop(static_cast<int>(policy.graceful_interval.count()), &error)) {
-            return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED,
-                QString::fromStdString(error));
+            return backend_stop_error(QString::fromStdString(error));
         }
         return backend_accept();
 #else
@@ -1108,12 +1107,11 @@ public:
                 const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
                 if (kill_error.has_value()) {
                     return
-                        backend_reject(
-                            Terminal_backend_error_code::TERMINATE_FAILED,
+                        backend_stop_error(
                             posix_error_message(QStringLiteral("SIGKILL"), *kill_error));
                 }
 
-                return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
+                return backend_stop_error(message);
             });
     }
 

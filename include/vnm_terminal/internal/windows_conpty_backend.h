@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <atomic>
 #include <memory>
+#include <semaphore>
 
 namespace vnm_terminal::internal {
 
@@ -39,6 +40,18 @@ struct Windows_conpty_backend_write_state_for_testing
     bool        native_cleanup_settled = false;
 };
 
+// Installed before start; lets native integration tests retain each cleanup
+// phase after the facade has gone without accessing a deleted backend.
+struct Windows_conpty_close_control_for_testing
+{
+    std::binary_semaphore close_entered{0};
+    std::binary_semaphore allow_close{0};
+    std::binary_semaphore observer_entered{0};
+    std::binary_semaphore allow_observer{0};
+    std::atomic_uint      close_count{0};
+    std::atomic_uint      observer_retirement_count{0};
+};
+
 class Windows_conpty_backend final : public Terminal_backend
 {
 public:
@@ -70,6 +83,7 @@ public:
     // The test can release this observation gate after destroying the facade;
     // it never calls a member through a deleted backend.
     bool set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate);
+    bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control);
 
 private:
     class Impl;

@@ -25,6 +25,7 @@ DECLARE_HANDLE(HPCON);
 #include <QDir>
 #include <QFileInfo>
 #include <QProcessEnvironment>
+#include <QScopeGuard>
 #include <QStringList>
 #include <algorithm>
 #include <chrono>
@@ -398,7 +399,7 @@ struct Conpty_api_load_result
 
 const Conpty_api_load_result& load_conpty_api()
 {
-    // Detached close callbacks can outlive their backend, so retain the module
+    // Owned close operations can outlive their backend, so retain the module
     // for the process lifetime. The inbox host corrupts split Unicode input.
     static const Conpty_api_load_result loaded = []() -> Conpty_api_load_result {
         std::wstring executable_path(32768, L'\0');
@@ -438,26 +439,66 @@ const Conpty_api_load_result& load_conpty_api()
     return loaded;
 }
 
-void close_pseudoconsole_detached(
-    Conpty_api::ClosePseudoConsole_fn  close_conpty,
-    HPCON                             conpty,
-    std::shared_ptr<Conpty_window_observer> window_observer)
+class Conpty_close_owner
 {
-    if (close_conpty == nullptr || conpty == nullptr) {
-        return;
+public:
+    using Close_control = Windows_conpty_close_control_for_testing;
+
+    Conpty_close_owner()
+    :
+        m_cleanup(this, &cleanup, &dispose)
+    {}
+
+    // The reservation is made before CreatePseudoConsole. Handoff cannot need
+    // another thread or fall back to a blocking native close on the GUI.
+    static void submit(
+        std::unique_ptr<Conpty_close_owner>     reservation,
+        Conpty_api::ClosePseudoConsole_fn       close,
+        HPCON                                  conpty,
+        std::shared_ptr<Conpty_window_observer> observer,
+        std::shared_ptr<Close_control>          control) noexcept
+    {
+        Conpty_close_owner* owner = reservation.release();
+        owner->m_close    = close;
+        owner->m_conpty   = conpty;
+        owner->m_observer = std::move(observer);
+        owner->m_control  = std::move(control);
+        owner->m_cleanup.release();
     }
 
-    try {
-        std::thread([close_conpty, conpty, window_observer] {
-            close_conpty(conpty);
-        }).detach();
+private:
+    static void cleanup(void* context) noexcept
+    {
+        auto* owner = static_cast<Conpty_close_owner*>(context);
+        if (owner->m_control) {
+            owner->m_control->close_entered.release();
+            owner->m_control->allow_close.acquire();
+        }
+        owner->m_close(owner->m_conpty);
+        if (owner->m_control) {
+            ++owner->m_control->close_count;
+            owner->m_control->observer_entered.release();
+            owner->m_control->allow_observer.acquire();
+        }
+        // Observer destruction joins its WinEvent thread. Registry completion
+        // must follow that join, not merely the return from ClosePseudoConsole.
+        owner->m_observer.reset();
+        if (owner->m_control) {
+            ++owner->m_control->observer_retirement_count;
+        }
     }
-    catch (const std::system_error&) {
-        // Thread creation failure is rarer than ClosePseudoConsole hanging; keep
-        // ownership deterministic when the fallback path is the only option.
-        close_conpty(conpty);
+
+    static void dispose(void* context) noexcept
+    {
+        delete static_cast<Conpty_close_owner*>(context);
     }
-}
+
+    Conpty_api::ClosePseudoConsole_fn       m_close = nullptr;
+    HPCON                                  m_conpty = nullptr;
+    std::shared_ptr<Conpty_window_observer> m_observer;
+    std::shared_ptr<Close_control>          m_control;
+    Native_backend_cleanup_reservation    m_cleanup;
+};
 
 bool size_fits_conpty(terminal_grid_size_t grid_size)
 {
@@ -760,6 +801,16 @@ public:
         return true;
     }
 
+    bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control)
+    {
+        const std::lock_guard lock(m_mutex);
+        if (m_start_attempted || m_start_in_progress) {
+            return false;
+        }
+        m_close_control_for_testing = std::move(control);
+        return true;
+    }
+
     Terminal_backend_result start(
         const Terminal_launch_config&  config,
         Terminal_backend_callbacks     callbacks)
@@ -822,6 +873,18 @@ public:
                     QStringLiteral("initial terminal size is outside the ConPTY range"));
         }
 
+        // A rejected attempt may be retried from its error callback. Give each
+        // attempt its own cleanup reservation before native ConPTY birth.
+        std::unique_ptr<Conpty_close_owner> close_owner;
+        try {
+            close_owner = std::make_unique<Conpty_close_owner>();
+        }
+        catch (...) {
+            return reject_start(Terminal_backend_error_code::START_FAILED,
+                QStringLiteral("cannot reserve ConPTY close ownership"));
+        }
+        const auto close_control = m_close_control_for_testing;
+
         Unique_handle pty_input_read;
         Unique_handle pty_input_write;
         Unique_handle pty_output_read;
@@ -849,7 +912,16 @@ public:
         pty_output_read.reset(output_read_handle);
         pty_output_write.reset(output_write_handle);
 
+        auto window_observer = std::make_shared<Conpty_window_observer>();
         HPCON local_conpty = nullptr;
+        const auto close_on_failed_start = qScopeGuard(
+            [&] {
+                if (local_conpty != nullptr) {
+                    Conpty_close_owner::submit(
+                        std::move(close_owner), conpty_api->close, local_conpty,
+                        std::move(window_observer), close_control);
+                }
+            });
         const HRESULT create_result = conpty_api->create(
             coord_from_grid_size(effective_config.initial_grid_size),
             pty_input_read.get(),
@@ -863,9 +935,7 @@ public:
                     hresult_message(QStringLiteral("CreatePseudoConsole"), create_result));
         }
 
-        auto window_observer = std::make_shared<Conpty_window_observer>();
         if (!window_observer->start()) {
-            conpty_api->close(local_conpty);
             return reject_start(
                 Terminal_backend_error_code::START_FAILED,
                 windows_error_message(QStringLiteral("ConPTY window observer"), window_observer->error()));
@@ -874,7 +944,6 @@ public:
         // compatibility window. Reported window PIDs can refer to clients.
         const HRESULT reparent_result = conpty_api->reparent(local_conpty, window_observer->owner());
         if (FAILED(reparent_result)) {
-            conpty_api->close(local_conpty);
             return reject_start(
                 Terminal_backend_error_code::START_FAILED,
                 hresult_message(QStringLiteral("ConptyReparentPseudoConsole"), reparent_result));
@@ -887,7 +956,6 @@ public:
             attribute_list,
             attribute_failure);
         if (is_backend_rejection(attribute_failure)) {
-            conpty_api->close(local_conpty);
             return reject_start(
                 attribute_failure.error->code,
                 attribute_failure.error->message);
@@ -920,7 +988,6 @@ public:
 
         Job_object_create_result process_job_result = create_process_tree_job();
         if (!process_job_result.handle) {
-            conpty_api->close(local_conpty);
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
@@ -965,7 +1032,6 @@ public:
         attribute_storage.clear();
 
         if (!process_created) {
-            conpty_api->close(local_conpty);
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
@@ -984,7 +1050,9 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_api                = *conpty_api;
+            m_close_owner        = std::move(close_owner);
             m_conpty             = local_conpty;
+            local_conpty         = nullptr;
             m_window_observer    = std::move(window_observer);
             m_callbacks          = std::move(callbacks);
             m_input_write        = std::move(pty_input_write);
@@ -1286,14 +1354,13 @@ public:
                     const DWORD terminate_job_error = GetLastError();
                     TerminateProcess(process, 1U);
                     return
-                        backend_reject(
-                            Terminal_backend_error_code::TERMINATE_FAILED,
+                        backend_stop_error(
                             windows_error_message(
                                 QStringLiteral("TerminateJobObject"),
                                 terminate_job_error));
                 }
 
-                return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
+                return backend_stop_error(message);
             });
     }
 
@@ -1511,8 +1578,13 @@ private:
         HPCON conpty = nullptr;
         Conpty_api::ClosePseudoConsole_fn close_conpty_api = nullptr;
         std::shared_ptr<Conpty_window_observer> window_observer;
+        std::unique_ptr<Conpty_close_owner> close_owner;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_conpty == nullptr) {
+                return;
+            }
+            close_owner      = std::move(m_close_owner);
             conpty           = m_conpty;
             close_conpty_api = m_api.close;
             m_conpty         = nullptr;
@@ -1524,7 +1596,9 @@ private:
             }
         }
 
-        close_pseudoconsole_detached(close_conpty_api, conpty, std::move(window_observer));
+        Conpty_close_owner::submit(
+            std::move(close_owner), close_conpty_api, conpty,
+            std::move(window_observer), m_close_control_for_testing);
     }
 
     void record_reader_thread_handle()
@@ -2168,6 +2242,7 @@ private:
     Unique_handle                      m_process;
     Unique_handle                      m_reader_thread_handle;
     Unique_handle                      m_writer_thread_handle;
+    std::unique_ptr<Conpty_close_owner> m_close_owner;
     Native_backend_cleanup_reservation m_cleanup;
     std::thread                        m_reader_thread;
     std::thread                        m_writer_thread;
@@ -2196,6 +2271,7 @@ private:
         Windows_conpty_start_fault_for_testing::NONE;
     bool m_cleanup_observation_blocked_for_testing = false;
     std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
+    std::shared_ptr<Windows_conpty_close_control_for_testing> m_close_control_for_testing;
     bool m_process_assigned_to_job = false;
     bool                               m_native_cleanup_settled = false;
     bool                               m_running = false;
@@ -2292,6 +2368,12 @@ void Windows_conpty_backend::set_cleanup_observation_blocked_for_testing(bool bl
 bool Windows_conpty_backend::set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate)
 {
     return m_impl->set_cleanup_observation_gate_for_testing(std::move(gate));
+}
+
+bool Windows_conpty_backend::set_close_control_for_testing(
+    std::shared_ptr<Windows_conpty_close_control_for_testing> control)
+{
+    return m_impl->set_close_control_for_testing(std::move(control));
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()

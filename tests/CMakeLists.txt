@@ -25,6 +25,13 @@ add_test(NAME vnm_terminal_native_backend_cleanup_owner_tests
 set_tests_properties(vnm_terminal_native_backend_cleanup_owner_tests PROPERTIES
     TIMEOUT 30 LABELS "native;shutdown;custody")
 
+add_executable(vnm_terminal_bounded_render_retry_tests bounded_render_retry_tests.cpp)
+set_target_properties(vnm_terminal_bounded_render_retry_tests PROPERTIES AUTOMOC OFF)
+target_include_directories(vnm_terminal_bounded_render_retry_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(vnm_terminal_bounded_render_retry_tests PRIVATE Threads::Threads)
+add_test(NAME vnm_terminal_bounded_render_retry_tests COMMAND vnm_terminal_bounded_render_retry_tests)
+set_tests_properties(vnm_terminal_bounded_render_retry_tests PROPERTIES TIMEOUT 10 LABELS "qsg;retry")
+
 
 if(UNIX)
     add_executable(vnm_terminal_posix_pty_foreground_custody_tests
@@ -1078,6 +1085,28 @@ if(WIN32)
             TIMEOUT 120
     )
 
+    foreach(atlas_idle_render_loop IN ITEMS threaded basic)
+        add_test(
+            NAME vnm_terminal_qsg_atlas_idle_recovery_${atlas_idle_render_loop}_d3d11
+            COMMAND
+                "${CMAKE_COMMAND}" -E env
+                ${vnm_terminal_qt_windows_qpa_environment}
+                "QSG_RENDER_LOOP=${atlas_idle_render_loop}"
+                ${vnm_terminal_qt_unscaled_environment}
+                "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+                "--idle-recovery"
+                "--backend" "d3d11"
+        )
+        set_tests_properties(
+            vnm_terminal_qsg_atlas_idle_recovery_${atlas_idle_render_loop}_d3d11
+            PROPERTIES
+                LABELS "qsg;hardware;atlas;idle-recovery"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 60
+        )
+    endforeach()
+
     set(vnm_terminal_qsg_atlas_report_environment
         ${vnm_terminal_qt_windows_qpa_environment}
         "QSG_RENDER_LOOP=threaded"
@@ -2098,6 +2127,20 @@ if(WIN32)
             "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
             "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
             "$<TARGET_FILE:vnm_terminal_error_mode_reporter>"
+    )
+
+    add_test(
+        NAME vnm_terminal_windows_conpty_close_ownership
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --close-ownership
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+    )
+    set_tests_properties(vnm_terminal_windows_conpty_close_ownership PROPERTIES
+        LABELS "conformance;windows;conpty;shutdown"
+        TIMEOUT 180
     )
 
     add_test(

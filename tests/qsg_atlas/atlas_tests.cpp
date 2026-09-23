@@ -13927,6 +13927,53 @@ bool atlas_failed_prepare_has_no_buffer_upload(
         atlas_buffer_has_no_accepted_upload(report.render.msdf_text_buffer);
 }
 
+bool test_atlas_persistent_rect_failure_is_bounded(QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_surface(window, surface);
+    surface.set_cursor_blink_enabled(false);
+    struct Clear_fault
+    {
+        ~Clear_fault() { term::qsg_atlas_fail_rect_buffer_create_for_testing(false); }
+    } clear_fault;
+    term::qsg_atlas_fail_rect_buffer_create_for_testing(true);
+    auto snapshot = make_pixel_base_snapshot({2, 8}, 19901U);
+    snapshot.metadata.publication_generation = 1U;
+    snapshot.cursor.visible = true;
+    snapshot.cursor.blink_enabled = false;
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface, std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+    window.show();
+    const auto pump_idle_for = [&](int milliseconds) {
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < milliseconds) {
+            app.processEvents(QEventLoop::AllEvents, 5);
+            QThread::msleep(1);
+        }
+    };
+    pump_idle_for(3500);
+    const auto exhausted = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    pump_idle_for(700);
+    const auto settled = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    bool ok = check(exhausted.prepare_count >= 7 && exhausted.prepare_count <= 12 &&
+            settled.prepare_count == exhausted.prepare_count &&
+            !settled.prepared_generation_committed,
+        "persistent rect allocation failure exhausts rather than resetting its retry budget");
+    term::qsg_atlas_fail_rect_buffer_create_for_testing(false);
+    ++snapshot.metadata.sequence;
+    ++snapshot.metadata.publication_generation;
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface, std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+    pump_idle_for(1500);
+    const auto recovered = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    ok &= check(recovered.prepared_generation_committed &&
+            recovered.render_snapshot_sequence == snapshot.metadata.sequence,
+        "a new source rearms recovery after exhaustion");
+    return ok;
+}
+
 bool test_atlas_failed_first_text_prepare_retries_glyph_resolutions(
     QGuiApplication& app)
 {
@@ -13939,10 +13986,32 @@ bool test_atlas_failed_first_text_prepare_retries_glyph_resolutions(
         QQuickWindow window;
         VNM_TerminalSurface surface;
         configure_atlas_prepare_transaction_surface(window, surface);
+        surface.set_cursor_blink_enabled(false);
+
+        // A recovery owner must make progress without output, cursor blinking,
+        // an explicit update request, or a grab that happens to provoke a frame.
+        const auto pump_idle_until = [&](const auto& predicate) {
+            QElapsedTimer deadline;
+            deadline.start();
+            while (deadline.elapsed() < 3000) {
+                app.processEvents(QEventLoop::AllEvents, 5);
+                const auto report =
+                    term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+                if (predicate(report)) {
+                    return true;
+                }
+                QThread::msleep(1);
+            }
+            return false;
+        };
 
         term::Terminal_render_snapshot blank =
             make_pixel_base_snapshot({2, 8}, 19850U + index * 2U);
         blank.metadata.publication_generation = 1U;
+        // Keep the baseline drawable without allowing cursor animation to
+        // become the recovery trigger.
+        blank.cursor.visible       = true;
+        blank.cursor.blink_enabled = false;
         term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
             surface,
             std::make_shared<const term::Terminal_render_snapshot>(blank));
@@ -13969,7 +14038,7 @@ bool test_atlas_failed_first_text_prepare_retries_glyph_resolutions(
         term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
             surface,
             std::make_shared<const term::Terminal_render_snapshot>(text));
-        const bool failed_prepared = pump_until(app, window, surface,
+        const bool failed_prepared = pump_idle_until(
             [&](const term::Qsg_atlas_frame_report& report) {
                 return report.prepared_snapshot_sequence == text.metadata.sequence &&
                     !report.prepared_generation_committed;
@@ -13987,9 +14056,11 @@ bool test_atlas_failed_first_text_prepare_retries_glyph_resolutions(
                 : failed_report.producer.shape_cache_lookups > 0,
             prefix + "exercises its cached glyph resolution path");
 
-        const bool recovered = pump_until(app, window, surface,
+        const bool recovered = pump_idle_until(
             [&](const term::Qsg_atlas_frame_report& report) {
                 return atlas_report_render_state_ready(report) &&
+                    report.prepare_count > failed_report.prepare_count &&
+                    report.render_count > failed_report.render_count &&
                     report.prepared_generation_committed &&
                     report.render_snapshot_sequence == text.metadata.sequence &&
                     report.render_publication_generation == 2U &&
@@ -20952,6 +21023,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_promoted(app);
     ok &= test_atlas_prepared_text_reuse(app);
+    ok &= test_atlas_persistent_rect_failure_is_bounded(app);
     ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
     ok &= test_atlas_failed_prepare_forces_next_sparse_full_upload(app);
     ok &= test_atlas_failed_prepare_preserves_font_epoch_basis(app);
@@ -21270,6 +21342,7 @@ int main(int argc, char** argv)
     const bool text_renderer_fallback =
         has_argument(argc, argv, "--text-renderer-fallback");
     const bool atlas_report = has_argument(argc, argv, "--atlas-report");
+    const bool idle_recovery = has_argument(argc, argv, "--idle-recovery");
     const bool async_msdf_atlas = has_argument(argc, argv, "--async-msdf-atlas");
     const bool arc_row_provenance =
         has_argument(argc, argv, "--arc-row-provenance");
@@ -21286,7 +21359,7 @@ int main(int argc, char** argv)
         render_smoke || dense_grid_smoke || primitive_parity ||
         forced_glyph_parity || forced_msdf_parity || auto_text_renderer ||
         layout_contract || text_renderer_fallback ||
-        atlas_report || async_msdf_atlas || arc_row_provenance || warm_lazy_smoke ||
+        atlas_report || idle_recovery || async_msdf_atlas || arc_row_provenance || warm_lazy_smoke ||
         lcd_capability_probe || host_state_smoke || cursor_descender_smoke ||
         msdf_orientation_discriminator;
     if (graphics_mode) {
@@ -21298,6 +21371,15 @@ int main(int argc, char** argv)
     }
 
     QGuiApplication app(argc, argv);
+    if (idle_recovery) {
+        const int backend_status = verify_requested_backend(app, backend, "atlas idle recovery");
+        if (backend_status != 0) {
+            return backend_status;
+        }
+        bool ok = test_atlas_persistent_rect_failure_is_bounded(app);
+        ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
+        return ok ? 0 : 1;
+    }
     if (post_verification_failure_contract) {
         return test_post_verification_failure_exit_contract();
     }

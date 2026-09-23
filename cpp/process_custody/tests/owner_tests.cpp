@@ -198,6 +198,50 @@ bool vacant_standard_slots(const std::string& helper, custody::Owner_mode mode)
     return ok;
 }
 
+bool large_bounded_start(const std::string& helper)
+{
+    Run run;
+    if (!check(run.launch(helper), "large-start helper spawn")) {
+        return false;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::PTY;
+    request.process.executable = "/bin/sh";
+    request.process.argv = {"/bin/sh", "-c", "test \"${#ENTRY_0}\" -eq 32768 && exit 23"};
+    for (int index = 0; index != 16; ++index) {
+        request.process.environment.push_back(
+            "ENTRY_" + std::to_string(index) + "=" + std::string(32768, 'x'));
+    }
+    const int original_flags = ::fcntl(run.control.native(), F_GETFL, 0);
+    if (!check(original_flags >= 0 &&
+            ::fcntl(run.control.native(), F_SETFL, original_flags | O_NONBLOCK) == 0,
+            "large-start control channel becomes nonblocking"))
+    {
+        return false;
+    }
+    std::string error;
+    const bool sent = custody::send_owner_start_until(
+        run.control, request, std::chrono::steady_clock::now() + 2s, &error);
+    const int restore_result = ::fcntl(run.control.native(), F_SETFL, original_flags);
+    if (!check(sent && restore_result == 0, "bounded large-start request is accepted")) {
+        return false;
+    }
+    bool started = false;
+    bool exited = false;
+    int exit_code = -1;
+    int master = -1;
+    bool ok = check(receipt(run, &started, &exited, &exit_code, &master),
+        "large-start receives exact native settlement");
+    ok &= check(started && exited && exit_code == 23 && master >= 0,
+        "the real PTY workload receives the complete large environment");
+    if (master >= 0) {
+        (void)::close(master);
+    }
+    run.control.close();
+    ok &= check(run.wait(), "large-start helper is reaped by its designated client");
+    return ok;
+}
+
 int fixture(const std::string& mode)
 {
     const pid_t child = fork();
@@ -229,6 +273,7 @@ int main(int argc, char** argv)
     std::string error;
     if (!custody::prepare_parent_process(&error)) return 2;
     bool ok = abort_before_execution();
+    ok &= large_bounded_start(argv[1]);
     for (auto mode : {custody::Owner_mode::COMMAND, custody::Owner_mode::PTY}) {
         const bool passed = vacant_standard_slots(argv[1], mode);
         std::printf("vacant-stdio-%s: %s\n", mode == custody::Owner_mode::PTY ? "pty" : "command",

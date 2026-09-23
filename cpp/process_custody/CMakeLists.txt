@@ -31,19 +31,39 @@ if(WIN32)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_property(TARGET vnm_process_custody PROPERTY
+        VNM_PROCESS_CUSTODY_OWNER_START_DEADLINE 1)
+    set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
+        VNM_PROCESS_CUSTODY_OWNER_START_DEADLINE)
     target_sources(vnm_process_custody PRIVATE src/owner_protocol.cpp)
     add_executable(vnm_process_custody_owner src/owner_main_posix.cpp)
     target_link_libraries(vnm_process_custody_owner PRIVATE vnm_process_custody)
     set_target_properties(vnm_process_custody_owner PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
-    option(VNM_PROCESS_CUSTODY_BUILD_TESTS "Build the standalone native owner tests" OFF)
+    set(vnm_process_custody_build_tests_default OFF)
+    if(BUILD_TESTING AND VNM_TERMINAL_SURFACE_BUILD_TESTING)
+        set(vnm_process_custody_build_tests_default ON)
+    endif()
+    option(VNM_PROCESS_CUSTODY_BUILD_TESTS
+        "Build the standalone native owner tests"
+        ${vnm_process_custody_build_tests_default})
     if(VNM_PROCESS_CUSTODY_BUILD_TESTS)
         enable_testing()
+        find_package(Threads REQUIRED)
         add_executable(vnm_process_custody_tests tests/owner_tests.cpp)
-        target_link_libraries(vnm_process_custody_tests PRIVATE vnm_process_custody)
+        target_link_libraries(vnm_process_custody_tests PRIVATE vnm_process_custody Threads::Threads)
         set_target_properties(vnm_process_custody_tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
         add_test(NAME vnm_process_custody_tests
             COMMAND vnm_process_custody_tests $<TARGET_FILE:vnm_process_custody_owner>)
         set_tests_properties(vnm_process_custody_tests PROPERTIES TIMEOUT 60)
+        add_executable(vnm_process_custody_start_deadline_tests
+            tests/owner_start_deadline_tests.cpp)
+        target_link_libraries(vnm_process_custody_start_deadline_tests PRIVATE
+            vnm_process_custody Threads::Threads)
+        set_target_properties(vnm_process_custody_start_deadline_tests PROPERTIES
+            AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+        add_test(NAME vnm_process_custody_start_deadline_tests
+            COMMAND vnm_process_custody_start_deadline_tests)
+        set_tests_properties(vnm_process_custody_start_deadline_tests PROPERTIES TIMEOUT 20)
     endif()
 endif()
 

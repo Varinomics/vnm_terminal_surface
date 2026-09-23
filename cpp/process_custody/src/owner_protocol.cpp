@@ -3,6 +3,11 @@
 #include <limits>
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <cstdint>
+#include <fcntl.h>
+#include <optional>
+#include <poll.h>
 
 namespace vnm::process_custody {
 namespace {
@@ -79,7 +84,8 @@ Encoder prefix(detail::Message_kind kind)
 }
 
 bool send(Duplex_channel& channel, const Encoder& message,
-    const std::vector<Native_handle>& descriptors, std::string* error)
+    const std::vector<Native_handle>& descriptors, std::string* error,
+    std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt)
 {
     int native_error = 0;
     if (message.bytes.size() > k_max_request_bytes || descriptors.size() > 64) {
@@ -95,9 +101,73 @@ bool send(Duplex_channel& channel, const Encoder& message,
         fragment.number(static_cast<std::uint32_t>(offset));
         const auto count = std::min(k_owner_message_bytes - fragment.bytes.size(), message.bytes.size() - offset);
         fragment.bytes.insert(fragment.bytes.end(), message.bytes.begin() + offset, message.bytes.begin() + offset + count);
-        const auto status = channel.send_descriptors(fragment.bytes.data(), fragment.bytes.size(),
-            offset == 0 ? descriptors : std::vector<Native_handle>{}, &native_error);
-        if (status != Io_status::TRANSFERRED) { transferred = false; break; }
+        const std::vector<Native_handle> no_descriptors;
+        const auto& fragment_descriptors = offset == 0 ? descriptors : no_descriptors;
+        while (true) {
+            if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+                if (error) {
+                    *error = "owner control send timed out";
+                }
+                return false;
+            }
+
+            native_error = 0;
+            const auto status = channel.send_descriptors(
+                fragment.bytes.data(), fragment.bytes.size(), fragment_descriptors, &native_error);
+            if (status == Io_status::TRANSFERRED) {
+                break;
+            }
+            if (status == Io_status::CLOSED) {
+                if (error) {
+                    *error = "owner control channel closed during send";
+                }
+                return false;
+            }
+            const bool would_block = status == Io_status::WOULD_BLOCK ||
+                (status == Io_status::FAILED &&
+                    (native_error == EAGAIN || native_error == EWOULDBLOCK));
+            if (!deadline || !would_block) {
+                transferred = false;
+                break;
+            }
+
+            // A failed SEQPACKET send transferred nothing. Resume this record,
+            // not the complete request, and keep the original deadline.
+            while (true) {
+                const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+                    *deadline - std::chrono::steady_clock::now()).count();
+                if (remaining <= 0) {
+                    if (error) {
+                        *error = "owner control send timed out";
+                    }
+                    return false;
+                }
+                pollfd descriptor{channel.native(), POLLOUT, 0};
+                const int timeout_ms = static_cast<int>(std::min<std::int64_t>(
+                    remaining, std::numeric_limits<int>::max()));
+                const int ready = ::poll(&descriptor, 1, timeout_ms);
+                if (ready < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (ready == 0) {
+                    continue;
+                }
+                if (ready < 0 ||
+                    (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                {
+                    if (error) {
+                        *error = "owner control channel failed during send readiness wait";
+                    }
+                    return false;
+                }
+                if ((descriptor.revents & POLLOUT) != 0) {
+                    break;
+                }
+            }
+        }
+        if (!transferred) {
+            break;
+        }
         offset += count;
     }
     if (transferred) return true;
@@ -107,7 +177,8 @@ bool send(Duplex_channel& channel, const Encoder& message,
 
 } // namespace
 
-bool send_owner_start(Duplex_channel& channel, const Owner_start_request& request, std::string* error)
+static bool send_owner_start_impl(Duplex_channel& channel, const Owner_start_request& request,
+    std::string* error, std::optional<std::chrono::steady_clock::time_point> deadline)
 {
     auto message = prefix(detail::Message_kind::START);
     message.number(static_cast<std::uint32_t>(request.mode));
@@ -133,7 +204,25 @@ bool send_owner_start(Duplex_channel& channel, const Owner_start_request& reques
         message.number(static_cast<std::uint32_t>(entry.child_number));
         descriptors.push_back(entry.parent_handle);
     }
-    return send(channel, message, descriptors, error);
+    return send(channel, message, descriptors, error, deadline);
+}
+
+bool send_owner_start(Duplex_channel& channel, const Owner_start_request& request, std::string* error)
+{
+    return send_owner_start_impl(channel, request, error, std::nullopt);
+}
+
+bool send_owner_start_until(Duplex_channel& channel, const Owner_start_request& request,
+    std::chrono::steady_clock::time_point deadline, std::string* error)
+{
+    const int flags = ::fcntl(channel.native(), F_GETFL, 0);
+    if (flags < 0 || (flags & O_NONBLOCK) == 0) {
+        if (error) {
+            *error = "deadline owner start requires a nonblocking channel";
+        }
+        return false;
+    }
+    return send_owner_start_impl(channel, request, error, deadline);
 }
 
 bool send_owner_stop(Duplex_channel& channel, int grace_ms, std::string* error)

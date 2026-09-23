@@ -4959,6 +4959,140 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
 }
 
 
+bool test_start_retry_after_pseudoconsole_rejection(const QString& fixture_path)
+{
+    bool ok = true;
+    Backend_capture capture;
+    auto backend = std::make_unique<term::Windows_conpty_backend>();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto control = std::make_shared<term::Windows_conpty_close_control_for_testing>();
+        control->allow_close.release();
+        control->allow_observer.release();
+        ok &= check(backend->set_close_control_for_testing(control),
+            "rejected start permits a new attempt-local close observer");
+        auto config = launch_config(fixture_path, {});
+        config.windows_native_arguments = QString(32768, QChar(u'x'));
+        const auto result = backend->start(config, capture.callbacks());
+        ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
+                result.native_dispatch_occurred,
+            "retry fixture reaches CreateProcessW after pseudoconsole birth");
+        ok &= check(control->close_entered.try_acquire_for(k_wait_timeout),
+            "each rejected attempt hands off its own pseudoconsole");
+        ok &= check(control->observer_entered.try_acquire_for(k_wait_timeout) &&
+                control->close_count == 1U,
+            "each rejected attempt closes exactly once");
+    }
+    const auto final_control = std::make_shared<term::Windows_conpty_close_control_for_testing>();
+    final_control->allow_close.release();
+    final_control->allow_observer.release();
+    ok &= check(backend->set_close_control_for_testing(final_control),
+        "successful retry receives fresh close gates");
+    const auto successful = backend->start(
+        launch_config(fixture_path, {QStringLiteral("--quick-exit")}), capture.callbacks());
+    ok &= check(successful.code != term::Terminal_backend_result_code::REJECTED &&
+            capture.wait_for_exit(),
+        "the same backend accepts a child after two post-pseudoconsole rejections");
+    backend.reset();
+    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout),
+        "all rejected and successful attempt owners settle");
+    ok &= check(final_control->close_count == 1U &&
+            final_control->observer_retirement_count == 1U,
+        "successful retry closes and retires its observer exactly once");
+    return ok;
+}
+
+bool test_close_and_observer_retirement_remain_accounted(const QString& fixture_path)
+{
+    bool ok = true;
+    for (const bool fail_before_child : {false, true}) {
+        const auto control = std::make_shared<term::Windows_conpty_close_control_for_testing>();
+        struct Close_release
+        {
+            std::shared_ptr<term::Windows_conpty_close_control_for_testing> control;
+            bool close_released = false;
+            bool observer_released = false;
+
+            ~Close_release()
+            {
+                release_close();
+                release_observer();
+            }
+
+            void release_close()
+            {
+                if (!close_released) {
+                    close_released = true;
+                    control->allow_close.release();
+                }
+            }
+
+            void release_observer()
+            {
+                if (!observer_released) {
+                    observer_released = true;
+                    control->allow_observer.release();
+                }
+            }
+        } release{control};
+        Backend_capture capture;
+        auto backend = std::make_unique<term::Windows_conpty_backend>();
+        ok &= check(backend->set_close_control_for_testing(control),
+            "close/observer gates are installed before native birth");
+        auto config = launch_config(fixture_path, {QStringLiteral("--quick-exit")});
+        QTemporaryDir working_directory;
+        ok &= check(working_directory.isValid(), "close-ownership temporary directory exists");
+        if (fail_before_child) {
+            // The valid cwd passes the shared precheck; CreateProcess rejects
+            // the oversized command line after the pseudoconsole and WinEvent
+            // observer already exist.
+            config.argv = {fixture_path};
+            config.working_directory = working_directory.path();
+            config.windows_native_arguments = QString(32768, QChar(u'x'));
+        }
+        const auto result = backend->start(config, capture.callbacks());
+        ok &= check((result.code == term::Terminal_backend_result_code::REJECTED) == fail_before_child,
+            "close fixture reaches the intended normal or pre-child failure path");
+        if (!fail_before_child) {
+            ok &= check(capture.wait_for_exit(), "real child exit precedes native close retirement");
+        }
+        const bool close_started = control->close_entered.try_acquire_for(k_wait_timeout);
+        ok &= check(close_started,
+            "native close task owns the real pseudoconsole");
+        const auto before = std::chrono::steady_clock::now();
+        backend.reset();
+        ok &= check(std::chrono::steady_clock::now() - before < std::chrono::milliseconds(250),
+            "facade destruction does not await held native close");
+        ok &= check(!term::Native_backend_cleanup_reservation::wait_until_idle(
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(20)),
+            "held pseudoconsole close remains in registry accounting");
+        {
+            Backend_capture independent_capture;
+            term::Windows_conpty_backend independent;
+            const auto independent_start = independent.start(
+                launch_config(fixture_path, {QStringLiteral("--quick-exit")}), independent_capture.callbacks());
+            ok &= check(independent_start.code != term::Terminal_backend_result_code::REJECTED &&
+                    independent_capture.wait_for_exit(),
+                "another native backend progresses while one close task is held");
+        }
+        release.release_close();
+        ok &= check(control->observer_entered.try_acquire_for(k_wait_timeout),
+            "physical close completes before observer retirement");
+        ok &= check(control->close_count == 1U && control->observer_retirement_count == 0U,
+            "close runs once while the exact observer remains owned");
+        ok &= check(!term::Native_backend_cleanup_reservation::wait_until_idle(
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(20)),
+            "held observer retirement remains in registry accounting");
+        release.release_observer();
+        ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+                std::chrono::steady_clock::now() + k_wait_timeout),
+            "registry settles after native close and observer thread retirement");
+        ok &= check(control->close_count == 1U && control->observer_retirement_count == 1U,
+            "close and observer retirement each finish exactly once");
+    }
+    return ok;
+}
+
 bool test_facade_hands_off_unconfirmed_native_cleanup(const QString& fixture_path)
 {
     auto blocked = std::make_shared<std::atomic_bool>(true);
@@ -5187,6 +5321,13 @@ int main(int argc, char** argv)
         ok &= wait_for_console_host_children_to_exit("callback lifetime");
         return ok ? 0 : 1;
     }
+    if (argc == 3 && std::string_view(argv[1]) == "--close-ownership") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_start_retry_after_pseudoconsole_rejection(fixture_path);
+        ok &= test_close_and_observer_retirement_remain_accounted(fixture_path);
+        ok &= wait_for_console_host_children_to_exit("close ownership");
+        return ok ? 0 : 1;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--compatibility-window") {
         const QString fixture_path = QString::fromLocal8Bit(argv[2]);
         bool ok = test_compatibility_window_stays_hidden(fixture_path, false);
@@ -5236,6 +5377,10 @@ int main(int argc, char** argv)
 
     run_test("facade hands off unconfirmed native cleanup",
         test_facade_hands_off_unconfirmed_native_cleanup(fixture_path));
+    run_test("start retry after pseudoconsole rejection",
+        test_start_retry_after_pseudoconsole_rejection(fixture_path));
+    run_test("close and observer retirement remain accounted",
+        test_close_and_observer_retirement_remain_accounted(fixture_path));
     run_test("native Terminal_session lifecycle",
         vnm_terminal::test_helpers::check_native_session_lifecycle(
             term::make_windows_conpty_backend, launch_config(fixture_path, {})));
