@@ -2687,6 +2687,122 @@ bool test_no_autowrap_wide_variation_glyph_reaches_retained_history()
     return ok;
 }
 
+bool test_no_autowrap_clipped_wide_glyph_survives_dch_history()
+{
+    bool ok = true;
+    const QString heart_with_emoji_presentation = QString::fromUtf8(
+        "\xe2\x9d\xa4\xef\xb8\x8f");
+    for (int delete_count = 1; delete_count <= 3; ++delete_count) {
+        const QByteArray delete_sequence = delete_count == 1
+            ? QByteArrayLiteral("\x1b[H\x1b[P")
+            : QByteArrayLiteral("\x1b[H\x1b[") +
+                QByteArray::number(delete_count) + QByteArrayLiteral("P");
+        term::Terminal_screen_model model = make_model(1, 4);
+        try {
+            (void)model.ingest(
+                QByteArrayLiteral("\x1b[?7l") + QByteArrayLiteral("abc") +
+                heart_with_emoji_presentation.toUtf8());
+            (void)model.ingest(delete_sequence);
+        }
+        catch (const std::exception& error) {
+            std::cerr << "FAIL: clipped-wide DCH setup threw: "
+                << error.what() << '\n';
+            ok = false;
+            continue;
+        }
+
+        const int heart_column = 3 - delete_count;
+        const term::Terminal_render_snapshot before_retention =
+            model.render_snapshot(110U + static_cast<std::uint64_t>(delete_count));
+        const term::Terminal_render_cell* clipped = snapshot_cell_at_position(
+            before_retention, 0, heart_column);
+        ok &= check(clipped != nullptr &&
+                clipped->text == heart_with_emoji_presentation &&
+                clipped->display_width == 1 && !clipped->wide_continuation,
+            "DCH moves the clipped glyph while it remains one physical cell");
+        term::Terminal_screen_model reflow_model = make_model(1, 4);
+        (void)reflow_model.ingest(
+            QByteArrayLiteral("\x1b[?7l") + QByteArrayLiteral("abc") +
+            heart_with_emoji_presentation.toUtf8());
+        (void)reflow_model.ingest(delete_sequence);
+        (void)reflow_model.resize({1, 5});
+        const term::Terminal_render_snapshot reflow_snapshot =
+            reflow_model.render_snapshot(120U + static_cast<std::uint64_t>(delete_count));
+        const term::Terminal_render_cell* reflowed_heart = snapshot_cell_at_position(
+            reflow_snapshot, 0, heart_column);
+        const term::Terminal_render_cell* reflowed_continuation =
+            snapshot_cell_at_position(reflow_snapshot, 0, heart_column + 1);
+        ok &= check(reflowed_heart != nullptr &&
+                reflowed_heart->text == heart_with_emoji_presentation &&
+                reflowed_heart->display_width == 2 &&
+                !reflowed_heart->wide_continuation &&
+                reflowed_continuation != nullptr &&
+                reflowed_continuation->wide_continuation,
+            "resizing after DCH restores the clipped glyph's natural two-cell span");
+
+        std::vector<QString> expected_cells(4U, QStringLiteral(" "));
+        if (delete_count == 1) {
+            expected_cells[0] = QStringLiteral("b");
+            expected_cells[1] = QStringLiteral("c");
+        }
+        else
+        if (delete_count == 2) {
+            expected_cells[0] = QStringLiteral("c");
+        }
+        expected_cells[static_cast<std::size_t>(heart_column)] =
+            heart_with_emoji_presentation;
+
+        QString expected_row_text;
+        for (const QString& cell_text : expected_cells) {
+            if (cell_text != QStringLiteral(" ")) {
+                expected_row_text += cell_text;
+            }
+        }
+        ok &= check(model.row_text(0).trimmed() == expected_row_text,
+            "DCH leaves the expected surviving row text before retention");
+
+        bool retained_without_throw = true;
+        try {
+            (void)model.ingest(QByteArrayLiteral("\n"));
+        }
+        catch (const std::exception& error) {
+            std::cerr << "FAIL: clipped-wide DCH row retention threw: "
+                << error.what() << '\n';
+            retained_without_throw = false;
+        }
+        ok &= check(retained_without_throw,
+            "DCH-shifted clipped-wide row can be archived without throwing");
+        if (!retained_without_throw) {
+            continue;
+        }
+
+        ok &= check(model.scrollback_size() == 1,
+            "DCH-shifted row enters retained history");
+        model.discard_retained_lookup_cache_for_testing();
+        const auto cells = model.retained_history_row_cells_for_testing(
+            term::Terminal_buffer_id::PRIMARY, 0);
+        ok &= check(cells.has_value() && cells->size() == 4U,
+            "DCH-shifted row materializes after retained lookup-cache discard");
+        if (!cells.has_value() || cells->size() != 4U) {
+            continue;
+        }
+
+        for (std::size_t column = 0U; column < expected_cells.size(); ++column) {
+            const auto& cell = cells->at(column);
+            const bool expected_occupied =
+                expected_cells[column] != QStringLiteral(" ");
+            ok &= check(cell.text == expected_cells[column] &&
+                    cell.display_width == 1 &&
+                    cell.natural_display_width ==
+                        (static_cast<int>(column) == heart_column ? 2 : 1) &&
+                    cell.occupied == expected_occupied &&
+                    !cell.wide_continuation,
+                "retained DCH row preserves each physical cell and clipped natural width");
+        }
+    }
+    return ok;
+}
+
 
 bool test_reflow_cursors_do_not_insert_a_wide_wrap_margin()
 {
@@ -2832,6 +2948,7 @@ int main()
     ok &= test_wide_glyph_written_at_one_column_keeps_natural_width();
     ok &= test_one_column_wide_glyph_reaches_retained_history();
     ok &= test_no_autowrap_wide_variation_glyph_reaches_retained_history();
+    ok &= test_no_autowrap_clipped_wide_glyph_survives_dch_history();
     ok &= test_reflow_cursors_do_not_insert_a_wide_wrap_margin();
     ok &= test_reflow_origin_spans_are_cleared_on_mutation_and_replacement();
     return ok ? 0 : 1;

@@ -843,8 +843,7 @@ bool cell_is_default_printable_ascii(
 
 Terminal_history_row_record_codec_status validate_cell_text(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes,
-    bool                             is_rightmost_column)
+    const QByteArray&                text_bytes)
 {
     if (!cell.occupied || cell.wide_continuation) {
         return Terminal_history_row_record_codec_status::OK;
@@ -861,12 +860,11 @@ Terminal_history_row_record_codec_status validate_cell_text(
     }
 
     if (width.cells != cell.display_width) {
-        // With autowrap disabled, a wide glyph at the right margin retains its
-        // text in one physical cell even when the source grid is wider.
-        // Accept only that bounded representation, not an arbitrary width
-        // mismatch or two unrelated narrow characters squeezed into a cell.
-        const bool clipped_wide_glyph = is_rightmost_column &&
-            cell.display_width == 1 && width.cells == 2 &&
+        // Editing can move a no-autowrap glyph away from the right margin
+        // without changing its one-cell physical representation. Accept only
+        // that bounded width-two glyph, not an arbitrary mismatch or two
+        // unrelated narrow characters squeezed into one cell.
+        const bool clipped_wide_glyph = cell.display_width == 1 && width.cells == 2 &&
             std::count_if(width.codepoints.begin(), width.codepoints.end(),
                 [](const Terminal_codepoint_width& codepoint) {
                     return codepoint.cells > 0;
@@ -929,8 +927,7 @@ Terminal_history_row_record_codec_status validate_cell_stream_shape(
 
             if (!cell_part.default_printable_ascii) {
                 const Terminal_history_row_record_codec_status text_status =
-                    validate_cell_text(
-                        cell, text_bytes, column == source_width - 1);
+                    validate_cell_text(cell, text_bytes);
                 if (text_status != Terminal_history_row_record_codec_status::OK) {
                     return text_status;
                 }
@@ -1838,7 +1835,6 @@ Terminal_history_row_record_codec_status read_extended_value(
 Terminal_history_row_record_codec_status read_extended_cell(
     Byte_reader&                  reader,
     const row_record_header_t&     header,
-    bool                          is_rightmost_column,
     Terminal_history_row_cell&     cell,
     QByteArray&                    encoded_text)
 {
@@ -1961,7 +1957,7 @@ Terminal_history_row_record_codec_status read_extended_cell(
     }
 
     const Terminal_history_row_record_codec_status text_status =
-        validate_cell_text(cell, encoded_text, is_rightmost_column);
+        validate_cell_text(cell, encoded_text);
     if (text_status != Terminal_history_row_record_codec_status::OK) {
         return text_status;
     }
@@ -2034,7 +2030,6 @@ Terminal_history_row_record_codec_status read_cell_stream(
                 read_extended_cell(
                     reader,
                     header,
-                    column + 1U == header.source_width,
                     cell,
                     encoded_text);
             if (status != Terminal_history_row_record_codec_status::OK) {

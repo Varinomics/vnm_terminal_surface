@@ -718,6 +718,40 @@ bool test_one_column_clipped_wide_cells_round_trip()
             records_equal(right_margin_decoded.record, right_margin),
         "multi-column right-margin clipped wide glyph survives codec round trip");
 
+    term::Terminal_history_ring moved_clipped_ring({4096U, 4096U});
+    term::Terminal_history_row_record moved_clipped = make_base_record(
+        305U, 405U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE, 4);
+    moved_clipped.provenance.content_stamp_ms = 23456;
+    moved_clipped.style_table.push_back(red_style());
+    moved_clipped.hyperlink_identity_keys.emplace(
+        k_first_hyperlink_ref,
+        QByteArrayLiteral("uri:https://example.test/clipped-wide"));
+    moved_clipped.cells.push_back(make_cell(QStringLiteral("b"), 1, true));
+    moved_clipped.cells.push_back(make_cell(QStringLiteral("c"), 1, true));
+    moved_clipped.cells.push_back(make_cell(
+        texts[1], 1, true, 1U, k_first_hyperlink_ref));
+    moved_clipped.cells.push_back(make_cell(QStringLiteral(" "), 1, false));
+    moved_clipped.content_origin_spans = {
+        make_origin_span(0, 4, 305U, 405U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+            23456),
+    };
+    term::Terminal_history_row_record_append_result moved_clipped_append;
+    const auto moved_clipped_decoded = append_and_decode(
+        moved_clipped_ring,
+        moved_clipped,
+        make_identity(22U, 305U),
+        moved_clipped_append);
+    ok &= check(moved_clipped_append.status ==
+            term::Terminal_history_row_record_codec_status::OK &&
+            moved_clipped_decoded.status ==
+                term::Terminal_history_row_record_codec_status::OK,
+        "DCH-shifted clipped glyph away from the right margin encodes and decodes");
+    ok &= check(records_equal(moved_clipped_decoded.record, moved_clipped),
+        "off-margin clipped glyph round trip preserves neighboring cells, style, "
+        "hyperlink, provenance, and content origins");
+
     term::Terminal_history_ring ring({4096U, 4096U});
     term::Terminal_history_row_record malformed = make_base_record(
         302U, 402U,
@@ -727,13 +761,6 @@ bool test_one_column_clipped_wide_cells_round_trip()
         ring, malformed, make_identity(22U, 302U));
     ok &= check(two_narrow.status == term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
         "clipped-wide exception does not admit two narrow characters in one cell");
-    malformed.metadata.source_width = 2;
-    malformed.cells[0].text = texts.front();
-    malformed.cells.emplace_back();
-    const auto wider_source = term::encode_terminal_history_row_record_to_ring(
-        ring, malformed, make_identity(22U, 302U));
-    ok &= check(wider_source.status == term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
-        "clipped-wide exception rejects a glyph that does not occupy the right margin");
     return ok;
 }
 

@@ -258,8 +258,8 @@ bool test_control_and_altgr()
             Qt::ControlModifier | Qt::AltModifier,
             QString(QChar(0x0003))),
 #if defined(Q_OS_WIN)
-        bytes_from_hex("1b5b36373b34363b333b313b31303b315f"),
-        "Ctrl+Alt platform C0 text uses a native Win32 key event on Windows");
+        packet_key_strokes(QByteArrayLiteral("\x1b\x03")),
+        "Ctrl+Alt platform C0 text preserves its Alt-prefixed bytes through packet input");
 #else
         bytes_from_hex("1b03"),
         "Ctrl+Alt platform C0 text falls through to Alt-prefixed control");
@@ -692,6 +692,28 @@ bool test_windows_balanced_input_semantics()
         win32_key_stroke(
             'X', 45, 'x', LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED),
         "right-Alt+X with left Alt held relies on ConPTY's single Alt prefix");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_A,
+            Qt::ControlModifier | Qt::AltModifier,
+            0x1eU,
+            'A',
+            0x00000006U,
+            QString(QChar(0x0001))),
+        packet_key_strokes(QByteArrayLiteral("\x1b\x01")),
+        "native Ctrl+left-Alt+A preserves ESC SOH through packet input");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_M,
+            Qt::ControlModifier | Qt::AltModifier,
+            0U,
+            VK_PACKET,
+            0x00000006U,
+            QStringLiteral("\r")),
+        packet_key_strokes(QByteArrayLiteral("\x1b\r")),
+        "VK_PACKET Ctrl+left-Alt+M preserves ESC CR through packet input");
 
     ok &= check_bytes_equal(
         encode_native(

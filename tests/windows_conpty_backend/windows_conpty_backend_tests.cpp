@@ -2442,6 +2442,12 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
     const QByteArray gate_ctrl_right_alt_a = encoded_native_key_event(
         Qt::Key_A, Qt::ControlModifier | Qt::AltModifier,
         0x1eU, 'A', 0x00000042U, QString(QChar(u'\x01')));
+    const QByteArray gate_ctrl_left_alt_a_soh = encoded_native_key_event(
+        Qt::Key_A, Qt::ControlModifier | Qt::AltModifier,
+        0x1eU, 'A', 0x00000006U, QString(QChar(u'\x01')));
+    const QByteArray gate_ctrl_left_alt_packet_m_cr = encoded_native_key_event(
+        Qt::Key_M, Qt::ControlModifier | Qt::AltModifier,
+        0U, VK_PACKET, 0x00000006U, QStringLiteral("\r"));
     const QByteArray gate_group_switch_up = encoded_native_key_event(
         Qt::Key_Up, Qt::GroupSwitchModifier,
         0xe048U, VK_UP, 0x01000042U, {});
@@ -2478,6 +2484,25 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             {{gate_group_switch_up}, packet_key_stroke_records(decode_hex("1b5b41"))},
             {{gate_shift_group_switch_return},
                 packet_key_stroke_records(QByteArrayLiteral("\r"))},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Ctrl+left-Alt C0 inputs preserve ESC-prefixed bytes through VT input",
+        {
+            {{gate_ctrl_left_alt_a_soh}, decode_hex("1b01")},
+            {{gate_ctrl_left_alt_packet_m_cr}, decode_hex("1b0d")},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Ctrl+left-Alt C0 VT-first routes reach classic readers as VK_PACKET strokes",
+        {
+            {{gate_ctrl_left_alt_a_soh}, packet_key_stroke_records(decode_hex("1b01"))},
+            {{gate_ctrl_left_alt_packet_m_cr}, packet_key_stroke_records(decode_hex("1b0d"))},
         },
         Escape_input_delivery::PACED,
         0U);

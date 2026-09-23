@@ -330,19 +330,6 @@ QByteArray win32_escape_strokes(const QKeyEvent& event)
     return escape;
 }
 
-bool windows_alt_chord_uses_vt_sequence_input(const QKeyEvent& event)
-{
-#if defined(Q_OS_WIN)
-    const Qt::KeyboardModifiers modifiers = event.modifiers();
-    return (modifiers & Qt::GroupSwitchModifier) != Qt::NoModifier ||
-        ((modifiers & Qt::AltModifier) != Qt::NoModifier &&
-            (event.nativeModifiers() & k_qt_win_alt_right) != 0U);
-#else
-    static_cast<void>(event);
-    return false;
-#endif
-}
-
 int windows_virtual_key(const QKeyEvent& event)
 {
     if (event.nativeVirtualKey() != 0U) {
@@ -523,6 +510,19 @@ QByteArray win32_vt_sequence_strokes(const QByteArray& bytes)
     return strokes;
 }
 #endif
+
+bool windows_alt_chord_uses_vt_sequence_input(const QKeyEvent& event)
+{
+#if defined(Q_OS_WIN)
+    const Qt::KeyboardModifiers modifiers = event.modifiers();
+    return (modifiers & Qt::GroupSwitchModifier) != Qt::NoModifier ||
+        ((modifiers & Qt::AltModifier) != Qt::NoModifier &&
+            (event.nativeModifiers() & k_qt_win_alt_right) != 0U);
+#else
+    static_cast<void>(event);
+    return false;
+#endif
+}
 
 int mouse_modifier_bits(Qt::KeyboardModifiers modifiers)
 {
@@ -960,12 +960,13 @@ Encoded_key_event encode_terminal_key_event_bytes(
     const QByteArray control_bytes = control_key_bytes(event);
     if (!control_bytes.isEmpty()) {
         const QByteArray bytes = alt_prefixed(control_bytes, event);
+        const bool preserve_alt_prefixed_control_bytes =
+            preserve_alt_vt_bytes ||
+            (event.modifiers() & Qt::AltModifier) != Qt::NoModifier;
         return {
             bytes,
-            preserve_alt_vt_bytes
+            preserve_alt_prefixed_control_bytes
                 ? Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE
-                : (event.modifiers() & Qt::AltModifier) != Qt::NoModifier
-                ? Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES
                 : Windows_native_input_operation::WINDOWS_OP_NONE,
         };
     }

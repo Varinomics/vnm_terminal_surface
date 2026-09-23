@@ -44,8 +44,9 @@ enum class Terminal_history_row_record_payload_kind : std::uint32_t
 struct Terminal_history_row_cell
 {
     QString                        text = QStringLiteral(" ");
-    // Physical stored width. A one-column source may clip a single wide
-    // glyph to one cell; its natural width remains derivable from text.
+    // Physical stored width. A natural-width-two glyph may be clipped to one
+    // cell; DCH or other editing can move that representation away from its
+    // source edge. Its natural width remains derivable from text.
     int                            display_width = 1;
     bool                           wide_continuation = false;
     bool                           occupied = false;

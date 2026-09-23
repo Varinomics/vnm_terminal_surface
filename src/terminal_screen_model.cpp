@@ -7851,16 +7851,19 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
         restored_cell.natural_display_width = cell.wide_continuation
             ? 0
             : std::max(1, cell.display_width);
-        if (static_cast<int>(index) == history_record.metadata.source_width - 1 &&
+        if (restored_cell.text_category ==
+                Terminal_render_cell_text_category::NON_ASCII &&
             cell.display_width == 1 &&
             cell.occupied && !cell.wide_continuation)
         {
-            // The codec validates a clipped-wide cell only at the right margin.
+            // Editing can move a clipped-wide cell away from the right margin.
             // Its original width is recoverable from the retained Unicode;
             // display_width alone would erase it during materialization.
             const QByteArray text_bytes = cell.text.toUtf8();
             const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
-            if (width.status == Terminal_unicode_width_status::OK) {
+            if (width.status == Terminal_unicode_width_status::OK &&
+                width.cells > restored_cell.display_width)
+            {
                 restored_cell.natural_display_width =
                     std::max(restored_cell.natural_display_width, width.cells);
             }
