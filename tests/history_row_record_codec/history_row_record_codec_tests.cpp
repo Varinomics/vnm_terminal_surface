@@ -668,6 +668,75 @@ bool test_ambiguous_provenance_and_origin_spans_round_trip()
     return ok;
 }
 
+
+bool test_one_column_clipped_wide_cells_round_trip()
+{
+    bool ok = true;
+    const std::vector<QString> texts = {
+        QString::fromUtf8("\xe4\xb8\x80"),
+        QString::fromUtf8("\xe2\x9d\xa4\xef\xb8\x8f"),
+        QString::fromUtf8("\xe4\xb8\x80\xcc\x81"),
+    };
+    for (const QString& text : texts) {
+        term::Terminal_history_ring ring({4096U, 4096U});
+        term::Terminal_history_row_record record = make_base_record(
+            301U, 401U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE, 1);
+        record.provenance.content_stamp_ms = 12345;
+        record.cells.push_back(make_cell(text, 1, true));
+        record.content_origin_spans = {
+            make_origin_span(0, 1, 201U, 211U,
+                term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+                12345),
+        };
+        term::Terminal_history_row_record_append_result append;
+        const auto decoded = append_and_decode(
+            ring, record, make_identity(22U, 301U), append);
+        ok &= check(append.status == term::Terminal_history_row_record_codec_status::OK,
+            "one-column clipped wide glyph encodes without discarding its text");
+        if (append.status != term::Terminal_history_row_record_codec_status::OK) {
+            continue;
+        }
+        ok &= check(decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+                records_equal(decoded.record, record),
+            "clipped wide text, physical width, and origins survive codec round trip");
+    }
+
+    term::Terminal_history_ring multi_column_ring({4096U, 4096U});
+    term::Terminal_history_row_record right_margin = make_base_record(
+        304U, 404U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE, 4);
+    right_margin.cells.resize(4U);
+    right_margin.cells.back() = make_cell(texts[1], 1, true);
+    term::Terminal_history_row_record_append_result right_margin_append;
+    const auto right_margin_decoded = append_and_decode(
+        multi_column_ring, right_margin, make_identity(22U, 304U), right_margin_append);
+    ok &= check(right_margin_append.status ==
+            term::Terminal_history_row_record_codec_status::OK &&
+            right_margin_decoded.status ==
+                term::Terminal_history_row_record_codec_status::OK &&
+            records_equal(right_margin_decoded.record, right_margin),
+        "multi-column right-margin clipped wide glyph survives codec round trip");
+
+    term::Terminal_history_ring ring({4096U, 4096U});
+    term::Terminal_history_row_record malformed = make_base_record(
+        302U, 402U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE, 1);
+    malformed.cells.push_back(make_cell(QStringLiteral("ab"), 1, true));
+    const auto two_narrow = term::encode_terminal_history_row_record_to_ring(
+        ring, malformed, make_identity(22U, 302U));
+    ok &= check(two_narrow.status == term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "clipped-wide exception does not admit two narrow characters in one cell");
+    malformed.metadata.source_width = 2;
+    malformed.cells[0].text = texts.front();
+    malformed.cells.emplace_back();
+    const auto wider_source = term::encode_terminal_history_row_record_to_ring(
+        ring, malformed, make_identity(22U, 302U));
+    ok &= check(wider_source.status == term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "clipped-wide exception rejects a glyph that does not occupy the right margin");
+    return ok;
+}
+
 bool test_self_contained_tables_are_required()
 {
     bool ok = true;
@@ -1759,6 +1828,7 @@ int main()
     ok &= test_extended_styles_hyperlinks_and_wide_cells_round_trip();
     ok &= test_generic_compact_default_ascii_after_blank_round_trip();
     ok &= test_ambiguous_provenance_and_origin_spans_round_trip();
+    ok &= test_one_column_clipped_wide_cells_round_trip();
     ok &= test_self_contained_tables_are_required();
     ok &= test_style_payload_canonicality_is_required();
     ok &= test_encode_rejects_malformed_cell_states();

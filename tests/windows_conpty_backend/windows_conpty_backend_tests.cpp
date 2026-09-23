@@ -1553,7 +1553,9 @@ bool flush_escape_reader_and_ack(
     return std::cout.good();
 }
 
-int run_escape_input_reader(const QString& observation_path)
+int run_escape_input_reader(
+    const QString& observation_path,
+    bool           hold_after_completion_ack = false)
 {
     HANDLE input      = GetStdHandle(STD_INPUT_HANDLE);
     DWORD  input_mode = 0U;
@@ -1630,6 +1632,12 @@ int run_escape_input_reader(const QString& observation_path)
                     return 1;
                 }
                 if (completion) {
+                    if (hold_after_completion_ack) {
+                        std::cout << "escape-input-reader-holding-after-ack\n" << std::flush;
+                        for (;;) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                    }
                     return 0;
                 }
                 continue;
@@ -2022,7 +2030,9 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         const char*                                  name,
         const std::vector<Escape_input_transaction>& transactions,
         Escape_input_delivery                        delivery,
-        std::size_t                                  priming_transaction_count)
+        std::size_t                                  priming_transaction_count,
+        bool                                         expect_normal_exit = true,
+        std::chrono::milliseconds                    normal_exit_timeout = k_wait_timeout)
     {
         last_observed_journal.clear();
         QTemporaryDir observation_directory;
@@ -2106,21 +2116,34 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             completion_acknowledged = send_sentinel_and_wait(completion_sentinel);
         }
         case_ok &= check(completion_acknowledged,
-            "Escape transport reader acknowledges the complete workload and exits");
+            "Escape transport reader acknowledges the complete workload");
 
-        bool child_exited = completion_acknowledged && capture.wait_for_exit();
-        if (!child_exited) {
+        const bool normal_exit_observed = completion_acknowledged &&
+            capture.wait_for_exit_within(normal_exit_timeout);
+        case_ok &= check(normal_exit_observed == expect_normal_exit,
+            expect_normal_exit
+                ? "Escape transport reader exits normally after completion"
+                : "negative Escape reader remains alive after its completion acknowledgment");
+        if (normal_exit_observed) {
+            const std::optional<term::Terminal_backend_exit> exit =
+                capture.exit_snapshot();
+            case_ok &= check(exit.has_value() && exit->exit_code == 0,
+                "Escape transport reader reports successful normal completion");
+        }
+
+        bool reader_reaped = normal_exit_observed;
+        if (!normal_exit_observed) {
             const term::Terminal_backend_result terminated = backend->terminate();
             const bool termination_started =
                 terminated.code == term::Terminal_backend_result_code::ACCEPTED ||
                 capture.exit_snapshot().has_value();
             case_ok &= check(termination_started,
                 "Escape transport failure cleanup can stop the reader");
-            child_exited = capture.wait_for_exit();
+            reader_reaped = capture.wait_for_exit();
+            case_ok &= check(reader_reaped,
+                "Escape transport failure cleanup observes the reader exit");
         }
-        case_ok &= check(child_exited,
-            "Escape transport reader exits before the final journal comparison");
-        if (child_exited) {
+        if (reader_reaped) {
             QFile observed_file(observation_path);
             const bool read_ok = observed_file.open(QIODevice::ReadOnly);
             const QByteArray actual = read_ok ? observed_file.readAll() : QByteArray();
@@ -2396,6 +2419,102 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         Escape_input_delivery::PACED,
         0U);
 
+    // Closure gates for the non-text Right-Alt paths. These deliberately use
+    // real native Qt metadata and the public encoder, not hand-built packets.
+    // Native console records lose the selected Alt distinction in ConPTY, so
+    // verify the VT bytes separately from the classic-reader packet records.
+    const QByteArray gate_right_alt_up = encoded_native_key_event(
+        Qt::Key_Up, Qt::AltModifier, 0xe048U, VK_UP, 0x01000040U, {});
+    const QByteArray gate_right_alt_f3 = encoded_native_key_event(
+        Qt::Key_F3, Qt::AltModifier, 0x3dU, VK_F3, 0x00000040U, {});
+    const QByteArray gate_right_alt_return = encoded_native_key_event(
+        Qt::Key_Return, Qt::AltModifier, 0x1cU, VK_RETURN, 0x00000040U,
+        QStringLiteral("\r"));
+    const QByteArray gate_ctrl_right_alt_return_cr = encoded_native_key_event(
+        Qt::Key_Return, Qt::ControlModifier | Qt::AltModifier,
+        0x1cU, VK_RETURN, 0x00000042U, QStringLiteral("\r"));
+    const QByteArray gate_ctrl_right_alt_return_lf = encoded_native_key_event(
+        Qt::Key_Return, Qt::ControlModifier | Qt::AltModifier,
+        0x1cU, VK_RETURN, 0x00000042U, QStringLiteral("\n"));
+    const QByteArray gate_right_alt_backspace = encoded_native_key_event(
+        Qt::Key_Backspace, Qt::AltModifier, 0x0eU, VK_BACK, 0x00000040U,
+        QStringLiteral("\b"));
+    const QByteArray gate_ctrl_right_alt_a = encoded_native_key_event(
+        Qt::Key_A, Qt::ControlModifier | Qt::AltModifier,
+        0x1eU, 'A', 0x00000042U, QString(QChar(u'\x01')));
+    const QByteArray gate_group_switch_up = encoded_native_key_event(
+        Qt::Key_Up, Qt::GroupSwitchModifier,
+        0xe048U, VK_UP, 0x01000042U, {});
+    const QByteArray gate_shift_group_switch_return = encoded_native_key_event(
+        Qt::Key_Return, Qt::ShiftModifier | Qt::GroupSwitchModifier,
+        0x1cU, VK_RETURN, 0x00000050U, QStringLiteral("\r"));
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Right-Alt navigation/control keys retain their selected VT operations",
+        {
+            {{gate_right_alt_up}, decode_hex("1b5b313b3341")},
+            {{gate_right_alt_f3}, decode_hex("1b5b313b3352")},
+            {{gate_right_alt_return}, decode_hex("1b0d")},
+            {{gate_ctrl_right_alt_return_cr}, decode_hex("1b0a")},
+            {{gate_ctrl_right_alt_return_lf}, decode_hex("1b0a")},
+            {{gate_right_alt_backspace}, decode_hex("1b7f")},
+            {{gate_ctrl_right_alt_a}, decode_hex("1b01")},
+            {{gate_group_switch_up}, decode_hex("1b5b41")},
+            {{gate_shift_group_switch_return}, QByteArrayLiteral("\r")},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "Right-Alt VT operations reach classic readers as VK_PACKET bytes",
+        {
+            {{gate_right_alt_up}, packet_key_stroke_records(decode_hex("1b5b313b3341"))},
+            {{gate_right_alt_f3}, packet_key_stroke_records(decode_hex("1b5b313b3352"))},
+            {{gate_right_alt_return}, packet_key_stroke_records(decode_hex("1b0d"))},
+            {{gate_ctrl_right_alt_return_cr}, packet_key_stroke_records(decode_hex("1b0a"))},
+            {{gate_ctrl_right_alt_return_lf}, packet_key_stroke_records(decode_hex("1b0a"))},
+            {{gate_right_alt_backspace}, packet_key_stroke_records(decode_hex("1b7f"))},
+            {{gate_ctrl_right_alt_a}, packet_key_stroke_records(decode_hex("1b01"))},
+            {{gate_group_switch_up}, packet_key_stroke_records(decode_hex("1b5b41"))},
+            {{gate_shift_group_switch_return},
+                packet_key_stroke_records(QByteArrayLiteral("\r"))},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+
+    // Retain the selected native-identity tradeoffs while checking actual
+    // transitions in one converter instance, without intervening ack keys.
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "Right/both/left Alt and committed GroupSwitch text remain distinct in a burst",
+        {
+            {{shift_return}, QByteArrayLiteral("\r")},
+            {{right_alt_x}, decode_hex("1b78")},
+            {{both_alt_x}, decode_hex("1b78")},
+            {{left_alt_x}, decode_hex("1b78")},
+            {{group_switch_right_alt_x}, QByteArrayLiteral("x")},
+            {{ordinary_letter}, QByteArrayLiteral("a")},
+            {{right_alt_x}, decode_hex("1b78")},
+        },
+        Escape_input_delivery::QUEUE_BURST,
+        1U);
+
+    const QByteArray gate_native_application_equal = encoded_native_key_event(
+        Qt::Key_Equal, Qt::KeypadModifier, 0x59U, VK_OEM_NEC_EQUAL, 0U,
+        QStringLiteral("="), false, 1, application_keypad_modes);
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "native keypad Equal metadata does not bypass application-mode packet policy",
+        {{{gate_native_application_equal}, packet_key_stroke_records(decode_hex("1b4f58"))}},
+        Escape_input_delivery::PACED,
+        0U);
+    ok &= run_case(
+        QStringLiteral("--escape-vt-input-reader"),
+        "application keypad Equal with supplied native metadata preserves SS3 X",
+        {{{gate_native_application_equal}, decode_hex("1b4f58")}},
+        Escape_input_delivery::PACED,
+        0U);
+
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "VT-first Right-Alt+X gives classic readers Escape then native Right-Alt+X",
@@ -2668,6 +2787,16 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             Escape_input_delivery::QUEUE_BURST,
             1U);
     }
+
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader-hold-after-ack"),
+        "completion acknowledgment does not hide a reader that misses normal exit",
+        {{{ordinary_letter}, native_key_stroke_records(
+            'A', letter_a_scan, 'a', 0)}},
+        Escape_input_delivery::PACED,
+        0U,
+        false,
+        std::chrono::milliseconds(250));
 
     return ok;
 }
@@ -5053,6 +5182,9 @@ int main(int argc, char** argv)
     }
     if (argc == 3 && std::string_view(argv[1]) == "--escape-input-reader") {
         return run_escape_input_reader(QString::fromLocal8Bit(argv[2]));
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--escape-input-reader-hold-after-ack") {
+        return run_escape_input_reader(QString::fromLocal8Bit(argv[2]), true);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--escape-vt-input-reader") {
         return run_escape_vt_input_reader(QString::fromLocal8Bit(argv[2]));

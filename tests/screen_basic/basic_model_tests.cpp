@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include <variant>
+#include <vector>
 
 namespace term = vnm_terminal::internal;
 
@@ -2592,6 +2593,152 @@ bool test_wide_glyph_written_at_one_column_keeps_natural_width()
     return ok;
 }
 
+
+bool test_one_column_wide_glyph_reaches_retained_history()
+{
+    bool ok = true;
+    const std::vector<QByteArray> glyphs = {
+        bytes_from_hex("e4b880"),
+        bytes_from_hex("e29da4efb88f"),
+    };
+    for (const QByteArray& glyph : glyphs) {
+        for (int scenario = 0; scenario < 3; ++scenario) {
+            term::Terminal_screen_model model = make_model(1, scenario == 2 ? 1 : 2);
+            try {
+                if (scenario == 1) {
+                    model = make_model(2, 2);
+                    (void)model.ingest(glyph + QByteArrayLiteral("\x1b[2;1H"));
+                    (void)model.resize({1, 1});
+                }
+                else {
+                    (void)model.ingest(glyph);
+                    if (scenario == 0) {
+                        (void)model.resize({1, 1});
+                    }
+                    (void)model.ingest(QByteArrayLiteral("X"));
+                }
+            }
+            catch (const std::exception& error) {
+                std::cerr << "FAIL: clipped-wide history scenario " << scenario
+                    << ": " << error.what() << '\n';
+                ok = false;
+                continue;
+            }
+            ok &= check(model.scrollback_size() == 1,
+                "clipped wide row is archived during resize or subsequent scrolling");
+            model.discard_retained_lookup_cache_for_testing();
+            const auto cells = model.retained_history_row_cells_for_testing(
+                term::Terminal_buffer_id::PRIMARY, 0);
+            ok &= check(cells.has_value() && cells->size() == 1,
+                "one-column retained row materializes after lookup-cache discard");
+            if (!cells.has_value() || cells->size() != 1) {
+                continue;
+            }
+            const auto& cell = cells->front();
+            ok &= check(cell.text == QString::fromUtf8(glyph) && cell.occupied &&
+                    !cell.wide_continuation && cell.display_width == 1 &&
+                    cell.natural_display_width == 2,
+                "retained materialization preserves clipped text and natural width");
+            const auto metadata = model.retained_row_record_metadata_for_testing(
+                term::Terminal_buffer_id::PRIMARY, 0);
+            ok &= check(metadata.has_value() && metadata->source_width == 1,
+                "archived clipped row retains its physical source width");
+        }
+    }
+    return ok;
+}
+
+bool test_no_autowrap_wide_variation_glyph_reaches_retained_history()
+{
+    bool ok = true;
+    const QString heart_with_emoji_presentation = QString::fromUtf8(
+        "\xe2\x9d\xa4\xef\xb8\x8f");
+    term::Terminal_screen_model model = make_model(1, 4);
+    try {
+        (void)model.ingest(
+            QByteArrayLiteral("\x1b[?7l") + QByteArrayLiteral("abc") +
+            heart_with_emoji_presentation.toUtf8() + QByteArrayLiteral("\n"));
+    }
+    catch (const std::exception& error) {
+        std::cerr << "FAIL: wider no-autowrap clipped glyph archiving threw: "
+            << error.what() << '\n';
+        ok = false;
+    }
+
+    ok &= check(model.scrollback_size() == 1,
+        "wider no-autowrap clipped wide row reaches retained history");
+    model.discard_retained_lookup_cache_for_testing();
+    const auto cells = model.retained_history_row_cells_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(cells.has_value() && cells->size() == 4,
+        "right-margin clipped glyph materializes from retained history");
+    if (!cells.has_value() || cells->size() != 4) {
+        return false;
+    }
+    const auto& clipped = cells->back();
+    ok &= check(clipped.text == heart_with_emoji_presentation && clipped.occupied &&
+            !clipped.wide_continuation && clipped.display_width == 1 &&
+            clipped.natural_display_width == 2,
+        "right-margin retained cell preserves its natural wide-glyph width");
+    const auto metadata = model.retained_row_record_metadata_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(metadata.has_value() && metadata->source_width == 4,
+        "right-margin clipped row retains its multi-column source width");
+    return ok;
+}
+
+
+bool test_reflow_cursors_do_not_insert_a_wide_wrap_margin()
+{
+    bool ok = true;
+    const QByteArray wide_glyph = bytes_from_hex("e4b8ad");
+    const QString joined_text =
+        QStringLiteral("abc") + QString::fromUtf8(wide_glyph) + QStringLiteral("x");
+    for (const bool saved_cursor : {false, true}) {
+        for (const bool live_cursor_in_gap : {false, true}) {
+            term::Terminal_screen_model model = make_model(4, 4);
+            (void)model.ingest(QByteArrayLiteral("abc"));
+            if (saved_cursor) {
+                (void)model.ingest(QByteArrayLiteral("\x1b" "7"));
+            }
+            (void)model.ingest(wide_glyph + QByteArrayLiteral("x"));
+            (void)model.ingest(live_cursor_in_gap
+                ? QByteArrayLiteral("\x1b[1;4H")
+                : QByteArrayLiteral("\x1b[3;1H"));
+            (void)model.resize({4, 6});
+            ok &= check(model.row_text(0).trimmed() == joined_text &&
+                    model.row_text(1).trimmed().isEmpty(),
+                "cursor in unused wide-wrap margin does not insert a content cell");
+            if (live_cursor_in_gap) {
+                ok &= check(model.cursor_position().row == 0 &&
+                        model.cursor_position().column == 3,
+                    "live gap cursor maps to the boundary before the wide glyph");
+            }
+            if (saved_cursor) {
+                (void)model.ingest(QByteArrayLiteral("\x1b" "8"));
+                ok &= check(model.cursor_position().row == 0 &&
+                        model.cursor_position().column == 3,
+                    "saved gap cursor restores before the wide glyph");
+            }
+            // Cursor boundaries must survive creating and removing the gap again.
+            (void)model.resize({4, 4});
+            (void)model.resize({4, 6});
+            ok &= check(model.row_text(0).trimmed() == joined_text &&
+                    model.row_text(1).trimmed().isEmpty(),
+                "repeat narrow/wide reflow does not manufacture a margin cell");
+        }
+    }
+
+    term::Terminal_screen_model written_margin = make_model(4, 4);
+    (void)written_margin.ingest(QByteArrayLiteral("abc") + wide_glyph +
+        QByteArrayLiteral("x\x1b[1;4HZ\x1b[3;1H"));
+    (void)written_margin.resize({4, 7});
+    ok &= check(written_margin.row_text(0).trimmed() ==
+            QStringLiteral("abcZ") + QString::fromUtf8(wide_glyph) + QStringLiteral("x"),
+        "real content written beyond an old early-wrap cut is retained");
+    return ok;
+}
+
 bool test_reflow_origin_spans_are_cleared_on_mutation_and_replacement()
 {
     bool ok = true;
@@ -2683,6 +2830,9 @@ int main()
     ok &= test_mixed_reflow_origin_spans_survive_scrollback_materialization();
     ok &= test_primary_one_column_reflow_restores_wide_glyph_and_cursors();
     ok &= test_wide_glyph_written_at_one_column_keeps_natural_width();
+    ok &= test_one_column_wide_glyph_reaches_retained_history();
+    ok &= test_no_autowrap_wide_variation_glyph_reaches_retained_history();
+    ok &= test_reflow_cursors_do_not_insert_a_wide_wrap_margin();
     ok &= test_reflow_origin_spans_are_cleared_on_mutation_and_replacement();
     return ok ? 0 : 1;
 }

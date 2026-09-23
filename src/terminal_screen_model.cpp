@@ -3456,10 +3456,17 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             }
             // Preserve written cells beyond an earlier wide-glyph wrap gap.
             count = std::max(count, source.soft_wrap_columns);
-            if ((int)index == old_cursor.row) {
+            // An early wide-glyph wrap can leave an unused right margin.
+            // A cursor in that margin is a boundary in the logical line, not
+            // another content cell to insert ahead of the next row. Keep the
+            // occupied extent above, including actual writes into the margin.
+            const bool joined_row = index < last;
+            if (!joined_row && (int)index == old_cursor.row) {
                 count = std::max(count, old_cursor.column + 1);
             }
-            if (old_saved.valid && (int)index == old_saved.position.row) {
+            if (!joined_row && old_saved.valid &&
+                (int)index == old_saved.position.row)
+            {
                 count = std::max(count, old_saved.position.column + 1);
             }
 
@@ -3483,9 +3490,10 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 }
                 return source.retained_line_provenance;
             };
-            const int cursor_boundary = old_cursor.column + (old_pending_wrap ? 1 : 0);
-            const int saved_boundary = old_saved.position.column +
-                (old_saved.pending_wrap ? 1 : 0);
+            const int cursor_boundary = std::min(count,
+                old_cursor.column + (old_pending_wrap ? 1 : 0));
+            const int saved_boundary = std::min(count,
+                old_saved.position.column + (old_saved.pending_wrap ? 1 : 0));
             const auto record_source_position = [&](int boundary, std::size_t offset)
             {
                 if ((int)index == old_cursor.row && cursor_boundary == boundary) {
@@ -7830,7 +7838,8 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
     retained_record.metadata = history_record.metadata;
     retained_record.row.cells.reserve(history_record.cells.size());
 
-    for (const Terminal_history_row_cell& cell : history_record.cells) {
+    for (std::size_t index = 0; index < history_record.cells.size(); ++index) {
+        const Terminal_history_row_cell& cell = history_record.cells[index];
         Cell restored_cell;
         restored_cell.text = cell.text;
         restored_cell.text_category = render_cell_text_category(QStringView(cell.text));
@@ -7839,11 +7848,23 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
         restored_cell.occupied = cell.occupied;
         restored_cell.style_id = cell.style_id;
         restored_cell.hyperlink_id = cell.hyperlink_id;
-        // The history codec stores display width, not latent width from a
-        // narrower live grid, so reconstruct the safest width it represents.
         restored_cell.natural_display_width = cell.wide_continuation
             ? 0
             : std::max(1, cell.display_width);
+        if (static_cast<int>(index) == history_record.metadata.source_width - 1 &&
+            cell.display_width == 1 &&
+            cell.occupied && !cell.wide_continuation)
+        {
+            // The codec validates a clipped-wide cell only at the right margin.
+            // Its original width is recoverable from the retained Unicode;
+            // display_width alone would erase it during materialization.
+            const QByteArray text_bytes = cell.text.toUtf8();
+            const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
+            if (width.status == Terminal_unicode_width_status::OK) {
+                restored_cell.natural_display_width =
+                    std::max(restored_cell.natural_display_width, width.cells);
+            }
+        }
         retained_record.row.cells.push_back(std::move(restored_cell));
     }
 

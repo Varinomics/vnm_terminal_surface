@@ -115,6 +115,16 @@ QByteArray win32_key_stroke(
         win32_input_event(virtual_key, scan_code, 0, 0, control_key_state);
 }
 
+QByteArray packet_key_strokes(const QByteArray& bytes)
+{
+    QByteArray result;
+    for (const char byte : bytes) {
+        result += win32_key_stroke(
+            VK_PACKET, 0, static_cast<unsigned char>(byte), 0);
+    }
+    return result;
+}
+
 QByteArray encode_native(
     int key,
     Qt::KeyboardModifiers modifiers,
@@ -549,15 +559,37 @@ bool test_windows_balanced_input_semantics()
             Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier,
             0x3dU,
             VK_F3,
-            0x00000770U,
+            0x00000734U,
             {}),
         win32_key_stroke(
             VK_F3,
             0x3d,
             0,
-            SHIFT_PRESSED | RIGHT_CTRL_PRESSED | RIGHT_ALT_PRESSED |
+            SHIFT_PRESSED | RIGHT_CTRL_PRESSED | LEFT_ALT_PRESSED |
                 CAPSLOCK_ON | NUMLOCK_ON | SCROLLLOCK_ON),
-        "Qt 6.11 right-side modifiers and every lock bit reach the native state");
+        "Qt 6.11 right Shift/Ctrl, left Alt, and every lock bit reach native state");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_F3,
+            Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier,
+            0x3dU,
+            VK_F3,
+            0x00000770U,
+            {}),
+        packet_key_strokes(QByteArrayLiteral("\x1b[1;8R")),
+        "right-Alt modified F3 preserves its VT sequence through packet input");
+
+    ok &= check_bytes_equal(
+        encode_native(
+            Qt::Key_Return,
+            Qt::ShiftModifier | Qt::GroupSwitchModifier,
+            0x1cU,
+            VK_RETURN,
+            0x00000050U,
+            QStringLiteral("\r")),
+        packet_key_strokes(QByteArrayLiteral("\r")),
+        "Shift+GroupSwitch+Return preserves its VT carriage return through packet input");
 
     const QString compressed_bmp = QString::fromUtf8("\xc3\xa9x");
     ok &= check_bytes_equal(
