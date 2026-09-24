@@ -3407,6 +3407,7 @@ bool test_transcript_orders_host_and_resize_requests_before_synchronous_output()
     ok &= check(session.resize(QSizeF(120.0, 36.0), {4, 12}).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "ordering resize succeeds");
+    session.process_backend_callback_events();
 
     recorder.reset();
 
@@ -3430,9 +3431,12 @@ bool test_transcript_orders_host_and_resize_requests_before_synchronous_output()
         first_event_position(*events, QStringLiteral("session.resize_request"));
     const std::optional<std::size_t> resize_output_position =
         first_event_position_with_bytes(*events, QStringLiteral("backend.output"), QByteArrayLiteral("resize-sync"));
-    ok &= check(resize_request_position.has_value() && resize_output_position.has_value() &&
-        *resize_request_position < *resize_output_position,
-        "session.resize_request is recorded before synchronous backend output");
+    ok &= check(resize_request_position.has_value(), "session.resize_request is recorded");
+    ok &= check(resize_output_position.has_value(), "synchronous resize backend output is recorded");
+    if (resize_request_position.has_value() && resize_output_position.has_value()) {
+        ok &= check(*resize_request_position < *resize_output_position,
+            "session.resize_request is recorded before synchronous backend output");
+    }
     return ok;
 }
 
