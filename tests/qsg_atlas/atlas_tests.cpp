@@ -7234,6 +7234,12 @@ std::set<int> glsl_es_versions(const QShader& shader)
     return versions;
 }
 
+bool shader_has_glsl_desktop_variant(const QShader& shader, int version)
+{
+    const QShaderKey key(QShader::GlslShader, QShaderVersion(version));
+    return shader.availableShaders().contains(key);
+}
+
 bool shader_has_invalid_es_array_sampler_variant(const QShader& shader)
 {
     for (const QShaderKey& key : shader.availableShaders()) {
@@ -7255,7 +7261,7 @@ bool shader_has_invalid_es_array_sampler_variant(const QShader& shader)
     return false;
 }
 
-bool test_shader_package_gles_contract()
+bool test_shader_package_variant_contract()
 {
     constexpr const char* k_glyph_vertex_path =
         ":/vnm_terminal_surface/shaders/atlas_glyph.vert.qsb";
@@ -7283,6 +7289,17 @@ bool test_shader_package_gles_contract()
         glsl_es_versions(glyph_alpha_fragment) == expected_glyph_es_versions,
         "glyph alpha fragment package matches the GLES 3.0 vertex variant");
     ok &= check(
+        shader_has_glsl_desktop_variant(glyph_alpha_fragment, 120) &&
+            shader_has_glsl_desktop_variant(glyph_alpha_fragment, 130) &&
+            shader_has_glsl_desktop_variant(glyph_alpha_fragment, 150) &&
+            shader_has_glsl_desktop_variant(glyph_alpha_fragment, 330),
+        "glyph alpha fragment package provides desktop GLSL variants");
+    ok &= check(
+        shader_has_glsl_desktop_variant(glyph_fragment, 120) &&
+            shader_has_glsl_desktop_variant(glyph_fragment, 150) &&
+            shader_has_glsl_desktop_variant(glyph_fragment, 330),
+        "dual-source glyph fragment package provides its OpenGL GLSL targets");
+    ok &= check(
         !shader_has_invalid_es_array_sampler_variant(glyph_fragment) &&
             !shader_has_invalid_es_array_sampler_variant(glyph_alpha_fragment),
         "glyph fragment packages do not expose texture arrays to GLSL ES below 3.0");
@@ -7301,6 +7318,15 @@ bool test_shader_package_gles_contract()
         fragment_es_300.contains(QByteArrayLiteral("sampler2DArray")) &&
             fragment_es_300.contains(QByteArrayLiteral("texture(")),
         "glyph GLES fragment samples the texture-array coverage atlas");
+
+    const QShaderKey desktop_glsl_150_key(
+        QShader::GlslShader, QShaderVersion(150));
+    const QByteArray dual_source_glsl_150 =
+        glyph_fragment.shader(desktop_glsl_150_key).shader();
+    ok &= check(
+        dual_source_glsl_150.contains(QByteArrayLiteral(
+            "layout(location = 0, index = 1) out vec4 output_blend_factor;")),
+        "dual-source glyph GLSL 150 package retains the explicit output location");
     return ok;
 }
 
@@ -21291,7 +21317,7 @@ bool test_font_file_bytes_for_font()
 bool run_unit_tests()
 {
     bool ok = true;
-    ok &= test_shader_package_gles_contract();
+    ok &= test_shader_package_variant_contract();
     ok &= test_source_posture();
     ok &= test_font_file_bytes_for_font();
     ok &= test_cache_key_includes_physical_size_and_face();

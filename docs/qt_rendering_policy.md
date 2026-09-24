@@ -36,7 +36,10 @@ GLSL ES 3.00. `atlas_glyph.vert.qsb` and
 `atlas_glyph_alpha.frag.qsb` must expose the same `300 es` target and must not
 expose a `100 es` target. GLSL ES 1.00 cannot declare or sample a
 `sampler2DArray`; including that generated variant makes Qt select source that
-cannot compile on an ES 3 device.
+cannot compile on an ES 3 device. The alpha fragment package must also expose
+desktop GLSL `120`, `130`, `150`, and `330` targets so Qt can select it on
+desktop OpenGL. Bake it with `--glsl "120,130,150,300 es,330"` to retain the
+required ES target without generating ES 1.00 source.
 
 Dual-source atlas fragment shader packages must carry OpenGL GLSL 330 targets
 and patched GLSL 150 replacements from the corresponding `.glsl150.frag`
