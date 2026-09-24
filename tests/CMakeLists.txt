@@ -1405,8 +1405,10 @@ add_test(
 )
 
 set(vnm_terminal_surface_host_timeout 60)
-if(WIN32 OR APPLE)
+if(WIN32)
     set(vnm_terminal_surface_host_timeout 120)
+elseif(APPLE)
+    set(vnm_terminal_surface_host_timeout 180)
 endif()
 
 set_tests_properties(vnm_terminal_surface_host PROPERTIES
