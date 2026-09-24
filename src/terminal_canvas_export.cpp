@@ -2,6 +2,8 @@
 
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/metrics_contract.h"
+#include "vnm_terminal/internal/qt_window_metrics.h"
+#include "vnm_terminal/internal/terminal_canvas_content_extent.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
@@ -9,10 +11,7 @@
 
 #include <QByteArray>
 #include <QFontInfo>
-#include <QQuickWindow>
-#include <QScreen>
 #include <QThread>
-#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <utility>
@@ -20,16 +19,6 @@
 namespace term = vnm_terminal::internal;
 
 namespace {
-
-qreal logical_dpi_for_surface(const VNM_TerminalSurface& surface)
-{
-    const QQuickWindow* const window = surface.window();
-    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
-    return term::normalized_logical_dpi(
-        screen != nullptr
-            ? screen->logicalDotsPerInch()
-            : term::k_vnm_terminal_default_logical_dpi);
-}
 
 std::uint16_t canvas_color_reference(const term::Terminal_color_ref& color)
 {
@@ -118,7 +107,7 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     const QFontInfo active_font(term::vnm_terminal_font(
         surface.font_family(),
         surface.effective_font_size(),
-        logical_dpi_for_surface(surface)));
+        term::window_logical_dpi(surface.window())));
     frame->font_family                 = active_font.family();
     frame->font_style                  = active_font.styleName();
     frame->font_weight                 = active_font.weight();
@@ -203,16 +192,13 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         });
     }
 
-    const int cursor_bottom =
-        snapshot->cursor.visible && snapshot->cursor.position.row >= 0 &&
-            snapshot->cursor.position.row < snapshot->grid_size.rows
-        ? snapshot->cursor.position.row + 1
-        : 0;
     terminal_canvas_content_extent_t content_extent;
-    content_extent.content_bottom_row_exclusive = std::clamp(
-        std::max({1, occupied_bottom, cursor_bottom}),
-        1,
-        snapshot->grid_size.rows);
+    content_extent.content_bottom_row_exclusive =
+        term::terminal_canvas_content_bottom_row_exclusive(
+            snapshot->grid_size.rows,
+            occupied_bottom,
+            snapshot->cursor.visible,
+            snapshot->cursor.position.row);
     content_extent.scrollback_rows = snapshot->viewport.scrollback_rows;
     content_extent.offset_from_tail = snapshot->viewport.offset_from_tail;
     content_extent.active_buffer =

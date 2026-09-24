@@ -1,7 +1,5 @@
 #pragma once
 
-#include <QByteArrayView>
-
 namespace vnm_terminal::internal {
 
 struct Terminal_utf8_scan_state
@@ -81,18 +79,6 @@ inline bool utf8_scan_consumes_byte(
     }
 
     return utf8_scan_start_sequence(byte, state);
-}
-
-inline Terminal_utf8_scan_state utf8_scan_state_after(
-    QByteArrayView             bytes,
-    Terminal_utf8_scan_state   initial_state)
-{
-    Terminal_utf8_scan_state state = initial_state;
-    for (const char byte : bytes) {
-        utf8_scan_consumes_byte(static_cast<unsigned char>(byte), state);
-    }
-
-    return state;
 }
 
 }

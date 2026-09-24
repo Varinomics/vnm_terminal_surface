@@ -470,88 +470,57 @@ struct Terminal_search_controller::Shared_state
             result.source_identity  == source_identity;
     }
 
-    bool select_next()
+    bool select_match(bool forward)
     {
         std::lock_guard<std::mutex> lock(result_mutex);
         if (result.matches.empty()) {
             return false;
         }
 
-        if (!result.current_row.has_value()) {
-            result.current_row = result.matches.begin()->first;
-            result.current_row_match_ordinal = 0;
-            result.current_match_number = 1;
+        auto row = result.current_row.has_value()
+            ? result.matches.find(*result.current_row)
+            : result.matches.end();
+        if (row == result.matches.end()) {
+            row = forward ? result.matches.begin() : std::prev(result.matches.end());
+            result.current_row = row->first;
+            result.current_row_match_ordinal = forward
+                ? 0
+                : static_cast<int>(row->second.spans.size()) - 1;
+            result.current_match_number = forward ? 1 : result.match_count;
             return true;
         }
 
-        auto row = result.matches.find(*result.current_row);
-        if (row == result.matches.end()) {
-            result.current_row = result.matches.begin()->first;
-            result.current_row_match_ordinal = 0;
-            result.current_match_number = 1;
-            return true;
-        }
-        if (result.current_row_match_ordinal + 1 <
-            static_cast<int>(row->second.spans.size()))
+        const int row_match_count = static_cast<int>(row->second.spans.size());
+        if (forward
+                ? result.current_row_match_ordinal + 1 < row_match_count
+                : result.current_row_match_ordinal > 0)
         {
-            ++result.current_row_match_ordinal;
+            result.current_row_match_ordinal += forward ? 1 : -1;
         }
         else {
-            ++row;
-            if (row == result.matches.end()) {
-                row = result.matches.begin();
-            }
-            result.current_row = row->first;
-            result.current_row_match_ordinal = 0;
-        }
-        result.current_match_number = result.current_match_number < result.match_count
-            ? result.current_match_number + 1
-            : 1;
-        return true;
-    }
-
-    bool select_previous()
-    {
-        std::lock_guard<std::mutex> lock(result_mutex);
-        if (result.matches.empty()) {
-            return false;
-        }
-
-        if (!result.current_row.has_value()) {
-            auto row = std::prev(result.matches.end());
-            result.current_row = row->first;
-            result.current_row_match_ordinal =
-                static_cast<int>(row->second.spans.size()) - 1;
-            result.current_match_number = result.match_count;
-            return true;
-        }
-
-        auto row = result.matches.find(*result.current_row);
-        if (row == result.matches.end()) {
-            row = std::prev(result.matches.end());
-            result.current_row = row->first;
-            result.current_row_match_ordinal =
-                static_cast<int>(row->second.spans.size()) - 1;
-            result.current_match_number = result.match_count;
-            return true;
-        }
-        if (result.current_row_match_ordinal > 0) {
-            --result.current_row_match_ordinal;
-        }
-        else {
-            if (row == result.matches.begin()) {
-                row = std::prev(result.matches.end());
+            if (forward) {
+                if (++row == result.matches.end()) {
+                    row = result.matches.begin();
+                }
+                result.current_row_match_ordinal = 0;
             }
             else {
-                --row;
+                row = row == result.matches.begin()
+                    ? std::prev(result.matches.end())
+                    : std::prev(row);
+                result.current_row_match_ordinal =
+                    static_cast<int>(row->second.spans.size()) - 1;
             }
             result.current_row = row->first;
-            result.current_row_match_ordinal =
-                static_cast<int>(row->second.spans.size()) - 1;
         }
-        result.current_match_number = result.current_match_number > 1
-            ? result.current_match_number - 1
-            : result.match_count;
+
+        result.current_match_number = forward
+            ? (result.current_match_number < result.match_count
+                ? result.current_match_number + 1
+                : 1)
+            : (result.current_match_number > 1
+                ? result.current_match_number - 1
+                : result.match_count);
         return true;
     }
 
@@ -1355,12 +1324,12 @@ Terminal_search_controller::source_row_handles(
 
 bool Terminal_search_controller::select_next()
 {
-    return !m_searching && m_shared->select_next();
+    return !m_searching && m_shared->select_match(true);
 }
 
 bool Terminal_search_controller::select_previous()
 {
-    return !m_searching && m_shared->select_previous();
+    return !m_searching && m_shared->select_match(false);
 }
 
 std::vector<Terminal_render_search_match_span>

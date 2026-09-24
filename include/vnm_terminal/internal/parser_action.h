@@ -607,14 +607,10 @@ inline Parser_action make_text_area_size_reply_action(int rows, int columns)
 
 inline Parser_action make_osc_query_reply_action(QByteArray wire_bytes, QString source_sequence)
 {
-    return {
-        Terminal_reply{
-            std::move(wire_bytes),
-            std::move(source_sequence),
-            Terminal_reply_kind::OSC_QUERY,
-            Parser_sequence_family::OSC,
-        },
-    };
+    return make_terminal_reply_action(
+        Terminal_reply_kind::OSC_QUERY,
+        std::move(wire_bytes),
+        std::move(source_sequence));
 }
 
 inline Parser_action make_osc52_write_request_action(

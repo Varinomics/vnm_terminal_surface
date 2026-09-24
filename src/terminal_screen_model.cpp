@@ -129,33 +129,6 @@ bool is_single_width_non_ascii_bmp(QChar character)
     return width_for_codepoint(static_cast<char32_t>(codepoint)).cells == 1;
 }
 
-Terminal_render_cell_text_category render_cell_text_category(QStringView text)
-{
-    if (text.isEmpty()) {
-        return Terminal_render_cell_text_category::EMPTY;
-    }
-
-    unsigned int outside_printable_ascii = 0U;
-    unsigned int non_ascii               = 0U;
-    const qsizetype text_size            = text.size();
-    const QChar* characters              = text.data();
-    for (qsizetype index = 0; index < text_size; ++index) {
-        const unsigned int code_unit = characters[index].unicode();
-        outside_printable_ascii |= static_cast<unsigned int>(
-            code_unit - k_printable_ascii_first >
-                k_printable_ascii_last - k_printable_ascii_first);
-        non_ascii |= code_unit;
-    }
-
-    if (outside_printable_ascii == 0U) {
-        return Terminal_render_cell_text_category::PRINTABLE_ASCII;
-    }
-
-    return (non_ascii & ~0x7fU) != 0U
-        ? Terminal_render_cell_text_category::NON_ASCII
-        : Terminal_render_cell_text_category::OTHER_ASCII;
-}
-
 terminal_history_handle_t retained_history_handle_from_provenance(
     const Terminal_retained_line_provenance& provenance)
 {
@@ -4906,7 +4879,8 @@ void Terminal_screen_model::install_cell_span(
 
     Cell& cell = screen_row.cells[position.column];
     cell.text              = std::move(text);
-    cell.text_category     = render_cell_text_category(QStringView(cell.text));
+    cell.text_category     = Terminal_render_cell_text::category_for_text(
+        QStringView(cell.text));
     cell.display_width     = display_width;
     cell.natural_display_width = std::max(display_width, natural_display_width);
     cell.wide_continuation = false;
@@ -7842,7 +7816,8 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
         const Terminal_history_row_cell& cell = history_record.cells[index];
         Cell restored_cell;
         restored_cell.text = cell.text;
-        restored_cell.text_category = render_cell_text_category(QStringView(cell.text));
+        restored_cell.text_category = Terminal_render_cell_text::category_for_text(
+            QStringView(cell.text));
         restored_cell.display_width = cell.display_width;
         restored_cell.wide_continuation = cell.wide_continuation;
         restored_cell.occupied = cell.occupied;

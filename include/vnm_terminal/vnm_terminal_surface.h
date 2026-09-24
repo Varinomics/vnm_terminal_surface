@@ -889,6 +889,11 @@ private:
     void geometryChange(const QRectF& new_geometry, const QRectF& old_geometry) override;
     void itemChange(ItemChange change, const ItemChangeData& value) override;
 
+    wheel_scroll_diagnostic_result_t scroll_viewport_with_diagnostics(
+        int                    line_delta,
+        std::optional<int>     offset_from_tail,
+        QString                source);
+
     void refresh_grid_metrics();
     void refresh_grid_metrics_if_device_pixel_ratio_changed();
 

@@ -2142,7 +2142,6 @@ Terminal_key_event_result Terminal_session::write_key_event_locked(
         return {};
     }
 
-    const std::uint64_t sequence = next_sequence();
     if (interaction_trace_enabled() && interaction_trace_id == 0U) {
         interaction_trace_id = next_interaction_trace_correlation_id();
     }
@@ -2154,27 +2153,13 @@ Terminal_key_event_result Terminal_session::write_key_event_locked(
                 interaction_trace_byte_summary(bytes),
             interaction_trace_id);
     }
-    if (!is_session_writable()) {
-        return {
-            true,
-            make_rejected_result(
-                sequence,
-                Terminal_session_result_code::INVALID_STATE,
-                make_backend_error(
-                    Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("session write requires a running backend"))),
-        };
-    }
-
-    const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_write_command(sequence, std::move(bytes), interaction_trace_id),
-        drain_policy);
     return {
         true,
-        finalize_accepted_text_input_result(
-            result,
-            sequence,
-            User_write_viewport_policy::RETURN_TO_TAIL),
+        write_user_bytes_locked(
+            std::move(bytes),
+            User_write_viewport_policy::RETURN_TO_TAIL,
+            drain_policy,
+            interaction_trace_id),
     };
 }
 
@@ -2243,39 +2228,23 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(
         return {};
     }
 
-    const std::uint64_t sequence = next_sequence();
     if (interaction_trace_enabled() && interaction_trace_id == 0U) {
         interaction_trace_id = next_interaction_trace_correlation_id();
     }
-    if (!is_session_writable()) {
-        return {
-            true,
-            make_rejected_result(
-                sequence,
-                Terminal_session_result_code::INVALID_STATE,
-                make_backend_error(
-                    Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("session write requires a running backend"))),
-        };
-    }
+    const Terminal_session_result result = write_user_bytes_locked(
+        std::move(bytes),
+        User_write_viewport_policy::RETURN_TO_TAIL,
+        Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        interaction_trace_id);
 
-    const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_write_command(sequence, std::move(bytes), interaction_trace_id));
-
-    Terminal_session_result final_result =
-        finalize_accepted_text_input_result(
-            result,
-            sequence,
-            User_write_viewport_policy::RETURN_TO_TAIL);
-
-    if (final_result.code == Terminal_session_result_code::ACCEPTED &&
+    if (result.code == Terminal_session_result_code::ACCEPTED &&
         ime_preedit_has_content(m_ime_preedit))
     {
         m_ime_preedit = {};
         advance_ime_preedit_generation();
     }
 
-    return {true, final_result};
+    return {true, result};
 }
 
 Terminal_paste_text_result Terminal_session::write_paste_text(

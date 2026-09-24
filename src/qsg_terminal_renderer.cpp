@@ -720,33 +720,6 @@ terminal_renderer_lifecycle_stats_t Terminal_renderer_lifecycle_recorder::snapsh
 
 namespace {
 
-Terminal_simple_content_text_category simple_content_text_category(const QString& text)
-{
-    if (text.isEmpty()) {
-        return Terminal_simple_content_text_category::EMPTY;
-    }
-
-    unsigned int outside_printable_ascii = 0U;
-    unsigned int non_ascii               = 0U;
-    const qsizetype text_size            = text.size();
-    const ushort* code_units             = text.utf16();
-    for (qsizetype index = 0; index < text_size; ++index) {
-        const unsigned int code_unit = code_units[index];
-        outside_printable_ascii |= static_cast<unsigned int>(
-            code_unit - k_printable_ascii_first >
-                k_printable_ascii_last - k_printable_ascii_first);
-        non_ascii |= code_unit;
-    }
-
-    if (outside_printable_ascii == 0U) {
-        return Terminal_simple_content_text_category::PRINTABLE_ASCII;
-    }
-
-    return (non_ascii & ~0x7fU) != 0U
-        ? Terminal_simple_content_text_category::NON_ASCII
-        : Terminal_simple_content_text_category::OTHER_ASCII;
-}
-
 Terminal_simple_content_text_category simple_content_text_category(
     Terminal_render_cell_text_category category)
 {

@@ -260,8 +260,10 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/qsg_terminal_render_frame.h
     include/vnm_terminal/internal/qsg_terminal_renderer.h
     include/vnm_terminal/internal/qt_grid_metrics_provider.h
+    include/vnm_terminal/internal/qt_window_metrics.h
     include/vnm_terminal/internal/render_snapshot.h
     include/vnm_terminal/internal/selection_contract.h
+    include/vnm_terminal/internal/terminal_canvas_content_extent.h
     include/vnm_terminal/internal/terminal_graphic_geometry.h
     include/vnm_terminal/internal/terminal_hyperlink.h
     include/vnm_terminal/internal/terminal_render_cell_text.h
@@ -366,6 +368,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/interaction_trace.h
     include/vnm_terminal/internal/metrics_contract.h
     include/vnm_terminal/internal/metrics_json_writers.h
+    include/vnm_terminal/internal/qt_window_metrics.h
     include/vnm_terminal/internal/parser_action.h
     include/vnm_terminal/internal/profile_text_writers.h
     include/vnm_terminal/internal/render_snapshot.h
@@ -375,6 +378,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_history_ring.h
     include/vnm_terminal/internal/terminal_history_row_record_codec.h
     include/vnm_terminal/internal/terminal_byte_stream_parser.h
+    include/vnm_terminal/internal/terminal_canvas_content_extent.h
     include/vnm_terminal/internal/terminal_input_mode.h
     include/vnm_terminal/internal/terminal_input_encoder.h
     include/vnm_terminal/internal/terminal_public_projection.h

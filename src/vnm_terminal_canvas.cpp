@@ -5,7 +5,9 @@
 
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
+#include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/terminal_canvas_content_extent.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 
@@ -41,25 +43,6 @@ qreal normalized_font_pixel_size(qreal font_size)
         static_cast<qreal>(term::k_vnm_terminal_max_font_pixel_size));
     return static_cast<qreal>(
         std::max(1, static_cast<int>(std::round(bounded))));
-}
-
-qreal device_pixel_ratio(const QQuickWindow* window)
-{
-    if (window == nullptr) {
-        return 1.0;
-    }
-
-    const qreal ratio = window->effectiveDevicePixelRatio();
-    return std::isfinite(ratio) && ratio > 0.0 ? ratio : 1.0;
-}
-
-qreal logical_dpi(const QQuickWindow* window)
-{
-    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
-    return term::normalized_logical_dpi(
-        screen != nullptr
-            ? screen->logicalDotsPerInch()
-            : term::k_vnm_terminal_default_logical_dpi);
 }
 
 term::Terminal_cursor_shape internal_cursor_shape(
@@ -104,22 +87,6 @@ const vnm_terminal::terminal_canvas_content_extent_t* supported_content_extent(
     return &*frame->content_extent;
 }
 
-int semantic_content_bottom_row_exclusive(
-    const vnm_terminal::Terminal_canvas_frame& frame)
-{
-    const int occupied_bottom = frame.cells.empty()
-        ? 0
-        : frame.cells.back().row + 1;
-    const int cursor_bottom =
-        frame.cursor.visible && frame.cursor.row >= 0 && frame.cursor.row < frame.rows
-        ? frame.cursor.row + 1
-        : 0;
-    return std::clamp(
-        std::max({1, occupied_bottom, cursor_bottom}),
-        1,
-        frame.rows);
-}
-
 bool supported_content_extent_is_valid(
     const vnm_terminal::Terminal_canvas_frame& frame)
 {
@@ -150,7 +117,11 @@ bool supported_content_extent_is_valid(
         extent->offset_from_tail >= 0 &&
         extent->offset_from_tail <= extent->scrollback_rows &&
         extent->content_bottom_row_exclusive ==
-            semantic_content_bottom_row_exclusive(frame);
+            term::terminal_canvas_content_bottom_row_exclusive(
+                frame.rows,
+                frame.cells.empty() ? 0 : frame.cells.back().row + 1,
+                frame.cursor.visible,
+                frame.cursor.row);
 }
 
 std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
@@ -426,6 +397,16 @@ VNM_TerminalCanvas::~VNM_TerminalCanvas()
     QObject::disconnect(m_private->screen_physical_dpi_changed_connection);
 }
 
+#define VNM_SET_CANVAS_APPEARANCE_PROPERTY(current, value, changed) \
+    do { \
+        if (current == value) { \
+            return; \
+        } \
+        current = value; \
+        emit changed(); \
+        refresh_render_state(); \
+    } while (false)
+
 QString VNM_TerminalCanvas::font_family() const
 {
     return m_font_family;
@@ -433,12 +414,7 @@ QString VNM_TerminalCanvas::font_family() const
 
 void VNM_TerminalCanvas::set_font_family(const QString& font_family)
 {
-    if (m_font_family == font_family) {
-        return;
-    }
-    m_font_family = font_family;
-    emit font_family_changed();
-    refresh_render_state();
+    VNM_SET_CANVAS_APPEARANCE_PROPERTY(m_font_family, font_family, font_family_changed);
 }
 
 QString VNM_TerminalCanvas::font_style() const
@@ -448,12 +424,7 @@ QString VNM_TerminalCanvas::font_style() const
 
 void VNM_TerminalCanvas::set_font_style(const QString& font_style)
 {
-    if (m_font_style == font_style) {
-        return;
-    }
-    m_font_style = font_style;
-    emit font_style_changed();
-    refresh_render_state();
+    VNM_SET_CANVAS_APPEARANCE_PROPERTY(m_font_style, font_style, font_style_changed);
 }
 
 int VNM_TerminalCanvas::font_weight() const
@@ -464,12 +435,7 @@ int VNM_TerminalCanvas::font_weight() const
 void VNM_TerminalCanvas::set_font_weight(int font_weight)
 {
     const int normalized = std::clamp(font_weight, 1, 1000);
-    if (m_font_weight == normalized) {
-        return;
-    }
-    m_font_weight = normalized;
-    emit font_weight_changed();
-    refresh_render_state();
+    VNM_SET_CANVAS_APPEARANCE_PROPERTY(m_font_weight, normalized, font_weight_changed);
 }
 
 bool VNM_TerminalCanvas::font_italic() const
@@ -479,12 +445,7 @@ bool VNM_TerminalCanvas::font_italic() const
 
 void VNM_TerminalCanvas::set_font_italic(bool font_italic)
 {
-    if (m_font_italic == font_italic) {
-        return;
-    }
-    m_font_italic = font_italic;
-    emit font_italic_changed();
-    refresh_render_state();
+    VNM_SET_CANVAS_APPEARANCE_PROPERTY(m_font_italic, font_italic, font_italic_changed);
 }
 
 qreal VNM_TerminalCanvas::font_size() const
@@ -512,13 +473,12 @@ bool VNM_TerminalCanvas::authoritative_cell_metrics_enabled() const
 
 void VNM_TerminalCanvas::set_authoritative_cell_metrics_enabled(bool enabled)
 {
-    if (m_authoritative_cell_metrics_enabled == enabled) {
-        return;
-    }
-    m_authoritative_cell_metrics_enabled = enabled;
-    emit authoritative_cell_metrics_enabled_changed();
-    refresh_render_state();
+    VNM_SET_CANVAS_APPEARANCE_PROPERTY(
+        m_authoritative_cell_metrics_enabled, enabled,
+        authoritative_cell_metrics_enabled_changed);
 }
+
+#undef VNM_SET_CANVAS_APPEARANCE_PROPERTY
 
 int VNM_TerminalCanvas::rows() const
 {
@@ -802,8 +762,8 @@ void VNM_TerminalCanvas::refresh_render_state()
     const qreal previous_ratio = m_private->device_pixel_ratio;
     const qreal previous_logical_dpi = m_private->logical_dpi;
     const QFont previous_font  = m_private->render_font;
-    m_private->device_pixel_ratio = device_pixel_ratio(window());
-    m_private->logical_dpi = logical_dpi(window());
+    m_private->device_pixel_ratio = term::window_device_pixel_ratio(window());
+    m_private->logical_dpi = term::window_logical_dpi(window());
     const qreal effective_font_size =
         vnm_terminal::effective_font_size_for_font(
             m_font_family,

@@ -1628,44 +1628,24 @@ bool Terminal_byte_stream_parser::should_buffer_incomplete_utf8(
     QByteArrayView bytes,
     qsizetype      offset) const
 {
-    const unsigned char first     = byte_at(bytes, offset);
-    const qsizetype     remaining = bytes.size() - offset;
-
-    if (first >= 0xc2U && first <= 0xdfU) {
-        return remaining < 2;
+    Terminal_utf8_scan_state utf8_state;
+    if (!utf8_scan_start_sequence(byte_at(bytes, offset), utf8_state)) {
+        return false;
     }
 
-    if (first >= 0xe0U && first <= 0xefU) {
-        if (remaining == 1) {
-            return true;
-        }
-        const unsigned char second = byte_at(bytes, offset + 1);
-        if (!is_utf8_continuation_byte(second) ||
-            (first == 0xe0U && second < 0xa0U) ||
-            (first == 0xedU && second >= 0xa0U))
-        {
+    // Buffer a valid prefix of the first scalar; malformed bytes end it.
+    for (qsizetype next = offset + 1;
+        utf8_state.continuation_remaining > 0 && next < bytes.size();
+        ++next)
+    {
+        const unsigned char byte = byte_at(bytes, next);
+        if (byte < utf8_state.next_minimum || byte > utf8_state.next_maximum) {
             return false;
         }
-        return remaining < 3;
+        utf8_scan_consumes_byte(byte, utf8_state);
     }
 
-    if (first >= 0xf0U && first <= 0xf4U) {
-        if (remaining == 1) {
-            return true;
-        }
-        const unsigned char second = byte_at(bytes, offset + 1);
-        if (!is_utf8_continuation_byte(second) ||
-            (first == 0xf0U && second < 0x90U) ||
-            (first == 0xf4U && second > 0x8fU))
-        {
-            return false;
-        }
-        if (remaining == 2)                                         { return true;  }
-        if (!is_utf8_continuation_byte(byte_at(bytes, offset + 2))) { return false; }
-        return remaining < 4;
-    }
-
-    return false;
+    return utf8_state.continuation_remaining > 0;
 }
 
 void Terminal_byte_stream_parser::emit_unsupported_control(

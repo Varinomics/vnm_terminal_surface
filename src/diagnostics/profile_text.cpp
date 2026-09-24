@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <initializer_list>
+#include <utility>
 
 namespace vnm_terminal::diagnostics {
 
@@ -49,6 +51,17 @@ void append_profile_counter(
     std::uint64_t              value)
 {
     stream << "  " << name << '=' << static_cast<qulonglong>(value) << '\n';
+}
+
+using profile_counter_t = std::pair<const char*, std::uint64_t>;
+
+void append_profile_counters(
+    QTextStream&                            stream,
+    std::initializer_list<profile_counter_t> counters)
+{
+    for (const auto& [name, value] : counters) {
+        append_profile_counter(stream, name, value);
+    }
 }
 
 void append_profile_bool(
@@ -95,54 +108,25 @@ void append_dirty_row_stats_section(
 {
     stream << "dirty_rows\n";
     stream << "  enabled=" << (stats.enabled ? "true" : "false") << '\n';
-    append_profile_counter(stream, "mark_requests", stats.mark_requests);
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "duplicate_mark_requests",
-        stats.duplicate_mark_requests);
-    append_profile_counter(
-        stream,
-        "out_of_bounds_mark_requests",
-        stats.out_of_bounds_mark_requests);
-    append_profile_counter(
-        stream,
-        "unique_pending_row_marks",
-        stats.unique_pending_row_marks);
-    append_profile_counter(stream, "mark_all_dirty_calls", stats.mark_all_dirty_calls);
-    append_profile_counter(
-        stream,
-        "dirty_rows_snapshot_calls",
-        stats.dirty_rows_snapshot_calls);
-    append_profile_counter(
-        stream,
-        "dirty_rows_snapshot_rows",
-        stats.dirty_rows_snapshot_rows);
-    append_profile_counter(
-        stream,
-        "collect_synchronized_calls",
-        stats.collect_synchronized_calls);
-    append_profile_counter(
-        stream,
-        "collect_synchronized_rows",
-        stats.collect_synchronized_rows);
-    append_profile_counter(stream, "publish_pending_calls", stats.publish_pending_calls);
-    append_profile_counter(stream, "published_unique_rows", stats.published_unique_rows);
-    append_profile_counter(
-        stream,
-        "release_synchronized_calls",
-        stats.release_synchronized_calls);
-    append_profile_counter(
-        stream,
-        "released_synchronized_rows",
-        stats.released_synchronized_rows);
-    append_profile_counter(
-        stream,
-        "max_pending_dirty_rows",
-        stats.max_pending_dirty_rows);
-    append_profile_counter(
-        stream,
-        "max_synchronized_dirty_rows",
-        stats.max_synchronized_dirty_rows);
+        {
+            {"mark_requests", stats.mark_requests},
+            {"duplicate_mark_requests", stats.duplicate_mark_requests},
+            {"out_of_bounds_mark_requests", stats.out_of_bounds_mark_requests},
+            {"unique_pending_row_marks", stats.unique_pending_row_marks},
+            {"mark_all_dirty_calls", stats.mark_all_dirty_calls},
+            {"dirty_rows_snapshot_calls", stats.dirty_rows_snapshot_calls},
+            {"dirty_rows_snapshot_rows", stats.dirty_rows_snapshot_rows},
+            {"collect_synchronized_calls", stats.collect_synchronized_calls},
+            {"collect_synchronized_rows", stats.collect_synchronized_rows},
+            {"publish_pending_calls", stats.publish_pending_calls},
+            {"published_unique_rows", stats.published_unique_rows},
+            {"release_synchronized_calls", stats.release_synchronized_calls},
+            {"released_synchronized_rows", stats.released_synchronized_rows},
+            {"max_pending_dirty_rows", stats.max_pending_dirty_rows},
+            {"max_synchronized_dirty_rows", stats.max_synchronized_dirty_rows},
+        });
 }
 
 bool dirty_row_bucket_has_activity(
@@ -214,140 +198,66 @@ void append_model_profile_stats_section(
 {
     stream << "model_profile_stats\n";
     stream << "  enabled=" << (stats.enabled ? "true" : "false") << '\n';
-    append_profile_counter(stream, "print_text_calls", stats.print_text_calls);
-    append_profile_counter(stream, "printable_ascii_span_calls", stats.printable_ascii_span_calls);
-    append_profile_counter(stream, "printable_ascii_span_characters", stats.printable_ascii_span_characters);
-    append_profile_counter(stream, "printable_ascii_cells_written", stats.printable_ascii_cells_written);
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "max_printable_ascii_span_characters",
-        stats.max_printable_ascii_span_characters);
-    append_profile_counter(
-        stream,
-        "printable_ascii_local_cells_inspected",
-        stats.printable_ascii_local_cells_inspected);
-    append_profile_counter(
-        stream,
-        "scalar_span_local_cells_inspected",
-        stats.scalar_span_local_cells_inspected);
-    append_profile_counter(stream, "erase_row_range_calls", stats.erase_row_range_calls);
-    append_profile_counter(stream, "erase_row_cells_visited", stats.erase_row_cells_visited);
-    append_profile_counter(stream, "erase_row_cells_replaced", stats.erase_row_cells_replaced);
-    append_profile_counter(
-        stream,
-        "erase_row_cells_already_erased",
-        stats.erase_row_cells_already_erased);
-    append_profile_counter(stream, "erase_row_wide_span_cells", stats.erase_row_wide_span_cells);
-    append_profile_counter(
-        stream,
-        "row_content_generation_comparisons",
-        stats.row_content_generation_comparisons);
-    append_profile_counter(
-        stream,
-        "row_content_generation_comparison_cells",
-        stats.row_content_generation_comparison_cells);
-    append_profile_counter(stream, "row_content_generation_advances", stats.row_content_generation_advances);
-    append_profile_counter(
-        stream,
-        "wide_boundary_repairs_from_text_writes",
-        stats.wide_boundary_repairs_from_text_writes);
-    append_profile_counter(stream, "dirty_marks_from_text_writes", stats.dirty_marks_from_text_writes);
-    append_profile_counter(stream, "line_wraps_from_text_writes", stats.line_wraps_from_text_writes);
-    append_profile_counter(
-        stream,
-        "scrollback_appends_from_text_writes",
-        stats.scrollback_appends_from_text_writes);
-    append_profile_counter(stream, "render_snapshot_requests", stats.render_snapshot_requests);
-    append_profile_counter(stream, "render_snapshots_constructed", stats.render_snapshots_constructed);
-    append_profile_counter(stream, "render_snapshot_rows_visited", stats.render_snapshot_rows_visited);
-    append_profile_counter(
-        stream,
-        "render_snapshot_rows_materialized",
-        stats.render_snapshot_rows_materialized);
-    append_profile_counter(stream, "render_snapshot_rows_borrowed", stats.render_snapshot_rows_borrowed);
-    append_profile_counter(stream, "render_snapshot_rows_owned", stats.render_snapshot_rows_owned);
-    append_profile_counter(
-        stream,
-        "render_snapshot_rows_built_from_model_storage",
-        stats.render_snapshot_rows_built_from_model_storage);
-    append_profile_counter(
-        stream,
-        "render_snapshot_model_row_accessor_borrows",
-        stats.render_snapshot_model_row_accessor_borrows);
-    append_profile_counter(stream, "render_snapshot_cells_scanned", stats.render_snapshot_cells_scanned);
-    append_profile_counter(stream, "render_snapshot_cells_emitted", stats.render_snapshot_cells_emitted);
-    append_profile_counter(
-        stream,
-        "render_snapshot_compact_empty_text_cells",
-        stats.render_snapshot_compact_empty_text_cells);
-    append_profile_counter(
-        stream,
-        "render_snapshot_compact_ascii_text_cells",
-        stats.render_snapshot_compact_ascii_text_cells);
-    append_profile_counter(
-        stream,
-        "render_snapshot_inline_single_bmp_text_cells",
-        stats.render_snapshot_inline_single_bmp_text_cells);
-    append_profile_counter(
-        stream,
-        "render_snapshot_fallback_qstring_copies",
-        stats.render_snapshot_fallback_qstring_copies);
-    append_profile_counter(
-        stream,
-        "render_snapshot_fallback_text_code_units_copied",
-        stats.render_snapshot_fallback_text_code_units_copied);
-    append_profile_counter(
-        stream,
-        "render_snapshot_fallback_printable_ascii_copies",
-        stats.render_snapshot_fallback_printable_ascii_copies);
-    append_profile_counter(
-        stream,
-        "render_snapshot_fallback_other_ascii_copies",
-        stats.render_snapshot_fallback_other_ascii_copies);
-    append_profile_counter(
-        stream,
-        "render_snapshot_fallback_single_non_ascii_copies",
-        stats.render_snapshot_fallback_single_non_ascii_copies);
-    append_profile_counter(
-        stream,
-        "render_snapshot_fallback_multi_text_copies",
-        stats.render_snapshot_fallback_multi_text_copies);
-    append_profile_counter(
-        stream,
-        "render_snapshot_unoccupied_cells_skipped",
-        stats.render_snapshot_unoccupied_cells_skipped);
-    append_profile_counter(
-        stream,
-        "render_snapshot_dirty_rows_requested",
-        stats.render_snapshot_dirty_rows_requested);
-    append_profile_counter(
-        stream,
-        "render_snapshot_dirty_rows_visible",
-        stats.render_snapshot_dirty_rows_visible);
-    append_profile_counter(
-        stream,
-        "render_snapshot_full_repaint_fallbacks",
-        stats.render_snapshot_full_repaint_fallbacks);
-    append_profile_counter(
-        stream,
-        "render_snapshot_viewport_fallbacks",
-        stats.render_snapshot_viewport_fallbacks);
-    append_profile_counter(
-        stream,
-        "render_snapshot_zero_dirty_publications",
-        stats.render_snapshot_zero_dirty_publications);
-    append_profile_counter(
-        stream,
-        "max_render_snapshot_rows_visited",
-        stats.max_render_snapshot_rows_visited);
-    append_profile_counter(
-        stream,
-        "max_render_snapshot_cells_emitted",
-        stats.max_render_snapshot_cells_emitted);
-    append_profile_counter(
-        stream,
-        "max_render_snapshot_fallback_text_units_per_cell",
-        stats.max_render_snapshot_fallback_text_units_per_cell);
+        {
+            {"print_text_calls", stats.print_text_calls},
+            {"printable_ascii_span_calls", stats.printable_ascii_span_calls},
+            {"printable_ascii_span_characters", stats.printable_ascii_span_characters},
+            {"printable_ascii_cells_written", stats.printable_ascii_cells_written},
+            {"max_printable_ascii_span_characters", stats.max_printable_ascii_span_characters},
+            {"printable_ascii_local_cells_inspected", stats.printable_ascii_local_cells_inspected},
+            {"scalar_span_local_cells_inspected", stats.scalar_span_local_cells_inspected},
+            {"erase_row_range_calls", stats.erase_row_range_calls},
+            {"erase_row_cells_visited", stats.erase_row_cells_visited},
+            {"erase_row_cells_replaced", stats.erase_row_cells_replaced},
+            {"erase_row_cells_already_erased", stats.erase_row_cells_already_erased},
+            {"erase_row_wide_span_cells", stats.erase_row_wide_span_cells},
+            {"row_content_generation_comparisons", stats.row_content_generation_comparisons},
+            {"row_content_generation_comparison_cells", stats.row_content_generation_comparison_cells},
+            {"row_content_generation_advances", stats.row_content_generation_advances},
+            {"wide_boundary_repairs_from_text_writes", stats.wide_boundary_repairs_from_text_writes},
+            {"dirty_marks_from_text_writes", stats.dirty_marks_from_text_writes},
+            {"line_wraps_from_text_writes", stats.line_wraps_from_text_writes},
+            {"scrollback_appends_from_text_writes", stats.scrollback_appends_from_text_writes},
+            {"render_snapshot_requests", stats.render_snapshot_requests},
+            {"render_snapshots_constructed", stats.render_snapshots_constructed},
+            {"render_snapshot_rows_visited", stats.render_snapshot_rows_visited},
+            {"render_snapshot_rows_materialized", stats.render_snapshot_rows_materialized},
+            {"render_snapshot_rows_borrowed", stats.render_snapshot_rows_borrowed},
+            {"render_snapshot_rows_owned", stats.render_snapshot_rows_owned},
+            {"render_snapshot_rows_built_from_model_storage",
+             stats.render_snapshot_rows_built_from_model_storage},
+            {"render_snapshot_model_row_accessor_borrows",
+             stats.render_snapshot_model_row_accessor_borrows},
+            {"render_snapshot_cells_scanned", stats.render_snapshot_cells_scanned},
+            {"render_snapshot_cells_emitted", stats.render_snapshot_cells_emitted},
+            {"render_snapshot_compact_empty_text_cells", stats.render_snapshot_compact_empty_text_cells},
+            {"render_snapshot_compact_ascii_text_cells", stats.render_snapshot_compact_ascii_text_cells},
+            {"render_snapshot_inline_single_bmp_text_cells",
+             stats.render_snapshot_inline_single_bmp_text_cells},
+            {"render_snapshot_fallback_qstring_copies", stats.render_snapshot_fallback_qstring_copies},
+            {"render_snapshot_fallback_text_code_units_copied",
+             stats.render_snapshot_fallback_text_code_units_copied},
+            {"render_snapshot_fallback_printable_ascii_copies",
+             stats.render_snapshot_fallback_printable_ascii_copies},
+            {"render_snapshot_fallback_other_ascii_copies",
+             stats.render_snapshot_fallback_other_ascii_copies},
+            {"render_snapshot_fallback_single_non_ascii_copies",
+             stats.render_snapshot_fallback_single_non_ascii_copies},
+            {"render_snapshot_fallback_multi_text_copies",
+             stats.render_snapshot_fallback_multi_text_copies},
+            {"render_snapshot_unoccupied_cells_skipped", stats.render_snapshot_unoccupied_cells_skipped},
+            {"render_snapshot_dirty_rows_requested", stats.render_snapshot_dirty_rows_requested},
+            {"render_snapshot_dirty_rows_visible", stats.render_snapshot_dirty_rows_visible},
+            {"render_snapshot_full_repaint_fallbacks", stats.render_snapshot_full_repaint_fallbacks},
+            {"render_snapshot_viewport_fallbacks", stats.render_snapshot_viewport_fallbacks},
+            {"render_snapshot_zero_dirty_publications", stats.render_snapshot_zero_dirty_publications},
+            {"max_render_snapshot_rows_visited", stats.max_render_snapshot_rows_visited},
+            {"max_render_snapshot_cells_emitted", stats.max_render_snapshot_cells_emitted},
+            {"max_render_snapshot_fallback_text_units_per_cell",
+             stats.max_render_snapshot_fallback_text_units_per_cell},
+        });
 }
 
 void append_retained_history_profile_section(
@@ -375,67 +285,45 @@ void append_session_profile_stats_section(
 {
     stream << "session_profile_stats\n";
     stream << "  enabled=" << (stats.enabled ? "true" : "false") << '\n';
-    append_profile_counter(stream, "render_snapshot_requests", stats.render_snapshot_requests);
-    append_profile_counter(stream, "render_snapshots_constructed", stats.render_snapshots_constructed);
-    append_profile_counter(stream, "render_snapshot_publications", stats.render_snapshot_publications);
-    append_profile_counter(stream, "full_snapshot_publications", stats.full_snapshot_publications);
-    append_profile_counter(stream, "content_snapshot_publications", stats.content_snapshot_publications);
-    append_profile_counter(stream, "selection_snapshot_publications", stats.selection_snapshot_publications);
-    append_profile_counter(stream, "geometry_snapshot_publications", stats.geometry_snapshot_publications);
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "public_projection_scroll_requests",
-        stats.public_projection_scroll_requests);
-    append_profile_counter(
-        stream,
-        "public_projection_scroll_publications",
-        stats.public_projection_scroll_publications);
-    append_profile_counter(stream, "dirty_coalescing_attempts", stats.dirty_coalescing_attempts);
-    append_profile_counter(stream, "dirty_coalescing_applied", stats.dirty_coalescing_applied);
-    append_profile_counter(stream, "zero_dirty_snapshot_publications", stats.zero_dirty_snapshot_publications);
-    append_profile_counter(
-        stream,
-        "snapshots_superseded_before_render",
-        stats.snapshots_superseded_before_render);
-    append_profile_counter(stream, "snapshots_marked_rendered", stats.snapshots_marked_rendered);
-    append_profile_counter(stream, "snapshots_consumed_by_bridge", stats.snapshots_consumed_by_bridge);
-    append_profile_counter(
-        stream,
-        "max_unrendered_snapshot_generations",
-        stats.max_unrendered_snapshot_generations);
+        {
+            {"render_snapshot_requests", stats.render_snapshot_requests},
+            {"render_snapshots_constructed", stats.render_snapshots_constructed},
+            {"render_snapshot_publications", stats.render_snapshot_publications},
+            {"full_snapshot_publications", stats.full_snapshot_publications},
+            {"content_snapshot_publications", stats.content_snapshot_publications},
+            {"selection_snapshot_publications", stats.selection_snapshot_publications},
+            {"geometry_snapshot_publications", stats.geometry_snapshot_publications},
+            {"public_projection_scroll_requests", stats.public_projection_scroll_requests},
+            {"public_projection_scroll_publications", stats.public_projection_scroll_publications},
+            {"dirty_coalescing_attempts", stats.dirty_coalescing_attempts},
+            {"dirty_coalescing_applied", stats.dirty_coalescing_applied},
+            {"zero_dirty_snapshot_publications", stats.zero_dirty_snapshot_publications},
+            {"snapshots_superseded_before_render", stats.snapshots_superseded_before_render},
+            {"snapshots_marked_rendered", stats.snapshots_marked_rendered},
+            {"snapshots_consumed_by_bridge", stats.snapshots_consumed_by_bridge},
+            {"max_unrendered_snapshot_generations", stats.max_unrendered_snapshot_generations},
+        });
     stream << "  consumer_materialization_counters_available=true\n";
     stream << "  consumer_materialization_counters_schema_semantics="
         << "geometry_derived_snapshot_materialization_counters\n";
     stream << "  consumer_materialization_counters_owner_semantics="
         << "terminal_session_profile_stats\n";
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "consumer_materialization_counters_geometry_derived_snapshot_calls",
-        stats.geometry_derived_materialization_calls);
-    append_profile_counter(
-        stream,
-        "consumer_materialization_counters_geometry_derived_snapshot_rows",
-        stats.geometry_derived_materialization_rows);
-    append_profile_counter(
-        stream,
-        "consumer_materialization_counters_geometry_derived_snapshot_cells",
-        stats.geometry_derived_materialization_cells);
-    append_profile_counter(
-        stream,
-        "retained_snapshot_payload_bytes",
-        stats.retained_snapshot_payload_bytes);
-    append_profile_counter(
-        stream,
-        "retained_snapshot_generation_count",
-        stats.retained_snapshot_generation_count);
-    append_profile_counter(
-        stream,
-        "max_retained_snapshot_payload_bytes",
-        stats.max_retained_snapshot_payload_bytes);
-    append_profile_counter(
-        stream,
-        "max_retained_snapshot_generation_count",
-        stats.max_retained_snapshot_generation_count);
+        {
+            {"consumer_materialization_counters_geometry_derived_snapshot_calls",
+             stats.geometry_derived_materialization_calls},
+            {"consumer_materialization_counters_geometry_derived_snapshot_rows",
+             stats.geometry_derived_materialization_rows},
+            {"consumer_materialization_counters_geometry_derived_snapshot_cells",
+             stats.geometry_derived_materialization_cells},
+            {"retained_snapshot_payload_bytes", stats.retained_snapshot_payload_bytes},
+            {"retained_snapshot_generation_count", stats.retained_snapshot_generation_count},
+            {"max_retained_snapshot_payload_bytes", stats.max_retained_snapshot_payload_bytes},
+            {"max_retained_snapshot_generation_count", stats.max_retained_snapshot_generation_count},
+        });
 }
 
 void append_slow_text_layout_diagnostics_section(
@@ -578,35 +466,27 @@ void append_qsg_atlas_profile_section(
     detail::emit_metrics_text(
         stream, warm_lazy, detail::atlas_warm_lazy_metrics_after_lazy_elapsed());
     stream << "  placement\n";
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "snapped_origin_failures",
-        static_cast<std::uint64_t>(report.frame_build.snapped_origin_failures));
-    append_profile_counter(
-        stream,
-        "frame_row_descriptors",
-        static_cast<std::uint64_t>(report.frame_build.frame_row_descriptors));
-    append_profile_counter(
-        stream,
-        "frame_layer_descriptors",
-        static_cast<std::uint64_t>(report.frame_build.frame_layer_descriptors));
-    append_profile_counter(
-        stream,
-        "qsg_layer_descriptors",
-        static_cast<std::uint64_t>(report.frame_build.qsg_layer_descriptors));
+        {
+            {"snapped_origin_failures",
+             static_cast<std::uint64_t>(report.frame_build.snapped_origin_failures)},
+            {"frame_row_descriptors", static_cast<std::uint64_t>(report.frame_build.frame_row_descriptors)},
+            {"frame_layer_descriptors",
+             static_cast<std::uint64_t>(report.frame_build.frame_layer_descriptors)},
+            {"qsg_layer_descriptors", static_cast<std::uint64_t>(report.frame_build.qsg_layer_descriptors)},
+        });
     stream << "  misses\n";
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "glyph_missed_instances",
-        static_cast<std::uint64_t>(report.frame_build.glyph_missed_instances));
-    append_profile_counter(
-        stream,
-        "glyph_coverage_failures",
-        static_cast<std::uint64_t>(report.frame_build.glyph_coverage_failures));
-    append_profile_counter(
-        stream,
-        "glyph_atlas_insert_failures",
-        static_cast<std::uint64_t>(report.frame_build.glyph_atlas_insert_failures));
+        {
+            {"glyph_missed_instances",
+             static_cast<std::uint64_t>(report.frame_build.glyph_missed_instances)},
+            {"glyph_coverage_failures",
+             static_cast<std::uint64_t>(report.frame_build.glyph_coverage_failures)},
+            {"glyph_atlas_insert_failures",
+             static_cast<std::uint64_t>(report.frame_build.glyph_atlas_insert_failures)},
+        });
     if (report.frame_build.first_glyph_miss.valid) {
         const term::Qsg_atlas_glyph_miss_diagnostic& miss =
             report.frame_build.first_glyph_miss;
@@ -632,81 +512,48 @@ void append_qsg_atlas_profile_section(
         stream << "  fallback_face_id="
             << profile_string_literal(miss.image.fallback_face_id)
             << '\n';
-        append_profile_counter(
+        append_profile_counters(
             stream,
-            "source_format",
-            static_cast<std::uint64_t>(miss.image.source_format));
-        append_profile_counter(
-            stream,
-            "source_string_start",
-            static_cast<std::uint64_t>(miss.image.source_string_start));
-        append_profile_counter(
-            stream,
-            "source_string_end",
-            static_cast<std::uint64_t>(miss.image.source_string_end));
-        append_profile_counter(
-            stream,
-            "atlas_page_count",
-            static_cast<std::uint64_t>(miss.atlas_page_count));
-        append_profile_counter(
-            stream,
-            "atlas_page_budget",
-            static_cast<std::uint64_t>(miss.atlas_page_budget));
+            {
+                {"source_format", static_cast<std::uint64_t>(miss.image.source_format)},
+                {"source_string_start", static_cast<std::uint64_t>(miss.image.source_string_start)},
+                {"source_string_end", static_cast<std::uint64_t>(miss.image.source_string_end)},
+                {"atlas_page_count", static_cast<std::uint64_t>(miss.atlas_page_count)},
+                {"atlas_page_budget", static_cast<std::uint64_t>(miss.atlas_page_budget)},
+            });
     }
     stream << "  coverage\n";
     detail::emit_metrics_text(stream, coverage, detail::glyph_coverage_metrics());
     stream << "  buffer_upload\n";
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "atlas_page_budget",
-        report.render.atlas_page_budget);
-    append_profile_counter(
-        stream,
-        "atlas_budget_bytes",
-        report.render.atlas_budget_bytes);
-    append_profile_counter(stream, "atlas_used_bytes", report.render.atlas_used_bytes);
-    append_profile_counter(
-        stream,
-        "atlas_failed_inserts",
-        report.render.atlas_failed_inserts);
-    append_profile_counter(
-        stream,
-        "shaped_text_runs",
-        static_cast<std::uint64_t>(report.render.shaped_text_runs));
-    append_profile_counter(
-        stream,
-        "shaped_glyph_records",
-        static_cast<std::uint64_t>(report.render.shaped_glyph_records));
-    append_profile_counter(
-        stream,
-        "shaped_missing_string_indexes",
-        static_cast<std::uint64_t>(
-            report.render.shaped_missing_string_indexes));
-    append_profile_counter(
-        stream,
-        "shaped_invalid_string_indexes",
-        static_cast<std::uint64_t>(
-            report.render.shaped_invalid_string_indexes));
+        {
+            {"atlas_page_budget", report.render.atlas_page_budget},
+            {"atlas_budget_bytes", report.render.atlas_budget_bytes},
+            {"atlas_used_bytes", report.render.atlas_used_bytes},
+            {"atlas_failed_inserts", report.render.atlas_failed_inserts},
+            {"shaped_text_runs", static_cast<std::uint64_t>(report.render.shaped_text_runs)},
+            {"shaped_glyph_records", static_cast<std::uint64_t>(report.render.shaped_glyph_records)},
+            {"shaped_missing_string_indexes", static_cast<std::uint64_t>(
+                report.render.shaped_missing_string_indexes)},
+            {"shaped_invalid_string_indexes", static_cast<std::uint64_t>(
+                report.render.shaped_invalid_string_indexes)},
+        });
     append_profile_bool(
         stream,
         "atlas_page_pressure",
         report.render.atlas_page_pressure);
     stream << "  render\n";
-    append_profile_counter(stream, "draw_calls", report.render.draw_calls);
-    append_profile_counter(stream, "rect_draw_calls", report.render.rect_draw_calls);
-    append_profile_counter(stream, "glyph_draw_calls", report.render.glyph_draw_calls);
-    append_profile_counter(
+    append_profile_counters(
         stream,
-        "rect_row_capacity",
-        static_cast<std::uint64_t>(report.render.rect_row_capacity));
-    append_profile_counter(
-        stream,
-        "rect_buffer_uploaded_bytes",
-        report.render.rect_buffer.uploaded_bytes);
-    append_profile_counter(
-        stream,
-        "glyph_buffer_uploaded_bytes",
-        report.render.glyph_buffer.uploaded_bytes);
+        {
+            {"draw_calls", report.render.draw_calls},
+            {"rect_draw_calls", report.render.rect_draw_calls},
+            {"glyph_draw_calls", report.render.glyph_draw_calls},
+            {"rect_row_capacity", static_cast<std::uint64_t>(report.render.rect_row_capacity)},
+            {"rect_buffer_uploaded_bytes", report.render.rect_buffer.uploaded_bytes},
+            {"glyph_buffer_uploaded_bytes", report.render.glyph_buffer.uploaded_bytes},
+        });
     stream << "  capabilities\n";
     detail::emit_metrics_text(stream, report.render, detail::atlas_capabilities_metrics());
 }

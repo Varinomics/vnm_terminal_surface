@@ -8,6 +8,7 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
+#include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
@@ -590,29 +591,6 @@ const term::Terminal_color_scheme& resolve_surface_color_scheme(
     const term::Terminal_color_scheme* scheme =
         term::find_color_scheme(surface.color_scheme());
     return scheme != nullptr ? *scheme : term::default_color_scheme();
-}
-
-qreal current_device_pixel_ratio(const QQuickWindow* window)
-{
-    if (window == nullptr) {
-        return 1.0;
-    }
-
-    const qreal device_pixel_ratio = window->effectiveDevicePixelRatio();
-    if (!std::isfinite(device_pixel_ratio) || device_pixel_ratio <= 0.0) {
-        return 1.0;
-    }
-
-    return device_pixel_ratio;
-}
-
-qreal current_logical_dpi(const QQuickWindow* window)
-{
-    const QScreen* const screen = window != nullptr ? window->screen() : nullptr;
-    return term::normalized_logical_dpi(
-        screen != nullptr
-            ? screen->logicalDotsPerInch()
-            : term::k_vnm_terminal_default_logical_dpi);
 }
 
 std::unique_ptr<term::Terminal_backend> make_native_backend()
@@ -5055,115 +5033,7 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
     int     line_delta,
     QString source)
 {
-    Q_ASSERT(thread() == QThread::currentThread());
-
-    wheel_scroll_diagnostic_result_t diagnostic;
-    diagnostic.session_present = m_private->session != nullptr;
-    if (line_delta == 0) {
-        diagnostic.no_op_cause = Scroll_noop_cause::ZERO_LINE_DELTA;
-        return diagnostic;
-    }
-
-    if (!diagnostic.session_present) {
-        diagnostic.no_op_cause = Scroll_noop_cause::NO_SESSION;
-        return diagnostic;
-    }
-
-    diagnostic.render_publication_blocked =
-        m_private->session->render_publication_blocked();
-    diagnostic.published_synchronized_output =
-        m_private->render_snapshot != nullptr &&
-        m_private->render_snapshot->modes.synchronized_output;
-
-    const term::Terminal_viewport_state viewport_before =
-        m_private->render_snapshot != nullptr
-            ? m_private->render_snapshot->viewport
-            : m_private->session->viewport_state();
-    diagnostic.alternate_screen =
-        viewport_before.active_buffer == term::Terminal_buffer_id::ALTERNATE;
-    if (source.isEmpty()) {
-        source = QStringLiteral("api.lines");
-    }
-    record_surface_scroll_intent_transcript(
-        m_private->transcript_recorder,
-        source,
-        line_delta,
-        std::nullopt,
-        viewport_before);
-    diagnostic.local_scroll_intent_recorded = true;
-    term::Terminal_session* const route_session = m_private->session.get();
-    const std::uint64_t route_session_generation = m_private->session_generation;
-    const term::Terminal_viewport_scroll_result scroll_result =
-        route_session->scroll_published_viewport_lines(line_delta);
-    diagnostic.scroll_action = public_scroll_action(scroll_result.action);
-    diagnostic.applied_line_delta = scroll_result.applied_line_delta;
-    sync_from_session();
-    if (!m_private->active_session_matches(route_session, route_session_generation)) {
-        return diagnostic;
-    }
-    diagnostic.local_scroll_applied =
-        scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
-    diagnostic.deferred_intent_recorded =
-        scroll_result.action ==
-            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
-    diagnostic.event_accepted =
-        diagnostic.local_scroll_applied || diagnostic.deferred_intent_recorded;
-
-    if (diagnostic.event_accepted)
-    {
-        const term::Terminal_viewport_state viewport_after =
-            m_private->render_snapshot != nullptr
-                ? m_private->render_snapshot->viewport
-                : m_private->session->viewport_state();
-        const bool render_publication_blocked_after_scroll =
-            m_private->session->render_publication_blocked();
-        const bool public_projection_scroll_visible =
-            render_publication_blocked_after_scroll &&
-            m_private->render_snapshot != nullptr &&
-            m_private->render_snapshot->basis ==
-                term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
-            m_private->render_snapshot->purpose ==
-                term::Terminal_render_snapshot_purpose::SCROLL &&
-            m_private->render_snapshot->public_scroll_diagnostics.visible_scroll_applied;
-        diagnostic.visible_scroll_applied =
-            diagnostic.local_scroll_applied &&
-            (!render_publication_blocked_after_scroll || public_projection_scroll_visible);
-        record_surface_scroll_transcript(
-            m_private->transcript_recorder,
-            source,
-            line_delta,
-            std::nullopt,
-            scroll_result,
-            viewport_before,
-            viewport_after);
-        if (diagnostic.visible_scroll_applied &&
-            !m_private->shutting_down.load())
-        {
-            emit viewport_interaction_applied();
-        }
-        return diagnostic;
-    }
-
-    if (diagnostic.render_publication_blocked) {
-        diagnostic.no_op_cause = Scroll_noop_cause::SYNCHRONIZED_OUTPUT_DEFERRED;
-    }
-    else
-    if (diagnostic.published_synchronized_output) {
-        diagnostic.no_op_cause = Scroll_noop_cause::SYNCHRONIZED_OUTPUT_PUBLISHED;
-    }
-    else
-    if (diagnostic.alternate_screen) {
-        diagnostic.no_op_cause = Scroll_noop_cause::ALTERNATE_SCREEN;
-    }
-    else
-    if (scroll_result.action == term::Terminal_viewport_scroll_action::AT_BOUNDARY) {
-        diagnostic.no_op_cause = Scroll_noop_cause::BOUNDARY_OR_CLAMP;
-    }
-    else {
-        diagnostic.no_op_cause = Scroll_noop_cause::NO_PUBLICATION;
-    }
-
-    return diagnostic;
+    return scroll_viewport_with_diagnostics(line_delta, std::nullopt, std::move(source));
 }
 
 bool VNM_TerminalSurface::scroll_to_offset_from_tail(int offset_from_tail)
@@ -5186,39 +5056,56 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     int     offset_from_tail,
     QString source)
 {
+    return scroll_viewport_with_diagnostics(0, offset_from_tail, std::move(source));
+}
+
+VNM_TerminalSurface::wheel_scroll_diagnostic_result_t
+VNM_TerminalSurface::scroll_viewport_with_diagnostics(
+    int              line_delta,
+    std::optional<int> offset_from_tail,
+    QString          source)
+{
     Q_ASSERT(thread() == QThread::currentThread());
 
     wheel_scroll_diagnostic_result_t diagnostic;
-    diagnostic.session_present = m_private->session != nullptr;
-    if (m_private->session == nullptr) {
+    term::Terminal_session* const session = m_private->session.get();
+    diagnostic.session_present = session != nullptr;
+    if (!offset_from_tail.has_value() && line_delta == 0) {
+        diagnostic.no_op_cause = Scroll_noop_cause::ZERO_LINE_DELTA;
+        return diagnostic;
+    }
+    if (session == nullptr) {
         diagnostic.no_op_cause = Scroll_noop_cause::NO_SESSION;
         return diagnostic;
     }
 
     diagnostic.render_publication_blocked =
-        m_private->session->render_publication_blocked();
+        session->render_publication_blocked();
     diagnostic.published_synchronized_output =
         m_private->render_snapshot != nullptr &&
         m_private->render_snapshot->modes.synchronized_output;
     const term::Terminal_viewport_state viewport_before =
         m_private->render_snapshot != nullptr
             ? m_private->render_snapshot->viewport
-            : m_private->session->viewport_state();
+            : session->viewport_state();
     diagnostic.alternate_screen =
         viewport_before.active_buffer == term::Terminal_buffer_id::ALTERNATE;
     if (source.isEmpty()) {
-        source = QStringLiteral("api.offset");
+        source = offset_from_tail.has_value()
+            ? QStringLiteral("api.offset")
+            : QStringLiteral("api.lines");
     }
-    // The session clamps the offset itself, but this difference is taken here
-    // from the caller's raw value, and it is the one place on this path where
-    // that value still reaches int arithmetic: an offset near the bottom of the
-    // range against any scrolled-back viewport underflows, which is undefined
-    // rather than merely a wrong number in the transcript.
-    const int requested_line_delta = static_cast<int>(std::clamp<long long>(
-        static_cast<long long>(offset_from_tail) -
-            static_cast<long long>(viewport_before.offset_from_tail),
-        std::numeric_limits<int>::min(),
-        std::numeric_limits<int>::max()));
+    int requested_line_delta = line_delta;
+    if (offset_from_tail.has_value()) {
+        // The session clamps the offset itself, while the transcript preserves
+        // the caller's raw request. Keep the intermediate wide enough for the
+        // full difference between two int values.
+        requested_line_delta = static_cast<int>(std::clamp<long long>(
+            static_cast<long long>(*offset_from_tail) -
+                static_cast<long long>(viewport_before.offset_from_tail),
+            std::numeric_limits<int>::min(),
+            std::numeric_limits<int>::max()));
+    }
     record_surface_scroll_intent_transcript(
         m_private->transcript_recorder,
         source,
@@ -5229,8 +5116,9 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     term::Terminal_session* const route_session = m_private->session.get();
     const std::uint64_t route_session_generation = m_private->session_generation;
     const term::Terminal_viewport_scroll_result scroll_result =
-        route_session->scroll_published_viewport_to_offset_from_tail(
-            offset_from_tail);
+        offset_from_tail.has_value()
+            ? route_session->scroll_published_viewport_to_offset_from_tail(*offset_from_tail)
+            : route_session->scroll_published_viewport_lines(line_delta);
     diagnostic.scroll_action = public_scroll_action(scroll_result.action);
     diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
@@ -5243,9 +5131,7 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
         scroll_result.action ==
             term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
     diagnostic.event_accepted =
-        scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
-        scroll_result.action ==
-            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
+        diagnostic.local_scroll_applied || diagnostic.deferred_intent_recorded;
     if (diagnostic.event_accepted) {
         const term::Terminal_viewport_state viewport_after =
             m_private->render_snapshot != nullptr
@@ -7602,8 +7488,8 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
 
 void VNM_TerminalSurface::refresh_grid_metrics()
 {
-    m_private->render_device_pixel_ratio = current_device_pixel_ratio(window());
-    m_private->render_logical_dpi        = current_logical_dpi(window());
+    m_private->render_device_pixel_ratio = term::window_device_pixel_ratio(window());
+    m_private->render_logical_dpi        = term::window_logical_dpi(window());
     const qreal previous_effective_font_size = m_private->effective_font_size;
     m_private->effective_font_size = vnm_terminal::effective_font_size_for_font(
         m_font_family,
@@ -7676,8 +7562,8 @@ void VNM_TerminalSurface::refresh_grid_metrics()
 
 void VNM_TerminalSurface::refresh_grid_metrics_if_device_pixel_ratio_changed()
 {
-    const qreal device_pixel_ratio = current_device_pixel_ratio(window());
-    const qreal logical_dpi = current_logical_dpi(window());
+    const qreal device_pixel_ratio = term::window_device_pixel_ratio(window());
+    const qreal logical_dpi = term::window_logical_dpi(window());
     if (same_property_value(device_pixel_ratio, m_private->render_device_pixel_ratio) &&
         same_property_value(logical_dpi, m_private->render_logical_dpi))
     {
