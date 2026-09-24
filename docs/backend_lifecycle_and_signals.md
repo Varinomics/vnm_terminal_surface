@@ -280,11 +280,16 @@ callback queue and then wakes the owner.
   finish before any session member is destroyed. This quiesces backend threads
   against the session before teardown.
 
-Each public session operation drains the backend callback queue first, then
-assigns a sequence and processes its own command, so backend output, backend
-exit, backend errors, user input, parser replies, and resize are all applied in
-one ordered stream. Backend exit is recorded once; a second exit command is
-rejected as invalid state.
+Synchronous Surface input and geometry operations capture the callback enqueue
+epoch when the event enters the GUI thread. They apply callbacks through that
+fixed frontier before route decisions, then admit their input or resize command
+ahead of callbacks that arrived later. Direct session input and resize calls
+capture their own frontier. Resize policy setters capture before changing the
+policy, apply the new policy, and then process callbacks through the captured
+epoch; arbitration settlement retains its request-id and held-tail order.
+Later callbacks remain queued for a following event or an asynchronous drain.
+The session still records commands in one ordered stream. Backend exit is
+recorded once; a second exit command is rejected as invalid state.
 
 ### Final output drain after process exit
 

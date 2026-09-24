@@ -52,6 +52,14 @@ struct Windows_conpty_close_control_for_testing
     std::atomic_uint      observer_retirement_count{0};
 };
 
+// Holds an admitted native resize before it enters ConPTY. Releasing the gate
+// lets the same call reach the packaged ResizePseudoConsole implementation.
+struct Windows_conpty_resize_control_for_testing
+{
+    std::binary_semaphore resize_entered{0};
+    std::binary_semaphore allow_resize{0};
+};
+
 class Windows_conpty_backend final : public Terminal_backend
 {
 public:
@@ -71,6 +79,9 @@ public:
     Terminal_backend_result resize(
         Terminal_backend_resize_request request) override;
 
+    Terminal_backend_resize_dispatch dispatch_resize(
+        Terminal_backend_resize_request request) override;
+
     Terminal_backend_result set_output_paused(
         bool                            paused) override;
 
@@ -84,6 +95,7 @@ public:
     // it never calls a member through a deleted backend.
     bool set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate);
     bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control);
+    bool set_resize_control_for_testing(std::shared_ptr<Windows_conpty_resize_control_for_testing> control);
 
 private:
     class Impl;

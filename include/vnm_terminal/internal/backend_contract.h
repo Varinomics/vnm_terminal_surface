@@ -153,6 +153,19 @@ struct Terminal_backend_resize_request
     terminal_grid_size_t                   grid_size;
 };
 
+struct Terminal_backend_resize_completion
+{
+    Terminal_backend_resize_request        request;
+    Terminal_backend_result                result;
+    bool                                    superseded = false;
+};
+
+struct Terminal_backend_resize_dispatch
+{
+    Terminal_backend_result                result;
+    bool                                    completion_pending = false;
+};
+
 struct Terminal_backend_exit
 {
     Terminal_exit_reason                   reason    = Terminal_exit_reason::EXITED;
@@ -164,6 +177,8 @@ struct Terminal_backend_callbacks
     std::function<void(QByteArray)>                output_received;
     std::function<void(Terminal_backend_exit)>     process_exited;
     std::function<void(Terminal_backend_error)>    error_reported;
+    std::function<void(Terminal_backend_resize_completion)>
+                                                resize_completed;
 };
 
 inline Terminal_backend_result backend_accept()
@@ -440,6 +455,15 @@ public:
 
     virtual Terminal_backend_result resize(
         Terminal_backend_resize_request request) = 0;
+
+    // Backends with a blocking native resize can override this and report its
+    // eventual result through resize_completed. The default keeps existing
+    // synchronous backends and callers on the same contract.
+    virtual Terminal_backend_resize_dispatch dispatch_resize(
+        Terminal_backend_resize_request request)
+    {
+        return {resize(request), false};
+    }
 
     virtual Terminal_backend_result set_output_paused(
         bool                            paused) = 0;

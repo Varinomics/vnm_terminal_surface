@@ -16,6 +16,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -107,6 +108,20 @@ enum class Backend_callback_drain_stop : std::uint8_t
 class Terminal_session
 {
 public:
+    class Input_frontier_scope
+    {
+    public:
+        explicit Input_frontier_scope(
+            Terminal_session& session,
+            bool              public_ingress = true);
+        ~Input_frontier_scope();
+        Input_frontier_scope(const Input_frontier_scope&) = delete;
+        Input_frontier_scope& operator=(const Input_frontier_scope&) = delete;
+
+    private:
+        Terminal_session& m_session;
+    };
+
     Terminal_session(
         std::unique_ptr<Terminal_backend>      backend,
         Terminal_session_config                config = {});
@@ -226,6 +241,11 @@ public:
     bool has_pending_backend_callback_events() const;
     std::size_t pending_backend_callback_event_count() const;
     std::uint64_t backend_callback_enqueue_epoch() const;
+    std::uint64_t capture_backend_callback_frontier();
+    void release_backend_callback_frontier(std::uint64_t epoch);
+    std::uint64_t begin_input_frontier(bool fresh_ingress = false);
+    void end_input_frontier();
+    std::optional<std::uint64_t> input_frontier_epoch() const;
     std::uint64_t backend_callback_processed_epoch() const;
     bool mouse_reporting_active() const;
     bool alternate_scroll_active() const;
@@ -406,6 +426,13 @@ private:
         bool                                          render_snapshot_metadata_changed = false;
     };
 
+    struct Pending_backend_resize
+    {
+        Terminal_resize_transaction resize;
+        std::uint64_t                sequence = 0U;
+        QString                      applied_message;
+    };
+
     Terminal_session_result enqueue_command(
         Terminal_session_command   command);
 
@@ -413,6 +440,8 @@ private:
         Terminal_session_command           command,
         Backend_callback_drain_policy      drain_policy =
             Backend_callback_drain_policy::DRAIN_CALLBACKS);
+    Terminal_session_result settle_text_area_resize_arbitration_locked(
+        terminal_text_area_resize_arbitration_settlement_t settlement);
 
     Backend_callback_drain_stop process_pending_commands(
         Backend_callback_drain_policy      drain_policy =
@@ -479,6 +508,16 @@ private:
     Terminal_session_result process_backend_error_command(
         const Terminal_session_command&        command);
 
+    Terminal_session_result process_backend_resize_completion_command(
+        const Terminal_session_command&        command);
+
+    Terminal_backend_resize_dispatch dispatch_backend_resize(
+        Terminal_resize_transaction& resize,
+        std::uint64_t                  sequence,
+        QString                        applied_message);
+
+    void cancel_pending_backend_resizes();
+
     Terminal_session_result write_user_bytes_locked(
         QByteArray                         bytes,
         User_write_viewport_policy         viewport_policy,
@@ -499,7 +538,10 @@ private:
         int                                line_delta);
 
     Terminal_backend_callbacks make_backend_callbacks();
-    void drain_backend_callback_commands();
+    void drain_backend_callback_commands(
+        std::optional<std::uint64_t> target_epoch = std::nullopt);
+    void process_backend_callback_events_to_current_epoch();
+    std::optional<Terminal_session_result> reject_unsettled_input_frontier();
     void pause_backend_output_from_callback_ingress();
 
     template<class T>
@@ -967,6 +1009,13 @@ private:
 
     mutable std::recursive_mutex                           m_mutex;
     std::shared_ptr<Terminal_session_callback_lifetime>    m_callback_lifetime;
+    struct Input_frontier_frame
+    {
+        std::uint64_t epoch = 0U;
+        bool owns_seal = false;
+    };
+    std::optional<std::uint64_t>                           m_input_frontier_epoch;
+    std::vector<Input_frontier_frame>                      m_input_frontier_stack;
 
     std::unique_ptr<Terminal_backend>                      m_backend;
     Terminal_session_config                                m_config;
@@ -982,6 +1031,7 @@ private:
                                                             m_pending_text_area_resize_arbitration_events;
     std::vector<Terminal_session_result>                   m_results;
     std::vector<Terminal_resize_transaction>               m_resize_transactions;
+    std::map<std::uint64_t, Pending_backend_resize>         m_pending_backend_resizes;
     std::vector<QByteArray>                                m_output_chunks;
     std::array<
         char,
@@ -1017,6 +1067,7 @@ private:
     terminal_grid_size_t                                   m_grid_size;
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
+    std::uint64_t                                          m_latest_backend_resize_id = 0U;
     std::uint64_t                                          m_next_delivery_order = 1U;
     std::uint64_t                                          m_next_text_area_resize_request_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;

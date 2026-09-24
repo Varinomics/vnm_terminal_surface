@@ -4,6 +4,7 @@
 
 #include "atlas_metric_descriptors.h"
 #include "metric_descriptor.h"
+#include "model_profile_metric_descriptors.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/profile_text_writers.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
@@ -198,66 +199,19 @@ void append_model_profile_stats_section(
 {
     stream << "model_profile_stats\n";
     stream << "  enabled=" << (stats.enabled ? "true" : "false") << '\n';
+    // The text-only erase counters sit between the first seven common counters and the rest.
+    const auto metrics = detail::model_profile_counter_metrics();
+    detail::emit_metrics_text(stream, stats, metrics.first(7));
     append_profile_counters(
         stream,
         {
-            {"print_text_calls", stats.print_text_calls},
-            {"printable_ascii_span_calls", stats.printable_ascii_span_calls},
-            {"printable_ascii_span_characters", stats.printable_ascii_span_characters},
-            {"printable_ascii_cells_written", stats.printable_ascii_cells_written},
-            {"max_printable_ascii_span_characters", stats.max_printable_ascii_span_characters},
-            {"printable_ascii_local_cells_inspected", stats.printable_ascii_local_cells_inspected},
-            {"scalar_span_local_cells_inspected", stats.scalar_span_local_cells_inspected},
             {"erase_row_range_calls", stats.erase_row_range_calls},
             {"erase_row_cells_visited", stats.erase_row_cells_visited},
             {"erase_row_cells_replaced", stats.erase_row_cells_replaced},
             {"erase_row_cells_already_erased", stats.erase_row_cells_already_erased},
             {"erase_row_wide_span_cells", stats.erase_row_wide_span_cells},
-            {"row_content_generation_comparisons", stats.row_content_generation_comparisons},
-            {"row_content_generation_comparison_cells", stats.row_content_generation_comparison_cells},
-            {"row_content_generation_advances", stats.row_content_generation_advances},
-            {"wide_boundary_repairs_from_text_writes", stats.wide_boundary_repairs_from_text_writes},
-            {"dirty_marks_from_text_writes", stats.dirty_marks_from_text_writes},
-            {"line_wraps_from_text_writes", stats.line_wraps_from_text_writes},
-            {"scrollback_appends_from_text_writes", stats.scrollback_appends_from_text_writes},
-            {"render_snapshot_requests", stats.render_snapshot_requests},
-            {"render_snapshots_constructed", stats.render_snapshots_constructed},
-            {"render_snapshot_rows_visited", stats.render_snapshot_rows_visited},
-            {"render_snapshot_rows_materialized", stats.render_snapshot_rows_materialized},
-            {"render_snapshot_rows_borrowed", stats.render_snapshot_rows_borrowed},
-            {"render_snapshot_rows_owned", stats.render_snapshot_rows_owned},
-            {"render_snapshot_rows_built_from_model_storage",
-             stats.render_snapshot_rows_built_from_model_storage},
-            {"render_snapshot_model_row_accessor_borrows",
-             stats.render_snapshot_model_row_accessor_borrows},
-            {"render_snapshot_cells_scanned", stats.render_snapshot_cells_scanned},
-            {"render_snapshot_cells_emitted", stats.render_snapshot_cells_emitted},
-            {"render_snapshot_compact_empty_text_cells", stats.render_snapshot_compact_empty_text_cells},
-            {"render_snapshot_compact_ascii_text_cells", stats.render_snapshot_compact_ascii_text_cells},
-            {"render_snapshot_inline_single_bmp_text_cells",
-             stats.render_snapshot_inline_single_bmp_text_cells},
-            {"render_snapshot_fallback_qstring_copies", stats.render_snapshot_fallback_qstring_copies},
-            {"render_snapshot_fallback_text_code_units_copied",
-             stats.render_snapshot_fallback_text_code_units_copied},
-            {"render_snapshot_fallback_printable_ascii_copies",
-             stats.render_snapshot_fallback_printable_ascii_copies},
-            {"render_snapshot_fallback_other_ascii_copies",
-             stats.render_snapshot_fallback_other_ascii_copies},
-            {"render_snapshot_fallback_single_non_ascii_copies",
-             stats.render_snapshot_fallback_single_non_ascii_copies},
-            {"render_snapshot_fallback_multi_text_copies",
-             stats.render_snapshot_fallback_multi_text_copies},
-            {"render_snapshot_unoccupied_cells_skipped", stats.render_snapshot_unoccupied_cells_skipped},
-            {"render_snapshot_dirty_rows_requested", stats.render_snapshot_dirty_rows_requested},
-            {"render_snapshot_dirty_rows_visible", stats.render_snapshot_dirty_rows_visible},
-            {"render_snapshot_full_repaint_fallbacks", stats.render_snapshot_full_repaint_fallbacks},
-            {"render_snapshot_viewport_fallbacks", stats.render_snapshot_viewport_fallbacks},
-            {"render_snapshot_zero_dirty_publications", stats.render_snapshot_zero_dirty_publications},
-            {"max_render_snapshot_rows_visited", stats.max_render_snapshot_rows_visited},
-            {"max_render_snapshot_cells_emitted", stats.max_render_snapshot_cells_emitted},
-            {"max_render_snapshot_fallback_text_units_per_cell",
-             stats.max_render_snapshot_fallback_text_units_per_cell},
         });
+    detail::emit_metrics_text(stream, stats, metrics.subspan(7));
 }
 
 void append_retained_history_profile_section(

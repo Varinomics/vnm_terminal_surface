@@ -874,6 +874,23 @@ signals:
 private:
     friend class vnm_terminal::internal::VNM_TerminalSurface_render_bridge;
 
+    class Input_frontier_scope
+    {
+    public:
+        explicit Input_frontier_scope(
+            VNM_TerminalSurface& surface,
+            bool                 drain_before_route = true,
+            bool                 fresh_ingress = true);
+        ~Input_frontier_scope();
+        Input_frontier_scope(const Input_frontier_scope&) = delete;
+        Input_frontier_scope& operator=(const Input_frontier_scope&) = delete;
+
+    private:
+        VNM_TerminalSurface&                     m_surface;
+        vnm_terminal::internal::Terminal_session* m_session = nullptr;
+        std::uint64_t                            m_generation = 0U;
+    };
+
     QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override;
     void updatePolish() override;
     void releaseResources() override;
@@ -896,6 +913,7 @@ private:
 
     void refresh_grid_metrics();
     void refresh_grid_metrics_if_device_pixel_ratio_changed();
+    void apply_font_size(qreal font_size);
 
     void set_grid_size(
         int                    rows,
@@ -970,6 +988,7 @@ private:
         Backend_callback_incomplete_follow_up
                                follow_up);
     void drain_backend_callback_events();
+    void drain_backend_callback_events_to_current_epoch();
     void drain_backend_callback_events(bool budgeted);
     void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);
     backend_callback_drain_result_t drain_backend_callback_events_until_epoch(
@@ -1011,6 +1030,7 @@ private:
         SKIP_EMPTY_OR_SINGLE_SPACE,
     };
     bool copy_selected_text_to_clipboard(Selection_copy_policy policy);
+    void clear_selection_within_input_event();
     void set_selection_state(Selection_state state);
     void set_search_state(
         QString             query,

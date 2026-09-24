@@ -1416,6 +1416,55 @@ set_tests_properties(vnm_terminal_surface_host PROPERTIES
     TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
 
+add_test(
+    NAME vnm_terminal_surface_host_async_resize_metadata
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --async-resize-metadata-only
+)
+set_tests_properties(vnm_terminal_surface_host_async_resize_metadata PROPERTIES
+    LABELS "conformance;surface;resize"
+    TIMEOUT 30
+)
+
+if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
+    add_test(
+        NAME vnm_terminal_surface_host_pending_mouse_wheel_trace
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --pending-mouse-wheel-trace-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_pending_mouse_wheel_trace PROPERTIES
+        LABELS "conformance;surface;input;wheel"
+        TIMEOUT 30
+    )
+endif()
+
+if(WIN32)
+    add_test(
+        NAME vnm_terminal_surface_host_held_resize_gui
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --held-resize-gui
+    )
+    set_tests_properties(vnm_terminal_surface_host_held_resize_gui PROPERTIES
+        LABELS "conformance;windows;conpty;surface;resize"
+        TIMEOUT 60
+    )
+endif()
+
 add_executable(vnm_terminal_msdf_availability
     msdf_availability/msdf_availability_tests.cpp
 )
@@ -2143,6 +2192,34 @@ if(WIN32)
     set_tests_properties(vnm_terminal_windows_conpty_close_ownership PROPERTIES
         LABELS "conformance;windows;conpty;shutdown"
         TIMEOUT 180
+    )
+
+    add_test(
+        NAME vnm_terminal_windows_conpty_held_resize_stop
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --held-resize-stop
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+    )
+    set_tests_properties(vnm_terminal_windows_conpty_held_resize_stop PROPERTIES
+        LABELS "conformance;windows;conpty;shutdown"
+        TIMEOUT 120
+    )
+
+    add_test(
+        NAME vnm_terminal_windows_conpty_async_resize_stop
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --async-held-resize-stop
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+    )
+    set_tests_properties(vnm_terminal_windows_conpty_async_resize_stop PROPERTIES
+        LABELS "conformance;windows;conpty;resize;shutdown"
+        TIMEOUT 120
     )
 
     add_test(

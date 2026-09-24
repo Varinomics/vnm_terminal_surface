@@ -531,6 +531,11 @@ public:
             m_errors.push_back(std::move(error));
             m_cv.notify_all();
         };
+        callbacks.resize_completed = [this](term::Terminal_backend_resize_completion completion) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_resize_completions.push_back(std::move(completion));
+            m_cv.notify_all();
+        };
         return callbacks;
     }
 
@@ -651,6 +656,16 @@ public:
         });
     }
 
+    bool wait_for_resize_completion_count(
+        std::size_t               count,
+        std::chrono::milliseconds timeout = k_wait_timeout)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, timeout, [&] {
+            return m_resize_completions.size() >= count;
+        });
+    }
+
     QByteArray output_snapshot()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -673,6 +688,13 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_errors;
+    }
+
+    std::vector<term::Terminal_backend_resize_completion>
+    resize_completions_snapshot()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_resize_completions;
     }
 
     std::vector<QByteArray> output_events_snapshot()
@@ -742,6 +764,8 @@ private:
     std::optional<std::size_t> m_exit_event_sequence;
     std::vector<term::Terminal_backend_error>
                                m_errors;
+    std::vector<term::Terminal_backend_resize_completion>
+                               m_resize_completions;
     std::size_t                m_next_event_sequence = 0U;
     int                        m_exit_count = 0;
 };
@@ -3600,6 +3624,393 @@ bool test_terminate_after_resize_storm_stops_child_process(const QString& fixtur
     return ok;
 }
 
+bool test_held_resize_allows_stop_escalation(const QString& fixture_path)
+{
+    bool ok = true;
+    Backend_capture capture;
+    auto backend = std::make_unique<term::Windows_conpty_backend>();
+    auto resize_control = std::make_shared<term::Windows_conpty_resize_control_for_testing>();
+    auto close_control  = std::make_shared<term::Windows_conpty_close_control_for_testing>();
+    close_control->allow_close.release();
+    close_control->allow_observer.release();
+    ok &= check(backend->set_resize_control_for_testing(resize_control),
+        "held-resize gate is installed before native start");
+    ok &= check(backend->set_close_control_for_testing(close_control),
+        "held-resize close observer is installed before native start");
+    if (!ok) {
+        return false;
+    }
+
+    term::Terminal_launch_config config =
+        launch_config(fixture_path, {QStringLiteral("--hold-open-pid-no-read")});
+    config.termination_policy.graceful_interval = std::chrono::milliseconds(0);
+    config.termination_policy.kill_interval     = std::chrono::milliseconds(500);
+    const term::Terminal_backend_result start_result = backend->start(config, capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "held-resize fixture starts");
+    if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
+        return false;
+    }
+
+    const std::optional<DWORD> child_pid =
+        capture.wait_for_pid_output(QByteArrayLiteral("hold-open-pid-no-read "));
+    ok &= check(child_pid.has_value(), "held-resize fixture reports its child pid");
+    Win32_process_handle child_process =
+        child_pid.has_value() ? open_process_handle(*child_pid) : Win32_process_handle{};
+    ok &= check(child_process.is_valid(), "held-resize child handle opens");
+    if (!child_process.is_valid()) {
+        (void)backend->terminate();
+        return false;
+    }
+    const std::optional<bool> child_running =
+        process_handle_is_running(child_process.get());
+    ok &= check(child_running.has_value() && *child_running,
+        "held-resize child remains alive before stop");
+    if (!child_running.has_value() || !*child_running) {
+        (void)backend->terminate();
+        return false;
+    }
+
+    std::mutex              watchdog_mutex;
+    std::condition_variable watchdog_cv;
+    std::atomic_bool        resize_released = false;
+    std::atomic_bool        watchdog_fired = false;
+    const auto release_resize = [&] {
+        if (!resize_released.exchange(true, std::memory_order_acq_rel)) {
+            resize_control->allow_resize.release();
+        }
+        watchdog_cv.notify_all();
+    };
+    std::thread watchdog([&] {
+        std::unique_lock lock(watchdog_mutex);
+        if (!watchdog_cv.wait_for(lock, std::chrono::seconds(45), [&] {
+                return resize_released.load(std::memory_order_acquire);
+            }))
+        {
+            watchdog_fired.store(true, std::memory_order_release);
+            lock.unlock();
+            release_resize();
+        }
+    });
+
+    std::thread resize_thread([&] {
+        (void)backend->resize({1U, {25, 81}});
+    });
+    const bool resize_entered = resize_control->resize_entered.try_acquire_for(k_wait_timeout);
+    ok &= check(resize_entered, "held resize reaches the native call seam");
+
+    term::Terminal_backend_result stop_result;
+    std::atomic_bool stop_returned = false;
+    std::thread stop_thread;
+    bool stop_committed_before_release = false;
+    bool stop_and_child_exited_before_release = false;
+    if (resize_entered) {
+        stop_thread = std::thread([&] {
+            stop_result = backend->terminate();
+            stop_returned.store(true, std::memory_order_release);
+        });
+
+        const auto commitment_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        do {
+            stop_committed_before_release = backend->write_state_for_testing().stopping;
+            if (stop_committed_before_release) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        while (std::chrono::steady_clock::now() < commitment_deadline &&
+            !resize_released.load(std::memory_order_acquire));
+
+        if (stop_committed_before_release) {
+            const auto progress_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+            do {
+                stop_and_child_exited_before_release =
+                    stop_returned.load(std::memory_order_acquire) &&
+                    WaitForSingleObject(child_process.get(), 0) == WAIT_OBJECT_0 &&
+                    !resize_released.load(std::memory_order_acquire);
+                if (stop_and_child_exited_before_release) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            while (std::chrono::steady_clock::now() < progress_deadline &&
+                !resize_released.load(std::memory_order_acquire));
+        }
+    }
+
+    ok &= check(stop_committed_before_release,
+        "stop commits while the admitted native resize is held");
+    ok &= check(stop_and_child_exited_before_release,
+        "zero-grace stop returns and escalates the child before resize release");
+    ok &= check(!close_control->close_entered.try_acquire() &&
+            close_control->close_count.load(std::memory_order_acquire) == 0U,
+        "ConPTY close does not begin while a native resize owns the handle");
+    ok &= check(!watchdog_fired.load(std::memory_order_acquire),
+        "held-resize watchdog does not need to release the native call");
+
+    release_resize();
+    watchdog.join();
+    resize_thread.join();
+    if (stop_thread.joinable()) {
+        stop_thread.join();
+    }
+    else {
+        stop_result = backend->terminate();
+    }
+
+    ok &= check(stop_result.code == term::Terminal_backend_result_code::ACCEPTED ||
+            stop_result.stop_committed,
+        "held-resize stop remains committed after release");
+    ok &= check(capture.wait_for_exit(), "held-resize child exit is reported");
+    ok &= check(capture.exit_count_snapshot() == 1,
+        "held-resize child exit is reported exactly once");
+    backend.reset();
+    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout),
+        "held-resize native cleanup settles after release");
+    ok &= check(close_control->close_count.load(std::memory_order_acquire) == 1U &&
+            close_control->observer_retirement_count.load(std::memory_order_acquire) == 1U,
+        "held-resize ConPTY close and observer retirement happen exactly once");
+    return ok;
+}
+
+bool test_async_held_resize_stop_coalesces_and_retires(const QString& fixture_path)
+{
+    bool ok = true;
+    Backend_capture capture;
+    auto backend = std::make_unique<term::Windows_conpty_backend>();
+    auto resize_control = std::make_shared<term::Windows_conpty_resize_control_for_testing>();
+    auto close_control = std::make_shared<term::Windows_conpty_close_control_for_testing>();
+    ok &= check(backend->set_resize_control_for_testing(resize_control),
+        "async held-resize gate is installed before native start");
+    ok &= check(backend->set_close_control_for_testing(close_control),
+        "async held-resize close observer is installed before native start");
+
+    term::Terminal_launch_config config = launch_config(
+        fixture_path,
+        {QStringLiteral("--spawn-hold-open-child-pid-no-read")});
+    config.termination_policy.graceful_interval = std::chrono::milliseconds(0);
+    config.termination_policy.kill_interval = std::chrono::milliseconds(500);
+    const term::Terminal_backend_result start_result = backend->start(
+        config,
+        capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "async held-resize tree fixture starts");
+    if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
+        return false;
+    }
+
+    const std::optional<DWORD> descendant_pid = capture.wait_for_pid_output(
+        QByteArrayLiteral("hold-open-child-pid-no-read "));
+    ok &= check(descendant_pid.has_value(),
+        "async held-resize fixture reports its descendant pid");
+    Win32_process_handle descendant_process = descendant_pid.has_value()
+        ? open_process_handle(*descendant_pid)
+        : Win32_process_handle{};
+    ok &= check(descendant_process.is_valid(),
+        "async held-resize descendant handle opens");
+    if (!descendant_process.is_valid()) {
+        (void)backend->terminate();
+        close_control->allow_close.release();
+        close_control->allow_observer.release();
+        (void)capture.wait_for_exit();
+        backend.reset();
+        (void)term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout);
+        return false;
+    }
+
+    std::mutex              watchdog_mutex;
+    std::condition_variable watchdog_cv;
+    std::atomic_bool        resize_released = false;
+    std::atomic_bool        close_released = false;
+    std::atomic_bool        observer_released = false;
+    std::atomic_bool        watchdog_fired = false;
+    std::atomic_bool        all_gates_released = false;
+    const auto release_resize = [&] {
+        if (!resize_released.exchange(true, std::memory_order_acq_rel)) {
+            resize_control->allow_resize.release();
+        }
+    };
+    const auto release_close = [&] {
+        if (!close_released.exchange(true, std::memory_order_acq_rel)) {
+            close_control->allow_close.release();
+        }
+    };
+    const auto release_observer = [&] {
+        if (!observer_released.exchange(true, std::memory_order_acq_rel)) {
+            close_control->allow_observer.release();
+        }
+    };
+    const auto release_all_gates = [&] {
+        release_resize();
+        release_close();
+        release_observer();
+        all_gates_released.store(true, std::memory_order_release);
+        watchdog_cv.notify_all();
+    };
+    std::thread watchdog([&] {
+        std::unique_lock lock(watchdog_mutex);
+        if (!watchdog_cv.wait_for(lock, std::chrono::seconds(45), [&] {
+                return all_gates_released.load(std::memory_order_acquire);
+            }))
+        {
+            watchdog_fired.store(true, std::memory_order_release);
+            lock.unlock();
+            release_all_gates();
+        }
+    });
+
+    const term::Terminal_backend_resize_dispatch first = backend->dispatch_resize(
+        {101U, {25, 81}});
+    ok &= check(first.result.code == term::Terminal_backend_result_code::ACCEPTED &&
+            first.completion_pending,
+        "first asynchronous resize is accepted without waiting for native completion");
+    const bool first_entered = resize_control->resize_entered.try_acquire_for(k_wait_timeout);
+    ok &= check(first_entered,
+        "first asynchronous resize reaches the held native call");
+
+    term::Terminal_backend_resize_dispatch second;
+    term::Terminal_backend_resize_dispatch third;
+    if (first_entered) {
+        second = backend->dispatch_resize({102U, {26, 82}});
+        third = backend->dispatch_resize({103U, {27, 83}});
+        ok &= check(second.result.code == term::Terminal_backend_result_code::ACCEPTED &&
+                second.completion_pending &&
+                third.result.code == term::Terminal_backend_result_code::ACCEPTED &&
+                third.completion_pending,
+            "newer asynchronous resize requests are accepted while the first call is held");
+        ok &= check(capture.wait_for_resize_completion_count(1U,
+                std::chrono::seconds(2)),
+            "replacing the queued request promptly retires its receipt");
+        const auto replacement_receipts = capture.resize_completions_snapshot();
+        ok &= check(replacement_receipts.size() == 1U &&
+                replacement_receipts.front().request.transaction_id == 102U &&
+                replacement_receipts.front().superseded &&
+                replacement_receipts.front().result.code ==
+                    term::Terminal_backend_result_code::ACCEPTED,
+            "the middle resize receives its exact accepted superseded receipt");
+    }
+
+    std::atomic_bool stop_returned = false;
+    term::Terminal_backend_result stop_result;
+    std::thread stop_thread([&] {
+        stop_result = backend->terminate();
+        stop_returned.store(true, std::memory_order_release);
+    });
+    const auto stop_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    bool tree_exited_before_release = false;
+    while (std::chrono::steady_clock::now() < stop_deadline &&
+        !resize_released.load(std::memory_order_acquire))
+    {
+        const bool stopping = backend->write_state_for_testing().stopping;
+        const bool descendant_exited =
+            WaitForSingleObject(descendant_process.get(), 0U) == WAIT_OBJECT_0;
+        tree_exited_before_release =
+            stopping && stop_returned.load(std::memory_order_acquire) && descendant_exited;
+        if (tree_exited_before_release) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ok &= check(tree_exited_before_release,
+        "stop returns and terminates the descendant while the active resize remains held");
+    const bool close_entered_before_release = close_control->close_entered.try_acquire();
+    ok &= check(!resize_released.load(std::memory_order_acquire) &&
+            close_control->close_count.load(std::memory_order_acquire) == 0U &&
+            !close_entered_before_release,
+        "the native close owner waits until the held call retires");
+
+    if (first_entered) {
+        ok &= check(capture.wait_for_resize_completion_count(2U,
+                std::chrono::seconds(2)),
+            "stop retires the coalesced latest request before releasing the active call");
+        const auto stopped_receipts = capture.resize_completions_snapshot();
+        const auto latest_stopped = std::find_if(
+            stopped_receipts.begin(),
+            stopped_receipts.end(),
+            [](const auto& completion) {
+                return completion.request.transaction_id == 103U;
+            });
+        ok &= check(latest_stopped != stopped_receipts.end() &&
+                latest_stopped->superseded &&
+                latest_stopped->result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "stop retires the latest queued resize with its exact superseded receipt");
+        ok &= check(stopped_receipts.size() == 2U &&
+                std::none_of(stopped_receipts.begin(), stopped_receipts.end(), [](const auto& completion) {
+                    return completion.request.transaction_id == 101U;
+                }),
+            "the active resize has no receipt until its native call returns");
+    }
+
+    release_resize();
+    if (stop_thread.joinable()) {
+        stop_thread.join();
+    }
+    ok &= check(stop_result.code == term::Terminal_backend_result_code::ACCEPTED ||
+            stop_result.stop_committed,
+        "async held-resize stop remains committed after release");
+    if (first_entered) {
+        ok &= check(capture.wait_for_resize_completion_count(3U),
+            "active resize receipt arrives after its native call retires");
+        const auto final_receipts = capture.resize_completions_snapshot();
+        const auto active_receipt = std::find_if(
+            final_receipts.begin(),
+            final_receipts.end(),
+            [](const auto& completion) {
+                return completion.request.transaction_id == 101U;
+            });
+        const auto active_receipt_count = std::count_if(
+            final_receipts.begin(),
+            final_receipts.end(),
+            [](const auto& completion) {
+                return completion.request.transaction_id == 101U;
+            });
+        ok &= check(final_receipts.size() == 3U &&
+                active_receipt_count == 1 &&
+                active_receipt != final_receipts.end() &&
+                active_receipt->superseded,
+            "the late active-call receipt is superseded exactly once after stop");
+    }
+
+    const bool close_entered = close_entered_before_release ||
+        close_control->close_entered.try_acquire_for(k_wait_timeout);
+    ok &= check(close_entered,
+        "ConPTY close is handed off after active native calls retire");
+    if (close_entered) {
+        ok &= check(close_control->observer_retirement_count.load(std::memory_order_acquire) == 0U,
+            "window observer remains owned until ConPTY close completes");
+        release_close();
+        const bool observer_entered = close_control->observer_entered.try_acquire_for(k_wait_timeout);
+        ok &= check(observer_entered,
+            "observer retirement follows the single ConPTY close");
+        ok &= check(close_control->close_count.load(std::memory_order_acquire) == 1U &&
+                close_control->observer_retirement_count.load(std::memory_order_acquire) == 0U,
+            "observer ownership remains live until the close returns");
+        release_observer();
+    }
+    else {
+        release_close();
+        release_observer();
+    }
+    ok &= check(capture.wait_for_exit(),
+        "async held-resize process exit is reported after native close handoff");
+    ok &= check(capture.exit_count_snapshot() == 1,
+        "async held-resize process exit is reported exactly once");
+    backend.reset();
+    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout),
+        "async held-resize cleanup settles after active-call retirement");
+    release_all_gates();
+    watchdog.join();
+    ok &= check(!watchdog_fired.load(std::memory_order_acquire),
+        "async held-resize watchdog does not release a gate");
+    ok &= check(close_control->close_count.load(std::memory_order_acquire) == 1U &&
+            close_control->observer_retirement_count.load(std::memory_order_acquire) == 1U,
+        "async held-resize close and observer retire exactly once");
+    return ok;
+}
+
 bool test_close_path_stops_descendant_process(const QString& fixture_path)
 {
     bool ok = true;
@@ -5326,6 +5737,18 @@ int main(int argc, char** argv)
         bool ok = test_start_retry_after_pseudoconsole_rejection(fixture_path);
         ok &= test_close_and_observer_retirement_remain_accounted(fixture_path);
         ok &= wait_for_console_host_children_to_exit("close ownership");
+        return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--held-resize-stop") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_held_resize_allows_stop_escalation(fixture_path);
+        ok &= wait_for_console_host_children_to_exit("held resize stop");
+        return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--async-held-resize-stop") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_async_held_resize_stop_coalesces_and_retires(fixture_path);
+        ok &= wait_for_console_host_children_to_exit("async held resize stop");
         return ok ? 0 : 1;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--compatibility-window") {

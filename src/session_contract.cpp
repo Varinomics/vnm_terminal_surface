@@ -180,6 +180,15 @@ Terminal_session_command make_backend_error_command(
             .error = std::move(error)};
 }
 
+Terminal_session_command make_backend_resize_completion_command(
+    std::uint64_t                       sequence,
+    Terminal_backend_resize_completion completion)
+{
+    return {.sequence = sequence,
+            .kind = Terminal_session_command_kind::BACKEND_RESIZE_COMPLETE,
+            .resize_completion = std::move(completion)};
+}
+
 Terminal_session_command make_backend_output_command(
     std::uint64_t          sequence,
     QByteArray             bytes)

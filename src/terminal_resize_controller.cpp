@@ -84,6 +84,10 @@ Terminal_session_result Terminal_resize_controller::refresh_from_geometry(QSizeF
 Terminal_session_result Terminal_resize_controller::resize_or_refresh_from_geometry(
     QSizeF source_geometry)
 {
+    Terminal_session::Input_frontier_scope frontier(m_session);
+    (void)m_session.process_backend_callback_events_until_epoch(
+        *m_session.input_frontier_epoch());
+
     const Terminal_metrics_result metrics_result =
         m_metrics_provider.grid_size_for_item_geometry(source_geometry);
     if (metrics_result.status != Terminal_metrics_status::OK) {

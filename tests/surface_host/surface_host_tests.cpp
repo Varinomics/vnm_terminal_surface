@@ -4,6 +4,9 @@
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
+#if defined(Q_OS_WIN)
+#include "vnm_terminal/internal/windows_conpty_backend.h"
+#endif
 
 #include <QClipboard>
 #include <QCoreApplication>
@@ -867,10 +870,49 @@ public:
         return term::backend_accept();
     }
 
+    term::Terminal_backend_resize_dispatch dispatch_resize(
+        term::Terminal_backend_resize_request request) override
+    {
+        const term::Terminal_backend_result result = resize(request);
+        if (term::is_backend_rejection(result) || !defer_resize_completions) {
+            return {result, false};
+        }
+
+        pending_resize_completions.push_back(request);
+        return {result, true};
+    }
+
+    bool complete_deferred_resize(
+        std::uint64_t transaction_id,
+        term::Terminal_backend_result result = term::backend_accept())
+    {
+        const auto pending = std::find_if(
+            pending_resize_completions.begin(),
+            pending_resize_completions.end(),
+            [transaction_id](const auto& request) {
+                return request.transaction_id == transaction_id;
+            });
+        if (pending == pending_resize_completions.end()) {
+            return false;
+        }
+
+        const auto request = *pending;
+        pending_resize_completions.erase(pending);
+        m_callbacks.resize_completed({request, std::move(result), false});
+        return true;
+    }
+
     term::Terminal_backend_result set_output_paused(bool paused) override
     {
         output_pause_requests.push_back(paused);
         output_paused = paused;
+        if (!paused) {
+            while (!outputs_during_output_resume.empty() && !output_paused) {
+                QByteArray output = std::move(outputs_during_output_resume.front());
+                outputs_during_output_resume.erase(outputs_during_output_resume.begin());
+                m_callbacks.output_received(std::move(output));
+            }
+        }
         return term::backend_accept();
     }
 
@@ -952,10 +994,13 @@ public:
                                write_delay{};
     std::vector<QByteArray>    outputs_during_start;
     std::vector<QByteArray>    outputs_during_write;
+    std::vector<QByteArray>    outputs_during_output_resume;
     std::vector<term::Terminal_launch_config>
                                start_configs;
     std::vector<term::Terminal_backend_resize_request>
                                resize_requests;
+    std::vector<term::Terminal_backend_resize_request>
+                               pending_resize_completions;
     std::vector<QByteArray>    writes;
     std::vector<bool>          output_pause_requests;
     std::vector<term::Terminal_launch_config>*
@@ -967,6 +1012,7 @@ public:
     term::Terminal_backend_result
                                start_result = term::backend_accept();
     std::thread                worker;
+    bool                       defer_resize_completions = false;
 
 private:
     term::Terminal_backend_callbacks m_callbacks;
@@ -1000,6 +1046,31 @@ Scripted_backend* start_surface_with_backend(
         std::move(backend),
         std::move(argv)).accepted;
     return backend_ptr;
+}
+
+QByteArray surface_backpressure_output(
+    const Scripted_backend& backend,
+    QByteArray             prefix = {})
+{
+    const std::size_t high_water_bytes =
+        backend.start_configs.back().output_delivery_limits->high_water_bytes;
+    const qsizetype padding_bytes = std::max<qsizetype>(
+        0,
+        static_cast<qsizetype>(high_water_bytes) - prefix.size());
+    prefix.append(QByteArray(padding_bytes, '\0'));
+    return prefix;
+}
+
+std::uint64_t queue_surface_frontier_output(
+    VNM_TerminalSurface& surface,
+    Scripted_backend& backend,
+    QByteArray before = {},
+    QByteArray after = QByteArrayLiteral("."))
+{
+    backend.outputs_during_output_resume = {std::move(after)};
+    backend.emit_output(surface_backpressure_output(backend, std::move(before)));
+    return term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+        surface);
 }
 
 void queue_posted_drain_budget_probe(
@@ -6332,25 +6403,25 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         Qt::ControlModifier,
         120,
         true,
-        "clamped Ctrl+wheel does not drain deferred backend output");
+        "clamped Ctrl+wheel settles its pre-event backend output");
     const std::shared_ptr<const term::Terminal_render_snapshot> post_zoom_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(post_zoom_snapshot != nullptr &&
-        !snapshot_contains_text(*post_zoom_snapshot, QStringLiteral("zoom-drain")),
-        "clamped Ctrl+wheel leaves deferred backend output pending");
+        snapshot_contains_text(*post_zoom_snapshot, QStringLiteral("zoom-drain")),
+        "clamped Ctrl+wheel publishes pre-event backend output");
     ok &= check(fixture.surface.font_size() == 72.0,
         "clamped Ctrl+wheel leaves maximum font size unchanged");
-    ok &= check(backend_ptr->output_paused,
-        "clamped Ctrl+wheel leaves deferred backend output paused");
+    ok &= check(!backend_ptr->output_paused,
+        "clamped Ctrl+wheel resumes pre-event backend output");
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
     const std::shared_ptr<const term::Terminal_render_snapshot> drained_zoom_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(drained_zoom_snapshot != nullptr &&
         snapshot_contains_text(*drained_zoom_snapshot, QStringLiteral("zoom-drain")),
-        "normal drain exposes deferred backend output after clamped Ctrl+wheel");
+        "normal drain preserves output published by clamped Ctrl+wheel");
     ok &= check(!backend_ptr->output_paused,
-        "normal drain after clamped Ctrl+wheel resumes backend output");
+        "normal drain after clamped Ctrl+wheel keeps backend output resumed");
     ok &= check(!backpressure_states.empty() && !backpressure_states.back(),
         "normal drain after clamped Ctrl+wheel publishes final backpressure release");
     const std::size_t post_zoom_write_count = backend_ptr->writes.size();
@@ -7860,22 +7931,35 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             120,
             true,
-            "pending alternate-screen transition does not drain before wheel routing");
+            "pending alternate-screen transition settles before wheel routing");
         const std::shared_ptr<const term::Terminal_render_snapshot> pending_wheel_snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
         ok &= check(pending_wheel_snapshot != nullptr &&
-            pending_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
-            pending_wheel_snapshot->viewport.offset_from_tail > 0,
-            "pending alternate-screen wheel uses published primary scrollback");
-        ok &= check(backend_ptr->writes.size() == pending_alternate_wheel_index,
-            "pending alternate-screen wheel writes no terminal input");
+            pending_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+            "pending alternate-screen wheel publishes the pre-event alternate mode");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> pending_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> pending_cursor_up_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            pending_alternate_wheel_index,
+            pending_cursor_up_chunks,
+            "pending alternate-screen wheel writes current-mode cursor input");
 
         term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
         const std::shared_ptr<const term::Terminal_render_snapshot> drained_alternate_snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
         ok &= check(drained_alternate_snapshot != nullptr &&
             drained_alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
-            "normal drain applies pending alternate-screen transition");
+            "normal drain preserves alternate-screen transition");
 
         const std::size_t drained_alternate_wheel_index = backend_ptr->writes.size();
         ok &= send_wheel_event(
@@ -7972,7 +8056,7 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             80,
             true,
-            "pending alternate-scroll toggle is accepted conservatively");
+            "pending alternate-scroll toggle is accepted after mode settlement");
         ok &= check(backend_ptr->writes.size() == partial_wheel_index,
             "pending alternate-scroll toggle writes no stale fragment input");
         term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
@@ -7981,15 +8065,29 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             40,
             true,
-            "first post-toggle high-resolution wheel fragment is retained");
-        ok &= check(backend_ptr->writes.size() == partial_wheel_index,
-            "first post-toggle high-resolution wheel fragment writes no input");
+            "first post-toggle high-resolution wheel fragment completes the settled step");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> first_post_toggle_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> first_post_toggle_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            partial_wheel_index,
+            first_post_toggle_chunks,
+            "first post-toggle fragment writes settled cursor-up input");
         ok &= send_wheel_event(
             fixture.surface,
             Qt::NoModifier,
             80,
             true,
-            "second post-toggle high-resolution wheel fragment completes a fresh step");
+            "second post-toggle high-resolution wheel fragment starts the next step");
 #if defined(Q_OS_WIN)
         const std::vector<QByteArray> expected_fragment_cursor_up_chunks =
             expected_synthetic_key_event_chunks(
@@ -8005,7 +8103,7 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             backend_ptr->writes,
             partial_wheel_index,
             expected_fragment_cursor_up_chunks,
-            "alternate-screen high-resolution wheel fragments write after a fresh full step");
+            "alternate-screen high-resolution wheel fragments preserve accumulated input");
 
         const std::size_t wheel_down_index = backend_ptr->writes.size();
         ok &= send_wheel_event(
@@ -8014,22 +8112,8 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             -120,
             true,
             "plain wheel down on alternate screen sends terminal input");
-#if defined(Q_OS_WIN)
-        const std::vector<QByteArray> expected_cursor_down_chunks =
-            expected_synthetic_key_event_chunks(
-                { Qt::Key_Down, Qt::Key_Down, Qt::Key_Down });
-#else
-        const std::vector<QByteArray> expected_cursor_down_chunks = {
-            QByteArrayLiteral("\x1b[B"),
-            QByteArrayLiteral("\x1b[B"),
-            QByteArrayLiteral("\x1b[B"),
-        };
-#endif
-        ok &= check_write_chunks_equal(
-            backend_ptr->writes,
-            wheel_down_index,
-            expected_cursor_down_chunks,
-            "plain wheel down on alternate screen writes cursor-down input");
+        ok &= check(backend_ptr->writes.size() == wheel_down_index,
+            "plain wheel down first cancels the remaining upward fragment");
 
         backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1h"));
         const std::size_t application_cursor_index = backend_ptr->writes.size();
@@ -8076,8 +8160,11 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "plain wheel with pending DEC 1007 reset is accepted conservatively");
-        ok &= check(backend_ptr->writes.size() == alternate_scroll_reset_index,
-            "pending DEC 1007 reset prevents stale alternate-screen input");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            alternate_scroll_reset_index,
+            expected_application_cursor_up_chunks,
+            "pending DEC 1007 reset uses settled application-cursor input");
 
         term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
         const std::size_t drained_alternate_scroll_reset_index = backend_ptr->writes.size();
@@ -8143,8 +8230,22 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             120,
             true,
             "synchronized hidden alternate-scroll wheel is accepted conservatively");
-        ok &= check(backend_ptr->writes.size() == synchronized_wheel_index,
-            "alternate-scroll wheel does not use hidden synchronized-output mode");
+#if defined(Q_OS_WIN)
+        const std::vector<QByteArray> expected_hidden_cursor_up_chunks =
+            expected_synthetic_key_event_chunks(
+                { Qt::Key_Up, Qt::Key_Up, Qt::Key_Up });
+#else
+        const std::vector<QByteArray> expected_hidden_cursor_up_chunks = {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        };
+#endif
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            synchronized_wheel_index,
+            expected_hidden_cursor_up_chunks,
+            "alternate-scroll wheel uses pre-event mode even during synchronized output");
     }
 
     {
@@ -8763,8 +8864,11 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             80,
             true,
             "drained collapsed mouse mode toggle starts a fresh wheel remainder");
-        ok &= check(backend_ptr->writes.size() == collapsed_boundary_wheel_index,
-            "drained collapsed mouse mode toggle does not reuse stale wheel remainder");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            collapsed_boundary_wheel_index,
+            { sgr_mouse_report(64, report_row, report_column, 'M') },
+            "next mouse fragment completes the current-mode wheel step");
         ok &= send_wheel_event(
             fixture.surface,
             Qt::NoModifier,
@@ -8788,8 +8892,11 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             40,
             true,
             "mouse wheel partial step is retained before ordinary output");
-        ok &= check(backend_ptr->writes.size() == ordinary_output_wheel_index,
-            "mouse wheel partial step before ordinary output writes no SGR report");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            ordinary_output_wheel_index,
+            { sgr_mouse_report(64, report_row, report_column, 'M') },
+            "mouse wheel fragment completes the carried current-mode step");
         backend_ptr->emit_output(QByteArrayLiteral("ordinary-output"));
         term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
             fixture.surface);
@@ -9024,14 +9131,17 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             0,
             120,
             true,
-            "pending mouse DECSET does not drain before wheel routing");
-        ok &= check(backend_ptr->writes.size() == pending_set_wheel_index,
-            "pending mouse DECSET writes no SGR bytes on the current wheel");
+            "pending mouse DECSET settles before wheel routing");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            pending_set_wheel_index,
+            { sgr_mouse_report(64, 0, 0, 'M') },
+            "pending mouse DECSET writes current-mode SGR bytes on the wheel");
         const std::shared_ptr<const term::Terminal_render_snapshot> pending_set_snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
         ok &= check(pending_set_snapshot != nullptr &&
-            pending_set_snapshot->viewport.offset_from_tail > 0,
-            "pending mouse DECSET current wheel uses published local scrollback");
+            pending_set_snapshot->viewport.offset_from_tail == 0,
+            "pending mouse DECSET current wheel keeps the viewport at tail");
 
         term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
             fixture.surface);
@@ -9485,7 +9595,7 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
     return ok;
 }
 
-bool test_local_first_wheel_scroll_keeps_callbacks_queued_without_backend_drain(
+bool test_local_first_wheel_scroll_applies_frontier_before_later_callbacks(
     QGuiApplication& app)
 {
     bool ok = true;
@@ -9530,33 +9640,24 @@ bool test_local_first_wheel_scroll_keeps_callbacks_queued_without_backend_drain(
         120,
         true,
         "local-first wheel scroll with post-barrier callback is accepted");
-    ok &= check(!post_barrier_output_queued,
-        "local-first wheel leaves pre-existing backend callback queued");
+    ok &= check(post_barrier_output_queued,
+        "local-first wheel applies the pre-input title callback");
 
     const std::shared_ptr<const term::Terminal_render_snapshot> post_wheel_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(post_wheel_snapshot != nullptr &&
         post_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
-        "local-first post-barrier callback stays queued until owner drain");
+        "later alternate-screen callback stays queued until owner drain");
     ok &= check(post_wheel_snapshot != nullptr &&
         post_wheel_snapshot->viewport.offset_from_tail > 0,
         "local-first wheel still applies primary scrollback movement");
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
-    ok &= check(post_barrier_output_queued,
-        "normal drain processes pre-existing callback and queues follow-up output");
     const std::shared_ptr<const term::Terminal_render_snapshot> first_drained_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(first_drained_snapshot != nullptr &&
-        first_drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
-        "follow-up output from notification callback waits for a later owner drain");
-
-    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
-    const std::shared_ptr<const term::Terminal_render_snapshot> second_drained_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(second_drained_snapshot != nullptr &&
-        second_drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
-        "local-first queued post-barrier callback is applied by the later drain");
+        first_drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+        "later alternate-screen callback is applied by the next owner drain");
 
     return ok;
 }
@@ -9818,28 +9919,42 @@ bool test_mouse_release_pending_report_uses_published_modes(QGuiApplication& app
         Qt::NoModifier,
         true,
         "hidden mouse-disable release is delivered after pending callback");
-    const term::terminal_cell_metrics_t current_metrics =
+    const term::terminal_cell_metrics_t release_metrics =
         current_cell_metrics(fixture.surface);
-    ok &= check(current_metrics.width > original_metrics.width,
-        "deferred release callback changes the live coordinate basis");
-    const int recomputed_column =
-        static_cast<int>(std::floor(point.x() / current_metrics.width));
-    ok &= check(recomputed_column != report_column,
-        "deferred release would use a different column without recompute");
+    ok &= check(release_metrics.width == original_metrics.width,
+        "release keeps its pre-event coordinate basis");
     ok &= check_write_chunks_equal(
         backend_ptr->writes,
         release_index,
         { sgr_mouse_report(0, report_row, report_column, 'm') },
         "deferred release writes exactly one published-frame release");
-    ok &= check(title_changed_count == 2,
-        "deferred release drains the post-entry backend callback");
+    ok &= check(title_changed_count == 1,
+        "release leaves the post-entry backend callback queued");
 
     const std::shared_ptr<const term::Terminal_render_snapshot> post_release_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(post_release_snapshot != nullptr &&
-        post_release_snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::NONE &&
-        !post_release_snapshot->modes.sgr_mouse_encoding,
-        "deferred release survives the published mouse disable");
+        post_release_snapshot->modes.mouse_tracking != term::Terminal_mouse_tracking_mode::NONE &&
+        post_release_snapshot->modes.sgr_mouse_encoding,
+        "release keeps its pre-event mouse mode");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const term::terminal_cell_metrics_t current_metrics =
+        current_cell_metrics(fixture.surface);
+    ok &= check(title_changed_count == 2 &&
+        current_metrics.width > original_metrics.width,
+        "later drain applies the deferred callback and font change");
+    const int recomputed_column =
+        static_cast<int>(std::floor(point.x() / current_metrics.width));
+    ok &= check(recomputed_column != report_column,
+        "later font change would use a different coordinate column");
+    const std::shared_ptr<const term::Terminal_render_snapshot> drained_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(drained_snapshot != nullptr &&
+        drained_snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::NONE &&
+        !drained_snapshot->modes.sgr_mouse_encoding,
+        "later drain applies the deferred mouse disable");
 
     return ok;
 }
@@ -10043,6 +10158,10 @@ bool test_pending_mouse_report_preserves_following_key_input(QGuiApplication& ap
         ok &= check(backend_ptr->writes.size() == write_index,
             "multi pending mouse/key preservation release remains pending while blocked");
 
+        (void)queue_surface_frontier_output(fixture.surface, *backend_ptr);
+        ok &= check(backend_ptr->output_paused,
+            "multi pending mouse/key preservation queues callback backlog");
+
         ok &= send_key(
             fixture.surface,
             Qt::Key_X,
@@ -10066,6 +10185,651 @@ bool test_pending_mouse_report_preserves_following_key_input(QGuiApplication& ap
             "multi pending mouse/key preservation cancels the stale mouse queue and writes the key");
     }
 
+    return ok;
+}
+
+bool test_single_pending_mouse_press_survives_frontier_backlog(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1000;1006hmouse-ready"),
+    };
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    ok &= check(started, "single frontier mouse/key surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_pending_published_mouse_report_block_count_for_testing(
+            fixture.surface,
+            1);
+    const std::uint64_t press_frontier_epoch =
+        queue_surface_frontier_output(fixture.surface, *backend_ptr);
+    backend_ptr->outputs_during_output_resume = {
+        surface_backpressure_output(*backend_ptr),
+        QByteArrayLiteral("."),
+    };
+    ok &= check(backend_ptr->output_paused,
+        "single frontier mouse/key output starts behind backpressure");
+    const QPointF point = point_in_grid_cell(fixture.surface, 0, 1);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "single frontier mouse press is accepted");
+    const std::uint64_t key_frontier_epoch =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface);
+    ok &= check(backend_ptr->writes == std::vector<QByteArray>{
+            sgr_mouse_report(0, 0, 1, 'M')} &&
+        key_frontier_epoch > press_frontier_epoch &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface) == press_frontier_epoch,
+        "single frontier mouse retry writes press while later output stays queued");
+
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        "single frontier following key is accepted");
+    ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface) > key_frontier_epoch &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface) == key_frontier_epoch,
+        "single frontier following key writes before replenished output");
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"));
+    ok &= check(backend_ptr->writes == std::vector<QByteArray>{
+            sgr_mouse_report(0, 0, 1, 'M'),
+            term::encode_terminal_key_event(key_event, {})},
+        "single frontier mouse press remains before the following key");
+
+    return ok;
+}
+
+bool test_surface_key_routes_stop_at_callback_frontier(QGuiApplication& app)
+{
+    bool ok = true;
+
+    for (int route = 0; route < 6; ++route) {
+        Surface_fixture fixture;
+        if (route == 5) {
+            fixture.surface.set_scrollback_limit(200);
+        }
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            route == 5
+                ? numbered_scroll_lines(80)
+                : QByteArrayLiteral("key-ready"),
+        };
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            {QStringLiteral("scripted-terminal")},
+            &started);
+        ok &= check(started, "frontier key surface starts");
+        if (!started) {
+            continue;
+        }
+
+        if (route == 4) {
+            const QPointF selection_start = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF selection_end = point_in_grid_cell(fixture.surface, 0, 3);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                selection_start,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier copy selection press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                selection_end,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier copy selection drag is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                selection_end,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "frontier copy selection release is accepted");
+            ok &= check(fixture.surface.selection_state() !=
+                VNM_TerminalSurface::Selection_state::NONE,
+                "frontier copy has a selection before Ctrl+C");
+        }
+
+        const std::uint64_t input_frontier_epoch =
+            queue_surface_frontier_output(fixture.surface, *backend_ptr);
+        ok &= check(backend_ptr->output_paused,
+            "frontier key output starts behind backpressure");
+
+        const int key = route == 0 ? Qt::Key_X
+            : route == 1 || route == 4 ? Qt::Key_C
+            : route == 2 || route == 5 ? Qt::Key_PageUp
+            : Qt::Key_PageDown;
+        const Qt::KeyboardModifiers modifiers = route == 1 || route == 4
+            ? Qt::ControlModifier
+            : Qt::NoModifier;
+        ok &= send_key(
+            fixture.surface,
+            key,
+            modifiers,
+            route == 0 ? QStringLiteral("x") : QString{},
+            "frontier surface key is accepted");
+        bool route_effect = false;
+        if (route == 4) {
+            ok &= check(backend_ptr->writes.empty(),
+                "frontier Ctrl+C copy writes no backend bytes");
+            ok &= check(fixture.surface.selection_state() ==
+                    VNM_TerminalSurface::Selection_state::NONE,
+                "frontier Ctrl+C copy clears the selection");
+            ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+                    QStringLiteral("key-"),
+                "frontier Ctrl+C copy writes selected text to clipboard");
+            route_effect = backend_ptr->writes.empty() &&
+                fixture.surface.selection_state() ==
+                    VNM_TerminalSurface::Selection_state::NONE &&
+                QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+                    QStringLiteral("key-");
+        }
+        else if (route == 5) {
+            const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(
+                    fixture.surface);
+            route_effect = backend_ptr->writes.empty() &&
+                snapshot != nullptr &&
+                snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+                snapshot->viewport.offset_from_tail > 0;
+        }
+        else {
+            const QKeyEvent key_event(
+                QEvent::KeyPress,
+                key,
+                modifiers,
+                route == 0 ? QStringLiteral("x") : QString{});
+            route_effect = backend_ptr->writes == std::vector<QByteArray>{
+                term::encode_terminal_key_event(key_event, {})};
+        }
+        ok &= check(route_effect &&
+            term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                fixture.surface) > input_frontier_epoch &&
+            term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+                fixture.surface) == input_frontier_epoch,
+            route == 0
+                ? "frontier ordinary key writes before later output"
+                : route == 1
+                    ? "frontier Ctrl+C writes before later output"
+                    : route == 2
+                        ? "frontier PageUp writes before later output"
+                        : route == 3
+                            ? "frontier PageDown writes before later output"
+                            : route == 4
+                                ? "frontier Ctrl+C copies before later output"
+                                : "frontier PageUp scrolls before later output");
+    }
+
+    return ok;
+}
+
+bool test_page_key_scrolls_before_post_frontier_alternate_screen(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    ok &= check(started, "frontier PageUp mode-order surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const std::uint64_t input_frontier_epoch =
+        queue_surface_frontier_output(
+            fixture.surface,
+            *backend_ptr,
+            numbered_scroll_lines(80),
+            QByteArrayLiteral("\x1b[?1049h"));
+    ok &= check(backend_ptr->output_paused,
+        "frontier PageUp mode output starts behind backpressure");
+
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_PageUp,
+        Qt::NoModifier,
+        {},
+        "frontier PageUp key is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr &&
+        snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        snapshot->viewport.offset_from_tail > 0 &&
+        backend_ptr->writes.empty() &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface) > input_frontier_epoch &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface) == input_frontier_epoch,
+        "frontier PageUp scrolls the primary viewport before alternate-screen output");
+
+    return ok;
+}
+
+bool test_surface_text_input_routes_keep_one_frontier(QGuiApplication& app)
+{
+    bool ok = true;
+    for (int route = 0; route < 3; ++route) {
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            {QStringLiteral("scripted-terminal")},
+            &started);
+        ok &= check(started, "frontier text-input surface starts");
+        if (!started) {
+            continue;
+        }
+
+        const std::uint64_t input_frontier_epoch =
+            queue_surface_frontier_output(
+                fixture.surface,
+                *backend_ptr,
+                QByteArrayLiteral("\x1b[?2004h"),
+                QByteArrayLiteral("\x1b[?2004l"));
+        ok &= check(backend_ptr->output_paused,
+            "frontier text input starts behind backpressure");
+
+        bool accepted = false;
+        QByteArray expected;
+        if (route == 0) {
+            accepted = fixture.surface.paste_text(QStringLiteral("p"));
+            expected = framed_paste(QByteArrayLiteral("p"));
+        }
+        else if (route == 1) {
+            accepted = fixture.surface.submit_utf8_message(QByteArrayLiteral("s")).accepted();
+            expected = framed_paste(QByteArrayLiteral("s")) + '\r';
+        }
+        else {
+            accepted = send_ime_commit(
+                fixture.surface,
+                QStringLiteral("i"),
+                "frontier IME commit is accepted");
+            expected = QByteArrayLiteral("i");
+        }
+        ok &= check(accepted &&
+            backend_ptr->writes == std::vector<QByteArray>{expected} &&
+            term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                fixture.surface) > input_frontier_epoch &&
+            term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+                fixture.surface) == input_frontier_epoch,
+            route == 0
+                ? "frontier paste writes bracketed bytes before the later mode reset"
+                : route == 1
+                    ? "frontier submitted text writes bracketed bytes before the later mode reset"
+                    : "frontier IME commit writes before the later mode reset");
+    }
+    return ok;
+}
+
+bool test_mouse_input_stops_at_callback_frontier(QGuiApplication& app)
+{
+    bool ok = true;
+
+    for (int route = 0; route < 3; ++route) {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("selection-ready")};
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            {QStringLiteral("scripted-terminal")},
+            &started);
+        ok &= check(started, "frontier mouse surface starts");
+        if (!started) {
+            continue;
+        }
+
+        const QPointF press_point = point_in_grid_cell(fixture.surface, 0, 1);
+        const QPointF later_point = point_in_grid_cell(fixture.surface, 0, 4);
+        if (route == 0) {
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                press_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier mouse setup press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                later_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier mouse setup drag is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                later_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "frontier mouse setup release is accepted");
+        }
+        else {
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                press_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier mouse selection press is accepted before backlog");
+            if (route == 2) {
+                ok &= send_mouse_event(
+                    fixture.surface,
+                    QEvent::MouseMove,
+                    later_point,
+                    Qt::NoButton,
+                    Qt::LeftButton,
+                    Qt::NoModifier,
+                    true,
+                    "frontier mouse release setup drag is accepted");
+            }
+        }
+        if (route != 1) {
+            ok &= check(fixture.surface.selection_state() !=
+                VNM_TerminalSurface::Selection_state::NONE,
+                "frontier mouse setup has a selection");
+        }
+
+        const std::uint64_t input_frontier_epoch =
+            queue_surface_frontier_output(fixture.surface, *backend_ptr);
+        ok &= check(backend_ptr->output_paused,
+            "frontier mouse output starts behind backpressure");
+
+        if (route == 0) {
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                press_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier mouse press is accepted");
+        }
+        else if (route == 1) {
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                later_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "frontier selection drag is accepted");
+        }
+        else {
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                later_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "frontier mouse release is accepted");
+        }
+
+        const bool selection_matches_route = route == 0
+            ? fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::NONE
+            : fixture.surface.selection_state() !=
+                VNM_TerminalSurface::Selection_state::NONE;
+        ok &= check(backend_ptr->writes.empty() &&
+            selection_matches_route &&
+            term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                fixture.surface) > input_frontier_epoch &&
+            term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+                fixture.surface) == input_frontier_epoch,
+            route == 0
+                ? "frontier mouse press returns before draining later output"
+                : route == 1
+                    ? "frontier selection drag returns before draining later output"
+                    : "frontier mouse release returns before draining later output");
+    }
+
+    return ok;
+}
+
+bool test_control_wheel_resize_keeps_event_frontier(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    ok &= check(started, "frontier Ctrl+wheel surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const qreal font_size_before = fixture.surface.font_size();
+    const std::size_t resize_count_before = backend_ptr->resize_requests.size();
+    const std::uint64_t input_frontier_epoch = queue_surface_frontier_output(
+        fixture.surface,
+        *backend_ptr,
+        QByteArrayLiteral("pre-zoom"),
+        QByteArrayLiteral("\x1b[?1049h"));
+    ok &= check(backend_ptr->output_paused,
+        "frontier Ctrl+wheel output starts behind backpressure");
+
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::ControlModifier,
+        1200,
+        true,
+        "frontier Ctrl+wheel zoom is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.font_size() == font_size_before + 10.0 &&
+        backend_ptr->resize_requests.size() > resize_count_before &&
+        backend_ptr->writes.empty(),
+        "frontier Ctrl+wheel changes font, resizes, and writes no terminal input");
+    ok &= check(snapshot != nullptr &&
+        snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface) > input_frontier_epoch &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface) == input_frontier_epoch,
+        "frontier Ctrl+wheel resizes before later alternate-screen output");
+    return ok;
+}
+
+bool test_reentrant_paste_captures_new_public_frontier(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    ok &= check(started, "reentrant frontier surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const std::size_t resize_count_before = backend_ptr->resize_requests.size();
+    const std::uint64_t outer_epoch = queue_surface_frontier_output(
+        fixture.surface,
+        *backend_ptr,
+        QByteArrayLiteral("pre-zoom"));
+    backend_ptr->outputs_during_write = {QByteArrayLiteral("\x1b[?2004l")};
+    bool callback_invoked = false;
+    bool outer_frontier_bounded = false;
+    bool paste_accepted = false;
+    std::uint64_t paste_epoch = 0U;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::font_size_changed,
+        &fixture.surface,
+        [&] {
+            callback_invoked = true;
+            outer_frontier_bounded =
+                term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                    fixture.surface) > outer_epoch &&
+                term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+                    fixture.surface) == outer_epoch;
+            backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2004h"));
+            paste_epoch =
+                term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                    fixture.surface);
+            paste_accepted = fixture.surface.paste_text(QStringLiteral("p"));
+        });
+
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::ControlModifier,
+        1200,
+        true,
+        "reentrant frontier Ctrl+wheel is accepted");
+    ok &= check(callback_invoked && outer_frontier_bounded &&
+        backend_ptr->resize_requests.size() > resize_count_before,
+        "reentrant frontier keeps E at notification and completes outer resize");
+    ok &= check(paste_accepted &&
+        backend_ptr->writes == std::vector<QByteArray>{
+            framed_paste(QByteArrayLiteral("p"))} &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface) == paste_epoch &&
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface) > paste_epoch,
+        "reentrant frontier applies DECSET before framed paste and leaves reset queued");
+    return ok;
+}
+
+bool test_resize_policy_setters_keep_callback_frontier(QGuiApplication& app)
+{
+    bool ok = true;
+    for (int route = 0; route < 2; ++route) {
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("policy-ready")};
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            {QStringLiteral("scripted-terminal")},
+            &started);
+        ok &= check(started, "frontier resize-policy surface starts");
+        if (!started) {
+            continue;
+        }
+
+        quint64 presented_request_id = 0U;
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::text_area_resize_arbitration_requested,
+            &fixture.surface,
+            [&presented_request_id](quint64 request_id, int, int) {
+                presented_request_id = request_id;
+            });
+        const int rows_before = fixture.surface.rows();
+        const int columns_before = fixture.surface.columns();
+        const std::size_t resize_count_before = backend_ptr->resize_requests.size();
+        const std::uint64_t input_frontier_epoch = queue_surface_frontier_output(
+            fixture.surface,
+            *backend_ptr,
+            QByteArrayLiteral("\x1b[8;24;80t"),
+            QByteArrayLiteral("\x1b[?1049h"));
+        ok &= check(backend_ptr->output_paused,
+            "frontier resize-policy output starts behind backpressure");
+
+        if (route == 0) {
+            fixture.surface.set_text_area_resize_policy(
+                VNM_TerminalSurface::Text_area_resize_policy::DISABLED);
+        }
+        else {
+            fixture.surface.set_text_area_resize_arbitration_enabled(true);
+        }
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(snapshot != nullptr &&
+            snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
+            "frontier resize-policy leaves post-E alternate screen unapplied");
+        ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                fixture.surface) > input_frontier_epoch,
+            "frontier resize-policy resume enqueues F");
+        ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+                fixture.surface) == input_frontier_epoch,
+            "frontier resize-policy stops after E");
+        ok &= check(fixture.surface.rows() == rows_before &&
+            fixture.surface.columns() == columns_before &&
+            backend_ptr->resize_requests.size() == resize_count_before &&
+            (route == 0 ? presented_request_id == 0U : presented_request_id != 0U),
+            route == 0
+                ? "frontier disabled resize policy suppresses E request"
+                : "frontier arbitration policy presents E request without resizing");
+    }
     return ok;
 }
 
@@ -10218,6 +10982,101 @@ bool test_local_first_wheel_trace_records_ingress_before_route(QGuiApplication& 
     if (wheel_ingress.has_value() && wheel_trace.has_value()) {
         ok &= check(wheel_ingress->event_index < wheel_trace->event_index,
             "wheel ingress trace precedes routed wheel trace");
+    }
+    return ok;
+#else
+    (void)app;
+    return true;
+#endif
+}
+
+bool test_wheel_fallback_trace_distinguishes_pending_mouse_report(
+    QGuiApplication& app)
+{
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    bool ok = true;
+    QTemporaryDir transcript_dir;
+    ok &= check(transcript_dir.isValid(), "pending-mouse wheel trace temp dir is valid");
+    if (!transcript_dir.isValid()) {
+        return ok;
+    }
+
+    const QString pending_path =
+        transcript_dir.filePath(QStringLiteral("pending_mouse_wheel.ndjson"));
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_transcript_capture_path(pending_path);
+        fixture.surface.set_wheel_trace_enabled(true);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1000;1006hpending-mouse-wheel"),
+        };
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            {QStringLiteral("scripted-terminal")},
+            &started);
+        ok &= check(started, "pending-mouse wheel trace surface starts");
+        if (!started) {
+            return false;
+        }
+
+        term::VNM_TerminalSurface_render_bridge::
+            set_pending_published_mouse_report_block_count_for_testing(
+                fixture.surface,
+                3);
+        const std::size_t write_count = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, 0, 1),
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "pending-mouse wheel trace admits the blocked press");
+        ok &= check(backend_ptr->writes.size() == write_count,
+            "pending-mouse wheel trace keeps the press queued");
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            false,
+            "pending-mouse wheel falls back while its report remains queued");
+        ok &= check(backend_ptr->writes.size() == write_count,
+            "pending-mouse wheel fallback leaves the report queued");
+    }
+
+    const auto read_wheel_trace = [&](const QString& path, const char* message) {
+        QString error;
+        const auto events = term::read_terminal_transcript(path, &error);
+        ok &= check(events.has_value(), message);
+        if (!events.has_value()) {
+            std::cerr << error.toStdString() << '\n';
+            return std::optional<QJsonObject>{};
+        }
+        const auto trace = last_transcript_event(
+            *events,
+            QStringLiteral("surface.wheel_trace"));
+        ok &= check(trace.has_value(), "fallback wheel trace exists in transcript");
+        return trace.has_value()
+            ? std::optional<QJsonObject>(trace->object)
+            : std::optional<QJsonObject>{};
+    };
+    const auto pending_trace = read_wheel_trace(
+        pending_path,
+        "pending-mouse wheel trace transcript parses");
+    if (pending_trace.has_value()) {
+        ok &= check(pending_trace->value(QStringLiteral("route")).toString() ==
+                QStringLiteral("qt_fallback") &&
+                pending_trace->value(QStringLiteral("session_present")).toBool(),
+            "pending-mouse fallback records a present session");
+        ok &= check(pending_trace->value(QStringLiteral("outcome")).toString() ==
+                QStringLiteral("pending_mouse_report"),
+            "pending-mouse fallback records its pending-report reason");
     }
     return ok;
 #else
@@ -17555,9 +18414,9 @@ bool test_keyboard_unhandled_key_skips_backend_drain(QGuiApplication& app)
 
     const std::shared_ptr<const term::Terminal_render_snapshot> pre_pump_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(pre_pump_snapshot == nullptr ||
-        !snapshot_contains_text(*pre_pump_snapshot, QStringLiteral("ignored-key-output")),
-        "unhandled key event does not drain pending backend output");
+    ok &= check(pre_pump_snapshot != nullptr &&
+        snapshot_contains_text(*pre_pump_snapshot, QStringLiteral("ignored-key-output")),
+        "unhandled key settles pre-event backend output before routing");
 
     pump_events(app);
     const std::shared_ptr<const term::Terminal_render_snapshot> post_pump_snapshot =
@@ -19097,6 +19956,364 @@ bool test_indeterminate_dispatched_start_is_reported_once(QGuiApplication& app)
     return ok;
 }
 
+#if defined(Q_OS_WIN)
+bool test_held_conpty_resize_keeps_surface_event_loop_responsive(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<term::Windows_conpty_backend>();
+    auto resize_control =
+        std::make_shared<term::Windows_conpty_resize_control_for_testing>();
+    bool ok = check(backend->set_resize_control_for_testing(resize_control),
+        "held-resize gate installs before the Surface starts its backend");
+    if (!ok) {
+        return false;
+    }
+
+    const QString command_interpreter = qEnvironmentVariable("ComSpec");
+    if (!check(!command_interpreter.isEmpty(),
+            "Windows command interpreter is available for the Surface fixture"))
+    {
+        return false;
+    }
+
+    const auto start_result = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+        fixture.surface,
+        std::move(backend),
+        {
+            command_interpreter,
+            QStringLiteral("/d"),
+            QStringLiteral("/q"),
+            QStringLiteral("/k"),
+            QStringLiteral("prompt PROMPT$G"),
+        },
+        QDir::currentPath());
+    ok &= check(start_result.accepted,
+        "Surface starts a real ConPTY process before the held resize");
+    if (!start_result.accepted) {
+        return false;
+    }
+
+    QEventLoop resize_event_loop;
+    std::atomic_bool resize_released = false;
+    std::atomic_bool marker_seen = false;
+    std::atomic_bool marker_ran_while_resize_held = false;
+    std::atomic_bool property_unsynced_while_resize_held = false;
+    std::atomic_bool snapshot_unsynced_while_resize_held = false;
+    std::atomic_bool watchdog_fired = false;
+    const auto release_resize = [&] {
+        if (!resize_released.exchange(true, std::memory_order_acq_rel)) {
+            resize_control->allow_resize.release();
+        }
+    };
+    const auto post_event_loop_marker = [&] {
+        return QMetaObject::invokeMethod(
+            &fixture.surface,
+            [&] {
+                const bool resize_is_held =
+                    !resize_released.load(std::memory_order_acquire);
+                marker_ran_while_resize_held.store(resize_is_held, std::memory_order_release);
+                if (resize_is_held) {
+                    const auto snapshot =
+                        term::VNM_TerminalSurface_render_bridge::render_snapshot(
+                            fixture.surface);
+                    property_unsynced_while_resize_held.store(
+                        !fixture.surface.backend_geometry_in_sync(),
+                        std::memory_order_release);
+                    snapshot_unsynced_while_resize_held.store(
+                        snapshot != nullptr &&
+                            !snapshot->metadata.backend_geometry_in_sync,
+                        std::memory_order_release);
+                }
+                marker_seen.store(true, std::memory_order_release);
+                resize_event_loop.quit();
+            },
+            Qt::QueuedConnection);
+    };
+
+    std::thread watchdog([&] {
+        if (!resize_control->resize_entered.try_acquire_for(std::chrono::seconds(20))) {
+            watchdog_fired.store(true, std::memory_order_release);
+            release_resize();
+            (void)post_event_loop_marker();
+            return;
+        }
+
+        if (!post_event_loop_marker()) {
+            watchdog_fired.store(true, std::memory_order_release);
+            release_resize();
+            return;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        if (!marker_seen.load(std::memory_order_acquire)) {
+            watchdog_fired.store(true, std::memory_order_release);
+            release_resize();
+        }
+    });
+
+    QTimer::singleShot(0, &fixture.surface, [&] {
+        fixture.surface.setSize(QSizeF(900.0, 500.0));
+    });
+    resize_event_loop.exec();
+    release_resize();
+    watchdog.join();
+
+    ok &= check(marker_seen.load(std::memory_order_acquire),
+        "Surface GUI event loop processes a queued marker during the held resize");
+    ok &= check(marker_ran_while_resize_held.load(std::memory_order_acquire) &&
+            !watchdog_fired.load(std::memory_order_acquire),
+        "the Surface resize returns before the native resize is released");
+    ok &= check(property_unsynced_while_resize_held.load(std::memory_order_acquire),
+        "the Surface geometry-sync property is false while native resize is held");
+    ok &= check(snapshot_unsynced_while_resize_held.load(std::memory_order_acquire),
+        "the installed render snapshot reports unsynced geometry while native resize is held");
+    ok &= check(pump_until(app, [&] {
+            return fixture.surface.backend_geometry_in_sync();
+        }, 1000),
+        "the Surface receives the completed resize after native release");
+    const auto completed_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(completed_snapshot != nullptr &&
+            completed_snapshot->metadata.backend_geometry_in_sync,
+        "the installed render snapshot reports synced geometry after resize receipt");
+
+    ok &= check(fixture.surface.terminate_process(),
+        "held-resize Surface fixture accepts termination");
+    ok &= check(pump_until(app, [&] {
+            return fixture.surface.process_state() ==
+                VNM_TerminalSurface::Process_state::EXITED;
+        }, 1000),
+        "held-resize Surface fixture exits after termination");
+    return ok;
+}
+#endif
+
+bool test_async_surface_resize_receipt_updates_geometry_snapshot(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted")},
+        &started);
+    if (!check(started, "scripted asynchronous Surface backend starts")) {
+        return false;
+    }
+
+    bool ok = pump_until(app, [&] {
+        const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(
+            fixture.surface);
+        return fixture.surface.backend_geometry_in_sync() &&
+            snapshot != nullptr && snapshot->metadata.backend_geometry_in_sync &&
+            snapshot->viewport.scrollback_rows > 3;
+    }, 100);
+    ok &= check(ok,
+        "the initial Surface property and snapshot are synchronized with retained history");
+    if (!ok) {
+        return false;
+    }
+    backend_ptr->defer_resize_completions = true;
+
+    QEventLoop marker_loop;
+    bool marker_observed_pending_geometry = false;
+    fixture.surface.setSize(QSizeF(900.0, 500.0));
+    QTimer::singleShot(0, &fixture.surface, [&] {
+        const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(
+            fixture.surface);
+        marker_observed_pending_geometry =
+            !fixture.surface.backend_geometry_in_sync() &&
+            snapshot != nullptr &&
+            !snapshot->metadata.backend_geometry_in_sync;
+        marker_loop.quit();
+    });
+    marker_loop.exec();
+    ok &= check(marker_observed_pending_geometry,
+        "the GUI marker sees false property and snapshot metadata while resize is pending");
+    ok &= check(!backend_ptr->pending_resize_completions.empty(),
+        "the asynchronous Surface resize is awaiting its receipt");
+    if (backend_ptr->pending_resize_completions.empty()) {
+        return false;
+    }
+
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(3),
+        "the pending-resize fixture detaches its viewport");
+    fixture.surface.set_search_query(QStringLiteral("scroll-line-"));
+    ok &= check(pump_until(app, [&] {
+            const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(
+                fixture.surface);
+            return fixture.surface.search_match_count() > 0 && snapshot != nullptr &&
+                !snapshot->search_match_spans.empty();
+        }, 100),
+        "a visible search overlay is established while resize is pending");
+
+    const QPointF selection_start = point_in_grid_cell(fixture.surface, 0, 0);
+    const QPointF selection_end = point_in_grid_cell(fixture.surface, 0, 4);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        selection_start,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "the pending-resize fixture starts a visible selection");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        selection_end,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "the pending-resize fixture extends a visible selection");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        selection_end,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "the pending-resize fixture completes a visible selection");
+
+    const auto pre_output_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(pre_output_snapshot != nullptr &&
+            pre_output_snapshot->viewport.offset_from_tail == 3 &&
+            !pre_output_snapshot->selection_spans.empty() &&
+            !pre_output_snapshot->search_match_spans.empty(),
+        "the pending fixture snapshot contains its detached viewport and both overlays");
+    const std::uint64_t pre_output_sequence = pre_output_snapshot != nullptr
+        ? pre_output_snapshot->metadata.sequence
+        : 0U;
+    backend_ptr->emit_output(QByteArrayLiteral("later-output\r\n"));
+    ok &= check(pump_until(app, [&] {
+            const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(
+                fixture.surface);
+            return snapshot != nullptr && snapshot->metadata.sequence > pre_output_sequence;
+        }, 100),
+        "later output publishes while the resize receipt is still pending");
+    const auto intervening_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(intervening_snapshot != nullptr &&
+            !intervening_snapshot->selection_spans.empty() &&
+            !intervening_snapshot->search_match_spans.empty() &&
+            intervening_snapshot->viewport.offset_from_tail > 0,
+        "later output leaves visible overlays and the detached viewport available for receipt comparison");
+
+    const std::uint64_t resize_id = backend_ptr->pending_resize_completions.back().transaction_id;
+    ok &= check(backend_ptr->complete_deferred_resize(resize_id),
+        "the scripted backend delivers the current resize receipt");
+    ok &= check(pump_until(app, [&] {
+            return fixture.surface.backend_geometry_in_sync();
+        }, 100),
+        "the Surface property reflects the accepted resize receipt");
+    const auto completed_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(completed_snapshot != nullptr &&
+            completed_snapshot->metadata.backend_geometry_in_sync,
+        "the render snapshot reflects the accepted resize receipt");
+    if (intervening_snapshot != nullptr && completed_snapshot != nullptr) {
+        const auto selection_spans_match = [](const auto& left, const auto& right) {
+            if (left.size() != right.size()) {
+                return false;
+            }
+            for (std::size_t index = 0; index < left.size(); ++index) {
+                if (left[index].source_range != right[index].source_range ||
+                    left[index].row != right[index].row ||
+                    left[index].first_column != right[index].first_column ||
+                    left[index].column_count != right[index].column_count)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const auto search_spans_match = [](const auto& left, const auto& right) {
+            if (left.size() != right.size()) {
+                return false;
+            }
+            for (std::size_t index = 0; index < left.size(); ++index) {
+                if (left[index].row != right[index].row ||
+                    left[index].first_column != right[index].first_column ||
+                    left[index].column_count != right[index].column_count ||
+                    left[index].current != right[index].current)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const auto& before = intervening_snapshot->viewport;
+        const auto& after = completed_snapshot->viewport;
+        ok &= check(selection_spans_match(
+                intervening_snapshot->selection_spans,
+                completed_snapshot->selection_spans),
+            "the resize receipt preserves visible selection spans from the intervening output");
+        ok &= check(search_spans_match(
+                intervening_snapshot->search_match_spans,
+                completed_snapshot->search_match_spans),
+            "the resize receipt preserves visible search spans from the intervening output");
+        ok &= check(before.active_buffer == after.active_buffer &&
+                before.scrollback_rows == after.scrollback_rows &&
+                before.visible_rows == after.visible_rows &&
+                before.offset_from_tail == after.offset_from_tail &&
+                before.follow_tail == after.follow_tail &&
+                before.alternate_screen_scroll_policy == after.alternate_screen_scroll_policy,
+            "the resize receipt preserves viewport mapping and follow state");
+        ok &= check(completed_snapshot->metadata.sequence >=
+                intervening_snapshot->metadata.sequence,
+            "the resize receipt snapshot sequence does not regress behind intervening output");
+    }
+
+    const std::size_t pending_resize_count =
+        backend_ptr->pending_resize_completions.size();
+    fixture.surface.setSize(QSizeF(920.0, 500.0));
+    const bool stale_resize_pending = pump_until(app, [&] {
+            const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(
+                fixture.surface);
+            return backend_ptr->pending_resize_completions.size() > pending_resize_count &&
+                !fixture.surface.backend_geometry_in_sync() && snapshot != nullptr &&
+                !snapshot->metadata.backend_geometry_in_sync;
+        }, 100);
+    ok &= check(stale_resize_pending,
+        "a second resize remains unsynchronized before process stop");
+    if (!stale_resize_pending) {
+        (void)fixture.surface.terminate_process();
+        (void)pump_until(app, [&] {
+            return fixture.surface.process_state() ==
+                VNM_TerminalSurface::Process_state::EXITED;
+        }, 1000);
+        return false;
+    }
+    const std::uint64_t stale_resize_id =
+        backend_ptr->pending_resize_completions.back().transaction_id;
+    ok &= check(fixture.surface.terminate_process(),
+        "the pending-receipt fixture accepts process termination");
+    ok &= check(pump_until(app, [&] {
+            return fixture.surface.process_state() ==
+                VNM_TerminalSurface::Process_state::EXITED;
+        }, 1000),
+        "the pending-receipt fixture exits before the delayed completion");
+    ok &= check(backend_ptr->complete_deferred_resize(stale_resize_id),
+        "the scripted backend delivers its delayed post-exit receipt");
+    pump_events(app);
+    const auto stale_completed_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(!fixture.surface.backend_geometry_in_sync() &&
+            stale_completed_snapshot != nullptr &&
+            !stale_completed_snapshot->metadata.backend_geometry_in_sync,
+        "a delayed resize receipt cannot restore geometry readiness after process exit");
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -19105,6 +20322,12 @@ int main(int argc, char** argv)
 
     if (app.arguments().contains(QStringLiteral("--selection-copy-intent-only"))) {
         return test_selection_copy_intent_after_output(app) ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--async-resize-metadata-only"))) {
+        return test_async_surface_resize_receipt_updates_geometry_snapshot(app) ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--pending-mouse-wheel-trace-only"))) {
+        return test_wheel_fallback_trace_distinguishes_pending_mouse_report(app) ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--clipboard-selection-only"))) {
         bool ok = test_selection_copy_intent_after_output(app);
@@ -19131,6 +20354,11 @@ int main(int argc, char** argv)
         ok &= test_surface_cursor_settle_input_grace(app);
         return ok ? 0 : 1;
     }
+#if defined(Q_OS_WIN)
+    if (app.arguments().contains(QStringLiteral("--held-resize-gui"))) {
+        return test_held_conpty_resize_keeps_surface_event_loop_responsive(app) ? 0 : 1;
+    }
+#endif
 
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
@@ -19210,15 +20438,24 @@ int main(int argc, char** argv)
     ok &= test_page_keys_scroll_primary_scrollback(app);
     ok &= test_page_keys_fall_through_on_alternate_screen(app);
     ok &= test_plain_wheel_boundaries_and_alternate_input(app);
-    ok &= test_local_first_wheel_scroll_keeps_callbacks_queued_without_backend_drain(app);
+    ok &= test_local_first_wheel_scroll_applies_frontier_before_later_callbacks(app);
     ok &= test_wheel_input_stops_after_post_barrier_callbacks_become_pending(app);
     ok &= test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(app);
     ok &= test_mouse_press_ignores_hidden_pending_mouse_enable(app);
     ok &= test_mouse_release_pending_report_uses_published_modes(app);
     ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
     ok &= test_pending_mouse_report_preserves_following_key_input(app);
+    ok &= test_single_pending_mouse_press_survives_frontier_backlog(app);
+    ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+    ok &= test_page_key_scrolls_before_post_frontier_alternate_screen(app);
+    ok &= test_surface_text_input_routes_keep_one_frontier(app);
+    ok &= test_mouse_input_stops_at_callback_frontier(app);
+    ok &= test_control_wheel_resize_keeps_event_frontier(app);
+    ok &= test_reentrant_paste_captures_new_public_frontier(app);
+    ok &= test_resize_policy_setters_keep_callback_frontier(app);
     ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
+    ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
     ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
     ok &= test_transcript_timing_diagnostics_records_hot_paths();

@@ -84,6 +84,15 @@ Terminal_backend_callbacks guard_native_backend_callbacks(
         {
             gate->invoke(callback, std::move(error));
         };
+    if (callbacks.resize_completed) {
+        guarded.resize_completed = [
+                gate,
+                callback = std::move(callbacks.resize_completed)
+            ](Terminal_backend_resize_completion completion)
+            {
+                gate->invoke(callback, std::move(completion));
+            };
+    }
     return guarded;
 }
 

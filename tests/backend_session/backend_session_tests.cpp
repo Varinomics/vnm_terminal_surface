@@ -2477,6 +2477,73 @@ bool test_text_area_resize_arbitration_folds_scanner_pending_into_the_hold()
     return ok;
 }
 
+bool test_text_area_resize_settlement_replays_tail_before_later_callback()
+{
+    bool ok = true;
+    term::Terminal_session_config config =
+        enable_test_traces(text_area_resize_arbitration_config());
+    config.backend_event_notifier = [] {};
+    config.output_queue_limits.high_water_bytes = 9U;
+    config.output_queue_limits.hard_limit_bytes = 64U;
+    config.output_queue_limits.high_water_commands = 1U;
+    config.output_queue_limits.hard_limit_commands = 8U;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "frontier settlement session starts");
+
+    backend->outputs_during_output_resume = {
+        QByteArrayLiteral("Q\0\0\0\0\0\0\0\0"),
+        QByteArrayLiteral("\x1b[?1049h"),
+    };
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;3;5tZ")) &&
+        backend->output_paused,
+        "frontier settlement request and tail pause output");
+    const std::uint64_t request_epoch = session->capture_backend_callback_frontier();
+    (void)session->process_backend_callback_events_until_epoch(request_epoch);
+    session->release_backend_callback_frontier(request_epoch);
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 1U && requests.front().request.has_value() &&
+        backend->output_paused,
+        "frontier settlement presents one request while F remains paused");
+    if (requests.size() != 1U || !requests.front().request.has_value()) {
+        return ok;
+    }
+    const std::uint64_t request_id = requests.front().request->request_id;
+    const std::uint64_t settlement_epoch = session->backend_callback_enqueue_epoch();
+    ok &= check(settlement_epoch > request_epoch,
+        "frontier settlement captures the queued held-tail callback");
+
+    const term::Terminal_session_result result =
+        session->settle_text_area_resize_arbitration({
+            request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+            {},
+        });
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(result.code == term::Terminal_session_result_code::ACCEPTED &&
+        settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::REJECTED) &&
+        settlements.front().settlement->request_id == request_id &&
+        snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) == QStringLiteral("ZQ") &&
+        backend->resize_requests.empty(),
+        "frontier settlement rejects the exact request and replays ZQ once");
+    ok &= check(session->backend_callback_processed_epoch() == settlement_epoch &&
+        session->backend_callback_enqueue_epoch() > settlement_epoch &&
+        session->has_pending_backend_callback_events(),
+        "frontier settlement leaves output resumed after its capture queued");
+    return ok;
+}
+
 bool test_text_area_resize_arbitration_rejects_a_stale_request_id()
 {
     bool ok = true;
@@ -3157,6 +3224,78 @@ bool test_text_area_resize_arbitration_settles_when_the_capability_is_removed()
         term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 1U,
         "a request after the capability is removed fires the standing notification");
 
+    return ok;
+}
+
+bool test_reentrant_policy_change_settles_before_later_callback()
+{
+    bool ok = true;
+    for (int route = 0; route < 2; ++route) {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(
+            session,
+            text_area_resize_arbitration_config());
+        ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "reentrant policy-change session starts");
+        const std::uint64_t request_id = arm_text_area_resize_arbitration(
+            *session,
+            *backend,
+            QByteArrayLiteral("\x1b[8;3;5tZ"));
+        ok &= check(request_id != 0U &&
+            session->pending_text_area_resize_arbitration().has_value(),
+            "reentrant policy-change request is in flight");
+
+        const std::uint64_t outer_epoch = session->backend_callback_enqueue_epoch();
+        bool reentered = false;
+        backend->outputs_during_write = {QByteArrayLiteral("F")};
+        backend->after_outputs_during_write = [&] {
+            reentered = true;
+            if (route == 0) {
+                session->set_text_area_resize_policy(
+                    term::Terminal_text_area_resize_policy::DISABLED);
+            }
+            else {
+                session->set_text_area_resize_arbitration(std::nullopt);
+            }
+        };
+        ok &= check(session->write_user_bytes(QByteArrayLiteral("trigger")).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "outer write accepts the reentrant policy change");
+        const auto settlements = take_pending_arbitration_events(*session);
+        const auto commands = session->processed_commands();
+        const auto expected_outcome = route == 0
+            ? term::Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED
+            : term::Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED;
+        ok &= check(reentered &&
+            backend->writes == std::vector<QByteArray>{QByteArrayLiteral("trigger")},
+            "reentrant policy-change callback runs after outer write admission");
+        ok &= check(session->backend_callback_enqueue_epoch() > outer_epoch &&
+            session->backend_callback_processed_epoch() == outer_epoch,
+            "reentrant policy-change leaves F after outer E");
+        ok &= check(!session->pending_text_area_resize_arbitration().has_value() &&
+            settlements.size() == 1U &&
+            settlement_has_outcome(settlements, 0U, expected_outcome),
+            route == 0
+                ? "reentrant disabled policy retires the request"
+                : "reentrant removed capability retires the request");
+        ok &= check(!commands.empty() &&
+            commands.back().kind ==
+                term::Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION,
+            "reentrant policy settlement is ordered after the outer write");
+
+        backend->outputs_during_write.clear();
+        backend->after_outputs_during_write = {};
+        session->process_backend_callback_events();
+        const auto after_callback = session->processed_commands();
+        const auto snapshot = session->latest_render_snapshot();
+        ok &= check(after_callback.size() == commands.size() + 1U &&
+            after_callback.back().kind ==
+                term::Terminal_session_command_kind::BACKEND_OUTPUT &&
+            snapshot.has_value() &&
+            snapshot_row_text(*snapshot, 0) == QStringLiteral("ZF"),
+            "post-write callback follows the settled request and held tail");
+    }
     return ok;
 }
 
@@ -12826,6 +12965,13 @@ bool test_synchronized_output_defers_content_until_release()
     ok &= check(ordered_force_called &&
         ordered_force_result.code == term::Terminal_session_result_code::ACCEPTED,
         "ordered force-release call inside backend callback lifetime is accepted");
+    const std::vector<term::Terminal_session_command> before_force_drain =
+        ordered_force_release_session->processed_commands();
+    ok &= check(before_force_drain.size() == 2U &&
+        before_force_drain.back().kind == term::Terminal_session_command_kind::USER_WRITE &&
+        ordered_force_release_session->has_pending_backend_callback_events(),
+        "reentrant force-release waits behind post-input callbacks");
+    ordered_force_release_session->process_backend_callback_events();
 
     const std::vector<term::Terminal_session_command> ordered_force_commands =
         ordered_force_release_session->processed_commands();
@@ -13289,6 +13435,305 @@ bool test_pre_input_queued_output_drains_during_input_without_echo()
         !snapshot_contains_text(*snapshot_after_input, QStringLiteral("readyx")) &&
         session->render_snapshot_generation() > pre_input_generation,
         "pre-input queued output drains into the snapshot during input");
+
+    return ok;
+}
+
+bool test_key_input_does_not_chase_output_replenished_on_resume()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = tight_session_config();
+    config.write_queue_limits = term::Terminal_queue_limits{};
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "replenished-output key session starts");
+
+    constexpr std::size_t k_resume_output_count = 1024U;
+    backend->outputs_during_output_resume.assign(
+        k_resume_output_count,
+        QByteArrayLiteral("."));
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1h")),
+        "replenished-output key queues application cursor mode first");
+    ok &= check(backend->output_paused,
+        "replenished-output key starts behind callback backpressure");
+
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_Left,
+        Qt::GroupSwitchModifier);
+    term::Terminal_input_mode_state application_cursor_mode;
+    application_cursor_mode.application_cursor_keys = true;
+    const QByteArray expected_key_bytes =
+        term::encode_terminal_key_event(key_event, application_cursor_mode);
+    ok &= check(expected_key_bytes != expected_encoded_key_event_bytes(key_event),
+        "replenished-output key encoding distinguishes cursor modes");
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        !backend->writes.empty() &&
+        backend->writes.back() == expected_key_bytes,
+        "replenished-output key applies pre-input mode and writes Left");
+    ok &= check(!backend->outputs_during_output_resume.empty(),
+        "replenished-output key writes before draining later output");
+
+    return ok;
+}
+
+bool test_resize_controller_fast_path_applies_only_captured_callbacks()
+{
+    bool ok = true;
+    term::Fake_terminal_grid_metrics_provider metrics;
+    metrics.set_cell_metrics({10.0, 20.0, 15.0, 5.0});
+    term::Terminal_session_config config = tight_session_config();
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_resize_controller controller(*session, metrics);
+    ok &= check(controller.start_from_geometry(
+        valid_launch_config(), QSizeF(800.0, 400.0)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "frontier resize-controller session starts");
+
+    backend->outputs_during_output_resume = {QByteArrayLiteral("\x1b[?1l")};
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1h")) &&
+        backend->output_paused,
+        "frontier resize-controller mode output pauses delivery");
+    const std::uint64_t frontier_epoch = session->backend_callback_enqueue_epoch();
+    const term::Terminal_session_result result =
+        controller.refresh_from_geometry(QSizeF(800.0, 400.0));
+    ok &= check(result.code == term::Terminal_session_result_code::ACCEPTED &&
+        backend->resize_requests.empty(),
+        "frontier resize-controller fast path remains a backend no-op");
+    ok &= check(session->backend_callback_processed_epoch() == frontier_epoch &&
+        session->backend_callback_enqueue_epoch() > frontier_epoch &&
+        session->has_pending_backend_callback_events(),
+        "frontier resize-controller fast path applies E without chasing F");
+    return ok;
+}
+
+bool test_key_input_precedes_output_queued_after_frontier()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = tight_session_config();
+    config.write_queue_limits = term::Terminal_queue_limits{};
+    config.backend_event_notifier = [] {};
+    config.trace_command_limit = 16U;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "frontier-order key session starts");
+
+    backend->outputs_during_output_resume = {
+        QByteArrayLiteral("\x1b[?1l"),
+    };
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1h")),
+        "frontier-order key queues application cursor mode");
+    ok &= check(backend->output_paused,
+        "frontier-order key starts behind callback backpressure");
+    ok &= check(backend->emit_error({
+            term::Terminal_backend_error_code::READ_FAILED,
+            QStringLiteral("frontier-order marker"),
+        }),
+        "frontier-order key queues a nonfatal target callback");
+    const std::uint64_t input_frontier_epoch =
+        session->backend_callback_enqueue_epoch();
+    const std::size_t processed_before_input =
+        session->processed_commands().size();
+
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_Left,
+        Qt::GroupSwitchModifier);
+    term::Terminal_input_mode_state application_cursor_mode;
+    application_cursor_mode.application_cursor_keys = true;
+    const QByteArray expected_key_bytes =
+        term::encode_terminal_key_event(key_event, application_cursor_mode);
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    const std::vector<term::Terminal_session_command> commands =
+        session->processed_commands();
+
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        backend->writes == std::vector<QByteArray>{expected_key_bytes},
+        "frontier-order key applies DECSET before encoding and writes");
+    ok &= check(session->backend_callback_enqueue_epoch() > input_frontier_epoch,
+        "frontier-order resume enqueues a post-frontier reset callback");
+    ok &= check(commands.size() == processed_before_input + 3U &&
+        commands[processed_before_input].kind ==
+            term::Terminal_session_command_kind::BACKEND_OUTPUT &&
+        commands[processed_before_input].backend_callback_epoch < input_frontier_epoch &&
+        commands[processed_before_input + 1U].kind ==
+            term::Terminal_session_command_kind::BACKEND_ERROR &&
+        commands[processed_before_input + 1U].backend_callback_epoch == input_frontier_epoch &&
+        commands[processed_before_input + 2U].kind ==
+            term::Terminal_session_command_kind::USER_WRITE &&
+        session->backend_callback_processed_epoch() == input_frontier_epoch &&
+        session->has_pending_backend_callback_events(),
+        "frontier-order key write precedes the queued post-frontier reset");
+
+    session->process_backend_callback_events();
+    const term::Terminal_key_event_result later_key_result =
+        session->write_key_event(key_event);
+    ok &= check(later_key_result.handled &&
+        later_key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        backend->writes.size() == 2U &&
+        backend->writes.back() == expected_encoded_key_event_bytes(key_event),
+        "frontier-order reset applies to later keys");
+
+    return ok;
+}
+
+bool test_captured_callback_frontier_seals_coalesced_output()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    config.trace_output_chunk_limit = 4U;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "coalesced-frontier session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("before")),
+        "coalesced-frontier queues initial output");
+    const std::uint64_t input_frontier_epoch =
+        session->capture_backend_callback_frontier();
+    ok &= check(backend->emit_output(QByteArrayLiteral("after")),
+        "coalesced-frontier queues later output");
+    const std::uint64_t later_frontier_epoch =
+        session->capture_backend_callback_frontier();
+    ok &= check(backend->emit_output(QByteArrayLiteral("latest")),
+        "coalesced-frontier queues output after the second seal");
+    ok &= check(session->backend_callback_enqueue_epoch() > later_frontier_epoch &&
+        later_frontier_epoch > input_frontier_epoch,
+        "coalesced-frontier output crosses two captured epochs");
+
+    (void)session->process_backend_callback_events_until_epoch(input_frontier_epoch);
+    ok &= check(session->backend_callback_processed_epoch() == input_frontier_epoch &&
+        session->output_chunks() == std::vector<QByteArray>{QByteArrayLiteral("before")} &&
+        session->has_pending_backend_callback_events(),
+        "coalesced-frontier later output stays beyond the captured epoch");
+
+    (void)session->process_backend_callback_events_until_epoch(later_frontier_epoch);
+    ok &= check(session->backend_callback_processed_epoch() == later_frontier_epoch &&
+        session->output_chunks() == std::vector<QByteArray>{
+            QByteArrayLiteral("before"), QByteArrayLiteral("after")} &&
+        session->has_pending_backend_callback_events(),
+        "coalesced-frontier older seal stays effective with a newer seal outstanding");
+
+    session->release_backend_callback_frontier(later_frontier_epoch);
+    session->release_backend_callback_frontier(input_frontier_epoch);
+    session->process_backend_callback_events();
+    ok &= check(session->output_chunks() == std::vector<QByteArray>{
+            QByteArrayLiteral("before"),
+            QByteArrayLiteral("after"),
+            QByteArrayLiteral("latest")},
+        "coalesced-frontier later output remains deliverable");
+    return ok;
+}
+
+bool test_synchronous_input_routes_do_not_chase_replenished_output()
+{
+    bool ok = true;
+
+    const auto run_case = [&](
+        const char* label,
+        QByteArray mode_output,
+        const std::function<bool(term::Terminal_session&, Scripted_backend&)>& submit) {
+        term::Terminal_session_config config = tight_session_config();
+        config.write_queue_limits = term::Terminal_queue_limits{};
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        backend->exit_on_interrupt = false;
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "frontier input-route session starts");
+
+        backend->outputs_during_output_resume.assign(
+            32U,
+            QByteArrayLiteral("."));
+        ok &= check(backend->emit_output(std::move(mode_output)) &&
+            backend->output_paused,
+            "frontier input-route queues mode output behind backpressure");
+        const std::uint64_t input_frontier_epoch =
+            session->backend_callback_enqueue_epoch();
+
+        ok &= check(submit(*session, *backend) &&
+            !backend->outputs_during_output_resume.empty() &&
+            session->backend_callback_processed_epoch() == input_frontier_epoch,
+            label);
+    };
+
+    run_case(
+        "frontier direct user bytes write before later output",
+        QByteArrayLiteral("\x1b[?1h"),
+        [](term::Terminal_session& session, Scripted_backend& backend) {
+            return session.write_user_bytes(QByteArrayLiteral("u")).code ==
+                    term::Terminal_session_result_code::ACCEPTED &&
+                backend.writes == std::vector<QByteArray>{QByteArrayLiteral("u")};
+        });
+    run_case(
+        "frontier IME commit writes before later output",
+        QByteArrayLiteral("\x1b[?1h"),
+        [](term::Terminal_session& session, Scripted_backend& backend) {
+            const term::Terminal_ime_commit_result result =
+                session.write_ime_commit(QStringLiteral("i"));
+            return result.handled &&
+                result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+                backend.writes == std::vector<QByteArray>{QByteArrayLiteral("i")};
+        });
+    run_case(
+        "frontier paste observes bracketed mode and writes before later output",
+        QByteArrayLiteral("\x1b[?2004h"),
+        [](term::Terminal_session& session, Scripted_backend& backend) {
+            const term::Terminal_paste_text_result result = session.write_paste_text(
+                QStringLiteral("p"),
+                term::Terminal_paste_framing_policy::APPLICATION_CONTROLLED);
+            return result.handled &&
+                result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+                backend.writes == std::vector<QByteArray>{
+                    framed_paste(QByteArrayLiteral("p"))};
+        });
+    run_case(
+        "frontier submitted text observes bracketed mode and writes before later output",
+        QByteArrayLiteral("\x1b[?2004h"),
+        [](term::Terminal_session& session, Scripted_backend& backend) {
+            const term::Terminal_paste_text_result result = session.write_submitted_text(
+                QStringLiteral("s"),
+                term::Terminal_paste_framing_policy::APPLICATION_CONTROLLED);
+            return result.handled &&
+                result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+                backend.writes == std::vector<QByteArray>{
+                    framed_paste(QByteArrayLiteral("s")) + '\r'};
+        });
+    run_case(
+        "frontier focus report observes DECSET and writes before later output",
+        QByteArrayLiteral("\x1b[?1004h"),
+        [](term::Terminal_session& session, Scripted_backend& backend) {
+            const term::Terminal_focus_event_result result =
+                session.write_focus_event(true);
+            return result.handled &&
+                result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+                backend.writes == std::vector<QByteArray>{QByteArrayLiteral("\x1b[I")};
+        });
+    run_case(
+        "frontier interrupt reaches backend before later output",
+        QByteArrayLiteral("\x1b[?1h"),
+        [](term::Terminal_session& session, Scripted_backend& backend) {
+            return session.interrupt().code ==
+                    term::Terminal_session_result_code::ACCEPTED &&
+                backend.interrupt_count == 1;
+        });
 
     return ok;
 }
@@ -14747,11 +15192,17 @@ bool test_callback_during_write_is_serialized()
         "write-callback session starts");
 
     backend->outputs_during_write = {QByteArrayLiteral("write-output")};
+    const std::uint64_t input_epoch = session->backend_callback_enqueue_epoch();
     const term::Terminal_session_result write_result =
         session->write_user_bytes(QByteArrayLiteral("abc"));
 
     ok &= check(write_result.code == term::Terminal_session_result_code::ACCEPTED,
         "write with backend callback is accepted");
+    ok &= check(session->output_chunks().empty() &&
+        session->backend_callback_processed_epoch() == input_epoch &&
+        session->backend_callback_enqueue_epoch() > input_epoch,
+        "write-time callback remains queued beyond the input frontier");
+    session->process_backend_callback_events();
     ok &= check(session->output_chunks().size() == 1U &&
         session->output_chunks().front() == QByteArrayLiteral("write-output"),
         "write-time backend callback output is delivered");
@@ -14768,6 +15219,66 @@ bool test_callback_during_write_is_serialized()
         *session,
         "write-time callback processed command stream stays monotonic");
 
+    return ok;
+}
+
+bool test_reentrant_paste_waits_for_its_own_mode_frontier()
+{
+    bool ok = true;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "reentrant paste session starts");
+
+    bool entered = false;
+    std::uint64_t mode_epoch = 0U;
+    term::Terminal_paste_text_result nested_paste;
+    backend->outputs_during_write = {QByteArrayLiteral("\x1b[?2004h")};
+    backend->after_outputs_during_write = [&] {
+        if (entered) {
+            return;
+        }
+        entered = true;
+        mode_epoch = session->backend_callback_enqueue_epoch();
+        nested_paste = session->write_paste_text(
+            QStringLiteral("p"),
+            term::Terminal_paste_framing_policy::APPLICATION_CONTROLLED);
+    };
+
+    const std::uint64_t outer_epoch = session->backend_callback_enqueue_epoch();
+    ok &= check(session->write_user_bytes(QByteArrayLiteral("outer")).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "outer write completes after reentrant paste attempt");
+    ok &= check(entered && mode_epoch > outer_epoch &&
+        nested_paste.handled &&
+        nested_paste.result.code == term::Terminal_session_result_code::INVALID_STATE &&
+        backend->writes == std::vector<QByteArray>{QByteArrayLiteral("outer")} &&
+        session->backend_callback_processed_epoch() == outer_epoch,
+        "reentrant paste rejects unsettled mode without writing plain bytes");
+
+    backend->outputs_during_write.clear();
+    backend->after_outputs_during_write = {};
+    session->process_backend_callback_events();
+    const std::vector<term::Terminal_session_command> after_mode =
+        session->processed_commands();
+    ok &= check(session->backend_callback_processed_epoch() == mode_epoch &&
+        after_mode.size() == 3U &&
+        after_mode[0].kind == term::Terminal_session_command_kind::START &&
+        after_mode[1].kind == term::Terminal_session_command_kind::USER_WRITE &&
+        after_mode[2].kind == term::Terminal_session_command_kind::BACKEND_OUTPUT,
+        "reentrant paste mode callback remains ordered after outer write");
+
+    const term::Terminal_paste_text_result subsequent_paste =
+        session->write_paste_text(
+            QStringLiteral("q"),
+            term::Terminal_paste_framing_policy::APPLICATION_CONTROLLED);
+    ok &= check(subsequent_paste.handled &&
+        subsequent_paste.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        backend->writes == std::vector<QByteArray>{
+            QByteArrayLiteral("outer"),
+            framed_paste(QByteArrayLiteral("q"))},
+        "paste after mode settlement writes bracketed bytes");
     return ok;
 }
 
@@ -19810,6 +20321,7 @@ int main()
     ok &= test_text_area_resize_arbitration_decreased_limit_starts_a_safe_tail_epoch();
     ok &= test_text_area_resize_arbitration_spans_a_chunk_boundary();
     ok &= test_text_area_resize_arbitration_folds_scanner_pending_into_the_hold();
+    ok &= test_text_area_resize_settlement_replays_tail_before_later_callback();
     ok &= test_text_area_resize_arbitration_rejects_a_stale_request_id();
     ok &= test_text_area_resize_arbitration_hold_limit_settles_the_request();
     ok &= test_text_area_resize_arbitration_same_callback_overflow_never_presents();
@@ -19822,6 +20334,7 @@ int main()
     ok &= test_text_area_resize_arbitration_survives_a_host_resize();
     ok &= test_text_area_resize_arbitration_settles_on_a_policy_change();
     ok &= test_text_area_resize_arbitration_settles_when_the_capability_is_removed();
+    ok &= test_reentrant_policy_change_settles_before_later_callback();
     ok &= test_text_area_resize_arbitration_advances_the_backend_callback_epoch();
     ok &= test_text_area_resize_arbitration_respects_the_disabled_policy();
     ok &= test_text_area_resize_arbitration_inside_synchronized_output();
@@ -19915,6 +20428,11 @@ int main()
     ok &= test_synchronized_output_defers_content_until_release();
     ok &= test_selection_only_synchronized_hold_keeps_held_output_unpublished();
     ok &= test_pre_input_queued_output_drains_during_input_without_echo();
+    ok &= test_key_input_does_not_chase_output_replenished_on_resume();
+    ok &= test_resize_controller_fast_path_applies_only_captured_callbacks();
+    ok &= test_key_input_precedes_output_queued_after_frontier();
+    ok &= test_captured_callback_frontier_seals_coalesced_output();
+    ok &= test_synchronous_input_routes_do_not_chase_replenished_output();
     ok &= test_viewport_scroll_public_session_path();
     ok &= test_resize_preserves_primary_scrollback();
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
@@ -19940,6 +20458,7 @@ int main()
     ok &= test_generated_reply_command_enqueue_failure_reports_backend_error();
     ok &= test_reentrant_start_callbacks_preserve_order();
     ok &= test_callback_during_write_is_serialized();
+    ok &= test_reentrant_paste_waits_for_its_own_mode_frontier();
     ok &= test_destructor_ignores_late_backend_callbacks();
     ok &= test_worker_thread_callback_is_delivered();
     ok &= test_deferred_callback_ingress_merges_adjacent_output();

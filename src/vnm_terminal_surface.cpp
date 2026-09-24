@@ -705,6 +705,15 @@ bool backend_drain_reached_notification_boundary(
         !session.has_pending_backend_callback_events();
 }
 
+bool protocol_callbacks_before_input_frontier_pending(
+    const term::Terminal_session& session)
+{
+    const std::optional<std::uint64_t> frontier = session.input_frontier_epoch();
+    return frontier.has_value()
+        ? session.backend_callback_processed_epoch() < *frontier
+        : session.has_pending_backend_callback_events();
+}
+
 term::Terminal_paste_framing_policy paste_framing_policy(
     VNM_TerminalSurface::Bracketed_paste_policy policy)
 {
@@ -2781,7 +2790,7 @@ struct VNM_TerminalSurface::Private
             {
                 if (drain_once) {
                     drain_once = false;
-                    surface.drain_backend_callback_events();
+                    surface.drain_backend_callback_events_to_current_epoch();
                     continue;
                 }
 
@@ -2826,23 +2835,27 @@ struct VNM_TerminalSurface::Private
         return !retry_pending_published_mouse_reports(surface, true);
     }
 
-    void resolve_pending_published_mouse_reports_before_terminal_input(
+    bool resolve_pending_published_mouse_reports_before_terminal_input(
         VNM_TerminalSurface& surface)
     {
         if (pending_published_mouse_reports.empty()) {
-            return;
+            return true;
         }
 
-        if (pending_published_mouse_reports.size() == 1U &&
-            retry_pending_published_mouse_reports(surface, true))
-        {
-            return;
+        if (pending_published_mouse_reports.size() == 1U) {
+            if (retry_pending_published_mouse_reports(surface, true)) {
+                return true;
+            }
+            // The accepted single report still owns its place before newer
+            // input. A later callback drain will retry it.
+            return false;
         }
 
         // Non-mouse input must not publish only a prefix of a mouse-report
         // queue. Multi-report queues are cancelled as a unit before the newer
         // terminal input proceeds.
         clear_pending_published_mouse_reports();
+        return true;
     }
 
     void clear_pending_published_mouse_reports()
@@ -3284,6 +3297,32 @@ VNM_TerminalSurface::~VNM_TerminalSurface()
     reset_session();
 }
 
+VNM_TerminalSurface::Input_frontier_scope::Input_frontier_scope(
+    VNM_TerminalSurface& surface,
+    bool                 drain_before_route,
+    bool                 fresh_ingress)
+    : m_surface(surface)
+{
+    if (m_surface.m_private == nullptr || m_surface.m_private->session == nullptr) {
+        return;
+    }
+    m_session = m_surface.m_private->session.get();
+    m_generation = m_surface.m_private->session_generation;
+    m_session->begin_input_frontier(fresh_ingress);
+    if (drain_before_route) {
+        m_surface.drain_backend_callback_events_to_current_epoch();
+    }
+}
+
+VNM_TerminalSurface::Input_frontier_scope::~Input_frontier_scope()
+{
+    if (m_session != nullptr && m_surface.m_private != nullptr &&
+        m_surface.m_private->active_session_matches(m_session, m_generation))
+    {
+        m_session->end_input_frontier();
+    }
+}
+
 void VNM_TerminalSurface::releaseResources()
 {
     Q_ASSERT(thread() == QThread::currentThread());
@@ -3310,6 +3349,7 @@ QString VNM_TerminalSurface::font_family() const
 
 void VNM_TerminalSurface::set_font_family(const QString& font_family)
 {
+    Input_frontier_scope input_frontier(*this);
     if (m_font_family == font_family) {
         return;
     }
@@ -3451,6 +3491,7 @@ vnm_terminal::Font_advance_policy VNM_TerminalSurface::font_advance_policy() con
 void VNM_TerminalSurface::set_font_advance_policy(
     vnm_terminal::Font_advance_policy policy)
 {
+    Input_frontier_scope input_frontier(*this);
     if (!vnm_terminal::font_advance_policy_is_valid(policy)) {
         policy = vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE;
     }
@@ -3479,6 +3520,12 @@ void VNM_TerminalSurface::set_font_advance_policy_value(int policy)
 
 void VNM_TerminalSurface::set_font_size(qreal font_size)
 {
+    Input_frontier_scope input_frontier(*this);
+    apply_font_size(font_size);
+}
+
+void VNM_TerminalSurface::apply_font_size(qreal font_size)
+{
     const qreal normalized_font_size = normalized_font_pixel_size(font_size);
     if (same_property_value(m_font_size, normalized_font_size)) {
         return;
@@ -3497,6 +3544,7 @@ QString VNM_TerminalSurface::color_scheme() const
 
 void VNM_TerminalSurface::set_color_scheme(const QString& color_scheme)
 {
+    Input_frontier_scope input_frontier(*this);
     const term::Terminal_color_scheme* scheme = term::find_color_scheme(color_scheme);
     if (scheme == nullptr) {
         vnm_terminal::diagnostics::write(
@@ -3613,6 +3661,7 @@ int VNM_TerminalSurface::scrollback_limit() const
 
 void VNM_TerminalSurface::set_scrollback_limit(int limit)
 {
+    Input_frontier_scope input_frontier(*this);
     const int bounded_limit = std::max(0, limit);
 
     if (m_scrollback_limit == bounded_limit) {
@@ -3634,6 +3683,7 @@ int VNM_TerminalSurface::scrollback_buffer_size_mib() const
 
 void VNM_TerminalSurface::set_scrollback_buffer_size_mib(int size_mib)
 {
+    Input_frontier_scope input_frontier(*this);
     const int minimum_mib = minimum_scrollback_buffer_size_mib();
     const int maximum_mib = maximum_scrollback_buffer_size_mib();
     if (size_mib < minimum_mib || size_mib > maximum_mib) {
@@ -3694,6 +3744,7 @@ std::size_t VNM_TerminalSurface::retained_history_capacity_bytes() const
 void VNM_TerminalSurface::set_retained_history_capacity_bytes(
     std::size_t capacity_bytes)
 {
+    Input_frontier_scope input_frontier(*this);
     if (capacity_bytes < minimum_retained_history_capacity_bytes() ||
         capacity_bytes > maximum_retained_history_capacity_bytes())
     {
@@ -3854,6 +3905,7 @@ bool VNM_TerminalSurface::primary_repaint_recovery_enabled() const
 
 void VNM_TerminalSurface::set_primary_repaint_recovery_enabled(bool enabled)
 {
+    Input_frontier_scope input_frontier(*this);
     if (m_primary_repaint_recovery_enabled == enabled) {
         return;
     }
@@ -4090,6 +4142,7 @@ VNM_TerminalSurface::text_area_resize_policy() const
 
 void VNM_TerminalSurface::set_text_area_resize_policy(Text_area_resize_policy policy)
 {
+    Input_frontier_scope input_frontier(*this, false);
     if (m_text_area_resize_policy == policy) {
         return;
     }
@@ -4112,6 +4165,7 @@ bool VNM_TerminalSurface::text_area_resize_arbitration_enabled() const
 
 void VNM_TerminalSurface::set_text_area_resize_arbitration_enabled(bool enabled)
 {
+    Input_frontier_scope input_frontier(*this, false);
     if (m_text_area_resize_arbitration_enabled == enabled) {
         return;
     }
@@ -4137,6 +4191,7 @@ int VNM_TerminalSurface::text_area_resize_arbitration_timeout_ms() const
 
 void VNM_TerminalSurface::set_text_area_resize_arbitration_timeout_ms(int timeout_ms)
 {
+    Input_frontier_scope input_frontier(*this, false);
     const int bounded_timeout_ms = std::max(timeout_ms, 0);
     if (m_text_area_resize_arbitration_timeout_ms == bounded_timeout_ms) {
         return;
@@ -4594,6 +4649,7 @@ bool VNM_TerminalSurface::respond_text_area_resize(
     int                                     effective_columns)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this, false);
 
     if (m_private->session == nullptr)
     {
@@ -4625,6 +4681,7 @@ bool VNM_TerminalSurface::respond_text_area_resize(
 void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this, false);
 
     if (m_private->session == nullptr)
     {
@@ -4688,6 +4745,7 @@ void VNM_TerminalSurface::refresh_hyperlink_hover_feedback()
 QString VNM_TerminalSurface::selected_text()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
 
     if (m_private->session == nullptr) {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
@@ -4696,7 +4754,7 @@ QString VNM_TerminalSurface::selected_text()
         return {};
     }
 
-    drain_backend_callback_events();
+    drain_backend_callback_events_to_current_epoch();
     const term::Terminal_selection_result result = m_private->session->selected_text();
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
@@ -4712,6 +4770,7 @@ QString VNM_TerminalSurface::selected_text()
 bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
     Selection_copy_policy policy)
 {
+    Input_frontier_scope input_frontier(*this, true, false);
     if (m_private->session == nullptr) {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface copy-selected-text reason=no-session"));
@@ -4753,6 +4812,12 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
 
 void VNM_TerminalSurface::clear_selection()
 {
+    Input_frontier_scope input_frontier(*this);
+    clear_selection_within_input_event();
+}
+
+void VNM_TerminalSurface::clear_selection_within_input_event()
+{
     Q_ASSERT(thread() == QThread::currentThread());
     m_private->cancel_clipboard_paste();
     m_private->dismiss_copy_intent();
@@ -4774,6 +4839,7 @@ void VNM_TerminalSurface::clear_selection()
 
 void VNM_TerminalSurface::set_search_query(QString query)
 {
+    Input_frontier_scope input_frontier(*this);
     Q_ASSERT(thread() == QThread::currentThread());
 
     if (m_private->session == nullptr) {
@@ -4803,9 +4869,10 @@ void VNM_TerminalSurface::clear_search()
 
 bool VNM_TerminalSurface::search_next()
 {
+    Input_frontier_scope input_frontier(*this);
     Q_ASSERT(thread() == QThread::currentThread());
 
-    drain_backend_callback_events();
+    drain_backend_callback_events_to_current_epoch();
     if (m_private->session == nullptr) {
         return false;
     }
@@ -4817,9 +4884,10 @@ bool VNM_TerminalSurface::search_next()
 
 bool VNM_TerminalSurface::search_previous()
 {
+    Input_frontier_scope input_frontier(*this);
     Q_ASSERT(thread() == QThread::currentThread());
 
-    drain_backend_callback_events();
+    drain_backend_callback_events_to_current_epoch();
     if (m_private->session == nullptr) {
         return false;
     }
@@ -4832,14 +4900,16 @@ bool VNM_TerminalSurface::search_previous()
 bool VNM_TerminalSurface::paste_text(QString text)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
     m_private->cancel_clipboard_paste();
     m_private->dismiss_copy_intent();
 
     if (m_private->session == nullptr) {
         return false;
     }
-    m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
-    if (m_private->session == nullptr) {
+    if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
+        m_private->session == nullptr)
+    {
         return false;
     }
 
@@ -4877,6 +4947,7 @@ vnm_terminal::Terminal_message_submission_result
 VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
     m_private->cancel_clipboard_paste();
     m_private->dismiss_copy_intent();
 
@@ -4922,7 +4993,12 @@ VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
         };
     }
 
-    m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
+    if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this)) {
+        return {
+            Outcome::BACKEND_REJECTED,
+            QStringLiteral("An earlier mouse report is still pending."),
+        };
+    }
     if (m_private->session == nullptr) {
         return {
             Outcome::NOT_RUNNING,
@@ -5033,6 +5109,7 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
     int     line_delta,
     QString source)
 {
+    Input_frontier_scope input_frontier(*this);
     return scroll_viewport_with_diagnostics(line_delta, std::nullopt, std::move(source));
 }
 
@@ -5056,6 +5133,7 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     int     offset_from_tail,
     QString source)
 {
+    Input_frontier_scope input_frontier(*this);
     return scroll_viewport_with_diagnostics(0, offset_from_tail, std::move(source));
 }
 
@@ -5066,6 +5144,7 @@ VNM_TerminalSurface::scroll_viewport_with_diagnostics(
     QString          source)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this, true, false);
 
     wheel_scroll_diagnostic_result_t diagnostic;
     term::Terminal_session* const session = m_private->session.get();
@@ -5201,9 +5280,10 @@ Terminal_process_start_result VNM_TerminalSurface::start_terminal(
     Terminal_process_start_request request)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
 
     if (m_private->session != nullptr) {
-        drain_backend_callback_events();
+        drain_backend_callback_events_to_current_epoch();
         if (is_live_process_state(m_private->session->process_state())) {
             report_backend_error({
                 term::Terminal_backend_error_code::START_FAILED,
@@ -5259,6 +5339,7 @@ Terminal_process_start_result VNM_TerminalSurface::start_native_terminal(
 bool VNM_TerminalSurface::interrupt_process()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
 
     if (m_private->session == nullptr) {
         report_backend_error({
@@ -5320,6 +5401,7 @@ void VNM_TerminalSurface::geometryChange(
     const QRectF&  new_geometry,
     const QRectF&  old_geometry)
 {
+    Input_frontier_scope input_frontier(*this, true, false);
     QQuickItem::geometryChange(new_geometry, old_geometry);
     if (new_geometry.size() == old_geometry.size()) {
         // Moving a pane does not resize its PTY or alter font/cell metrics.
@@ -5334,6 +5416,10 @@ void VNM_TerminalSurface::geometryChange(
 
 void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& value)
 {
+    std::optional<Input_frontier_scope> input_frontier;
+    if (change == ItemActiveFocusHasChanged) {
+        input_frontier.emplace(*this, true, false);
+    }
     QQuickItem::itemChange(change, value);
     if (change == ItemActiveFocusHasChanged || change == ItemSceneChange ||
         change == ItemVisibleHasChanged || change == ItemEnabledHasChanged)
@@ -5382,8 +5468,9 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
     else
     if (change == ItemActiveFocusHasChanged && !hasActiveFocus()) {
         if (m_private->session != nullptr) {
-            m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
-            if (m_private->session == nullptr) {
+            if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
+                m_private->session == nullptr)
+            {
                 term::Ime_preedit_state state;
                 m_private->set_ime_preedit_state(*this, std::move(state));
                 return;
@@ -5408,8 +5495,9 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
     else
     if (change == ItemActiveFocusHasChanged) {
         if (m_private->session != nullptr) {
-            m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
-            if (m_private->session == nullptr) {
+            if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
+                m_private->session == nullptr)
+            {
                 return;
             }
             term::Terminal_session* const route_session = m_private->session.get();
@@ -5428,6 +5516,20 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
 
 bool VNM_TerminalSurface::event(QEvent* event)
 {
+    const bool input_event =
+        event->type() == QEvent::KeyPress ||
+        event->type() == QEvent::MouseButtonPress ||
+        event->type() == QEvent::MouseButtonDblClick ||
+        event->type() == QEvent::MouseButtonRelease ||
+        event->type() == QEvent::MouseMove ||
+        event->type() == QEvent::Wheel ||
+        event->type() == QEvent::InputMethod ||
+        event->type() == QEvent::FocusIn ||
+        event->type() == QEvent::FocusOut;
+    std::optional<Input_frontier_scope> input_frontier;
+    if (input_event) {
+        input_frontier.emplace(*this);
+    }
     if (event->type() == QEvent::KeyRelease &&
         static_cast<QKeyEvent*>(event)->key() == Qt::Key_C && m_private->copy_key_suppressed)
     {
@@ -5489,7 +5591,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         m_private->copy_key_suppressed = false;
         // Resolve pending output before deciding whether Ctrl+C means copy or
         // interrupt; output can invalidate the attachment during this key.
-        drain_backend_callback_events();
+        drain_backend_callback_events_to_current_epoch();
         m_private->observe_selection_attachment();
         if (m_copy_shortcut_policy ==
             Copy_shortcut_policy::COPY_SELECTION_OR_TERMINAL_INPUT)
@@ -5503,7 +5605,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
                 // Ctrl+C and the chord would never reach the terminal as an
                 // interrupt again. Retiring it here is also what makes the
                 // documented rule usable: copy, then interrupt.
-                clear_selection();
+                clear_selection_within_input_event();
                 m_private->copy_key_suppressed = true;
                 event->accept();
                 term::record_interaction_trace("surface", "key-route", QStringLiteral("copy"), trace_id);
@@ -5529,7 +5631,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 
     if (m_private->session != nullptr) {
         if (is_unmodified_page_scroll_key(*event)) {
-            drain_backend_callback_events();
+            drain_backend_callback_events_to_current_epoch();
             if (m_private->session == nullptr) {
                 event->ignore();
                 return;
@@ -5544,8 +5646,9 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             {
                 const int visible_rows =
                     std::max(1, published_snapshot->viewport.visible_rows);
-                (void)scroll_viewport_lines_with_diagnostics(
+                (void)scroll_viewport_with_diagnostics(
                     direction * visible_rows,
+                    std::nullopt,
                     QStringLiteral("key.page"));
                 event->accept();
                 term::record_interaction_trace("surface", "key-route", QStringLiteral("page-scroll"), trace_id);
@@ -5553,8 +5656,9 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             }
         }
 
-        m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
-        if (m_private->session == nullptr) {
+        if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
+            m_private->session == nullptr)
+        {
             event->ignore();
             return;
         }
@@ -5630,7 +5734,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     dismiss_row_timestamp_tooltip();
 
     forceActiveFocus(Qt::MouseFocusReason);
-    drain_backend_callback_events();
+    drain_backend_callback_events_to_current_epoch();
 
     const term::Terminal_mouse_button button = terminal_mouse_button(event->button());
     std::shared_ptr<const term::Terminal_render_snapshot> published_snapshot =
@@ -6047,7 +6151,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
-    drain_backend_callback_events();
+    drain_backend_callback_events_to_current_epoch();
     if (m_private->session == nullptr) {
         trace_decision(QStringLiteral("drag-inactive"));
         return;
@@ -6209,7 +6313,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
     event->ignore();
     set_hyperlink_hover_position(event->position());
     dismiss_row_timestamp_tooltip();
-    drain_backend_callback_events();
+    drain_backend_callback_events_to_current_epoch();
 
     std::optional<term::terminal_grid_position_t> viewport_position;
     std::optional<term::terminal_grid_position_t> logical_position;
@@ -6777,7 +6881,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             object.insert(
                 QStringLiteral("protocol_state_stale"),
                 m_private->session != nullptr &&
-                    m_private->session->has_pending_backend_callback_events());
+                    protocol_callbacks_before_input_frontier_pending(*m_private->session));
 
             bool trace_alternate_screen = alternate_screen;
 
@@ -6882,7 +6986,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
         const qreal requested_font_size = term::font_size_after_wheel_zoom(m_font_size, steps);
         const qreal previous_font_size  = m_font_size;
-        set_font_size(requested_font_size);
+        apply_font_size(requested_font_size);
         if (term::has_vertical_wheel_delta(*event) ||
             !same_property_value(previous_font_size, m_font_size))
         {
@@ -6909,12 +7013,16 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         return;
     }
 
-    m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
-    if (m_private->session == nullptr) {
+    const bool pending_mouse_reports_resolved =
+        m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
+    if (!pending_mouse_reports_resolved || m_private->session == nullptr) {
+        const QString outcome = m_private->session == nullptr
+            ? QStringLiteral("no_session")
+            : QStringLiteral("pending_mouse_report");
         QQuickItem::wheelEvent(event);
         finish_trace(
             QStringLiteral("qt_fallback"),
-            QStringLiteral("no_session"),
+            outcome,
             event->isAccepted());
         return;
     }
@@ -6923,7 +7031,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         m_private->render_snapshot;
     const bool protocol_state_stale =
         m_private->session != nullptr &&
-        m_private->session->has_pending_backend_callback_events();
+        protocol_callbacks_before_input_frontier_pending(*m_private->session);
     const term::Terminal_input_mode_state published_input_modes =
         wheel_snapshot != nullptr
             ? input_modes_from_render_snapshot(*wheel_snapshot)
@@ -7016,6 +7124,9 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 last_result = *write_result;
                 ++alternate_key_count;
                 if (!is_accepted(last_result.code)) {
+                    break;
+                }
+                if (m_private->session->has_pending_backend_callback_events()) {
                     break;
                 }
             }
@@ -7112,6 +7223,9 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 ++mouse_report_count;
                 last_result = *write_result;
                 if (!is_accepted(last_result.code)) {
+                    break;
+                }
+                if (m_private->session->has_pending_backend_callback_events()) {
                     break;
                 }
             }
@@ -7407,8 +7521,9 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
     std::optional<term::Terminal_ime_commit_result> commit_result;
     if (m_private->session != nullptr) {
         if (!commit_text.isEmpty()) {
-            m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
-            if (m_private->session == nullptr) {
+            if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
+                m_private->session == nullptr)
+            {
                 event->ignore();
                 term::record_interaction_trace(
                     "ime", "input-method-result", QStringLiteral("route=session-lost accepted=false"), trace_id);
@@ -7576,6 +7691,7 @@ void VNM_TerminalSurface::refresh_grid_metrics_if_device_pixel_ratio_changed()
 void VNM_TerminalSurface::refresh_grid_from_item_geometry()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this, true, false);
 
     refresh_grid_metrics();
 }
@@ -7797,10 +7913,11 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
     std::unique_ptr<term::Terminal_backend>    backend,
     term::Terminal_launch_config               launch_config)
 {
+    Input_frontier_scope input_frontier(*this, true, false);
     Q_ASSERT(thread() == QThread::currentThread());
 
     if (m_private->session != nullptr) {
-        drain_backend_callback_events();
+        drain_backend_callback_events_to_current_epoch();
         if (is_live_process_state(m_private->session->process_state())) {
             report_backend_error({
                 term::Terminal_backend_error_code::START_FAILED,
@@ -8030,6 +8147,28 @@ void VNM_TerminalSurface::drain_backend_callback_events()
     drain_backend_callback_events_with_budget(std::nullopt);
 }
 
+void VNM_TerminalSurface::drain_backend_callback_events_to_current_epoch()
+{
+    if (m_private->session == nullptr) {
+        return;
+    }
+
+    const std::optional<std::uint64_t> active_frontier =
+        m_private->session->input_frontier_epoch();
+    if (active_frontier.has_value()) {
+        (void)drain_backend_callback_events_until_epoch(*active_frontier, std::nullopt);
+        return;
+    }
+
+    term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
+    const std::uint64_t pre_input_epoch = session->capture_backend_callback_frontier();
+    (void)drain_backend_callback_events_until_epoch(pre_input_epoch, std::nullopt);
+    if (m_private->active_session_matches(session, session_generation)) {
+        session->release_backend_callback_frontier(pre_input_epoch);
+    }
+}
+
 void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 {
     auto& drain_stats = m_private->backend_drain_stats;
@@ -8254,7 +8393,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         ++drain_stats.output_backpressure_after_drain;
     }
     record_total_elapsed();
-    if (session_still_active) {
+    if (session_still_active && !session->input_frontier_epoch().has_value()) {
         (void)m_private->retry_pending_published_mouse_reports(
             *this,
             false,
@@ -8339,6 +8478,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
 void VNM_TerminalSurface::refresh_active_session_geometry()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this, true, false);
 
     if (m_private->session == nullptr || m_private->resize_controller == nullptr) {
         return;
@@ -8346,15 +8486,6 @@ void VNM_TerminalSurface::refresh_active_session_geometry()
 
     if (!is_live_process_state(m_private->session->process_state())) {
         sync_from_session();
-        return;
-    }
-
-    term::Terminal_session* const session = m_private->session.get();
-    const std::uint64_t session_generation = m_private->session_generation;
-    (void)process_backend_callback_events_recorded(session, std::nullopt, false);
-    if (!m_private->active_session_matches(session, session_generation) ||
-        !is_live_process_state(session->process_state()))
-    {
         return;
     }
 
@@ -8850,16 +8981,19 @@ void VNM_TerminalSurface::updatePolish()
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
-    refresh_grid_metrics_if_device_pixel_ratio_changed();
-
     // Polish runs before the scene graph syncs this item into the next frame.
     // Drain already-arrived backend callbacks here so a pending render update
     // does not capture a snapshot that is older than queued echo/output.
     if (m_private->session == nullptr || m_private->shutting_down.load()) {
+        refresh_grid_metrics_if_device_pixel_ratio_changed();
         return;
     }
+    // Geometry refreshed from polish uses the same finite callback snapshot as
+    // this frame's budgeted catch-up. New callbacks wait for a later frame.
+    Input_frontier_scope polish_frontier(*this, false, false);
     term::Terminal_session* const session = m_private->session.get();
     const std::uint64_t session_generation = m_private->session_generation;
+    const std::uint64_t target_epoch = *session->input_frontier_epoch();
     if (!session->has_pending_backend_callback_events()) {
         if (session->render_snapshot_generation() !=
             m_private->last_installed_render_publication_generation)
@@ -8869,14 +9003,19 @@ void VNM_TerminalSurface::updatePolish()
                 return;
             }
         }
+        refresh_grid_metrics_if_device_pixel_ratio_changed();
         return;
     }
 
-    const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
     if (target_epoch > session->backend_callback_processed_epoch()) {
         (void)drain_backend_callback_events_until_epoch(
             target_epoch,
             m_private->backend_callback_frame_catchup_budget());
+    }
+    if (m_private->active_session_matches(session, session_generation) &&
+        session->backend_callback_processed_epoch() >= target_epoch)
+    {
+        refresh_grid_metrics_if_device_pixel_ratio_changed();
     }
 }
 

@@ -28,6 +28,7 @@ enum class Terminal_session_command_kind
     FORCE_RELEASE_SYNCHRONIZED_OUTPUT,
     BACKEND_EXIT,
     BACKEND_ERROR,
+    BACKEND_RESIZE_COMPLETE,
     RESIZE,
     USER_WRITE,
     USER_PASTE,
@@ -171,6 +172,7 @@ enum class Terminal_backend_resize_result
 {
     APPLIED,
     FAILED,
+    PENDING,
 };
 
 struct Terminal_resize_transaction
@@ -197,6 +199,7 @@ struct Terminal_session_command
     std::optional<Terminal_resize_transaction> resize;
     std::optional<Terminal_backend_exit>       exit;
     std::optional<Terminal_backend_error>      error;
+    std::optional<Terminal_backend_resize_completion> resize_completion;
     std::optional<terminal_text_area_resize_arbitration_settlement_t>
                                                text_area_resize_arbitration;
 };
@@ -376,6 +379,10 @@ Terminal_session_command make_backend_exit_command(
 Terminal_session_command make_backend_error_command(
     std::uint64_t          sequence,
     Terminal_backend_error error);
+
+Terminal_session_command make_backend_resize_completion_command(
+    std::uint64_t                         sequence,
+    Terminal_backend_resize_completion   completion);
 
 Terminal_session_command make_backend_output_command(
     std::uint64_t          sequence,

@@ -15,8 +15,10 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -1718,11 +1720,16 @@ public:
             output_command
                 ? static_cast<std::size_t>(command.bytes.size())
                 : 0U;
+        // A captured input frontier cannot move when later output arrives.
+        const std::uint64_t sealed_frontier = m_captured_backend_callback_frontiers.empty()
+            ? 0U
+            : *m_captured_backend_callback_frontiers.rbegin();
         const bool append_to_previous_output =
             m_coalesce_output_callbacks                                                     &&
             output_command                                                                  &&
             !m_pending_commands.empty()                                                     &&
-            m_pending_commands.back().kind == Terminal_session_command_kind::BACKEND_OUTPUT;
+            m_pending_commands.back().kind == Terminal_session_command_kind::BACKEND_OUTPUT &&
+            m_pending_commands.back().backend_callback_epoch > sealed_frontier;
         const std::size_t command_count = append_to_previous_output ? 0U : 1U;
         const Terminal_queue_result result =
             m_pending_callback_queue.reserve(byte_count, command_count);
@@ -1781,7 +1788,8 @@ public:
     std::deque<Terminal_session_command> take_pending_commands(
         std::size_t                       available_output_bytes,
         std::size_t                       available_output_commands,
-        std::vector<std::uint64_t>&       backend_output_capture_failure_epochs)
+        std::vector<std::uint64_t>&       backend_output_capture_failure_epochs,
+        std::optional<std::uint64_t>      target_epoch)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::deque<Terminal_session_command> commands;
@@ -1804,6 +1812,14 @@ public:
 
         while (!m_pending_commands.empty()) {
             const Terminal_session_command& pending = m_pending_commands.front();
+            // A captured frontier separates input from callbacks that arrived
+            // during the drain, including output resumed by backpressure.
+            if (target_epoch.has_value() &&
+                m_captured_backend_callback_frontiers.contains(*target_epoch) &&
+                pending.backend_callback_epoch > *target_epoch)
+            {
+                break;
+            }
             const bool output_command =
                 pending.kind == Terminal_session_command_kind::BACKEND_OUTPUT;
             const std::size_t byte_count = output_command
@@ -1876,6 +1892,23 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
 
         return m_last_enqueued_backend_callback_epoch;
+    }
+
+    std::uint64_t capture_backend_callback_frontier()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const std::uint64_t epoch = m_last_enqueued_backend_callback_epoch;
+        m_captured_backend_callback_frontiers.insert(epoch);
+        return epoch;
+    }
+
+    void release_backend_callback_frontier(std::uint64_t epoch)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto frontier = m_captured_backend_callback_frontiers.find(epoch);
+        if (frontier != m_captured_backend_callback_frontiers.end()) {
+            m_captured_backend_callback_frontiers.erase(frontier);
+        }
     }
 
     void stop_backend_output()
@@ -1962,6 +1995,7 @@ private:
     std::uint64_t                        m_backend_exit_after_stop_epoch = 0U;
     std::uint64_t                        m_next_backend_callback_epoch = 1U;
     std::uint64_t                        m_last_enqueued_backend_callback_epoch = 0U;
+    std::multiset<std::uint64_t>         m_captured_backend_callback_frontiers;
 };
 
 Backend_callback_invocation::Backend_callback_invocation(
@@ -2028,6 +2062,19 @@ Terminal_session::~Terminal_session()
     m_backend.reset();
 }
 
+Terminal_session::Input_frontier_scope::Input_frontier_scope(
+    Terminal_session& session,
+    bool              public_ingress)
+    : m_session(session)
+{
+    m_session.begin_input_frontier(public_ingress && m_session.m_processing_commands);
+}
+
+Terminal_session::Input_frontier_scope::~Input_frontier_scope()
+{
+    m_session.end_input_frontier();
+}
+
 Terminal_session_result Terminal_session::start(Terminal_launch_config launch_config)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -2047,18 +2094,25 @@ Terminal_session_result Terminal_session::start(Terminal_launch_config launch_co
 Terminal_session_result Terminal_session::write_user_bytes(QByteArray bytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return *unsettled;
+    }
 
     return write_user_bytes_locked(
         std::move(bytes),
         User_write_viewport_policy::RETURN_TO_TAIL,
-        Backend_callback_drain_policy::DRAIN_CALLBACKS);
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
 }
 
 Terminal_session_result Terminal_session::write_user_bytes_without_backend_drain(
     QByteArray bytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return *unsettled;
+    }
 
     return write_user_bytes_locked(
         std::move(bytes),
@@ -2072,8 +2126,10 @@ Terminal_session::try_write_user_bytes_without_backend_drain_if_callbacks_empty(
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    if (!m_pending_commands.empty() ||
-        m_callback_lifetime->has_pending_or_active_callbacks())
+    if ((!m_input_frontier_epoch.has_value() ||
+            m_last_processed_backend_callback_epoch < *m_input_frontier_epoch) &&
+        (!m_pending_commands.empty() ||
+            m_callback_lifetime->has_pending_or_active_callbacks()))
     {
         return std::nullopt;
     }
@@ -2114,12 +2170,15 @@ Terminal_key_event_result Terminal_session::write_key_event(
     std::uint64_t    interaction_trace_id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return {true, *unsettled};
+    }
 
     return write_key_event_locked(
         event,
-        Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED,
         interaction_trace_id);
 }
 
@@ -2169,8 +2228,10 @@ Terminal_session::try_write_mouse_event_without_backend_drain_if_callbacks_empty
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    if (!m_pending_commands.empty() ||
-        m_callback_lifetime->has_pending_or_active_callbacks())
+    if ((!m_input_frontier_epoch.has_value() ||
+            m_last_processed_backend_callback_epoch < *m_input_frontier_epoch) &&
+        (!m_pending_commands.empty() ||
+            m_callback_lifetime->has_pending_or_active_callbacks()))
     {
         return std::nullopt;
     }
@@ -2218,8 +2279,11 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(
     }
 
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return {true, *unsettled};
+    }
 
     QByteArray bytes = text.toUtf8();
     if (m_process_state == Terminal_process_state::NOT_STARTED ||
@@ -2234,7 +2298,7 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(
     const Terminal_session_result result = write_user_bytes_locked(
         std::move(bytes),
         User_write_viewport_policy::RETURN_TO_TAIL,
-        Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED,
         interaction_trace_id);
 
     if (result.code == Terminal_session_result_code::ACCEPTED &&
@@ -2253,8 +2317,8 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     std::uint64_t                  interaction_trace_id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     if (m_process_state == Terminal_process_state::NOT_STARTED ||
         m_process_state == Terminal_process_state::STARTING)
@@ -2298,6 +2362,15 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
         };
     };
 
+    if (m_input_frontier_epoch.has_value() &&
+        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+    {
+        return refuse_before_encoding(
+            Terminal_session_result_code::INVALID_STATE,
+            QStringLiteral(
+                "paste mode callback frontier is unsettled during an active command"));
+    }
+
     if (!is_session_writable()) {
         return refuse_before_encoding(
             Terminal_session_result_code::INVALID_STATE,
@@ -2339,7 +2412,8 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
         interaction_trace_id = next_interaction_trace_correlation_id();
     }
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_paste_command(sequence, std::move(bytes), interaction_trace_id));
+        make_user_paste_command(sequence, std::move(bytes), interaction_trace_id),
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
     return {
         true,
         finalize_accepted_text_input_result(
@@ -2355,8 +2429,11 @@ Terminal_paste_text_result Terminal_session::write_submitted_text(
     std::uint64_t                  interaction_trace_id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return {true, *unsettled};
+    }
 
     const Terminal_input_mode_state modes = m_screen_model.has_value()
         ? m_screen_model->input_mode_state()
@@ -2414,7 +2491,8 @@ Terminal_paste_text_result Terminal_session::write_submitted_text(
     }
 
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_message_command(sequence, std::move(bytes), interaction_trace_id));
+        make_user_message_command(sequence, std::move(bytes), interaction_trace_id),
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
     return {
         true,
         finalize_accepted_text_input_result(
@@ -2427,8 +2505,11 @@ Terminal_paste_text_result Terminal_session::write_submitted_text(
 Terminal_focus_event_result Terminal_session::write_focus_event(bool focused)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return {true, *unsettled};
+    }
 
     if (!m_screen_model.has_value() || !m_screen_model->mode_state().focus_reporting) {
         return {};
@@ -2445,7 +2526,8 @@ Terminal_focus_event_result Terminal_session::write_focus_event(bool focused)
         true,
         write_user_bytes_locked(
             QByteArray(report.data(), report.size()),
-            User_write_viewport_policy::PRESERVE_VIEWPORT),
+            User_write_viewport_policy::PRESERVE_VIEWPORT,
+            Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED),
     };
 }
 
@@ -2502,7 +2584,11 @@ Terminal_session_result Terminal_session::resize(
     terminal_grid_size_t   grid_size)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return *unsettled;
+    }
 
     const std::uint64_t sequence = next_sequence();
 
@@ -2514,14 +2600,21 @@ Terminal_session_result Terminal_session::resize(
     resize.snapshot_grid_size       = grid_size;
     resize.backend_geometry_in_sync = m_backend_geometry_in_sync;
 
-    return enqueue_and_process_synchronous_command(make_resize_command(sequence, resize));
+    return enqueue_and_process_synchronous_command(
+        make_resize_command(sequence, resize),
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
 }
 
 Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines(int line_delta)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (m_input_frontier_epoch.has_value() &&
+        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+    {
+        return {};
+    }
 
     return scroll_viewport_lines_locked(line_delta);
 }
@@ -2633,8 +2726,13 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_line
     int line_delta)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (m_input_frontier_epoch.has_value() &&
+        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+    {
+        return {};
+    }
 
     if (!m_screen_model.has_value() || line_delta == 0) {
         return {};
@@ -2685,8 +2783,13 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_o
     int offset_from_tail)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (m_input_frontier_epoch.has_value() &&
+        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+    {
+        return {};
+    }
 
     if (!m_screen_model.has_value()) {
         return {};
@@ -2784,8 +2887,8 @@ Terminal_viewport_scroll_result Terminal_session::finish_public_projection_scrol
 void Terminal_session::set_selection_range(Terminal_selection_range range)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     set_selection_range_from_published_source_locked(
         range,
@@ -2797,8 +2900,8 @@ void Terminal_session::set_selection_range_from_published_source(
     terminal_selection_source_identity_t source)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     set_selection_range_from_published_source_locked(range, source);
 }
@@ -2815,8 +2918,8 @@ void Terminal_session::set_selection_range_from_drained_published_source(
 void Terminal_session::detach_selection_visual_attachment()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     if (public_projection_hold_active()) {
         m_public_viewport_controller.record_selection_mutation_unsupported();
@@ -2859,8 +2962,8 @@ void Terminal_session::detach_selection_visual_attachment()
 void Terminal_session::clear_selection()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     if (public_projection_hold_active()) {
         m_public_viewport_controller.record_selection_mutation_unsupported();
@@ -2895,8 +2998,8 @@ void Terminal_session::clear_selection()
 void Terminal_session::set_scrollback_limit(int limit)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     m_config.scrollback_limit = std::max(0, limit);
     if (!m_screen_model.has_value()) {
@@ -2934,8 +3037,8 @@ void Terminal_session::set_retained_history_capacity_bytes(
     std::size_t capacity_bytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     m_config.retained_history_capacity_bytes = capacity_bytes;
     if (!m_screen_model.has_value()) {
@@ -2972,8 +3075,8 @@ void Terminal_session::set_retained_history_capacity_bytes(
 void Terminal_session::set_color_state(Terminal_color_state state)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     // Remember the requested color state so it survives a screen-model
     // (re)creation. At startup this runs before the model exists (the model is
@@ -3016,6 +3119,7 @@ void Terminal_session::set_text_area_resize_policy(
     Terminal_text_area_resize_policy policy)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Input_frontier_scope frontier(*this, false);
 
     if (m_config.text_area_resize_policy == policy) {
         return;
@@ -3036,21 +3140,21 @@ void Terminal_session::set_text_area_resize_policy(
     {
         // The host just declared it cannot move its window, which is the answer
         // the in-flight request was waiting for.
-        (void)settle_text_area_resize_arbitration({
+        (void)settle_text_area_resize_arbitration_locked({
             m_text_area_resize_arbitration->request_id,
             Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED,
             {},
         });
     }
 
-    drain_backend_callback_commands();
-    process_pending_commands();
+    process_backend_callback_events_to_current_epoch();
 }
 
 void Terminal_session::set_text_area_resize_arbitration(
     std::optional<terminal_text_area_resize_arbitration_config_t> arbitration)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Input_frontier_scope frontier(*this, false);
 
     // Assigned before the release, for the same reason set_text_area_resize_policy
     // assigns before its drain: the release must run under the new capability
@@ -3061,14 +3165,13 @@ void Terminal_session::set_text_area_resize_arbitration(
         arbitration->version ==
             k_terminal_text_area_resize_arbitration_capability_version;
     if (!capability_available && m_text_area_resize_arbitration.has_value()) {
-        (void)settle_text_area_resize_arbitration({
+        (void)settle_text_area_resize_arbitration_locked({
             m_text_area_resize_arbitration->request_id,
             Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED,
             {},
         });
     }
-    drain_backend_callback_commands();
-    process_pending_commands();
+    process_backend_callback_events_to_current_epoch();
     const std::size_t configured_hold_limit = capability_available
         ? arbitration->hold_limit_bytes
         : 0U;
@@ -3151,7 +3254,13 @@ Terminal_session_result Terminal_session::settle_text_area_resize_arbitration(
     terminal_text_area_resize_arbitration_settlement_t settlement)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Input_frontier_scope frontier(*this);
+    return settle_text_area_resize_arbitration_locked(settlement);
+}
 
+Terminal_session_result Terminal_session::settle_text_area_resize_arbitration_locked(
+    terminal_text_area_resize_arbitration_settlement_t settlement)
+{
     const bool host_settlement =
         settlement.outcome == Terminal_text_area_resize_arbitration_outcome::ACCEPTED ||
         settlement.outcome == Terminal_text_area_resize_arbitration_outcome::REJECTED ||
@@ -3176,15 +3285,17 @@ Terminal_session_result Terminal_session::settle_text_area_resize_arbitration(
         Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION;
     command.text_area_resize_arbitration = settlement;
 
-    drain_backend_callback_commands();
-    return enqueue_and_process_synchronous_command(std::move(command));
+    process_backend_callback_events_to_current_epoch();
+    return enqueue_and_process_synchronous_command(
+        std::move(command),
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
 }
 
 void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     if (m_config.recover_scrollback_from_primary_repaints == enabled) {
         return;
@@ -3199,10 +3310,16 @@ void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
 Terminal_session_result Terminal_session::interrupt()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    if (const auto unsettled = reject_unsettled_input_frontier()) {
+        return *unsettled;
+    }
 
     const std::uint64_t sequence = next_sequence();
-    return enqueue_and_process_synchronous_command(make_interrupt_command(sequence));
+    return enqueue_and_process_synchronous_command(
+        make_interrupt_command(sequence),
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
 }
 
 Terminal_session_result Terminal_session::terminate()
@@ -3299,6 +3416,51 @@ std::uint64_t Terminal_session::backend_callback_enqueue_epoch() const
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     return m_callback_lifetime->last_enqueued_backend_callback_epoch();
+}
+
+std::uint64_t Terminal_session::capture_backend_callback_frontier()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_callback_lifetime->capture_backend_callback_frontier();
+}
+
+void Terminal_session::release_backend_callback_frontier(std::uint64_t epoch)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_callback_lifetime->release_backend_callback_frontier(epoch);
+}
+
+std::uint64_t Terminal_session::begin_input_frontier(bool fresh_ingress)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const bool owns_seal = fresh_ingress || m_input_frontier_stack.empty();
+    const std::uint64_t epoch = owns_seal
+        ? m_callback_lifetime->capture_backend_callback_frontier()
+        : m_input_frontier_stack.back().epoch;
+    m_input_frontier_stack.push_back({epoch, owns_seal});
+    m_input_frontier_epoch = epoch;
+    return *m_input_frontier_epoch;
+}
+
+void Terminal_session::end_input_frontier()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Q_ASSERT(!m_input_frontier_stack.empty());
+    const Input_frontier_frame frame = m_input_frontier_stack.back();
+    m_input_frontier_stack.pop_back();
+    if (frame.owns_seal) {
+        m_callback_lifetime->release_backend_callback_frontier(frame.epoch);
+    }
+    m_input_frontier_epoch = m_input_frontier_stack.empty()
+        ? std::nullopt
+        : std::optional<std::uint64_t>{m_input_frontier_stack.back().epoch};
+}
+
+std::optional<std::uint64_t> Terminal_session::input_frontier_epoch() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_input_frontier_epoch;
 }
 
 std::uint64_t Terminal_session::backend_callback_processed_epoch() const
@@ -3698,8 +3860,8 @@ void Terminal_session::clear_search()
 bool Terminal_session::search_next()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     if (!m_search.select_next()) {
         return false;
@@ -3710,8 +3872,8 @@ bool Terminal_session::search_next()
 bool Terminal_session::search_previous()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
 
     if (!m_search.select_previous()) {
         return false;
@@ -4250,10 +4412,44 @@ Terminal_session_result Terminal_session::enqueue_and_process_synchronous_comman
     Terminal_session_command           command,
     Backend_callback_drain_policy      drain_policy)
 {
+    if (drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED &&
+        m_input_frontier_epoch.has_value() &&
+        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+    {
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_STATE,
+            make_backend_error(
+                Terminal_backend_error_code::WRITE_FAILED,
+                QStringLiteral("input callback frontier is unsettled")));
+    }
+
     const std::uint64_t sequence = command.sequence;
     const Terminal_session_result enqueue_result = enqueue_command(std::move(command));
     if (enqueue_result.code != Terminal_session_result_code::ACCEPTED) {
         return enqueue_result;
+    }
+
+    if (m_input_frontier_epoch.has_value() &&
+        drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED)
+    {
+        const auto first_later_callback = std::find_if(
+            m_pending_commands.begin(),
+            m_pending_commands.end(),
+            [&](const Terminal_session_command& pending) {
+                return pending.backend_callback_epoch > *m_input_frontier_epoch;
+            });
+        const auto input = std::find_if(
+            m_pending_commands.begin(),
+            m_pending_commands.end(),
+            [&](const Terminal_session_command& pending) {
+                return pending.sequence == sequence;
+            });
+        if (first_later_callback != m_pending_commands.end() &&
+            input != m_pending_commands.end() && first_later_callback < input)
+        {
+            std::rotate(first_later_callback, input, std::next(input));
+        }
     }
 
     begin_result_capture(sequence);
@@ -4347,9 +4543,18 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
     Backend_callback_drain_stop stop = Backend_callback_drain_stop::COMPLETE;
     for (;;) {
         if (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS) {
-            drain_backend_callback_commands();
+            drain_backend_callback_commands(target_backend_callback_epoch);
         }
         if (m_pending_commands.empty()) {
+            break;
+        }
+        const std::optional<std::uint64_t> input_frontier =
+            drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED
+                ? m_input_frontier_epoch
+                : target_backend_callback_epoch;
+        if (input_frontier.has_value() &&
+            m_pending_commands.front().backend_callback_epoch > *input_frontier)
+        {
             break;
         }
 
@@ -4528,6 +4733,8 @@ Terminal_session_result Terminal_session::process_command(Terminal_session_comma
             return process_backend_exit_command(command);
         case Terminal_session_command_kind::BACKEND_ERROR:
             return process_backend_error_command(command);
+        case Terminal_session_command_kind::BACKEND_RESIZE_COMPLETE:
+            return process_backend_resize_completion_command(command);
         case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
             return process_text_area_resize_arbitration_command(command);
     }
@@ -4816,8 +5023,11 @@ Terminal_session_result Terminal_session::process_resize_command(
         resize.snapshot_grid_size = m_grid_size;
         resize.model_result       = Terminal_model_resize_result::APPLIED;
         const bool backend_geometry_was_in_sync = m_backend_geometry_in_sync;
-        const Terminal_backend_result backend_result =
-            m_backend->resize({resize.id, resize.target_grid_size});
+        const Terminal_backend_resize_dispatch resize_dispatch = dispatch_backend_resize(
+            resize,
+            command.sequence,
+            QStringLiteral("resize applied"));
+        const Terminal_backend_result& backend_result = resize_dispatch.result;
         if (is_backend_rejection(backend_result)) {
             resize.backend_result           = Terminal_backend_resize_result::FAILED;
             resize.backend_geometry_in_sync = false;
@@ -4842,6 +5052,12 @@ Terminal_session_result Terminal_session::process_resize_command(
                 resize,
                 false,
             });
+        }
+        else if (resize_dispatch.completion_pending) {
+            resize.backend_result           = Terminal_backend_resize_result::PENDING;
+            resize.backend_geometry_in_sync = false;
+            resize_context.render_snapshot_metadata_changed =
+                backend_geometry_was_in_sync;
         }
         else {
             resize.backend_result           = Terminal_backend_resize_result::APPLIED;
@@ -4898,6 +5114,46 @@ void Terminal_session::finalize_resize_transaction(
         resize,
         false,
     });
+}
+
+Terminal_backend_resize_dispatch Terminal_session::dispatch_backend_resize(
+    Terminal_resize_transaction& resize,
+    std::uint64_t                sequence,
+    QString                      applied_message)
+{
+    m_latest_backend_resize_id = resize.id;
+    Terminal_backend_resize_dispatch dispatch = m_backend->dispatch_resize({
+        resize.id,
+        resize.target_grid_size,
+    });
+    if (dispatch.completion_pending &&
+        dispatch.result.code == Terminal_backend_result_code::ACCEPTED)
+    {
+        resize.backend_result           = Terminal_backend_resize_result::PENDING;
+        resize.backend_geometry_in_sync = false;
+        m_backend_geometry_in_sync      = false;
+        m_pending_backend_resizes.insert_or_assign(
+            resize.id,
+            Pending_backend_resize{resize, sequence, std::move(applied_message)});
+    }
+
+    return dispatch;
+}
+
+void Terminal_session::cancel_pending_backend_resizes()
+{
+    for (auto& [id, pending] : m_pending_backend_resizes) {
+        (void)id;
+        pending.resize.backend_result = Terminal_backend_resize_result::FAILED;
+        pending.resize.backend_geometry_in_sync = false;
+        finalize_resize_transaction(
+            pending.resize,
+            pending.sequence,
+            QStringLiteral("resize canceled by process stop"));
+    }
+    m_pending_backend_resizes.clear();
+    m_latest_backend_resize_id = 0U;
+    m_backend_geometry_in_sync = false;
 }
 
 void Terminal_session::consume_screen_model_resize_transition_callback(
@@ -4994,8 +5250,11 @@ void Terminal_session::consume_screen_model_resize_transition(
         });
     }
     else {
-        const Terminal_backend_result backend_result =
-            m_backend->resize({resize.id, resize.target_grid_size});
+        const Terminal_backend_resize_dispatch resize_dispatch = dispatch_backend_resize(
+            resize,
+            context.sequence,
+            outcome_prefix + QStringLiteral(" applied"));
+        const Terminal_backend_result& backend_result = resize_dispatch.result;
         if (is_backend_rejection(backend_result)) {
             resize.backend_result           = Terminal_backend_resize_result::FAILED;
             resize.backend_geometry_in_sync = false;
@@ -5021,6 +5280,12 @@ void Terminal_session::consume_screen_model_resize_transition(
                 resize,
                 false,
             });
+        }
+        else if (resize_dispatch.completion_pending) {
+            resize.backend_result           = Terminal_backend_resize_result::PENDING;
+            resize.backend_geometry_in_sync = false;
+            context.render_snapshot_metadata_changed =
+                context.render_snapshot_metadata_changed || backend_geometry_was_in_sync;
         }
         else {
             resize.backend_result           = Terminal_backend_resize_result::APPLIED;
@@ -5194,12 +5459,16 @@ Terminal_session_result Terminal_session::process_terminate_command(
             m_backend_ready            = backend_was_ready;
             m_backend_geometry_in_sync = geometry_was_in_sync;
         }
+        else {
+            cancel_pending_backend_resizes();
+        }
         if (!m_backend_error_queued_during_command) {
             record_backend_error(command.sequence, *backend_result.error);
         }
         return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 
+    cancel_pending_backend_resizes();
     return make_accepted_result(command.sequence);
 }
 
@@ -6485,11 +6754,13 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
             false);
     }
 
+    cancel_pending_backend_resizes();
     m_exit_status    = *command.exit;
     m_process_state  = command.exit->reason == Terminal_exit_reason::FAILED_TO_START
         ? Terminal_process_state::FAILED
         : Terminal_process_state::EXITED;
     m_backend_ready  = false;
+    m_backend_geometry_in_sync = false;
     m_stop_requested = false;
     if (m_backend_output_capture_writer) {
         const Backend_output_capture_writer_result capture_result =
@@ -6539,6 +6810,82 @@ Terminal_session_result Terminal_session::process_backend_error_command(
     }
 
     record_backend_error(command.sequence, *command.error);
+    return make_accepted_result(command.sequence);
+}
+
+Terminal_session_result Terminal_session::process_backend_resize_completion_command(
+    const Terminal_session_command& command)
+{
+    if (!command.resize_completion.has_value()) {
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_ARGUMENT,
+            make_backend_error(
+                Terminal_backend_error_code::RESIZE_FAILED,
+                QStringLiteral("backend resize completion requires a receipt")));
+    }
+
+    const Terminal_backend_resize_completion& completion = *command.resize_completion;
+    const auto pending = m_pending_backend_resizes.find(
+        completion.request.transaction_id);
+    if (pending == m_pending_backend_resizes.end()) {
+        // Stop, exit or a newer lifecycle already retired this request.
+        return make_accepted_result(command.sequence);
+    }
+
+    Pending_backend_resize request = std::move(pending->second);
+    m_pending_backend_resizes.erase(pending);
+    const bool valid_receipt =
+        completion.request.transaction_id == request.resize.id &&
+        grid_sizes_match(
+            completion.request.grid_size,
+            request.resize.target_grid_size);
+    const bool accepted =
+        valid_receipt &&
+        !completion.superseded &&
+        completion.result.code == Terminal_backend_result_code::ACCEPTED &&
+        is_valid_backend_result(completion.result);
+    const bool latest_request =
+        request.resize.id == m_latest_backend_resize_id &&
+        m_process_state == Terminal_process_state::RUNNING &&
+        !m_stop_requested &&
+        grid_sizes_match(m_grid_size, request.resize.target_grid_size);
+    const bool geometry_became_synchronized =
+        accepted && latest_request && !m_backend_geometry_in_sync;
+
+    QString message;
+    if (completion.superseded) {
+        request.resize.backend_result = Terminal_backend_resize_result::FAILED;
+        message = QStringLiteral("resize superseded before native dispatch");
+    }
+    else if (!accepted) {
+        request.resize.backend_result = Terminal_backend_resize_result::FAILED;
+        message = request.applied_message;
+        message.replace(QStringLiteral(" applied"), QStringLiteral(" failed"));
+        const Terminal_backend_error error = completion.result.error.value_or(
+            make_backend_error(
+                Terminal_backend_error_code::RESIZE_FAILED,
+                QStringLiteral("backend returned an invalid resize receipt")));
+        record_backend_error(request.sequence, error);
+    }
+    else {
+        request.resize.backend_result = Terminal_backend_resize_result::APPLIED;
+        message = request.applied_message;
+        if (!latest_request) {
+            message += QStringLiteral(" (geometry changed before completion)");
+        }
+    }
+
+    request.resize.backend_geometry_in_sync = accepted && latest_request;
+    if (request.resize.id == m_latest_backend_resize_id) {
+        m_backend_geometry_in_sync = request.resize.backend_geometry_in_sync;
+    }
+    finalize_resize_transaction(request.resize, request.sequence, std::move(message));
+    if (geometry_became_synchronized) {
+        publish_synchronized_resize_snapshot(
+            command.sequence,
+            QStringLiteral("backend geometry synchronized"));
+    }
     return make_accepted_result(command.sequence);
 }
 
@@ -6606,6 +6953,14 @@ Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
             notify_backend_event(session, false);
         }
     };
+    callbacks.resize_completed = [lifetime, notify_backend_event](
+        Terminal_backend_resize_completion completion) {
+        Backend_callback_invocation callback(lifetime);
+        callback.enqueue(make_backend_resize_completion_command(0U, std::move(completion)));
+        if (Terminal_session* session = callback.session()) {
+            notify_backend_event(session, false);
+        }
+    };
     return callbacks;
 }
 
@@ -6613,7 +6968,10 @@ void Terminal_session::process_backend_callback_events()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    (void)process_pending_commands();
+    (void)process_pending_commands(
+        Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        std::nullopt,
+        m_input_frontier_epoch);
 }
 
 Backend_callback_drain_stop Terminal_session::process_backend_callback_events_for(
@@ -6629,7 +6987,8 @@ Backend_callback_drain_stop Terminal_session::process_backend_callback_events_fo
 
     return process_pending_commands(
         Backend_callback_drain_policy::DRAIN_CALLBACKS,
-        std::chrono::steady_clock::now() + budget);
+        std::chrono::steady_clock::now() + budget,
+        m_input_frontier_epoch);
 }
 
 Backend_callback_drain_stop Terminal_session::process_backend_callback_events_until_epoch(
@@ -6638,10 +6997,17 @@ Backend_callback_drain_stop Terminal_session::process_backend_callback_events_un
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
+    const std::uint64_t requested_epoch = target_epoch;
+    if (m_input_frontier_epoch.has_value()) {
+        target_epoch = std::min(target_epoch, *m_input_frontier_epoch);
+    }
+
     if (target_epoch == 0U ||
         m_last_processed_backend_callback_epoch >= target_epoch)
     {
-        return Backend_callback_drain_stop::COMPLETE;
+        return target_epoch < requested_epoch
+            ? Backend_callback_drain_stop::UNSETTLED
+            : Backend_callback_drain_stop::COMPLETE;
     }
 
     Backend_callback_drain_deadline deadline = std::nullopt;
@@ -6651,10 +7017,13 @@ Backend_callback_drain_stop Terminal_session::process_backend_callback_events_un
         deadline = std::chrono::steady_clock::now() + std::max(*budget, zero);
     }
 
-    return process_pending_commands(
+    const Backend_callback_drain_stop stop = process_pending_commands(
         Backend_callback_drain_policy::DRAIN_CALLBACKS,
         deadline,
         target_epoch);
+    return target_epoch < requested_epoch && stop == Backend_callback_drain_stop::COMPLETE
+        ? Backend_callback_drain_stop::UNSETTLED
+        : stop;
 }
 
 void Terminal_session::pause_backend_output_from_callback_ingress()
@@ -6684,7 +7053,8 @@ void Terminal_session::pause_backend_output_from_callback_ingress()
     set_output_backpressure_active(true, sequence);
 }
 
-void Terminal_session::drain_backend_callback_commands()
+void Terminal_session::drain_backend_callback_commands(
+    std::optional<std::uint64_t> target_epoch)
 {
     for (;;) {
         std::vector<std::uint64_t> backend_output_capture_failure_epochs;
@@ -6703,7 +7073,8 @@ void Terminal_session::drain_backend_callback_commands()
             m_callback_lifetime->take_pending_commands(
                 available_output_bytes,
                 available_output_commands,
-                backend_output_capture_failure_epochs);
+                backend_output_capture_failure_epochs,
+                target_epoch);
         if (commands.empty()) {
             return;
         }
@@ -6761,6 +7132,28 @@ void Terminal_session::drain_backend_callback_commands()
             record_result(std::move(result));
         }
     }
+}
+
+void Terminal_session::process_backend_callback_events_to_current_epoch()
+{
+    Input_frontier_scope frontier(*this, false);
+    (void)process_backend_callback_events_until_epoch(*m_input_frontier_epoch);
+}
+
+std::optional<Terminal_session_result>
+Terminal_session::reject_unsettled_input_frontier()
+{
+    if (!m_input_frontier_epoch.has_value() ||
+        m_last_processed_backend_callback_epoch >= *m_input_frontier_epoch)
+    {
+        return std::nullopt;
+    }
+    return make_rejected_result(
+        next_sequence(),
+        Terminal_session_result_code::INVALID_STATE,
+        make_backend_error(
+            Terminal_backend_error_code::WRITE_FAILED,
+            QStringLiteral("input callback frontier is unsettled")));
 }
 
 void Terminal_session::record_processed_command(Terminal_session_command command)
@@ -7367,8 +7760,11 @@ bool Terminal_session::retry_text_area_resize_request(
         return backend_geometry_was_in_sync != m_backend_geometry_in_sync;
     }
 
-    const Terminal_backend_result backend_result =
-        m_backend->resize({resize.id, resize.target_grid_size});
+    const Terminal_backend_resize_dispatch resize_dispatch = dispatch_backend_resize(
+        resize,
+        sequence,
+        QStringLiteral("text-area resize applied"));
+    const Terminal_backend_result& backend_result = resize_dispatch.result;
     if (is_backend_rejection(backend_result)) {
         resize.backend_result           = Terminal_backend_resize_result::FAILED;
         resize.backend_geometry_in_sync = false;
@@ -7384,6 +7780,12 @@ bool Terminal_session::retry_text_area_resize_request(
             resize,
             false,
         });
+        return backend_geometry_was_in_sync != m_backend_geometry_in_sync;
+    }
+
+    if (resize_dispatch.completion_pending) {
+        resize.backend_result           = Terminal_backend_resize_result::PENDING;
+        resize.backend_geometry_in_sync = false;
         return backend_geometry_was_in_sync != m_backend_geometry_in_sync;
     }
 
@@ -10117,36 +10519,50 @@ void Terminal_session::publish_synchronized_resize_snapshot(
         ++m_profile_stats.render_snapshot_requests;
     }
 #endif
-    if (selection_trace_requested(m_config.selection_trace_enabled)) {
-        write_selection_trace(m_config.selection_trace_enabled,
-            QStringLiteral(
-                "session publish-synchronized-resize-snapshot begin sequence=%1 message=\"%2\" "
-                "generation=%3 basis={%4} selection_count=0 ranges=none")
-                .arg(static_cast<qulonglong>(sequence))
-                .arg(message)
-                .arg(static_cast<qulonglong>(m_render_snapshot_generation))
-                .arg(selection_trace_content_basis(m_selection_content_basis)));
+    const bool current_snapshot_has_geometry =
+        m_latest_render_snapshot != nullptr &&
+        grid_sizes_match(m_latest_render_snapshot->grid_size, m_grid_size);
+    Terminal_render_snapshot snapshot;
+    if (current_snapshot_has_geometry) {
+        snapshot = *m_latest_render_snapshot;
+        snapshot.metadata.sequence                 = sequence;
+        snapshot.metadata.backend_geometry_in_sync = m_backend_geometry_in_sync;
     }
-    const Terminal_render_snapshot* public_snapshot = m_latest_content_render_snapshot.get();
-    Terminal_render_snapshot empty_public_snapshot;
-    if (public_snapshot == nullptr) {
-        empty_public_snapshot =
-            make_empty_render_snapshot(
-                m_grid_size,
-                viewport_adapted_to_grid({}, m_grid_size),
-                sequence);
-        public_snapshot = &empty_public_snapshot;
-    }
+    else {
+        const Terminal_render_snapshot* public_snapshot =
+            m_latest_content_render_snapshot.get();
+        Terminal_render_snapshot empty_public_snapshot;
+        if (public_snapshot == nullptr) {
+            empty_public_snapshot =
+                make_empty_render_snapshot(
+                    m_grid_size,
+                    viewport_adapted_to_grid({}, m_grid_size),
+                    sequence);
+            public_snapshot = &empty_public_snapshot;
+        }
 
-    Terminal_render_snapshot snapshot =
-        geometry_snapshot_from_public_snapshot(
+        snapshot = geometry_snapshot_from_public_snapshot(
             *public_snapshot,
             m_grid_size,
             sequence,
             m_backend_geometry_in_sync,
             &m_profile_stats);
-    snapshot.metadata.row_origin_generation              = m_row_origin_generation;
+        snapshot.metadata.row_origin_generation = m_row_origin_generation;
+    }
     snapshot.metadata.publication_generation             = m_render_snapshot_generation + 1U;
+
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
+        write_selection_trace(m_config.selection_trace_enabled,
+            QStringLiteral(
+                "session publish-synchronized-resize-snapshot begin sequence=%1 message=\"%2\" "
+                "generation=%3 basis={%4} selection_count=%5 selection_spans=%6")
+                .arg(static_cast<qulonglong>(sequence))
+                .arg(message)
+                .arg(static_cast<qulonglong>(m_render_snapshot_generation))
+                .arg(selection_trace_content_basis(m_selection_content_basis))
+                .arg(static_cast<qulonglong>(snapshot.selection_spans.size()))
+                .arg(selection_trace_selection_spans(snapshot.selection_spans)));
+    }
     m_latest_render_snapshot =
         std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -10355,6 +10771,7 @@ Terminal_session::Queue_category Terminal_session::queue_category_for(
         case Terminal_session_command_kind::FORCE_RELEASE_SYNCHRONIZED_OUTPUT:
         case Terminal_session_command_kind::BACKEND_EXIT:
         case Terminal_session_command_kind::BACKEND_ERROR:
+        case Terminal_session_command_kind::BACKEND_RESIZE_COMPLETE:
         case Terminal_session_command_kind::RESIZE:
         case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
             return Queue_category::NONE;

@@ -811,6 +811,16 @@ public:
         return true;
     }
 
+    bool set_resize_control_for_testing(std::shared_ptr<Windows_conpty_resize_control_for_testing> control)
+    {
+        const std::lock_guard lock(m_mutex);
+        if (m_start_attempted || m_start_in_progress) {
+            return false;
+        }
+        m_resize_control_for_testing = std::move(control);
+        return true;
+    }
+
     Terminal_backend_result start(
         const Terminal_launch_config&  config,
         Terminal_backend_callbacks     callbacks)
@@ -1156,6 +1166,14 @@ public:
             // bounded response. Returning from start is not settlement.
             worker_result.start_outcome_determinate = false;
         }
+        if (!is_backend_rejection(worker_result)) {
+            Terminal_backend_result resize_worker_result = start_resize_worker();
+            if (is_backend_rejection(resize_worker_result)) {
+                resize_worker_result.native_dispatch_occurred = true;
+                resize_worker_result.start_outcome_determinate = false;
+                worker_result = std::move(resize_worker_result);
+            }
+        }
         if (!post_birth_failure.isEmpty()) {
             // The logical start failed. Native cleanup is a separate result:
             // keep the wait worker, Job and process until exact settlement.
@@ -1218,6 +1236,7 @@ public:
 
         HPCON conpty = nullptr;
         Conpty_api::ResizePseudoConsole_fn resize_conpty = nullptr;
+        std::shared_ptr<Windows_conpty_resize_control_for_testing> resize_control;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_running || m_stopping || m_conpty == nullptr) {
@@ -1229,9 +1248,14 @@ public:
 
             conpty = m_conpty;
             resize_conpty = m_api.resize;
+            resize_control = m_resize_control_for_testing;
             ++m_conpty_active_calls;
         }
 
+        if (resize_control) {
+            resize_control->resize_entered.release();
+            resize_control->allow_resize.acquire();
+        }
         const HRESULT result =
             resize_conpty(conpty, coord_from_grid_size(request.grid_size));
         finish_conpty_call();
@@ -1243,6 +1267,136 @@ public:
         }
 
         return backend_accept();
+    }
+
+    Terminal_backend_resize_dispatch dispatch_resize(
+        Terminal_backend_resize_request request)
+    {
+        if (!size_fits_conpty(request.grid_size)) {
+            return {
+                backend_reject(
+                    Terminal_backend_error_code::RESIZE_FAILED,
+                    QStringLiteral("ConPTY resize requires a positive SHORT-sized grid")),
+                false,
+            };
+        }
+
+        std::optional<Terminal_backend_resize_request> superseded;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_running || m_stopping || m_shutdown_started || m_conpty == nullptr) {
+                return {
+                    backend_reject(
+                        Terminal_backend_error_code::RESIZE_FAILED,
+                        QStringLiteral("ConPTY resize requires a running process")),
+                    false,
+                };
+            }
+            if (!m_callbacks.resize_completed) {
+                return {
+                    backend_reject(
+                        Terminal_backend_error_code::RESIZE_FAILED,
+                        QStringLiteral("ConPTY asynchronous resize requires a completion callback")),
+                    false,
+                };
+            }
+
+            superseded = std::move(m_queued_resize);
+            m_queued_resize = request;
+        }
+
+        m_resize_cv.notify_one();
+        if (superseded.has_value()) {
+            report_resize_completion(*superseded, backend_accept(), true);
+        }
+        return {backend_accept(), true};
+    }
+
+    Terminal_backend_result start_resize_worker()
+    {
+        std::shared_ptr<std::latch> startup_gate;
+        try {
+            startup_gate = std::make_shared<std::latch>(1);
+            m_resize_thread = spawn_native_backend_gated_worker(
+                call_state(),
+                startup_gate,
+                [this] { resize_loop(); });
+            startup_gate->count_down();
+        }
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                startup_gate->count_down();
+            }
+            const QString message = QStringLiteral("ConPTY resize worker startup failed: %1")
+                .arg(QString::fromLocal8Bit(error.what()));
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
+                Terminal_backend_error_code::START_FAILED,
+                message);
+            request_deferred_cleanup();
+            return backend_reject(Terminal_backend_error_code::START_FAILED, message);
+        }
+
+        return backend_accept();
+    }
+
+    void resize_loop()
+    {
+        for (;;) {
+            Terminal_backend_resize_request request;
+            bool stopped = false;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_resize_cv.wait(lock, [&] {
+                    return m_stopping || m_shutdown_started || m_queued_resize.has_value();
+                });
+                if (m_stopping || m_shutdown_started) {
+                    if (m_queued_resize.has_value()) {
+                        request = *m_queued_resize;
+                        m_queued_resize.reset();
+                        stopped = true;
+                    }
+                    else {
+                        return;
+                    }
+                }
+                else {
+                    request = *m_queued_resize;
+                    m_queued_resize.reset();
+                }
+            }
+
+            if (stopped) {
+                report_resize_completion(request, backend_accept(), true);
+                return;
+            }
+
+            Terminal_backend_result result = resize(request);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                stopped = m_stopping || m_shutdown_started;
+            }
+            report_resize_completion(request, std::move(result), stopped);
+            if (stopped) {
+                return;
+            }
+        }
+    }
+
+    void report_resize_completion(
+        Terminal_backend_resize_request request,
+        Terminal_backend_result         result,
+        bool                            superseded)
+    {
+        std::function<void(Terminal_backend_resize_completion)> callback;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            callback = m_callbacks.resize_completed;
+        }
+        if (callback) {
+            callback({request, std::move(result), superseded});
+        }
     }
 
     Terminal_backend_result set_output_paused(bool paused)
@@ -1310,6 +1464,7 @@ public:
         HANDLE process     = nullptr;
         HANDLE process_job = nullptr;
         Terminal_termination_policy policy;
+        std::optional<Terminal_backend_resize_request> cancelled_resize;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_running || m_stopping || !m_process) {
@@ -1326,13 +1481,20 @@ public:
             m_stopping             = true;
             m_output_paused        = false;
             m_exit_reason_override = Terminal_exit_reason::TERMINATED;
+            cancelled_resize = std::move(m_queued_resize);
+            m_queued_resize.reset();
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
+        m_resize_cv.notify_all();
         cancel_blocking_input();
-        request_conpty_close();
-        return start_termination_escalation(process, process_job, policy);
+        Terminal_backend_result result =
+            start_termination_escalation(process, process_job, policy);
+        if (cancelled_resize.has_value()) {
+            report_resize_completion(*cancelled_resize, backend_accept(), true);
+        }
+        return result;
     }
 
     Terminal_backend_result start_termination_escalation(
@@ -1380,10 +1542,10 @@ public:
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
+        m_resize_cv.notify_all();
         cancel_blocking_input();
-        request_conpty_close();
-
         request_native_process_tree_termination();
+        request_conpty_close();
 
         if (!native_backend_reader_finished_within(
                 m_mutex,
@@ -1398,6 +1560,7 @@ public:
             m_writer_thread,
             m_wait_thread,
             m_termination_thread);
+        join_or_detach_native_backend_thread(m_resize_thread);
 
         // Worker construction can fail before a wait loop exists. This exact
         // owner still must observe the root and Job before releasing handles.
@@ -1421,10 +1584,12 @@ public:
             const std::lock_guard lock(m_mutex);
             m_stopping = true;
             m_output_paused = false;
+            m_queued_resize.reset();
             m_callbacks = {};
         }
         m_output_cv.notify_all();
         m_write_cv.notify_all();
+        m_resize_cv.notify_all();
         m_callback_gate->revoke_and_drain();
     }
 
@@ -2047,7 +2212,9 @@ private:
         }
         finish_paused_output_delivery(paused_output_delivery_started);
         m_output_cv.notify_all();
+        m_resize_cv.notify_all();
         drain_paused_output_before_exit_report();
+        request_native_process_tree_termination();
         request_conpty_close();
         if (!native_backend_reader_finished_within(
                 m_mutex,
@@ -2062,7 +2229,6 @@ private:
                 m_reader_finished);
         }
         drain_paused_output_before_exit_report();
-        request_native_process_tree_termination();
         wait_for_native_process_tree_settlement();
         report_exit_once(Terminal_exit_reason::EXITED, static_cast<int>(exit_code));
     }
@@ -2229,6 +2395,7 @@ private:
     std::condition_variable            m_write_cv;
     std::condition_variable            m_reader_cv;
     std::condition_variable            m_conpty_cv;
+    std::condition_variable            m_resize_cv;
     std::condition_variable            m_public_call_cv;
     Terminal_backend_callbacks         m_callbacks;
     std::shared_ptr<Native_backend_callback_gate> m_callback_gate =
@@ -2248,9 +2415,11 @@ private:
     std::thread                        m_writer_thread;
     std::thread                        m_wait_thread;
     std::thread                        m_termination_thread;
+    std::thread                        m_resize_thread;
     std::set<std::thread::id>          m_worker_thread_ids;
     QByteArray                         m_paused_output;
     std::deque<Queued_write>           m_write_queue;
+    std::optional<Terminal_backend_resize_request> m_queued_resize;
     std::optional<Terminal_exit_reason>
                                        m_exit_reason_override;
     Terminal_termination_policy        m_termination_policy;
@@ -2272,6 +2441,7 @@ private:
     bool m_cleanup_observation_blocked_for_testing = false;
     std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
     std::shared_ptr<Windows_conpty_close_control_for_testing> m_close_control_for_testing;
+    std::shared_ptr<Windows_conpty_resize_control_for_testing> m_resize_control_for_testing;
     bool m_process_assigned_to_job = false;
     bool                               m_native_cleanup_settled = false;
     bool                               m_running = false;
@@ -2326,6 +2496,14 @@ Terminal_backend_result Windows_conpty_backend::resize(
     return impl->resize(request);
 }
 
+Terminal_backend_resize_dispatch Windows_conpty_backend::dispatch_resize(
+    Terminal_backend_resize_request request)
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
+    return impl->dispatch_resize(request);
+}
+
 Terminal_backend_result Windows_conpty_backend::set_output_paused(bool paused)
 {
     Impl* impl = m_impl.get();
@@ -2374,6 +2552,12 @@ bool Windows_conpty_backend::set_close_control_for_testing(
     std::shared_ptr<Windows_conpty_close_control_for_testing> control)
 {
     return m_impl->set_close_control_for_testing(std::move(control));
+}
+
+bool Windows_conpty_backend::set_resize_control_for_testing(
+    std::shared_ptr<Windows_conpty_resize_control_for_testing> control)
+{
+    return m_impl->set_resize_control_for_testing(std::move(control));
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()
