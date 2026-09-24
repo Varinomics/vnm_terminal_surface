@@ -707,6 +707,10 @@ public:
         owner_request.dimensions.columns = initial_winsize.ws_col;
         std::string owner_error;
         bool owner_started = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_start_attempted = true;
+        }
         try {
             owner_started = m_owner.launch(owner_request, &master_fd, &child_pid, &owner_error);
         }

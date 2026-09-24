@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -50,12 +51,25 @@ int wait_for(int fd, short events, int timeout_ms)
     pollfd descriptor{};
     descriptor.fd     = fd;
     descriptor.events = events;
-    int ready = 0;
-    do {
-        ready = poll(&descriptor, 1, timeout_ms);
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
+    int remaining_ms = timeout_ms;
+    for (;;) {
+        const int ready = poll(&descriptor, 1, remaining_ms);
+        if (ready >= 0 || errno != EINTR) {
+            return ready;
+        }
+        if (timeout_ms < 0) {
+            continue;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return 0;
+        }
+        remaining_ms = static_cast<int>(
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count());
     }
-    while (ready < 0 && errno == EINTR);
-    return ready;
 }
 
 bool set_nonblocking(int fd, std::string* out_error)

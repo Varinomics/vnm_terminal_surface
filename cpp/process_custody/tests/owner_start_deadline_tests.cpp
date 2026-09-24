@@ -3,9 +3,12 @@
 #include "../src/owner_protocol.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -16,6 +19,13 @@ namespace custody = vnm::process_custody;
 using namespace std::chrono_literals;
 
 namespace {
+
+volatile sig_atomic_t receive_signal_observed = 0;
+
+void interrupt_receive(int)
+{
+    receive_signal_observed = 1;
+}
 
 bool check(bool condition, const char* message)
 {
@@ -174,6 +184,99 @@ bool expired_deadline_sends_nothing()
     return ok;
 }
 
+bool interrupted_receive_keeps_its_deadline()
+{
+    custody::Duplex_channel sender;
+    custody::Duplex_channel receiver;
+    std::string error;
+    if (!custody::Duplex_channel::create_pair(
+            custody::k_owner_message_bytes, &sender, &receiver, &error))
+    {
+        return check(false, "interrupted-receive channel setup");
+    }
+
+    struct sigaction action{};
+    struct sigaction previous_action{};
+    action.sa_handler = interrupt_receive;
+    ::sigemptyset(&action.sa_mask);
+    if (::sigaction(SIGUSR1, &action, &previous_action) != 0) {
+        return check(false, "install receive-interrupt handler");
+    }
+
+    sigset_t signals;
+    sigset_t previous_mask;
+    ::sigemptyset(&signals);
+    ::sigaddset(&signals, SIGUSR1);
+    if (::pthread_sigmask(SIG_UNBLOCK, &signals, &previous_mask) != 0) {
+        (void)::sigaction(SIGUSR1, &previous_action, nullptr);
+        return check(false, "unblock receive-interrupt signal");
+    }
+
+    receive_signal_observed = 0;
+    const pthread_t receiving_thread = ::pthread_self();
+    std::atomic<bool> finished{false};
+    std::thread interrupter([&] {
+        const auto signal_deadline = std::chrono::steady_clock::now() + 600ms;
+        while (!finished.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < signal_deadline)
+        {
+            std::this_thread::sleep_for(5ms);
+            if (!finished.load(std::memory_order_acquire)) {
+                (void)::pthread_kill(receiving_thread, SIGUSR1);
+            }
+        }
+    });
+
+    const auto started = std::chrono::steady_clock::now();
+    custody::Owner_event event;
+    const auto status = custody::receive_owner_event(receiver, &event, 80, &error);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    finished.store(true, std::memory_order_release);
+    interrupter.join();
+
+    (void)::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
+    (void)::sigaction(SIGUSR1, &previous_action, nullptr);
+
+    std::printf("interrupted receive: requested=80ms elapsed=%lldms\n",
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    bool ok = check(receive_signal_observed != 0, "the receiving thread was interrupted");
+    ok &= check(status == custody::Receive_status::TIMEOUT, "silent owner receive times out");
+    ok &= check(elapsed >= 80ms && elapsed < 300ms,
+        "receive interruptions consume, rather than restart, the finite timeout");
+    return ok;
+}
+
+bool negative_timeout_waits_for_message()
+{
+    custody::Duplex_channel sender;
+    custody::Duplex_channel receiver;
+    std::string error;
+    if (!custody::Duplex_channel::create_pair(
+            custody::k_owner_message_bytes, &sender, &receiver, &error))
+    {
+        return check(false, "infinite-receive channel setup");
+    }
+
+    const std::array<std::uint8_t, 1> payload{0x5a};
+    auto send_status = custody::Io_status::FAILED;
+    std::thread writer([&] {
+        std::this_thread::sleep_for(30ms);
+        send_status = sender.send(payload.data(), payload.size());
+    });
+
+    std::array<std::uint8_t, custody::k_owner_message_bytes> received_payload{};
+    const auto received = receiver.receive(
+        received_payload.data(), received_payload.size(), -1);
+    writer.join();
+
+    bool ok = check(send_status == custody::Io_status::TRANSFERRED,
+        "infinite-receive fixture sends one message");
+    ok &= check(received.status == custody::Receive_status::MESSAGE &&
+            received.size == payload.size() && received_payload[0] == payload[0],
+        "negative timeout waits indefinitely until a message arrives");
+    return ok;
+}
+
 bool closed_peer_fails_without_sigpipe()
 {
     custody::Duplex_channel sender;
@@ -206,8 +309,10 @@ int main()
     ok &= absent_reader_times_out();
     ok &= expired_deadline_sends_nothing();
     ok &= closed_peer_fails_without_sigpipe();
+    ok &= interrupted_receive_keeps_its_deadline();
+    ok &= negative_timeout_waits_for_message();
     std::puts(ok
-        ? "PASS: deadline START preserves fragments, descriptors, EOF handling and peer failure"
+        ? "PASS: deadline START and receive timeout semantics remain bounded"
         : "FAIL: deadline START");
     return ok ? 0 : 1;
 }

@@ -2225,6 +2225,23 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         LABELS "conformance;posix;pty"
         TIMEOUT 120
     )
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(
+            NAME vnm_terminal_posix_pty_backend_failed_start_retries
+            COMMAND
+                "${CMAKE_COMMAND}" -E env
+                "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_posix_pty_backend>"
+                "--failed-start-retries"
+                "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+        )
+
+        set_tests_properties(vnm_terminal_posix_pty_backend_failed_start_retries PROPERTIES
+            LABELS "conformance;posix;pty;start-failure"
+            TIMEOUT 120
+        )
+    endif()
 endif()
 
 set(vnm_terminal_test_process_targets

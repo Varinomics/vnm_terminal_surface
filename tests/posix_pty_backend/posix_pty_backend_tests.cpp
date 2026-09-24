@@ -9,6 +9,7 @@
 
 #include <QByteArray>
 #include <QFile>
+#include <QFileDevice>
 #include <QFileInfo>
 #include <QIODevice>
 #include <QString>
@@ -618,6 +619,139 @@ bool test_failed_executable(const QString& fixture_path)
 
     return ok;
 }
+
+#if defined(__linux__)
+bool create_invalid_shebang_executable(
+    QTemporaryDir& directory,
+    QString&      executable_path)
+{
+    executable_path = directory.filePath(QStringLiteral("invalid-shebang"));
+    const QString interpreter_path = directory.filePath(QStringLiteral("missing-interpreter"));
+    QFile executable(executable_path);
+    if (!check(executable.open(QIODevice::WriteOnly),
+            "post-dispatch retry executable can be created"))
+    {
+        return false;
+    }
+
+    const QByteArray executable_contents =
+        QByteArrayLiteral("#!") + QFile::encodeName(interpreter_path) + QByteArrayLiteral("\n");
+    if (!check(executable.write(executable_contents) == executable_contents.size(),
+            "post-dispatch retry executable shebang is written"))
+    {
+        return false;
+    }
+    executable.close();
+    return check(executable.setPermissions(
+            QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner),
+        "post-dispatch retry executable is executable");
+}
+
+bool is_single_start_rejection(const term::Terminal_backend_result& result)
+{
+    return result.code == term::Terminal_backend_result_code::REJECTED &&
+        result.error.has_value() &&
+        result.error->code == term::Terminal_backend_error_code::START_FAILED &&
+        result.error->message.contains(QStringLiteral("can only be started once")) &&
+        !result.native_dispatch_occurred;
+}
+
+bool test_callback_reentrant_failed_start_retry()
+{
+    QTemporaryDir executable_dir;
+    if (!check(executable_dir.isValid(),
+            "callback-reentrant retry executable directory is available"))
+    {
+        return false;
+    }
+
+    QString executable_path;
+    if (!create_invalid_shebang_executable(executable_dir, executable_path)) {
+        return false;
+    }
+
+    const term::Terminal_launch_config config = launch_config(executable_path, {});
+    Backend_capture initial_capture;
+    Backend_capture retry_capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    term::Terminal_backend_callbacks callbacks = initial_capture.callbacks();
+    const auto record_initial_error = callbacks.error_reported;
+    bool retry_invoked = false;
+    std::optional<term::Terminal_backend_result> retry_result;
+    callbacks.error_reported = [&](term::Terminal_backend_error error) {
+        record_initial_error(std::move(error));
+        if (!retry_invoked) {
+            retry_invoked = true;
+            retry_result = backend->start(config, retry_capture.callbacks());
+        }
+    };
+
+    const term::Terminal_backend_result start_result =
+        backend->start(config, std::move(callbacks));
+    bool ok = check(start_result.code == term::Terminal_backend_result_code::REJECTED &&
+        start_result.error.has_value() &&
+        start_result.error->code == term::Terminal_backend_error_code::START_FAILED &&
+        start_result.native_dispatch_occurred &&
+        !start_result.start_outcome_determinate,
+        "invalid shebang interpreter fails after native dispatch");
+    ok &= check(initial_capture.errors_snapshot().size() == 1U,
+        "callback-reentrant scenario reports the original native failure once");
+    ok &= check(retry_invoked && retry_result.has_value(),
+        "callback-reentrant scenario retries before deferred cleanup is requested");
+    if (retry_result.has_value()) {
+        ok &= check(is_single_start_rejection(*retry_result),
+            "callback-reentrant retry rejects without reusing native ownership");
+    }
+    const auto retry_errors = retry_capture.errors_snapshot();
+    ok &= check(retry_errors.size() == 1U &&
+        retry_errors.front().code == term::Terminal_backend_error_code::START_FAILED &&
+        retry_errors.front().message.contains(QStringLiteral("can only be started once")),
+        "callback-reentrant retry reports the single-start rejection");
+
+    return ok;
+}
+
+bool test_post_return_failed_start_retry()
+{
+    QTemporaryDir executable_dir;
+    if (!check(executable_dir.isValid(),
+            "post-return retry executable directory is available"))
+    {
+        return false;
+    }
+
+    QString executable_path;
+    if (!create_invalid_shebang_executable(executable_dir, executable_path)) {
+        return false;
+    }
+
+    const term::Terminal_launch_config config = launch_config(executable_path, {});
+    Backend_capture initial_capture;
+    Backend_capture retry_capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    const term::Terminal_backend_result start_result =
+        backend->start(config, initial_capture.callbacks());
+    bool ok = check(start_result.code == term::Terminal_backend_result_code::REJECTED &&
+        start_result.error.has_value() &&
+        start_result.error->code == term::Terminal_backend_error_code::START_FAILED &&
+        start_result.native_dispatch_occurred &&
+        !start_result.start_outcome_determinate,
+        "post-return scenario reaches native exec failure");
+
+    const term::Terminal_backend_result retry_result =
+        backend->start(config, retry_capture.callbacks());
+    ok &= check(is_single_start_rejection(retry_result),
+        "post-return retry rejects without reusing native ownership");
+    const auto initial_errors = initial_capture.errors_snapshot();
+    const auto retry_errors = retry_capture.errors_snapshot();
+    ok &= check(initial_errors.size() == 1U && retry_errors.size() == 1U &&
+        retry_errors.front().code == term::Terminal_backend_error_code::START_FAILED &&
+        retry_errors.front().message.contains(QStringLiteral("can only be started once")),
+        "post-return retry reports the single-start rejection");
+
+    return ok;
+}
+#endif
 
 bool test_rejection_paths(const QString& fixture_path)
 {
@@ -1482,6 +1616,21 @@ int main(int argc, char** argv)
         return vnm_terminal::test_helpers::check_foreground_cleanup(
             QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath()) ? 0 : 1;
     }
+#if defined(__linux__)
+    if (argc == 2 && std::string_view(argv[1]) == "--failed-start-reentrant-retry") {
+        return test_callback_reentrant_failed_start_retry() ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--failed-start-post-return-retry") {
+        return test_post_return_failed_start_retry() ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--failed-start-retries") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_missing_working_directory(fixture_path);
+        ok &= test_callback_reentrant_failed_start_retry();
+        ok &= test_post_return_failed_start_retry();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && (std::string_view(argv[1]) == "--foreground-adopted" ||
                      std::string_view(argv[1]) == "--foreground-host-eof" ||
                      std::string_view(argv[1]) == "--foreground-owner-loss")) {
@@ -1516,6 +1665,10 @@ int main(int argc, char** argv)
     ok &= test_interactive_canvas_fixture(fixture_path);
     ok &= test_missing_working_directory(fixture_path);
     ok &= test_failed_executable(fixture_path);
+#if defined(__linux__)
+    ok &= test_callback_reentrant_failed_start_retry();
+    ok &= test_post_return_failed_start_retry();
+#endif
     ok &= test_rejection_paths(fixture_path);
     ok &= test_interrupt(fixture_path);
     ok &= test_interrupt_without_stdin_reader(fixture_path);
