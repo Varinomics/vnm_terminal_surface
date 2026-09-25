@@ -483,6 +483,8 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
     m_primary_backing.retained_history.capacity_bytes =
         terminal_history_ring_aligned_capacity(
             m_config.retained_history_capacity_bytes);
+    m_parser.set_sixel_raster_limit_bytes(terminal_history_ring_max_record_bytes(
+        m_primary_backing.retained_history.capacity_bytes));
 
     reset_grid();
     refresh_active_grid_retained_lookup_indexes();
@@ -786,6 +788,12 @@ void Terminal_screen_model::apply_action(
             if constexpr (std::is_same_v<mutation_t, Screen_bell_mutation>) {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::apply_action::bell");
+                static_cast<void>(mutation);
+            }
+            else
+            if constexpr (std::is_same_v<mutation_t, Screen_sixel_image_mutation>) {
+                // Images are not placed on the grid: a decoded image changes
+                // no screen state, cursor included.
                 static_cast<void>(mutation);
             }
             else {
@@ -4277,6 +4285,8 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
     const std::vector<terminal_history_handle_t> evicted_handles =
         m_primary_backing.resize_retained_history_capacity(aligned_capacity);
     m_config.retained_history_capacity_bytes = aligned_capacity;
+    m_parser.set_sixel_raster_limit_bytes(terminal_history_ring_max_record_bytes(
+        m_primary_backing.retained_history.capacity_bytes));
     for (const terminal_history_handle_t handle : evicted_handles) {
         erase_retained_lookup_entry(
             Terminal_buffer_id::PRIMARY,

@@ -48,7 +48,7 @@ sequence: DCS string payload
 feature: string payload hard limit
 status: supported
 action_category: payload-limit
-behavior: accepts payloads up to 1048576 raw bytes before unsupported discard
+behavior: accepts payloads up to 1048576 raw bytes before unsupported discard; sixel data is never buffered and is bounded by dcs-sixel-decoded-limit instead
 host_policy: none
 payload_limit: 1048576 raw bytes
 recovery: discard over-limit payload until ST or recovery boundary
@@ -112,12 +112,60 @@ sequence: unsupported DCS
 feature: unsupported string recovery
 status: unsupported-discard
 action_category: unsupported-discard
-behavior: discards payload and mutates no screen state
+behavior: discards payload and mutates no screen state; a header with an intermediate, a private marker, or a final byte other than q, such as DECRQSS $q and XTGETTCAP +q, is not sixel
 host_policy: none
 payload_limit: 1048576 raw bytes
 recovery: recover at ST or recovery boundary
 reply: no-reply
 diagnostic: unsupported DCS diagnostic
+oracle: product-decision-vnm-terminal
+
+## dcs-sixel-image
+
+id: dcs-sixel-image
+family: DCS
+sequence: DCS P1 ; P2 ; P3 q sixel data ST, as ESC P and ESC \ or as C1 controls
+feature: sixel graphics image
+status: supported
+action_category: screen-mutation
+behavior: a header of digits and semicolons ending in q streams the data to a decoder as it arrives, and ST yields one decoded image of RGBA8 pixels in sixel device pixels with its extent, final sixel cursor row top, and pixel aspect ratio; data characters ? to ~ are six pixels with the least significant bit on top; ! repeats the next data character; # selects, or defines in HLS or RGB percent and selects, one of 256 color registers private to the image and starting from the VT340 default color map; " sets the aspect ratio and the background raster size; $ returns to the left of the sixel line and - moves to the next one; P1 picks the aspect ratio from the manual table, P2 1 leaves undrawn pixels transparent while 0, 2 and other values paint them and the declared raster with register 0, and P3 is ignored; the image is not placed on the grid
+host_policy: none
+payload_limit: raw sixel data unbounded and never buffered; decoded image bounded by dcs-sixel-decoded-limit
+recovery: ESC [ or C1 CSI inside the data abandons the image and resets to ground
+reply: no-reply
+diagnostic: DCS recovery diagnostic when a CSI abandons the image; limit diagnostic per dcs-sixel-decoded-limit
+oracle: dec-vt330-vt340-graphics-manual
+
+## dcs-sixel-product-decisions
+
+id: dcs-sixel-product-decisions
+family: DCS
+sequence: DCS P1 ; P2 ; P3 q sixel data ST
+feature: sixel behavior the manual leaves open
+status: supported
+action_category: screen-mutation
+behavior: raster attributes apply only before the first data character or graphics new line, so an image has one aspect ratio; Pan/Pad is rounded up, as OpenConsole does, where the manual says nearest, and an omitted or zero Pad keeps the ratio; P1 above 9 is 1:1; data drawn before a color is selected uses register 15; color numbers past 255 wrap; registers 16 to 255 start with the VT340 map repeated; a register color is taken when a sixel is drawn, while the background takes register 0 as it stands at ST; the extent covers the drawn pixels and, with a background, the declared raster; numeric parameters saturate at 32767; other bytes are ignored
+host_policy: none
+payload_limit: decoded image bounded by dcs-sixel-decoded-limit
+recovery: CAN or SUB inside the data abandons the image without a diagnostic and returns to ground; other string families keep CAN and SUB as payload
+reply: no-reply
+diagnostic: none for a cancelled image
+oracle: product-decision-vnm-terminal
+
+## dcs-sixel-decoded-limit
+
+id: dcs-sixel-decoded-limit
+family: DCS
+sequence: DCS P1 ; P2 ; P3 q sixel data ST
+feature: decoded sixel image hard limit
+status: supported
+action_category: payload-limit
+behavior: caps an image at the retained history's largest record, ring capacity / 8, following capacity changes; the decoded size is extent width x height x 4 bytes and is checked whenever the extent grows and again at ST, never against declared raster attributes alone; an image over the cap keeps no pixels but still ends with its extent, final sixel cursor row top, and aspect ratio
+host_policy: the retained history capacity sets the cap
+payload_limit: decoded image up to retained history capacity / 8 bytes, 8388608 at the default 67108864 byte ring
+recovery: drop the pixels and keep decoding geometry until ST or a recovery boundary
+reply: no-reply
+diagnostic: DCS sixel payload-limit diagnostic with the decoded size and the cap
 oracle: product-decision-vnm-terminal
 
 ## apc-unsupported-discard

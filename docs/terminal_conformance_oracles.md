@@ -61,6 +61,19 @@ forbidden_use: no copied external output, names, comments, byte streams, or gold
 inventory_ref: tests/conformance/README.md
 notes: fixture authors must avoid GPL-derived material
 
+## dec-vt330-vt340-graphics-manual
+
+oracle_id: dec-vt330-vt340-graphics-manual
+oracle_type: external-standard
+status: approved
+license_posture: published DEC manual; behavior specification only, no import
+pin_or_version: VT330/VT340 Programmer Reference Manual vol. 2, Graphics Programming, EK-VT3XX-GP-002, second edition, May 1988
+checked_in_output_allowed: yes
+allowed_use: sixel graphics behavior from chapter 14 and the VT340 default color map and HLS hue circle from chapter 2; fixtures and expected results are authored from that text
+forbidden_use: no manual text, figures, or examples copied in as fixtures or goldens
+inventory_ref: none
+notes: read at https://vt100.net/docs/vt3xx-gp/chapter14.html and chapter2.html; where the manual is silent the sixel matrix row records the product decision
+
 ## xterm-409-reference
 
 oracle_id: xterm-409-reference

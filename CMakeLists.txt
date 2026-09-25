@@ -377,6 +377,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_canvas_fixture_contract.h
     include/vnm_terminal/internal/terminal_history_ring.h
     include/vnm_terminal/internal/terminal_history_row_record_codec.h
+    include/vnm_terminal/internal/sixel_decoder.h
     include/vnm_terminal/internal/terminal_byte_stream_parser.h
     include/vnm_terminal/internal/terminal_canvas_content_extent.h
     include/vnm_terminal/internal/terminal_input_mode.h
@@ -421,6 +422,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_repaint_recovery.cpp
     src/terminal_resize_controller.cpp
     src/terminal_session.cpp
+    src/sixel_decoder.cpp
     src/terminal_byte_stream_parser.cpp
     src/terminal_canvas_export.cpp
     src/terminal_screen_model.cpp
