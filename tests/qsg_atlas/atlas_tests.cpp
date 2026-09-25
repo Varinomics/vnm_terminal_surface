@@ -13813,7 +13813,7 @@ void configure_atlas_prepare_transaction_forced_msdf_surface(
     window.resize(420, 140);
     surface.setParentItem(window.contentItem());
     surface.setSize(QSizeF(360.0, 90.0));
-    surface.set_font_family(QString());
+    surface.set_font_family(term::vnm_terminal_default_monospace_font_family());
     surface.set_font_size(18.0);
     surface.set_color_scheme(QStringLiteral("Campbell"));
     surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::MSDF);
@@ -13826,7 +13826,7 @@ void configure_atlas_prepare_transaction_auto_msdf_surface(
     window.resize(420, 140);
     surface.setParentItem(window.contentItem());
     surface.setSize(QSizeF(360.0, 90.0));
-    surface.set_font_family(QString());
+    surface.set_font_family(term::vnm_terminal_default_monospace_font_family());
     surface.set_font_size(18.0);
     surface.set_color_scheme(QStringLiteral("Campbell"));
     surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::AUTO);
@@ -13865,6 +13865,46 @@ bool seed_atlas_prepare_transaction_baseline(
     return seeded;
 }
 
+// Pumps frames until the predicate holds. An MSDF atlas bake runs on the global
+// thread pool and can take many seconds in a Debug build. Every prepare reports
+// the pending-bake message until the prepare that adopts the bake, so the frame
+// budget restarts on each such frame; a failed bake reports its failure
+// instead. The deadline bounds a bake that never completes.
+bool pump_until_msdf_bakes_settle(
+    QGuiApplication&     app,
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>&
+                         predicate)
+{
+    constexpr qint64 k_settled_budget_ms = 3000;
+    constexpr qint64 k_deadline_ms       = 60000;
+    QElapsedTimer deadline;
+    QElapsedTimer settled;
+    deadline.start();
+    settled.start();
+    while (deadline.elapsed() < k_deadline_ms &&
+        settled.elapsed() < k_settled_budget_ms)
+    {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_frame_report report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        if (predicate(report)) {
+            return true;
+        }
+        if (report.render.msdf_text_message ==
+            QStringLiteral("MSDF atlas build pending"))
+        {
+            settled.restart();
+        }
+    }
+
+    return false;
+}
+
 bool seed_atlas_prepare_transaction_msdf_baseline(
     QGuiApplication&              app,
     QQuickWindow&                 window,
@@ -13893,7 +13933,7 @@ bool seed_atlas_prepare_transaction_msdf_baseline(
     window.show();
     const int expected_glyphs =
         atlas_msdf_resource_stability_expected_glyphs();
-    const bool baseline_rendered = pump_until(
+    const bool baseline_rendered = pump_until_msdf_bakes_settle(
         app,
         window,
         surface,
