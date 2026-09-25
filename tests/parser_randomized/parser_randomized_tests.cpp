@@ -1,8 +1,10 @@
+#include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
 #include <QByteArrayView>
+#include <QImage>
 #include <QString>
 #include <algorithm>
 #include <cctype>
@@ -743,6 +745,20 @@ void append_screen_mutation_summary(
         void operator()(const term::Screen_bell_mutation&) const
         {
             append_screen_mutation_payload_summary(out);
+        }
+
+        void operator()(const term::Screen_sixel_image_mutation& mutation) const
+        {
+            QByteArray raster;
+            for (int y = 0; y < mutation.raster.height(); ++y) {
+                raster.append(
+                    reinterpret_cast<const char*>(mutation.raster.constScanLine(y)),
+                    mutation.raster.width() * 4);
+            }
+            out << mutation.width << 'x' << mutation.height << ':'
+                << mutation.final_cursor_y << ':'
+                << mutation.pixel_aspect_ratio << ':'
+                << byte_array_hex(raster);
         }
     };
 
@@ -2162,6 +2178,116 @@ Test_case make_string_recovery_test_case(
     return test_case;
 }
 
+// A sixel image decodes while its data streams in, and a DCS is classified
+// while its header streams in, so neither may depend on where the stream is
+// split. The single-byte plan puts a chunk boundary between every pair of
+// bytes, including inside the header, the parameters and the terminator.
+Test_case make_dcs_test_case(
+    const std::string&                 name,
+    const QByteArray&                  dcs,
+    std::vector<Expected_diagnostic>   diagnostics,
+    std::uint64_t                      chunk_seed)
+{
+    Test_case test_case;
+    test_case.name                           = name;
+    test_case.config                         = {term::terminal_grid_size_t{2, 12}, 4, 4};
+    test_case.bytes                          = QByteArrayLiteral("A") + dcs + QByteArrayLiteral("B");
+    test_case.expected_visible_text_utf8     = QByteArrayLiteral("AB\n");
+    test_case.has_expected_visible_text_utf8 = true;
+    test_case.chunk_seed                     = chunk_seed;
+    test_case.expected_reply_count           = 0;
+    set_expected_diagnostics(test_case, std::move(diagnostics));
+    return test_case;
+}
+
+void append_dcs_cases(std::vector<Test_case>& cases)
+{
+    const std::size_t sixel_limit_bytes = term::terminal_history_ring_max_record_bytes(
+        term::terminal_history_ring_aligned_capacity(
+            term::k_terminal_default_retained_history_capacity_bytes));
+
+    cases.push_back(make_dcs_test_case(
+        "generated_sixel_image",
+        QByteArrayLiteral(
+            "\x1bP0;1;0q\"1;1;3;12#1;2;100;0;0~~@-#2;2;0;100;0!3N$#1A\x1b\\"),
+        {},
+        0x3c91e07a5b6d28f4ULL));
+
+    QByteArray c1_image("\x90", 1);
+    c1_image.append(QByteArrayLiteral("q#1;1;120;50;100~-~"));
+    c1_image.append("\x9c", 1);
+    cases.push_back(make_dcs_test_case(
+        "generated_sixel_c1_image", c1_image, {}, 0xd4a2687f1e05b93cULL));
+
+    cases.push_back(make_dcs_test_case(
+        "generated_sixel_cancel_can",
+        QByteArrayLiteral("\x1bPq#1~~\x18"),
+        {},
+        0x6e18c5f2a70d943bULL));
+    cases.push_back(make_dcs_test_case(
+        "generated_sixel_cancel_sub",
+        QByteArrayLiteral("\x1bPq#1~~\x1a"),
+        {},
+        0x95b3d17c4e62a08fULL));
+
+    cases.push_back(make_dcs_test_case(
+        "generated_sixel_recovery",
+        QByteArrayLiteral("\x1bPq#1~~\x1b[0m"),
+        {
+            expected_diagnostic(
+                term::Parser_diagnostic_code::MALFORMED_INPUT,
+                QStringLiteral("DCS recovery"),
+                term::Parser_sequence_family::DCS,
+                0U,
+                0U,
+                term::Parser_recovery_strategy::RESET_TO_GROUND),
+        },
+        0x0f7ad2b95c6384e1ULL));
+
+    cases.push_back(make_dcs_test_case(
+        "generated_sixel_over_cap",
+        QByteArrayLiteral("\x1bPq\"1;1;2000;2000#1~\x1b\\"),
+        {
+            expected_diagnostic(
+                term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED,
+                QStringLiteral("DCS sixel"),
+                term::Parser_sequence_family::DCS,
+                2000U * 2000U * 4U,
+                sixel_limit_bytes,
+                term::Parser_recovery_strategy::DISCARD_STRING),
+        },
+        0xa51c7e4d82b9f063ULL));
+
+    // DECRQSS and XTGETTCAP end in 'q' too; their intermediates keep them the
+    // unsupported DCS they are, payload and diagnostic included.
+    cases.push_back(make_dcs_test_case(
+        "generated_dcs_decrqss_unsupported",
+        QByteArrayLiteral("\x1bP$qm\x1b\\"),
+        {
+            expected_diagnostic(
+                term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
+                QStringLiteral("DCS"),
+                term::Parser_sequence_family::DCS,
+                3U,
+                term::k_dcs_payload_limit_bytes,
+                term::Parser_recovery_strategy::DISCARD_STRING),
+        },
+        0x7b20e94fc6d1a358ULL));
+    cases.push_back(make_dcs_test_case(
+        "generated_dcs_xtgettcap_unsupported",
+        QByteArrayLiteral("\x1bP+q544e\x1b\\"),
+        {
+            expected_diagnostic(
+                term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
+                QStringLiteral("DCS"),
+                term::Parser_sequence_family::DCS,
+                6U,
+                term::k_dcs_payload_limit_bytes,
+                term::Parser_recovery_strategy::DISCARD_STRING),
+        },
+        0xe3469a0b5d7f12c8ULL));
+}
+
 std::vector<Test_case> generated_cases()
 {
     std::vector<Test_case> cases;
@@ -2318,6 +2444,8 @@ std::vector<Test_case> generated_cases()
         term::Parser_sequence_family::SOS,
         term::k_sos_payload_limit_bytes,
         0x42a6f0d9718c3b5eULL));
+
+    append_dcs_cases(cases);
 
     for (Test_case& test_case : cases) {
         const bool actions_depend_on_chunk_boundaries =

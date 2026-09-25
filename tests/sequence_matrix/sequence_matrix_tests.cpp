@@ -234,6 +234,9 @@ const std::set<std::string>& required_sequence_ids()
         "pm-payload-limit",
         "sos-payload-limit",
         "dcs-unsupported-discard",
+        "dcs-sixel-image",
+        "dcs-sixel-product-decisions",
+        "dcs-sixel-decoded-limit",
         "apc-unsupported-discard",
         "pm-unsupported-discard",
         "sos-unsupported-discard",
@@ -324,6 +327,7 @@ const std::set<std::string>& required_oracle_ids()
     static const std::set<std::string> ids = {
         "product-decision-vnm-terminal",
         "independent-vnm-fixture",
+        "dec-vt330-vt340-graphics-manual",
         "xterm-409-reference",
         "vttest-reference",
         "contour-candidate",

@@ -1,10 +1,12 @@
 #pragma once
 
 #include "vnm_terminal/internal/parser_action.h"
+#include "vnm_terminal/internal/sixel_decoder.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include <QByteArray>
 #include <QByteArrayView>
 #include <QtGlobal>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -27,6 +29,13 @@ class Terminal_byte_stream_parser
 {
 public:
     std::vector<Parser_action> ingest(QByteArrayView bytes);
+
+    // The decoded size a sixel image may reach; its owner keeps it equal to
+    // the retained history's largest record.
+    void set_sixel_raster_limit_bytes(std::size_t limit_bytes)
+    {
+        m_sixel_decoder.set_raster_limit_bytes(limit_bytes);
+    }
 
 private:
     enum class String_state_result
@@ -53,6 +62,10 @@ private:
         qsizetype&                     offset,
         std::vector<Parser_action>&    actions);
 
+    void classify_dcs_header(
+        QByteArrayView                 bytes,
+        qsizetype&                     offset);
+
     void start_string(
         Parser_sequence_family         family,
         QByteArrayView                 bytes,
@@ -73,6 +86,10 @@ private:
 
     void finish_string(
         Parser_sequence_family         family,
+        Parser_string_terminator       terminator,
+        std::vector<Parser_action>&    actions);
+
+    void finish_sixel(
         Parser_string_terminator       terminator,
         std::vector<Parser_action>&    actions);
 
@@ -108,6 +125,8 @@ private:
     Parser_sequence_family     m_string_family                 = Parser_sequence_family::NONE;
     bool                       m_string_over_limit             = false;
     Terminal_utf8_scan_state   m_string_utf8_scan_state;
+    bool                       m_dcs_header_pending            = false;
+    Sixel_decoder              m_sixel_decoder;
     bool                       m_discarding_csi                = false;
     bool                       m_discarding_escape             = false;
     std::uint64_t              m_next_host_request_id          = 1U;

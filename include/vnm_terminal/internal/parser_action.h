@@ -4,6 +4,7 @@
 #include "vnm_terminal/internal/terminal_style.h"
 #include <QString>
 #include <QByteArray>
+#include <QImage>
 #include <variant>
 #include <cstddef>
 #include <cstdint>
@@ -106,6 +107,7 @@ enum class Parser_string_terminator
     ST_7BIT,
     ST_8BIT,
     RECOVERY,
+    CANCEL,
     END_OF_INPUT,
 };
 
@@ -136,6 +138,7 @@ enum class Screen_mutation_kind
     SET_ICON_NAME,
     BELL,
     SET_HYPERLINK,
+    SIXEL_IMAGE,
 };
 
 enum class Parser_diagnostic_code
@@ -225,6 +228,29 @@ struct Screen_set_hyperlink_mutation
     QByteArray identity_key;
 };
 
+// A sixel image decoded at its string terminator. The raster is RGBA8888
+// premultiplied in sixel device pixels, with every drawn pixel opaque and
+// every undrawn one all zero, and with the pixel aspect ratio already applied
+// as repeated rows, so placement cuts it into text rows without scaling. Its
+// rows may be padded past width x 4 bytes, so readers go by bytesPerLine. The
+// raster is implicitly shared and null when the image drew nothing or its
+// extent exceeded the decoded-size cap. The geometry holds either way:
+// placement scrolls and moves the cursor for an image whether or not its
+// pixels were kept.
+struct Screen_sixel_image_mutation
+{
+    QImage     raster;
+    // The image extent in device pixels; the raster's size when there is one.
+    int        width              = 0;
+    int        height             = 0;
+    // The top of the final sixel row, a trailing graphics new line included:
+    // the VT340 puts the text cursor on the row this pixel falls in.
+    int        final_cursor_y     = 0;
+    // Rows each sixel pixel covers, the same for the whole image. Placement
+    // can reduce it exactly by keeping that many of each run of rows.
+    int        pixel_aspect_ratio = 1;
+};
+
 using Screen_mutation = std::variant<
     Screen_print_text_mutation,
     Screen_carriage_return_mutation,
@@ -234,7 +260,8 @@ using Screen_mutation = std::variant<
     Screen_set_title_mutation,
     Screen_set_icon_name_mutation,
     Screen_bell_mutation,
-    Screen_set_hyperlink_mutation>;
+    Screen_set_hyperlink_mutation,
+    Screen_sixel_image_mutation>;
 
 struct Terminal_sgr_operation
 {
@@ -356,6 +383,11 @@ inline Screen_mutation_kind screen_mutation_kind(const Screen_mutation& mutation
         Screen_mutation_kind operator()(const Screen_set_hyperlink_mutation&) const
         {
             return Screen_mutation_kind::SET_HYPERLINK;
+        }
+
+        Screen_mutation_kind operator()(const Screen_sixel_image_mutation&) const
+        {
+            return Screen_mutation_kind::SIXEL_IMAGE;
         }
     };
 

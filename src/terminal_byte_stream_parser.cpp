@@ -289,6 +289,30 @@ bool is_escape_final_byte(unsigned char byte)
     return byte >= 0x30U && byte <= 0x7eU;
 }
 
+// A DCS header is parameter bytes, then intermediates, then one final byte.
+// It is decided at the first byte that cannot continue a plain parameter
+// list, and only 'q' there makes it sixel: a private marker, a colon or an
+// intermediate (DECRQSS "$q", XTGETTCAP "+q") makes it another DCS. Controls
+// inside a header are skipped as the DEC parser skips them, except ESC, CAN
+// and SUB, which end a string rather than belong to it.
+bool dcs_header_continues(unsigned char byte)
+{
+    if ((byte >= '0' && byte <= '9') || byte == ';' || byte == 0x7fU) {
+        return true;
+    }
+
+    return byte < 0x20U && byte != 0x1bU && byte != 0x18U && byte != 0x1aU;
+}
+
+Parser_action make_string_recovery_diagnostic(Parser_sequence_family family)
+{
+    return
+        make_malformed_recovery_diagnostic(
+            source_name_for_family(family) + QStringLiteral(" recovery"),
+            family,
+            Parser_recovery_strategy::RESET_TO_GROUND);
+}
+
 bool string_terminator_is_valid_for_family(
     Parser_sequence_family     family,
     Parser_string_terminator   terminator)
@@ -1203,6 +1227,10 @@ void Terminal_byte_stream_parser::continue_string(
     qsizetype&                     offset,
     std::vector<Parser_action>&    actions)
 {
+    if (m_dcs_header_pending) {
+        classify_dcs_header(bytes, offset);
+    }
+
     Parser_string_terminator terminator = Parser_string_terminator::END_OF_INPUT;
     const qsizetype terminator_offset =
         find_string_terminator(bytes, m_string_family, offset, terminator);
@@ -1247,10 +1275,49 @@ void Terminal_byte_stream_parser::start_string(
 {
     m_string_family = family;
     m_string_payload.clear();
-    m_string_over_limit = false;
+    m_string_over_limit  = false;
+    m_dcs_header_pending = family == Parser_sequence_family::DCS;
     reset_utf8_scan_state(m_string_utf8_scan_state);
     offset = payload_begin;
     continue_string(bytes, offset, actions);
+}
+
+void Terminal_byte_stream_parser::classify_dcs_header(
+    QByteArrayView                 bytes,
+    qsizetype&                     offset)
+{
+    // A header that overran the payload limit belongs to a string that is
+    // already being discarded, whatever its final byte turns out to be.
+    if (m_string_over_limit) {
+        m_dcs_header_pending = false;
+        return;
+    }
+
+    // Undecided header bytes are buffered like any DCS payload, so a DCS
+    // that is not sixel keeps its whole payload under the DCS limit.
+    qsizetype decision_offset = offset;
+    while (decision_offset < bytes.size() &&
+        dcs_header_continues(byte_at(bytes, decision_offset)))
+    {
+        ++decision_offset;
+    }
+
+    if (decision_offset == bytes.size()) {
+        return;
+    }
+
+    m_dcs_header_pending = false;
+    if (byte_at(bytes, decision_offset) != 'q') {
+        return;
+    }
+
+    // From the final byte on the data streams to the decoder instead of the
+    // buffer; the header bytes buffered so far carry its parameters.
+    QByteArray header_parameters = std::move(m_string_payload);
+    m_string_payload.clear();
+    header_parameters.append(bytes.data() + offset, decision_offset - offset);
+    m_sixel_decoder.begin(header_parameters);
+    offset = decision_offset + 1;
 }
 
 qsizetype Terminal_byte_stream_parser::find_string_terminator(
@@ -1293,6 +1360,14 @@ qsizetype Terminal_byte_stream_parser::find_string_terminator(
             terminator = Parser_string_terminator::RECOVERY;
             return i;
         }
+        // CAN and SUB cancel a control string in the DEC parser, which is how
+        // an application abandons an image it has started. Other strings
+        // carry them as payload.
+        if (m_sixel_decoder.active() && (byte == 0x18U || byte == 0x1aU)) {
+            reset_utf8_scan_state(m_string_utf8_scan_state);
+            terminator = Parser_string_terminator::CANCEL;
+            return i;
+        }
     }
 
     m_string_utf8_scan_state = utf8_scan_state;
@@ -1306,6 +1381,13 @@ bool Terminal_byte_stream_parser::append_string_payload(
     std::vector<Parser_action>&    actions)
 {
     if (payload.empty() || m_string_over_limit) {
+        return true;
+    }
+
+    // Sixel data streams into the decoder and is never buffered, so the DCS
+    // payload limit does not apply to it; the decoded-size cap does.
+    if (m_sixel_decoder.active()) {
+        m_sixel_decoder.decode(payload, actions);
         return true;
     }
 
@@ -1334,19 +1416,22 @@ void Terminal_byte_stream_parser::finish_string(
     const bool was_over_limit = m_string_over_limit;
     QByteArray payload        = std::move(m_string_payload);
     m_string_payload.clear();
-    m_string_over_limit = false;
+    m_string_over_limit  = false;
+    m_dcs_header_pending = false;
     reset_utf8_scan_state(m_string_utf8_scan_state);
     m_string_family = Parser_sequence_family::NONE;
+
+    if (m_sixel_decoder.active()) {
+        finish_sixel(terminator, actions);
+        return;
+    }
 
     if (was_over_limit) {
         return;
     }
 
     if (terminator == Parser_string_terminator::RECOVERY) {
-        actions.push_back(make_malformed_recovery_diagnostic(
-            source_name_for_family(family) + QStringLiteral(" recovery"),
-            family,
-            Parser_recovery_strategy::RESET_TO_GROUND));
+        actions.push_back(make_string_recovery_diagnostic(family));
         return;
     }
 
@@ -1365,6 +1450,26 @@ void Terminal_byte_stream_parser::finish_string(
         static_cast<std::size_t>(payload.size()),
         payload_limit_for_family(family),
         Parser_recovery_strategy::DISCARD_STRING));
+}
+
+void Terminal_byte_stream_parser::finish_sixel(
+    Parser_string_terminator       terminator,
+    std::vector<Parser_action>&    actions)
+{
+    // Only the string terminator completes an image. A recovery boundary or
+    // CAN/SUB abandons it: nothing is placed, and the next image starts from
+    // a fresh decoder.
+    if (terminator == Parser_string_terminator::ST_7BIT ||
+        terminator == Parser_string_terminator::ST_8BIT)
+    {
+        m_sixel_decoder.finish(actions);
+        return;
+    }
+
+    m_sixel_decoder.abort();
+    if (terminator == Parser_string_terminator::RECOVERY) {
+        actions.push_back(make_string_recovery_diagnostic(Parser_sequence_family::DCS));
+    }
 }
 
 void Terminal_byte_stream_parser::finish_csi_sequence(

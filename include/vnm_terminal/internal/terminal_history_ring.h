@@ -27,6 +27,13 @@ constexpr std::uint32_t terminal_history_ring_record_overhead_bytes()
         k_terminal_history_ring_record_footer_bytes;
 }
 
+// The largest record a ring of this capacity accepts. Anything that has to
+// fit one record, such as a decoded sixel image, is capped by the same rule.
+constexpr std::size_t terminal_history_ring_max_record_bytes(std::size_t capacity_bytes)
+{
+    return capacity_bytes / 8U;
+}
+
 enum class Terminal_history_ring_status
 {
     OK,
@@ -175,7 +182,7 @@ public:
     bool ok() const { return m_status == Terminal_history_ring_status::OK; }
 
     std::size_t capacity_bytes() const { return m_capacity_bytes; }
-    std::size_t max_record_bytes() const { return m_capacity_bytes / 8U; }
+    std::size_t max_record_bytes() const { return terminal_history_ring_max_record_bytes(m_capacity_bytes); }
     std::size_t max_payload_bytes() const;
 
     std::uint64_t oldest_live_byte_sequence() const;

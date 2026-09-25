@@ -28,7 +28,7 @@ against an app build that consumes this surface.
 | Render snapshot and frame building | `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_qsg_atlas`, `vnm_terminal_render_cell_text` | surface |
 | Surface / host API (scroll, selection, paste, focus, clipboard) | `vnm_terminal_surface_host` | surface |
 | Search, scrollback match identity, and search overlays | `vnm_terminal_search_index`, `vnm_terminal_backend_session`, `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, `vnm_terminal_custom_titlebar_integration` | surface + application |
-| Screen model, parser, and escape-sequence behavior | `vnm_terminal_screen_basic`, `vnm_terminal_screen_operations`, `vnm_terminal_screen_alternate`, `vnm_terminal_screen_sgr`, `vnm_terminal_terminal_modes`, `vnm_terminal_viewport`, `vnm_terminal_sequence_matrix`, `vnm_terminal_parser_ir`, `vnm_terminal_parser_randomized` | surface |
+| Screen model, parser, and escape-sequence behavior | `vnm_terminal_screen_basic`, `vnm_terminal_screen_operations`, `vnm_terminal_screen_alternate`, `vnm_terminal_screen_sgr`, `vnm_terminal_terminal_modes`, `vnm_terminal_viewport`, `vnm_terminal_sequence_matrix`, `vnm_terminal_parser_ir`, `vnm_terminal_parser_randomized`, `vnm_terminal_sixel_decoder` | surface |
 | XTWINOPS text-area resize arbitration | `vnm_terminal_backend_session`, `vnm_terminal_surface_host`, `vnm_terminal_screen_operations`, `vnm_terminal_sequence_matrix` | surface |
 | Cell pixel size (CSI 14 t and CSI 16 t replies, POSIX winsize pixels, backend cell geometry) | `vnm_terminal_screen_operations`, `vnm_terminal_parser_ir`, `vnm_terminal_backend_session`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_qt_metrics`, `vnm_terminal_qt_metrics_scaled`, `vnm_terminal_sequence_matrix` | surface |
 | CLI / application behavior | `vnm_terminal_smoke`, `vnm_terminal_help_*`, `vnm_terminal_rejects_*` | application |
@@ -48,8 +48,10 @@ against an app build that consumes this surface.
   `vnm_terminal_surface_behavior_smokes` and
   `vnm_terminal_native_surface_behavior_smokes` variants from the same
   executable. The native variant is registered on Windows, Linux, and macOS.
-- The parser subsystem is covered by `vnm_terminal_parser_ir` (IR contract) and
-  `vnm_terminal_parser_randomized` (randomized corpus). `vnm_terminal_input_encoder`
+- The parser subsystem is covered by `vnm_terminal_parser_ir` (IR contract),
+  `vnm_terminal_parser_randomized` (randomized corpus), and
+  `vnm_terminal_sixel_decoder` (sixel DCS dispatch, decoding, and the decoded-size
+  cap). `vnm_terminal_input_encoder`
   covers key, mouse, paste, and focus encoding and is the companion to
   `vnm_terminal_surface_host` for input changes.
 - `vnm_terminal_sequence_matrix` checks the supported/ignored/rejected sequence
