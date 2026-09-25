@@ -66,6 +66,11 @@ struct terminal_cell_pixel_size_t
         const terminal_cell_pixel_size_t&) = default;
 };
 
+inline bool is_valid_cell_pixel_size(terminal_cell_pixel_size_t size)
+{
+    return size.width > 0 && size.height > 0;
+}
+
 struct Terminal_metrics_result
 {
     Terminal_metrics_status    status  = Terminal_metrics_status::OK;

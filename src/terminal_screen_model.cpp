@@ -460,6 +460,12 @@ Terminal_screen_model_config_status validate_terminal_screen_model_config(
         return Terminal_screen_model_config_status::INVALID_TAB_WIDTH;
     }
 
+    if (config.cell_pixel_size.has_value() &&
+        !is_valid_cell_pixel_size(*config.cell_pixel_size))
+    {
+        return Terminal_screen_model_config_status::INVALID_CELL_PIXEL_SIZE;
+    }
+
     return Terminal_screen_model_config_status::OK;
 }
 
@@ -4355,6 +4361,10 @@ void Terminal_screen_model::set_text_area_resize_policy(
 
 void Terminal_screen_model::set_cell_pixel_size(terminal_cell_pixel_size_t size)
 {
+    if (!is_valid_cell_pixel_size(size)) {
+        throw std::invalid_argument("invalid cell pixel size");
+    }
+
     m_config.cell_pixel_size = size;
 }
 

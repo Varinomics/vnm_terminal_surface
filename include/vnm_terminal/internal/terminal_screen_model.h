@@ -92,8 +92,8 @@ struct Terminal_screen_model_config
                                k_terminal_default_retained_history_capacity_bytes;
     Terminal_text_area_resize_policy text_area_resize_policy =
         Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
-    // Positive when present. Without it no pixel geometry is known, so the
-    // CSI 14 t and CSI 16 t pixel reports stay unsupported.
+    // Must be positive when present. Without it no pixel geometry is known, so
+    // the CSI 14 t and CSI 16 t pixel reports stay unsupported.
     std::optional<terminal_cell_pixel_size_t> cell_pixel_size;
 };
 
@@ -104,6 +104,7 @@ enum class Terminal_screen_model_config_status
     INVALID_SCROLLBACK_LIMIT,
     INVALID_RETAINED_HISTORY_CAPACITY,
     INVALID_TAB_WIDTH,
+    INVALID_CELL_PIXEL_SIZE,
 };
 
 Terminal_screen_model_config_status validate_terminal_screen_model_config(

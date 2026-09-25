@@ -3120,7 +3120,7 @@ void Terminal_session::set_color_state(Terminal_color_state state)
 
 void Terminal_session::set_cell_pixel_size(terminal_cell_pixel_size_t size)
 {
-    Q_ASSERT(size.width > 0 && size.height > 0);
+    Q_ASSERT(is_valid_cell_pixel_size(size));
 
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);

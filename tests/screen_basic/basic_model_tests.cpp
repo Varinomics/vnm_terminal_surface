@@ -365,6 +365,14 @@ bool test_config_validation()
             term::Terminal_screen_model_config_status::INVALID_RETAINED_HISTORY_CAPACITY,
         "retained-history capacity above the supported maximum is rejected");
 
+    term::Terminal_screen_model_config zero_cell_width_config;
+    zero_cell_width_config.grid_size       = {3, 6};
+    zero_cell_width_config.cell_pixel_size = term::terminal_cell_pixel_size_t{0, 18};
+    ok &= check(
+        term::validate_terminal_screen_model_config(zero_cell_width_config) ==
+            term::Terminal_screen_model_config_status::INVALID_CELL_PIXEL_SIZE,
+        "a cell pixel size without positive width is rejected");
+
     bool threw = false;
     try {
         term::Terminal_screen_model invalid(
