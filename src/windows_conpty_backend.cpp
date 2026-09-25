@@ -57,6 +57,11 @@ constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
 constexpr std::size_t k_conpty_paused_output_high_watermark_ceiling_bytes =
     64U * 1024U;
 constexpr int k_interrupt_exit_code = 130;
+// OpenConsole places sixel images on a fixed 10x20 pixel cell and advances its
+// own cursor by that cell, whatever the host renders, and the pseudoconsole API
+// carries no pixel size. Children sized against this cell land where
+// OpenConsole puts its cursor; the pixel values they read are virtual.
+constexpr terminal_cell_pixel_size_t k_openconsole_cell_pixel_size{10, 20};
 
 DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 {
@@ -2523,6 +2528,11 @@ Terminal_backend_result Windows_conpty_backend::terminate()
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->terminate();
+}
+
+std::optional<terminal_cell_pixel_size_t> Windows_conpty_backend::fixed_cell_pixel_size() const
+{
+    return k_openconsole_cell_pixel_size;
 }
 
 Windows_conpty_backend_write_state_for_testing

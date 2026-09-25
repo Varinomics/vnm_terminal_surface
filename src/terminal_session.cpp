@@ -2042,6 +2042,9 @@ Terminal_session::Terminal_session(
 {
     m_config.scrollback_limit = std::max(0, m_config.scrollback_limit);
     m_bell_state.policy = m_config.bell_policy;
+    if (m_backend != nullptr) {
+        m_cell_pixel_size = m_backend->fixed_cell_pixel_size();
+    }
     if (m_config.text_area_resize_arbitration.has_value() &&
         m_config.text_area_resize_arbitration->version ==
             k_terminal_text_area_resize_arbitration_capability_version)
@@ -3112,6 +3115,37 @@ void Terminal_session::set_color_state(Terminal_color_state state)
             previous_viewport,
             previous_grid_size);
         publish_render_snapshot(next_sequence(), QStringLiteral("color state changed"));
+    }
+}
+
+void Terminal_session::set_cell_pixel_size(terminal_cell_pixel_size_t size)
+{
+    Q_ASSERT(size.width > 0 && size.height > 0);
+
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+
+    // A fixed backend cell stays in force whatever the display reports: that
+    // backend's pseudoconsole places images on its own cell, so the child has
+    // to size them against it.
+    if (m_backend == nullptr ||
+        m_backend->fixed_cell_pixel_size().has_value() ||
+        m_cell_pixel_size == size)
+    {
+        return;
+    }
+
+    m_cell_pixel_size = size;
+    if (m_screen_model.has_value()) {
+        m_screen_model->set_cell_pixel_size(size);
+    }
+
+    // Only the pixel size moved, so the grid, the model and the resize
+    // transactions stay as they are; the backend updates the child directly.
+    const Terminal_backend_result backend_result = m_backend->set_cell_pixel_size(size);
+    if (is_backend_rejection(backend_result)) {
+        record_backend_error(next_sequence(), *backend_result.error);
     }
 }
 
@@ -7435,6 +7469,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     screen_config.recover_scrollback_from_primary_repaints =
         m_config.recover_scrollback_from_primary_repaints;
     screen_config.text_area_resize_policy = m_config.text_area_resize_policy;
+    screen_config.cell_pixel_size         = m_cell_pixel_size;
     m_screen_model.emplace(screen_config);
     if (m_color_state.has_value()) {
         m_screen_model->set_color_state(*m_color_state);

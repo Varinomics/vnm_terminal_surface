@@ -441,6 +441,29 @@ bool test_terminal_reply_ir()
     ok &= check(text_area_size_reply.source_family == term::Parser_sequence_family::CSI,
         "text-area size reply source family");
 
+    const term::Parser_action text_area_pixel_size =
+        term::make_text_area_pixel_size_reply_action(480, 720);
+    const auto& text_area_pixel_size_reply =
+        std::get<term::Terminal_reply>(text_area_pixel_size.payload);
+    ok &= check(text_area_pixel_size_reply.kind ==
+            term::Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE,
+        "text-area pixel size reply kind");
+    ok &= check(text_area_pixel_size_reply.wire_bytes == QByteArrayLiteral("\x1b[4;480;720t"),
+        "text-area pixel size reply bytes");
+    ok &= check(text_area_pixel_size_reply.source_family == term::Parser_sequence_family::CSI,
+        "text-area pixel size reply source family");
+
+    const term::Parser_action cell_pixel_size =
+        term::make_cell_pixel_size_reply_action(20, 9);
+    const auto& cell_pixel_size_reply =
+        std::get<term::Terminal_reply>(cell_pixel_size.payload);
+    ok &= check(cell_pixel_size_reply.kind == term::Terminal_reply_kind::CELL_PIXEL_SIZE,
+        "cell pixel size reply kind");
+    ok &= check(cell_pixel_size_reply.wire_bytes == QByteArrayLiteral("\x1b[6;20;9t"),
+        "cell pixel size reply bytes");
+    ok &= check(cell_pixel_size_reply.source_family == term::Parser_sequence_family::CSI,
+        "cell pixel size reply source family");
+
     const term::Parser_action osc = term::make_osc_query_reply_action(
         QByteArrayLiteral("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
         QStringLiteral("OSC 10"));

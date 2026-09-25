@@ -360,6 +360,38 @@ reply: no-reply
 diagnostic: malformed sequence diagnostic; unsupported sequence diagnostic for a rejected grid, a disabled policy or a refused arbitration
 oracle: product-decision-vnm-terminal
 
+## csi-window-op-14
+
+id: csi-window-op-14
+family: CSI
+sequence: CSI 14 t
+feature: xterm text-area pixel size report
+status: supported
+action_category: terminal-reply
+behavior: reports the text area as rows times the cell pixel height and columns times the cell pixel width without changing terminal state; unsupported while no cell pixel size is known
+host_policy: the cell pixel size is the surface's cell in device pixels on the POSIX backend and a fixed virtual 10x20 cell on the Windows ConPTY backend, the cell OpenConsole places sixel images on (product-platform-matrix); a session with no reported cell and no fixed backend cell has none
+payload_limit: none
+recovery: malformed parameters discard the sequence and the parser continues
+reply: CSI 4 ; height ; width t text-area pixel size reply through same backend write path
+diagnostic: malformed sequence diagnostic; unsupported sequence diagnostic without a cell pixel size and for the CSI 14 ; 2 t window form
+oracle: xterm-409-reference
+
+## csi-window-op-16
+
+id: csi-window-op-16
+family: CSI
+sequence: CSI 16 t
+feature: xterm character cell pixel size report
+status: supported
+action_category: terminal-reply
+behavior: reports the cell pixel height and width without changing terminal state; unsupported while no cell pixel size is known
+host_policy: the cell pixel size is the surface's cell in device pixels on the POSIX backend and a fixed virtual 10x20 cell on the Windows ConPTY backend, the cell OpenConsole places sixel images on (product-platform-matrix); a session with no reported cell and no fixed backend cell has none
+payload_limit: none
+recovery: malformed parameters discard the sequence and the parser continues
+reply: CSI 6 ; height ; width t cell pixel size reply through same backend write path
+diagnostic: malformed sequence diagnostic; unsupported sequence diagnostic without a cell pixel size
+oracle: xterm-409-reference
+
 ## csi-window-op-18
 
 id: csi-window-op-18

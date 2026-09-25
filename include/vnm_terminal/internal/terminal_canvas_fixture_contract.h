@@ -43,6 +43,12 @@ struct terminal_canvas_fixture_shell_like_smoke_contract_t
     std::string_view   echo_text;
     std::string_view   size_command;
     std::string_view   size_prefix;
+    // POSIX only: reports the winsize pixel fields as <xpixel>x<ypixel>.
+    std::string_view   pixel_size_command;
+    std::string_view   pixel_size_prefix;
+    // Sends CSI 16 t and reports the reply the terminal sends back, in hex.
+    std::string_view   cell_size_query_command;
+    std::string_view   cell_size_reply_prefix;
     std::string_view   stream_command;
     std::string_view   gated_stream_command;
     std::string_view   gated_stream_ready_output;
@@ -87,6 +93,10 @@ terminal_canvas_fixture_shell_like_smoke_contract()
         "surface-ok",
         "size",
         "size ",
+        "pixels",
+        "pixels ",
+        "cell-size-query",
+        "cell-size-reply ",
         "stream",
         "stream-gated",
         "stream-gated-ready",

@@ -1991,6 +1991,21 @@ struct VNM_TerminalSurface::Private
     }
 #endif
 
+    // The metrics are logical and already snapped to device pixels, so the
+    // rounding only absorbs floating-point error.
+    void report_cell_pixel_size()
+    {
+        if (session == nullptr || !term::is_valid_cell_metrics(cell_metrics)) {
+            return;
+        }
+
+        const qreal device_pixel_ratio = grid_metrics_provider.device_pixel_ratio();
+        session->set_cell_pixel_size({
+            static_cast<int>(std::lround(cell_metrics.width  * device_pixel_ratio)),
+            static_cast<int>(std::lround(cell_metrics.height * device_pixel_ratio)),
+        });
+    }
+
     void request_render_update(VNM_TerminalSurface& surface)
     {
         ++render_invalidation_stats.update_requests;
@@ -7661,6 +7676,9 @@ void VNM_TerminalSurface::refresh_grid_metrics()
     const term::Terminal_metrics_result grid_result =
         term::grid_size_for_geometry(boundingRect().size(), m_private->cell_metrics);
     if (m_private->session != nullptr) {
+        // Ahead of the grid refresh, so a font change that also moves the grid
+        // resizes the backend with the new pixel size already in place.
+        m_private->report_cell_pixel_size();
         refresh_active_session_geometry();
     }
     else {
@@ -8061,6 +8079,8 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
     m_private->session_generation = started_session_generation;
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
+    // Before the backend starts, so the child's first winsize has pixels.
+    m_private->report_cell_pixel_size();
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
         *m_private->session,
         m_private->grid_metrics_provider);

@@ -875,6 +875,49 @@ bool write_shell_size()
     return write_stdout_line(line.str());
 }
 
+#if !defined(_WIN32)
+bool write_shell_pixel_size()
+{
+    winsize size{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) != 0) {
+        return write_stdout_line("pixels unavailable");
+    }
+
+    std::ostringstream line;
+    line << term::terminal_canvas_fixture_shell_like_smoke_contract().pixel_size_prefix
+        << size.ws_xpixel << 'x' << size.ws_ypixel;
+    return write_stdout_line(line.str());
+}
+#endif
+
+// The reply is read through its final byte. The bound keeps a reply that never
+// ends from hanging the fixture.
+int run_shell_cell_size_query()
+{
+    if (!write_all_stdout("\x1b[16t")) {
+        return 86;
+    }
+
+    constexpr std::size_t k_max_reply_bytes = 32U;
+    std::vector<unsigned char> reply;
+    do {
+        unsigned char byte = 0U;
+        if (std::fread(&byte, 1U, 1U, stdin) != 1U) {
+            return 87;
+        }
+        reply.push_back(byte);
+    }
+    while (reply.back() != 't' && reply.size() < k_max_reply_bytes);
+
+    std::string line(
+        term::terminal_canvas_fixture_shell_like_smoke_contract().cell_size_reply_prefix);
+    line += encode_hex(reply);
+    if (!write_stdout_line(line)) {
+        return 88;
+    }
+    return write_shell_prompt() ? -1 : 89;
+}
+
 std::string shell_stream_line(int row)
 {
     std::ostringstream line;
@@ -1055,6 +1098,19 @@ int run_shell_command(std::string_view line, bool& skip_lf_after_cr)
             return 32;
         }
         return write_shell_prompt() ? -1 : 33;
+    }
+
+#if !defined(_WIN32)
+    if (line == contract.pixel_size_command) {
+        if (!write_shell_pixel_size()) {
+            return 90;
+        }
+        return write_shell_prompt() ? -1 : 91;
+    }
+#endif
+
+    if (line == contract.cell_size_query_command) {
+        return run_shell_cell_size_query();
     }
 
     if (line_starts_with_command(line, contract.stream_command)) {

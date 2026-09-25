@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <semaphore>
 
 namespace vnm_terminal::internal {
@@ -87,6 +88,8 @@ public:
 
     Terminal_backend_result interrupt() override;
     Terminal_backend_result terminate() override;
+
+    std::optional<terminal_cell_pixel_size_t> fixed_cell_pixel_size() const override;
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing();
     bool set_start_fault_for_testing(Windows_conpty_start_fault_for_testing fault);

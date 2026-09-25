@@ -5191,7 +5191,7 @@ bool test_replies_and_cursor_save_restore()
     check_rejected_csi_t_query(
         result,
         term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
-        "CSI 14 t is an unsupported lowercase t query");
+        "CSI 14 t without a cell pixel size is an unsupported lowercase t query");
 
     result = model.ingest(QByteArrayLiteral("\x1b[19t"));
     check_rejected_csi_t_query(
@@ -5303,6 +5303,120 @@ bool test_text_area_resize_policy_gates_the_request()
         "application-controlled text-area resize policy applies the requested grid");
     ok &= check(notifications_in(result).size() == 1U,
         "application-controlled text-area resize policy emits one resize notification");
+
+    return ok;
+}
+
+// xterm ctlseqs: CSI 14 t reports the text area as CSI 4 ; height ; width t and
+// CSI 16 t reports one character cell as CSI 6 ; height ; width t, in pixels.
+bool test_pixel_size_reports_follow_cell_pixel_size()
+{
+    bool ok = true;
+
+    const auto check_reply = [&](
+        const term::Terminal_reply& reply,
+        term::Terminal_reply_kind   kind,
+        const QByteArray&           wire_bytes,
+        const QString&              source_sequence,
+        const char*                 label) {
+        ok &= check(reply.kind == kind &&
+            reply.wire_bytes == wire_bytes &&
+            reply.source_sequence == source_sequence,
+            label);
+    };
+    const auto check_unsupported = [&](
+        const term::Terminal_screen_model_result& result,
+        const char*                               label) {
+        ok &= check(replies_in(result).empty() &&
+            diagnostic_count(result) == 1 &&
+            first_diagnostic(result).code ==
+                term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
+            label);
+    };
+
+    term::Terminal_screen_model_config config;
+    config.grid_size        = term::terminal_grid_size_t{7, 13};
+    config.scrollback_limit = 16;
+    config.tab_width        = 4;
+    config.cell_pixel_size  = term::terminal_cell_pixel_size_t{9, 18};
+    term::Terminal_screen_model model(config);
+
+    model.ingest(QByteArrayLiteral("abc"));
+    term::Terminal_screen_model_result result =
+        model.ingest(QByteArrayLiteral("\x1b[14t\x1b[16t"));
+    ok &= check(diagnostic_count(result) == 0, "pixel size reports have no diagnostics");
+    std::vector<term::Terminal_reply> replies = replies_in(result);
+    ok &= check(replies.size() == 2U, "each pixel size query emits one reply");
+    check_reply(
+        reply_at(replies, 0U),
+        term::Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE,
+        QByteArrayLiteral("\x1b[4;126;117t"),
+        QStringLiteral("CSI 14 t"),
+        "CSI 14 t reports rows and columns times the cell pixel size");
+    check_reply(
+        reply_at(replies, 1U),
+        term::Terminal_reply_kind::CELL_PIXEL_SIZE,
+        QByteArrayLiteral("\x1b[6;18;9t"),
+        QStringLiteral("CSI 16 t"),
+        "CSI 16 t reports the cell pixel height and width");
+    ok &= check(model.row_text(0) == QStringLiteral("abc"),
+        "pixel size queries do not mutate screen text");
+    ok &= dirty_rows_equal(result, {}, "pixel size queries have no dirty rows");
+
+    model.resize(term::terminal_grid_size_t{9, 11});
+    result  = model.ingest(QByteArrayLiteral("\x1b[14t\x1b[16t"));
+    replies = replies_in(result);
+    ok &= check(replies.size() == 2U, "pixel size queries reply after a grid resize");
+    check_reply(
+        reply_at(replies, 0U),
+        term::Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE,
+        QByteArrayLiteral("\x1b[4;162;99t"),
+        QStringLiteral("CSI 14 t"),
+        "CSI 14 t follows the resized grid");
+    check_reply(
+        reply_at(replies, 1U),
+        term::Terminal_reply_kind::CELL_PIXEL_SIZE,
+        QByteArrayLiteral("\x1b[6;18;9t"),
+        QStringLiteral("CSI 16 t"),
+        "CSI 16 t keeps the cell across a grid resize");
+
+    model.set_cell_pixel_size({10, 20});
+    result  = model.ingest(QByteArrayLiteral("\x1b[14t\x1b[16t"));
+    replies = replies_in(result);
+    ok &= check(replies.size() == 2U, "pixel size queries reply after a cell change");
+    check_reply(
+        reply_at(replies, 0U),
+        term::Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE,
+        QByteArrayLiteral("\x1b[4;180;110t"),
+        QStringLiteral("CSI 14 t"),
+        "CSI 14 t follows the changed cell");
+    check_reply(
+        reply_at(replies, 1U),
+        term::Terminal_reply_kind::CELL_PIXEL_SIZE,
+        QByteArrayLiteral("\x1b[6;20;10t"),
+        QStringLiteral("CSI 16 t"),
+        "CSI 16 t follows the changed cell");
+    ok &= check(model.grid_size().rows == 9 && model.grid_size().columns == 11,
+        "a cell change leaves the grid alone");
+
+    check_unsupported(
+        model.ingest(QByteArrayLiteral("\x1b[14;2t")),
+        "CSI 14 ; 2 t window pixel size stays unsupported");
+    check_unsupported(
+        model.ingest(QByteArrayLiteral("\x1b[15t")),
+        "CSI 15 t screen pixel size stays unsupported");
+    replies = replies_in(model.ingest(QByteArrayLiteral("\x1b[18t")));
+    ok &= check(replies.size() == 1U &&
+        reply_at(replies, 0U).wire_bytes == QByteArrayLiteral("\x1b[8;9;11t"),
+        "CSI 18 t still reports the grid in cells");
+
+    term::Terminal_screen_model unknown_cell_model = make_model(7, 13);
+    check_unsupported(
+        unknown_cell_model.ingest(QByteArrayLiteral("\x1b[14t")),
+        "CSI 14 t without a cell pixel size is unsupported");
+    check_unsupported(
+        unknown_cell_model.ingest(QByteArrayLiteral("\x1b[16t")),
+        "CSI 16 t without a cell pixel size is unsupported");
 
     return ok;
 }
@@ -5537,6 +5651,7 @@ int main()
     ok &= test_retained_line_content_generation_mutations();
     ok &= test_replies_and_cursor_save_restore();
     ok &= test_text_area_resize_policy_gates_the_request();
+    ok &= test_pixel_size_reports_follow_cell_pixel_size();
     ok &= test_text_area_resize_request_status_classifier();
     return ok ? 0 : 1;
 }

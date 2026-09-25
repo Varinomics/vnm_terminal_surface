@@ -1532,6 +1532,70 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
     return ok;
 }
 
+// The packaged ConPTY forwards CSI 16 t to the host instead of answering it, and
+// the host's reply reaches the child's VT input. The reply carries the fixed
+// 10x20 cell OpenConsole places sixel images on, whatever the display's cell is,
+// so a ConPTY update that starts answering or reshapes the reply fails here.
+bool test_cell_pixel_size_query_round_trips_through_conpty(const QString& fixture_path)
+{
+    bool ok = true;
+
+    const term::terminal_canvas_fixture_shell_like_smoke_contract_t contract =
+        term::terminal_canvas_fixture_shell_like_smoke_contract();
+    term::Terminal_session_config config;
+    config.trace_output_chunk_limit = 4096U;
+    config.backend_event_notifier   = [] {};
+    term::Terminal_session session(term::make_windows_conpty_backend(), config);
+    session.set_cell_pixel_size({9, 18});
+    ok &= check(session.start(
+            launch_config(fixture_path, {QStringLiteral("--shell-like-smoke")})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "ConPTY session starts the shell-like fixture");
+
+    const auto wait_for_output = [&](const QByteArray& needle) {
+        const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        do {
+            session.process_backend_callback_events();
+            QByteArray received;
+            for (const QByteArray& chunk : session.output_chunks()) {
+                received += chunk;
+            }
+            if (received.contains(needle)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+
+    ok &= check(wait_for_output(shell_fixture_prompt()),
+        "ConPTY session shows the shell-like fixture prompt");
+    ok &= check(session.write_user_bytes(
+            shell_fixture_command(contract.cell_size_query_command)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "ConPTY session sends the cell size query command");
+    QByteArray expected_report(
+        contract.cell_size_reply_prefix.data(),
+        static_cast<qsizetype>(contract.cell_size_reply_prefix.size()));
+    expected_report += QByteArrayLiteral("\x1b[6;20;10t").toHex();
+    ok &= check(wait_for_output(expected_report),
+        "the child reads the fixed 10x20 cell back through ConPTY");
+
+    ok &= check(session.write_user_bytes(shell_fixture_command(contract.exit_command)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "ConPTY session sends exit to the shell-like fixture");
+    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    while (!session.exit_status().has_value() && std::chrono::steady_clock::now() < deadline) {
+        session.process_backend_callback_events();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ok &= check(session.exit_status().has_value() && session.exit_status()->exit_code == 0,
+        "shell-like fixture exits cleanly after the cell size query");
+
+    return ok;
+}
+
 int run_paste_input_reader(const QString& output_path)
 {
     const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
@@ -5813,6 +5877,8 @@ int main(int argc, char** argv)
     run_test("progressing output exit wait has absolute bound",
         test_progressing_output_exit_wait_has_absolute_bound());
     run_test("interactive canvas fixture", test_interactive_canvas_fixture(fixture_path));
+    run_test("cell pixel size query round-trips through ConPTY",
+        test_cell_pixel_size_query_round_trips_through_conpty(fixture_path));
     run_test("compatibility window normal close", test_compatibility_window_stays_hidden(fixture_path, false));
     run_test("compatibility window forced close", test_compatibility_window_stays_hidden(fixture_path, true));
     run_test("Unicode paste preserves console input",

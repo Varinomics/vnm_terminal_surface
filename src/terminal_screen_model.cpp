@@ -1268,6 +1268,20 @@ void Terminal_screen_model::apply_control_sequence(
                                     m_config.grid_size.columns));
                                 return;
                             }
+                            // The pixel reports need a known cell pixel size; without
+                            // one they stay unsupported like the other window operations.
+                            if (mode == 14 && m_config.cell_pixel_size.has_value()) {
+                                generated_actions.push_back(make_text_area_pixel_size_reply_action(
+                                    m_config.grid_size.rows    * m_config.cell_pixel_size->height,
+                                    m_config.grid_size.columns * m_config.cell_pixel_size->width));
+                                return;
+                            }
+                            if (mode == 16 && m_config.cell_pixel_size.has_value()) {
+                                generated_actions.push_back(make_cell_pixel_size_reply_action(
+                                    m_config.cell_pixel_size->height,
+                                    m_config.cell_pixel_size->width));
+                                return;
+                            }
 
                             unsupported();
                             return;
@@ -4337,6 +4351,11 @@ void Terminal_screen_model::set_text_area_resize_policy(
     Terminal_text_area_resize_policy policy)
 {
     m_config.text_area_resize_policy = policy;
+}
+
+void Terminal_screen_model::set_cell_pixel_size(terminal_cell_pixel_size_t size)
+{
+    m_config.cell_pixel_size = size;
 }
 
 void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)

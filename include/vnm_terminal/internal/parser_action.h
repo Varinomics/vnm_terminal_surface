@@ -166,6 +166,8 @@ enum class Terminal_reply_kind
     DECRQM,
     OSC_QUERY,
     TEXT_AREA_SIZE,
+    TEXT_AREA_PIXEL_SIZE,
+    CELL_PIXEL_SIZE,
 };
 
 enum class Terminal_sgr_operation_kind
@@ -545,6 +547,8 @@ inline Parser_sequence_family source_family_for_reply_kind(Terminal_reply_kind k
         case Terminal_reply_kind::DSR_CURSOR_POSITION:
         case Terminal_reply_kind::DECRQM:
         case Terminal_reply_kind::TEXT_AREA_SIZE:
+        case Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE:
+        case Terminal_reply_kind::CELL_PIXEL_SIZE:
             return Parser_sequence_family::CSI;
     }
 
@@ -603,6 +607,24 @@ inline Parser_action make_text_area_size_reply_action(int rows, int columns)
             Terminal_reply_kind::TEXT_AREA_SIZE,
             QByteArray("\x1b[8;") + QByteArray::number(rows) + ';' + QByteArray::number(columns) + 't',
             QStringLiteral("CSI 18 t"));
+}
+
+inline Parser_action make_text_area_pixel_size_reply_action(int height, int width)
+{
+    return
+        make_terminal_reply_action(
+            Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE,
+            QByteArray("\x1b[4;") + QByteArray::number(height) + ';' + QByteArray::number(width) + 't',
+            QStringLiteral("CSI 14 t"));
+}
+
+inline Parser_action make_cell_pixel_size_reply_action(int height, int width)
+{
+    return
+        make_terminal_reply_action(
+            Terminal_reply_kind::CELL_PIXEL_SIZE,
+            QByteArray("\x1b[6;") + QByteArray::number(height) + ';' + QByteArray::number(width) + 't',
+            QStringLiteral("CSI 16 t"));
 }
 
 inline Parser_action make_osc_query_reply_action(QByteArray wire_bytes, QString source_sequence)

@@ -73,11 +73,27 @@ bool size_fits_pty(terminal_grid_size_t grid_size)
         grid_size.columns <= std::numeric_limits<unsigned short>::max();
 }
 
-winsize winsize_from_grid_size(terminal_grid_size_t grid_size)
+// The winsize pixel fields carry the text-area size. Readers take zero as
+// unknown, which is also what a size beyond the field's range reports.
+unsigned short winsize_pixel_extent(int cells, int cell_pixels)
+{
+    const long long extent = static_cast<long long>(cells) * cell_pixels;
+    if (extent > std::numeric_limits<unsigned short>::max()) {
+        return 0U;
+    }
+
+    return static_cast<unsigned short>(extent);
+}
+
+winsize winsize_from_grid_size(
+    terminal_grid_size_t       grid_size,
+    terminal_cell_pixel_size_t cell_pixel_size)
 {
     winsize size{};
-    size.ws_row = static_cast<unsigned short>(grid_size.rows);
-    size.ws_col = static_cast<unsigned short>(grid_size.columns);
+    size.ws_row    = static_cast<unsigned short>(grid_size.rows);
+    size.ws_col    = static_cast<unsigned short>(grid_size.columns);
+    size.ws_xpixel = winsize_pixel_extent(grid_size.columns, cell_pixel_size.width);
+    size.ws_ypixel = winsize_pixel_extent(grid_size.rows, cell_pixel_size.height);
     return size;
 }
 
@@ -676,8 +692,13 @@ public:
                     posix_error_message(QStringLiteral("pipe backend write wake"), pipe_result));
         }
 
+        terminal_cell_pixel_size_t cell_pixel_size;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            cell_pixel_size = m_cell_pixel_size;
+        }
         winsize initial_winsize =
-            winsize_from_grid_size(effective_config.initial_grid_size);
+            winsize_from_grid_size(effective_config.initial_grid_size, cell_pixel_size);
         int master_fd = -1;
 #if defined(__linux__)
         pid_t child_pid = -1;
@@ -705,6 +726,8 @@ public:
         }
         owner_request.dimensions.rows = initial_winsize.ws_row;
         owner_request.dimensions.columns = initial_winsize.ws_col;
+        owner_request.dimensions.pixel_width = initial_winsize.ws_xpixel;
+        owner_request.dimensions.pixel_height = initial_winsize.ws_ypixel;
         std::string owner_error;
         bool owner_started = false;
         {
@@ -912,6 +935,7 @@ public:
         }
 
         int master = -1;
+        terminal_cell_pixel_size_t cell_pixel_size;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_running || m_process_stopping || m_stopping || !m_master || m_child_pid <= 0) {
@@ -921,10 +945,48 @@ public:
                         QStringLiteral("POSIX PTY resize requires a running process"));
             }
 
+            master          = m_master.get();
+            cell_pixel_size = m_cell_pixel_size;
+        }
+
+        winsize size = winsize_from_grid_size(request.grid_size, cell_pixel_size);
+        if (::ioctl(master, TIOCSWINSZ, &size) < 0) {
+            return
+                backend_reject(
+                    Terminal_backend_error_code::RESIZE_FAILED,
+                    posix_error_message(QStringLiteral("TIOCSWINSZ"), errno));
+        }
+
+        return backend_accept();
+    }
+
+    Terminal_backend_result set_cell_pixel_size(terminal_cell_pixel_size_t cell_pixel_size)
+    {
+        int master = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_cell_pixel_size = cell_pixel_size;
+            // Before start the size waits for the spawn winsize, and a child
+            // that is stopping has no terminal left to tell.
+            if (!m_running || m_process_stopping || m_stopping || !m_master || m_child_pid <= 0) {
+                return backend_accept();
+            }
+
             master = m_master.get();
         }
 
-        winsize size = winsize_from_grid_size(request.grid_size);
+        // Only the pixel fields change. The grid is read back from the terminal
+        // rather than mirrored here, so this cannot restore a stale one.
+        winsize size{};
+        if (::ioctl(master, TIOCGWINSZ, &size) < 0) {
+            return
+                backend_reject(
+                    Terminal_backend_error_code::RESIZE_FAILED,
+                    posix_error_message(QStringLiteral("TIOCGWINSZ"), errno));
+        }
+
+        size.ws_xpixel = winsize_pixel_extent(size.ws_col, cell_pixel_size.width);
+        size.ws_ypixel = winsize_pixel_extent(size.ws_row, cell_pixel_size.height);
         if (::ioctl(master, TIOCSWINSZ, &size) < 0) {
             return
                 backend_reject(
@@ -2057,6 +2119,7 @@ private:
                                                 std::nullopt);
     std::size_t                         m_queued_write_bytes = 0U;
     std::size_t                         m_public_call_depth = 0U;
+    terminal_cell_pixel_size_t          m_cell_pixel_size;
     pid_t                               m_child_pid = -1;
     pid_t                               m_child_process_group = -1;
     bool                                m_running = false;
@@ -2144,6 +2207,16 @@ Terminal_backend_result Posix_pty_backend::terminate()
         impl->call_state(),
         impl->deferred_master_close_claim());
     return impl->terminate();
+}
+
+Terminal_backend_result Posix_pty_backend::set_cell_pixel_size(
+    terminal_cell_pixel_size_t size)
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
+    return impl->set_cell_pixel_size(size);
 }
 
 std::unique_ptr<Terminal_backend> make_posix_pty_backend()

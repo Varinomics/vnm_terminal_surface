@@ -248,6 +248,8 @@ const std::set<std::string>& required_sequence_ids()
         "osc-52-read-deny",
         "dec-private-1",
         "csi-window-op-8",
+        "csi-window-op-14",
+        "csi-window-op-16",
         "csi-window-op-18",
         "dec-private-3",
         "dec-private-5",

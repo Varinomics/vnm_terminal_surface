@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/session_contract.h"
 #include "vnm_terminal/internal/selection_contract.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
@@ -223,6 +224,11 @@ public:
     void set_scrollback_limit(int limit);
     void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
     void set_color_state(Terminal_color_state state);
+    // Reports the display's cell size in device pixels. Unless the backend
+    // fixes its own cell, it becomes the cell of the model's pixel reports,
+    // kept for a model created later, and reaches the backend without a resize
+    // transaction.
+    void set_cell_pixel_size(terminal_cell_pixel_size_t size);
     void set_primary_repaint_recovery_enabled(bool enabled);
     Terminal_session_result interrupt();
     Terminal_session_result terminate();
@@ -1052,6 +1058,10 @@ private:
     // Last color state requested via set_color_state, remembered so it can be
     // reapplied when the screen model is (re)created on the first resize.
     std::optional<Terminal_color_state>                    m_color_state;
+    // The cell size the child is told about: the backend's fixed cell when it
+    // declares one, else the last display cell reported. Remembered, like the
+    // color state, for the model created at start.
+    std::optional<terminal_cell_pixel_size_t>              m_cell_pixel_size;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_render_snapshot;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_content_render_snapshot;
     terminal_selection_content_basis_t                     m_latest_content_render_snapshot_content_basis;

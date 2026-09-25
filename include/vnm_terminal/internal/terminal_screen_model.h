@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/csi_parameter_parsing.h"
+#include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
@@ -91,6 +92,9 @@ struct Terminal_screen_model_config
                                k_terminal_default_retained_history_capacity_bytes;
     Terminal_text_area_resize_policy text_area_resize_policy =
         Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
+    // Positive when present. Without it no pixel geometry is known, so the
+    // CSI 14 t and CSI 16 t pixel reports stay unsupported.
+    std::optional<terminal_cell_pixel_size_t> cell_pixel_size;
 };
 
 enum class Terminal_screen_model_config_status
@@ -619,6 +623,7 @@ public:
     Terminal_screen_model_result set_color_state(Terminal_color_state state);
     void set_primary_repaint_recovery_enabled(bool enabled);
     void set_text_area_resize_policy(Terminal_text_area_resize_policy policy);
+    void set_cell_pixel_size(terminal_cell_pixel_size_t size);
     Terminal_screen_model_result force_release_synchronized_output(
         terminal_screen_model_trailing_changes_t* trailing_changes = nullptr);
 

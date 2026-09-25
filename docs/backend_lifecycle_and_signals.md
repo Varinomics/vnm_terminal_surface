@@ -156,6 +156,37 @@ the input pipe and loops until the chunk is fully written. A write that fails
 while the backend is not stopping reports `WRITE_FAILED` and marks the writer
 failed, which closes the write side.
 
+## Terminal Size And Cell Pixels
+
+The session hands the backend the grid at start (`initial_grid_size`) and on
+every resize (`Terminal_backend_resize_request`), and the display's cell size in
+device pixels through `set_cell_pixel_size` whenever it changes, before start
+included. The surface reports that cell before it starts the backend.
+
+### POSIX winsize
+
+The POSIX backend writes both into the PTY `winsize`: `ws_row` and `ws_col`
+carry the grid, and `ws_xpixel` and `ws_ypixel` carry the text area in pixels,
+columns times the cell width and rows times the cell height. A pixel field is
+zero while no cell size is known or when the product does not fit the field.
+The spawn `winsize` already has pixels; on Linux the process-custody owner
+creates the PTY with them. A resize sets the new grid with the current pixels.
+A pixel-only change, such as a font change that keeps the grid or a move to a
+screen with another device pixel ratio, reads the grid back with `TIOCGWINSZ`
+and rewrites the pixel fields with `TIOCSWINSZ`, without a resize transaction.
+The kernel signals `SIGWINCH` to the foreground process group only when the
+stored `winsize` changes. A font change that also moves the grid updates the
+pixels first and then resizes, so the child can observe two changes.
+
+### Windows cell geometry
+
+`ResizePseudoConsole` takes a character grid only. The ConPTY backend declares
+a fixed 10x20 cell through `fixed_cell_pixel_size`: OpenConsole places sixel
+images on that cell and moves its own cursor by it, whatever the host renders.
+The session answers CSI 14 t and CSI 16 t with that cell instead of the
+display's, so every Windows client reads virtual pixel sizes, and it does not
+forward the display's cell to the backend.
+
 ## Interrupt (Ctrl+C)
 
 The two backends deliver interrupt differently because POSIX has a signal

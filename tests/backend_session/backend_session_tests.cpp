@@ -286,6 +286,18 @@ public:
         return term::backend_accept();
     }
 
+    std::optional<term::terminal_cell_pixel_size_t> fixed_cell_pixel_size() const override
+    {
+        return fixed_cell;
+    }
+
+    term::Terminal_backend_result set_cell_pixel_size(
+        term::terminal_cell_pixel_size_t size) override
+    {
+        cell_pixel_sizes.push_back(size);
+        return term::backend_accept();
+    }
+
     bool emit_output(QByteArray bytes)
     {
         if (!running || output_paused) {
@@ -367,6 +379,10 @@ public:
                                resize_requests;
     std::vector<term::Terminal_launch_config>
                                start_configs;
+    std::optional<term::terminal_cell_pixel_size_t>
+                               fixed_cell;
+    std::vector<term::terminal_cell_pixel_size_t>
+                               cell_pixel_sizes;
     bool                       emit_output_on_destroy           = false;
     std::thread                callback_worker;
 
@@ -14513,6 +14529,87 @@ bool test_backend_output_replies_use_write_path()
     return ok;
 }
 
+// Reply formats follow xterm ctlseqs (CSI 4 ; height ; width t for CSI 14 t,
+// CSI 6 ; height ; width t for CSI 16 t). The fixed 10x20 cell is the one the
+// packaged ConPTY's OpenConsole places sixel images on.
+bool test_cell_pixel_size_reaches_model_and_backend()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    session->set_cell_pixel_size({9, 18});
+    ok &= check(backend->cell_pixel_sizes.size() == 1U &&
+        backend->cell_pixel_sizes.back() == term::terminal_cell_pixel_size_t{9, 18},
+        "a cell reported before start reaches the backend ahead of the spawn");
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "cell pixel session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[16t\x1b[14t")),
+        "backend emits the pixel size queries");
+    ok &= check(backend->writes.size() == 2U &&
+        backend->writes[0] == QByteArrayLiteral("\x1b[6;18;9t") &&
+        backend->writes[1] == QByteArrayLiteral("\x1b[4;432;720t"),
+        "a cell reported before the model existed answers through the backend write path");
+
+    const std::size_t   resize_transactions_before = session->resize_transactions().size();
+    const std::size_t   resize_requests_before     = backend->resize_requests.size();
+    const std::uint64_t snapshot_generation_before = session->render_snapshot_generation();
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(backend->cell_pixel_sizes.size() == 2U &&
+        backend->cell_pixel_sizes.back() == term::terminal_cell_pixel_size_t{10, 20},
+        "a pixel-only change reaches the backend");
+    ok &= check(session->resize_transactions().size() == resize_transactions_before &&
+        backend->resize_requests.size() == resize_requests_before,
+        "a pixel-only change creates no resize transaction");
+    ok &= check(session->grid_size().rows == 24 &&
+        session->grid_size().columns == 80 &&
+        session->render_snapshot_generation() == snapshot_generation_before,
+        "a pixel-only change neither reflows nor republishes the grid");
+
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(backend->cell_pixel_sizes.size() == 2U,
+        "an unchanged cell report does not reach the backend again");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[16t\x1b[14t")),
+        "backend emits the pixel size queries after the cell change");
+    ok &= check(backend->writes.size() == 4U &&
+        backend->writes[2] == QByteArrayLiteral("\x1b[6;20;10t") &&
+        backend->writes[3] == QByteArrayLiteral("\x1b[4;480;800t"),
+        "the pixel size replies follow the changed cell");
+
+    ok &= check(session->resize(QSizeF(1000.0, 600.0), {30, 100}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "cell pixel session resizes");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[14t")),
+        "backend emits the text-area pixel query after the resize");
+    ok &= check(backend->writes.size() == 5U &&
+        backend->writes[4] == QByteArrayLiteral("\x1b[4;600;1000t"),
+        "the text-area pixel reply follows the resized grid");
+
+    auto fixed_backend_owner = std::make_unique<Scripted_backend>();
+    fixed_backend_owner->fixed_cell = term::terminal_cell_pixel_size_t{10, 20};
+    Scripted_backend* fixed_backend = fixed_backend_owner.get();
+    term::Terminal_session fixed_session(
+        std::move(fixed_backend_owner),
+        enable_test_traces(recovery_disabled_primary_backing_session_config()));
+    fixed_session.set_cell_pixel_size({9, 18});
+    ok &= check(fixed_session.start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "fixed-cell session starts");
+    ok &= check(fixed_backend->emit_output(QByteArrayLiteral("\x1b[16t\x1b[14t")),
+        "fixed-cell backend emits the pixel size queries");
+    ok &= check(fixed_backend->writes.size() == 2U &&
+        fixed_backend->writes[0] == QByteArrayLiteral("\x1b[6;20;10t") &&
+        fixed_backend->writes[1] == QByteArrayLiteral("\x1b[4;480;800t"),
+        "a fixed backend cell answers the pixel queries whatever the display reports");
+    ok &= check(fixed_backend->cell_pixel_sizes.empty(),
+        "a backend with a fixed cell never receives the display's cell");
+
+    return ok;
+}
+
 bool test_mixed_output_query_ordering()
 {
     bool ok = true;
@@ -20449,6 +20546,7 @@ int main()
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();
     ok &= test_backend_output_replies_use_write_path();
+    ok &= test_cell_pixel_size_reaches_model_and_backend();
     ok &= test_mixed_output_query_ordering();
     ok &= test_terminal_canvas_fixture_script_through_session();
     ok &= test_generated_replies_settle_with_output_callback_epoch();

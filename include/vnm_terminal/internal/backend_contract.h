@@ -470,6 +470,26 @@ public:
 
     virtual Terminal_backend_result interrupt() = 0;
     virtual Terminal_backend_result terminate() = 0;
+
+    // A backend whose pseudoconsole places images on a cell of its own, with
+    // no regard for the display, declares that cell here. The session then
+    // reports it to the child as the cell pixel size and never forwards the
+    // display's. std::nullopt means the child sees the display's cell.
+    virtual std::optional<terminal_cell_pixel_size_t> fixed_cell_pixel_size() const
+    {
+        return std::nullopt;
+    }
+
+    // Receives the display's cell size in device pixels whenever it changes,
+    // before start included. The backend reports it with the grid at start and
+    // on every resize; a change while the child runs reaches the child without
+    // a grid change or resize transaction.
+    virtual Terminal_backend_result set_cell_pixel_size(
+        terminal_cell_pixel_size_t      size)
+    {
+        (void)size;
+        return backend_accept();
+    }
 };
 
 }

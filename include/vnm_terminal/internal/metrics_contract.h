@@ -54,6 +54,18 @@ struct terminal_cell_metrics_t
     qreal                      descent = 0.0;
 };
 
+// The cell size the child is told about, in whole pixels: the CSI 14 t and
+// CSI 16 t replies and the POSIX winsize pixel fields derive from it.
+struct terminal_cell_pixel_size_t
+{
+    int                        width  = 0;
+    int                        height = 0;
+
+    friend bool operator==(
+        const terminal_cell_pixel_size_t&,
+        const terminal_cell_pixel_size_t&) = default;
+};
+
 struct Terminal_metrics_result
 {
     Terminal_metrics_status    status  = Terminal_metrics_status::OK;

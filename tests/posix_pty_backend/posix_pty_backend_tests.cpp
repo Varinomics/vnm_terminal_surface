@@ -545,6 +545,78 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
     return ok;
 }
 
+// POSIX winsize semantics: ws_xpixel and ws_ypixel carry the text area in
+// pixels, columns times the cell width and rows times the cell height.
+bool test_winsize_carries_text_area_pixels(const QString& fixture_path)
+{
+    bool ok = true;
+
+    const term::terminal_canvas_fixture_shell_like_smoke_contract_t contract =
+        term::terminal_canvas_fixture_shell_like_smoke_contract();
+    const auto command = [](std::string_view name) {
+        return QByteArray(name.data(), static_cast<qsizetype>(name.size())) + '\r';
+    };
+    const auto report = [](std::string_view prefix, int first, int second) {
+        return QByteArray(prefix.data(), static_cast<qsizetype>(prefix.size())) +
+            QByteArray::number(first) + 'x' + QByteArray::number(second) + "\r\n";
+    };
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    ok &= check(backend->set_cell_pixel_size({9, 18}).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "POSIX PTY backend accepts a cell pixel size before start");
+    ok &= check(backend->start(
+            launch_config(fixture_path, {QStringLiteral("--shell-like-smoke")}),
+            capture.callbacks()).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "POSIX PTY backend starts the shell-like fixture");
+    ok &= check(capture.wait_for_output(QByteArray(contract.prompt.data(),
+            static_cast<qsizetype>(contract.prompt.size()))),
+        "shell-like fixture prompt reaches backend output");
+
+    ok &= check(backend->write(command(contract.pixel_size_command)).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "shell-like fixture accepts the spawn pixel query");
+    ok &= check(capture.wait_for_output(report(contract.pixel_size_prefix, 720, 432)),
+        "the spawn winsize carries the text-area pixels");
+
+    ok &= check(backend->resize({1U, {30, 100}}).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "POSIX PTY backend resizes the shell-like fixture");
+    ok &= check(backend->write(command(contract.pixel_size_command)).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "shell-like fixture accepts the resized pixel query");
+    ok &= check(capture.wait_for_output(report(contract.pixel_size_prefix, 900, 540)),
+        "a grid resize carries the text-area pixels of the new grid");
+
+    ok &= check(backend->set_cell_pixel_size({10, 20}).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "POSIX PTY backend accepts a pixel-only change");
+    ok &= check(backend->write(
+            command(contract.pixel_size_command) + command(contract.size_command)).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "shell-like fixture accepts the pixel-only queries");
+    ok &= check(capture.wait_for_output(report(contract.pixel_size_prefix, 1000, 600)),
+        "a pixel-only change reaches the child for the current grid");
+    ok &= check(capture.wait_for_output(report(contract.size_prefix, 30, 100)),
+        "a pixel-only change keeps the grid");
+
+    ok &= check(backend->write(command(contract.exit_command)).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "shell-like fixture accepts exit");
+    ok &= check(capture.wait_for_exit(), "shell-like fixture exits");
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 0,
+        "shell-like fixture reports clean exit");
+    ok &= check_no_backend_errors(capture,
+        "winsize pixel fixture produces no backend errors");
+
+    return ok;
+}
+
 bool test_missing_working_directory(const QString& fixture_path)
 {
     bool ok = true;
@@ -1663,6 +1735,7 @@ int main(int argc, char** argv)
     ok &= vnm_terminal::test_helpers::check_native_session_lifecycle(
         term::make_posix_pty_backend, launch_config(fixture_path, {}));
     ok &= test_interactive_canvas_fixture(fixture_path);
+    ok &= test_winsize_carries_text_area_pixels(fixture_path);
     ok &= test_missing_working_directory(fixture_path);
     ok &= test_failed_executable(fixture_path);
 #if defined(__linux__)

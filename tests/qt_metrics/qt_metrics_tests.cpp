@@ -135,6 +135,7 @@ public:
             return callback_result;
         }
 
+        cell_pixel_sizes_at_start = cell_pixel_sizes.size();
         start_configs.push_back(config);
 
         const term::Terminal_backend_result config_result =
@@ -186,6 +187,13 @@ public:
         return term::backend_accept();
     }
 
+    term::Terminal_backend_result set_cell_pixel_size(
+        term::terminal_cell_pixel_size_t size) override
+    {
+        cell_pixel_sizes.push_back(size);
+        return term::backend_accept();
+    }
+
     bool emit_output(QByteArray bytes)
     {
         if (!running || !m_callbacks.output_received) {
@@ -202,6 +210,9 @@ public:
                                resize_requests;
     std::vector<QByteArray>    writes;
     std::vector<bool>          pause_requests;
+    std::vector<term::terminal_cell_pixel_size_t>
+                               cell_pixel_sizes;
+    std::size_t                cell_pixel_sizes_at_start = 0U;
 
 private:
     term::Terminal_backend_callbacks m_callbacks;
@@ -658,6 +669,77 @@ bool test_controller_with_real_provider(QGuiApplication& app, qreal device_pixel
         "resize transaction ids are monotonic");
     ok &= check(backend_ptr->resize_requests.back().transaction_id > first_resize_id,
         "backend resize request ids are monotonic");
+
+    return ok;
+}
+
+// Oracle: the Qt_grid_metrics_provider cell times the device pixel ratio, in
+// whole device pixels. The scaled target runs at a fractional ratio, so the
+// reply there is in device pixels, not logical ones. The reply format is
+// xterm's CSI 6 ; height ; width t.
+bool test_surface_reports_device_pixel_cell(QGuiApplication& app, qreal device_pixel_ratio)
+{
+    bool ok = true;
+
+    QQuickWindow window;
+    window.resize(420, 220);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(420.0, 220.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(13.0);
+
+    window.show();
+    pump_events(app);
+
+    const auto device_pixel_cell = [&surface, device_pixel_ratio] {
+        const term::terminal_cell_metrics_t metrics =
+            surface_metrics_provider(surface, device_pixel_ratio).cell_metrics();
+        return term::terminal_cell_pixel_size_t{
+            static_cast<int>(std::lround(metrics.width  * device_pixel_ratio)),
+            static_cast<int>(std::lround(metrics.height * device_pixel_ratio)),
+        };
+    };
+    const auto cell_reply = [](term::terminal_cell_pixel_size_t cell) {
+        return QByteArrayLiteral("\x1b[6;") + QByteArray::number(cell.height) + ';' +
+            QByteArray::number(cell.width) + 't';
+    };
+
+    auto               backend     = std::make_unique<Recording_backend>();
+    Recording_backend* backend_ptr = backend.get();
+    ok &= check(term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+            surface,
+            std::move(backend),
+            {QStringLiteral("terminal-fixture")}).accepted,
+        "cell pixel surface starts");
+    pump_events(app);
+
+    const term::terminal_cell_pixel_size_t initial_cell = device_pixel_cell();
+    ok &= check(backend_ptr->cell_pixel_sizes_at_start == 1U &&
+        backend_ptr->cell_pixel_sizes.front() == initial_cell,
+        "the surface reports its device-pixel cell before the backend starts");
+    ok &= check(backend_ptr->emit_output(QByteArrayLiteral("\x1b[16t")),
+        "recording backend emits CSI 16 t");
+    pump_events(app);
+    ok &= check(!backend_ptr->writes.empty() &&
+        backend_ptr->writes.back() == cell_reply(initial_cell),
+        "CSI 16 t answers with the provider cell times the device pixel ratio");
+
+    surface.set_font_size(19.0);
+    pump_events(app);
+    const term::terminal_cell_pixel_size_t changed_cell = device_pixel_cell();
+    ok &= check(changed_cell != initial_cell,
+        "a larger font changes the device-pixel cell");
+    ok &= check(!backend_ptr->cell_pixel_sizes.empty() &&
+        backend_ptr->cell_pixel_sizes.back() == changed_cell,
+        "a font change reports the new device-pixel cell to the backend");
+    ok &= check(backend_ptr->emit_output(QByteArrayLiteral("\x1b[16t")),
+        "recording backend emits CSI 16 t after the font change");
+    pump_events(app);
+    ok &= check(!backend_ptr->writes.empty() &&
+        backend_ptr->writes.back() == cell_reply(changed_cell),
+        "CSI 16 t follows the font change");
 
     return ok;
 }
@@ -1241,6 +1323,7 @@ int main(int argc, char** argv)
     ok &= test_provider_metrics(observed_dpr);
     ok &= test_surface_publication(app, observed_dpr);
     ok &= test_controller_with_real_provider(app, observed_dpr);
+    ok &= test_surface_reports_device_pixel_cell(app, observed_dpr);
     ok &= test_diagnostics_metrics_json(app);
     ok &= test_font_advance_policies();
     ok &= test_public_font_metrics_replicates_internal();
