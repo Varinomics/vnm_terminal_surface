@@ -43,6 +43,7 @@
 #include <QQuickWindow>
 #include <QRawFont>
 #include <QRectF>
+#include <QSGRenderNode>
 #include <QSGRendererInterface>
 #include <QSGSimpleRectNode>
 #include <QSGTextNode>
@@ -9669,8 +9670,6 @@ bool test_msdf_text_failure_diagnostics_merge()
     failed.msdf_text_missed_supported_glyphs = 7;
     failed.msdf_text_atlas_built             = true;
     failed.msdf_text_atlas_ready             = true;
-    failed.msdf_text_texture_ready           = true;
-    failed.msdf_text_texture_uploaded        = true;
     failed.msdf_text_cache_miss              = true;
     failed.msdf_text_atlas_build_attempted   = true;
     failed.msdf_text_atlas_build_succeeded   = true;
@@ -9702,8 +9701,6 @@ bool test_msdf_text_failure_diagnostics_merge()
         "MSDF diagnostics merge preserves failure counters across populated retry");
     ok &= check(populated_retry.msdf_text_atlas_built &&
             populated_retry.msdf_text_atlas_ready &&
-            populated_retry.msdf_text_texture_ready &&
-            populated_retry.msdf_text_texture_uploaded &&
             populated_retry.msdf_text_cache_miss &&
             populated_retry.msdf_text_atlas_build_attempted &&
             populated_retry.msdf_text_atlas_build_succeeded,
@@ -10750,9 +10747,71 @@ Atlas_host_state_result test_atlas_scissor_host_state(
     return result;
 }
 
-Atlas_host_state_result test_atlas_stencil_host_state(
-    QGuiApplication& app)
+// Without NoExternalRendering the scene graph brackets render() with
+// beginExternal() and endExternal(), which drops the command buffer's cached
+// graphics pipeline. A following batch that shares the stencil clip reuses the
+// stencil contents without drawing them, so its render node starts render()
+// with no pipeline bound.
+class Atlas_external_render_node final : public QSGRenderNode
 {
+public:
+    Atlas_external_render_node(
+        QRectF                            bounds,
+        std::shared_ptr<std::atomic<int>> stencil_renders)
+    :
+        m_bounds(bounds),
+        m_stencil_renders(std::move(stencil_renders))
+    {}
+
+    RenderingFlags flags() const override { return BoundedRectRendering; }
+    QRectF rect() const override { return m_bounds; }
+
+    void render(const RenderState* state) override
+    {
+        if (state != nullptr && state->stencilEnabled()) {
+            m_stencil_renders->fetch_add(1);
+        }
+    }
+
+private:
+    QRectF                            m_bounds;
+    std::shared_ptr<std::atomic<int>> m_stencil_renders;
+};
+
+class Atlas_external_render_item final : public QQuickItem
+{
+public:
+    explicit Atlas_external_render_item(std::shared_ptr<std::atomic<int>> stencil_renders)
+    :
+        m_stencil_renders(std::move(stencil_renders))
+    {
+        setFlag(QQuickItem::ItemHasContents, true);
+    }
+
+protected:
+    QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override
+    {
+        if (old_node != nullptr) {
+            return old_node;
+        }
+        return new Atlas_external_render_node(boundingRect(), m_stencil_renders);
+    }
+
+private:
+    std::shared_ptr<std::atomic<int>> m_stencil_renders;
+};
+
+Atlas_host_state_result test_atlas_stencil_host_state(
+    QGuiApplication& app,
+    bool             external_predecessor)
+{
+    const char* const case_name = external_predecessor
+        ? "external-predecessor-stencil"
+        : "stencil";
+    const std::string prefix = external_predecessor
+        ? "atlas external-predecessor stencil host "
+        : "atlas stencil host ";
+
     QQuickWindow window;
     window.setColor(QColor(4, 8, 12));
     window.resize(280, 220);
@@ -10765,9 +10824,20 @@ Atlas_host_state_result test_atlas_stencil_host_state(
     clip_host.setTransformOrigin(QQuickItem::TopLeft);
     clip_host.setRotation(16.0);
 
+    const auto predecessor_stencil_renders = std::make_shared<std::atomic<int>>(0);
+    std::optional<Atlas_external_render_item> predecessor;
+    if (external_predecessor) {
+        predecessor.emplace(predecessor_stencil_renders);
+        predecessor->setParentItem(&clip_host);
+        predecessor->setSize(clip_host.size());
+    }
+
     VNM_TerminalSurface surface;
     surface.setParentItem(&clip_host);
-    configure_atlas_host_state_surface(surface, QSizeF(130.0, 82.0), 983U);
+    configure_atlas_host_state_surface(
+        surface,
+        QSizeF(130.0, 82.0),
+        external_predecessor ? 986U : 983U);
 
     window.show();
     Atlas_host_state_result result;
@@ -10781,14 +10851,18 @@ Atlas_host_state_result test_atlas_stencil_host_state(
         surface,
         result.capture,
         [&](const Atlas_host_state_capture& capture) {
-            return count_atlas_host_pixels(capture.image, inside_clip) > 20;
+            return
+                (!external_predecessor || predecessor_stencil_renders->load() > 0) &&
+                count_atlas_host_pixels(capture.image, inside_clip) > 20;
         });
     if (!rendered) {
         result.unsupported = atlas_host_backend_unusable(result.capture.report);
         if (!result.unsupported) {
-            std::cerr << "FAIL: atlas stencil host did not render expected "
-                << "captured pixels inside the rotated clip\n";
-            print_atlas_host_state_report("stencil", result.capture);
+            std::cerr << "FAIL: " << prefix << "did not render expected "
+                << "captured pixels inside the rotated clip"
+                << " (predecessor stencil renders="
+                << predecessor_stencil_renders->load() << ")\n";
+            print_atlas_host_state_report(case_name, result.capture);
         }
         return result;
     }
@@ -10802,13 +10876,17 @@ Atlas_host_state_result test_atlas_stencil_host_state(
         clip_host.mapToScene(QPointF(92.0, 45.0)),
         4);
 
-    bool ok = check_atlas_host_state_report("stencil", result.capture);
+    bool ok = check_atlas_host_state_report(case_name, result.capture);
+    if (external_predecessor) {
+        ok &= check(predecessor_stencil_renders->load() > 0,
+            prefix + "renders the predecessor under the clip");
+    }
     ok &= check(count_atlas_host_pixels(result.capture.image, inside_clip) > 20,
-        "atlas stencil host renders inside the rotated clip");
+        prefix + "renders inside the rotated clip");
     ok &= check(count_atlas_host_pixels(result.capture.image, outside_right) == 0,
-        "atlas stencil host rejects pixels right of the rotated clip");
+        prefix + "rejects pixels right of the rotated clip");
     ok &= check(count_atlas_host_pixels(result.capture.image, outside_lower) == 0,
-        "atlas stencil host rejects pixels below the rotated clip body");
+        prefix + "rejects pixels below the rotated clip body");
     result.ok = ok;
     return result;
 }
@@ -10975,7 +11053,10 @@ int test_atlas_host_state_smoke(QGuiApplication& app, const char* backend)
     if (!run_case(test_atlas_scissor_host_state(app))) {
         return k_unsupported_backend_skip_return_code;
     }
-    if (!run_case(test_atlas_stencil_host_state(app))) {
+    if (!run_case(test_atlas_stencil_host_state(app, /*external_predecessor=*/false))) {
+        return k_unsupported_backend_skip_return_code;
+    }
+    if (!run_case(test_atlas_stencil_host_state(app, /*external_predecessor=*/true))) {
         return k_unsupported_backend_skip_return_code;
     }
     if (!run_case(test_atlas_layer_host_state(app))) {
@@ -13813,10 +13894,12 @@ void configure_atlas_prepare_transaction_forced_msdf_surface(
     window.resize(420, 140);
     surface.setParentItem(window.contentItem());
     surface.setSize(QSizeF(360.0, 90.0));
-    surface.set_font_family(QString());
+    surface.set_font_family(term::vnm_terminal_default_monospace_font_family());
     surface.set_font_size(18.0);
     surface.set_color_scheme(QStringLiteral("Campbell"));
     surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::MSDF);
+    // Rejected prepares are compared pixel for pixel with the committed frame.
+    surface.set_cursor_blink_enabled(false);
 }
 
 void configure_atlas_prepare_transaction_auto_msdf_surface(
@@ -13826,7 +13909,7 @@ void configure_atlas_prepare_transaction_auto_msdf_surface(
     window.resize(420, 140);
     surface.setParentItem(window.contentItem());
     surface.setSize(QSizeF(360.0, 90.0));
-    surface.set_font_family(QString());
+    surface.set_font_family(term::vnm_terminal_default_monospace_font_family());
     surface.set_font_size(18.0);
     surface.set_color_scheme(QStringLiteral("Campbell"));
     surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::AUTO);
@@ -13865,6 +13948,46 @@ bool seed_atlas_prepare_transaction_baseline(
     return seeded;
 }
 
+// Pumps frames until the predicate holds. An MSDF atlas bake runs on the global
+// thread pool and can take many seconds in a Debug build. Every prepare reports
+// the pending-bake message until the prepare that adopts the bake, so the frame
+// budget restarts on each such frame; a failed bake reports its failure
+// instead. The deadline bounds a bake that never completes.
+bool pump_until_msdf_bakes_settle(
+    QGuiApplication&     app,
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>&
+                         predicate)
+{
+    constexpr qint64 k_settled_budget_ms = 3000;
+    constexpr qint64 k_deadline_ms       = 60000;
+    QElapsedTimer deadline;
+    QElapsedTimer settled;
+    deadline.start();
+    settled.start();
+    while (deadline.elapsed() < k_deadline_ms &&
+        settled.elapsed() < k_settled_budget_ms)
+    {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_frame_report report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        if (predicate(report)) {
+            return true;
+        }
+        if (report.render.msdf_text_message ==
+            QStringLiteral("MSDF atlas build pending"))
+        {
+            settled.restart();
+        }
+    }
+
+    return false;
+}
+
 bool seed_atlas_prepare_transaction_msdf_baseline(
     QGuiApplication&              app,
     QQuickWindow&                 window,
@@ -13893,7 +14016,7 @@ bool seed_atlas_prepare_transaction_msdf_baseline(
     window.show();
     const int expected_glyphs =
         atlas_msdf_resource_stability_expected_glyphs();
-    const bool baseline_rendered = pump_until(
+    const bool baseline_rendered = pump_until_msdf_bakes_settle(
         app,
         window,
         surface,
@@ -13951,6 +14074,33 @@ bool atlas_failed_prepare_has_no_buffer_upload(
         atlas_buffer_has_no_accepted_upload(report.render.rect_buffer)  &&
         atlas_buffer_has_no_accepted_upload(report.render.glyph_buffer) &&
         atlas_buffer_has_no_accepted_upload(report.render.msdf_text_buffer);
+}
+
+// Checks that two window grabs show the same frame, pixel for pixel. A rejected
+// prepare renders the committed frame, so the window must look exactly as it
+// did before the rejected snapshot arrived.
+bool check_same_frame(
+    const QImage&    expected_image,
+    const QImage&    actual_image,
+    std::string_view message)
+{
+    const Pixel_diff_stats stats = compare_regions(
+        expected_image,
+        actual_image,
+        {QRectF(expected_image.rect())},
+        1.0);
+    const bool same =
+        !expected_image.isNull()                      &&
+        actual_image.size() == expected_image.size() &&
+        stats.compared_pixels > 0                     &&
+        stats.diff_pixels == 0;
+    if (!same) {
+        std::cerr << "frame differs from the expected frame:"
+            << " compared_pixels=" << stats.compared_pixels
+            << " diff_pixels=" << stats.diff_pixels
+            << '\n';
+    }
+    return check(same, message);
 }
 
 bool test_atlas_persistent_rect_failure_is_bounded(QGuiApplication& app)
@@ -14361,6 +14511,7 @@ bool test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(
     {
         return skipped;
     }
+    const QImage committed_image = window.grabWindow();
 
     term::qsg_atlas_fail_msdf_resource_prepare_for_snapshot_sequence_for_testing(
         19840U);
@@ -14378,6 +14529,9 @@ bool test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(
         baseline_report.prepare_count,
         19840U,
         failed_report);
+    // Grab while the failure is still armed, so the captured frame is the
+    // rejected attempt's retained frame rather than a successful retry.
+    const QImage rejected_image = window.grabWindow();
     term::qsg_atlas_clear_msdf_resource_failures_for_testing();
 
     bool ok = true;
@@ -14391,6 +14545,8 @@ bool test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(
     ok &= check(failed_prepared &&
             atlas_failed_prepare_has_no_buffer_upload(failed_report),
         "atlas forced MSDF prepare-resource failure records no accepted buffer upload");
+    ok &= check_same_frame(committed_image, rejected_image,
+        "atlas forced MSDF prepare-resource failure keeps drawing the committed frame");
     return ok;
 }
 
@@ -14414,6 +14570,7 @@ bool test_atlas_forced_msdf_buffer_failure_does_not_commit(
     {
         return skipped;
     }
+    const QImage committed_image = window.grabWindow();
 
     term::qsg_atlas_fail_msdf_text_buffer_update_for_snapshot_sequence_for_testing(
         19842U);
@@ -14431,6 +14588,7 @@ bool test_atlas_forced_msdf_buffer_failure_does_not_commit(
         baseline_report.prepare_count,
         19842U,
         failed_report);
+    const QImage rejected_image = window.grabWindow();
     term::qsg_atlas_clear_msdf_resource_failures_for_testing();
 
     bool ok = true;
@@ -14444,6 +14602,194 @@ bool test_atlas_forced_msdf_buffer_failure_does_not_commit(
     ok &= check(failed_prepared &&
             atlas_failed_prepare_has_no_buffer_upload(failed_report),
         "atlas forced MSDF instance-buffer failure records no accepted buffer upload");
+    ok &= check_same_frame(committed_image, rejected_image,
+        "atlas forced MSDF instance-buffer failure keeps drawing the committed frame");
+    return ok;
+}
+
+// A prepared frame that committed and draws its text through MSDF.
+bool atlas_report_commits_msdf_frame(
+    const term::Qsg_atlas_frame_report& report,
+    std::uint64_t                       sequence)
+{
+    return
+        atlas_report_render_state_ready(report)     &&
+        report.prepared_generation_committed        &&
+        report.render_snapshot_sequence == sequence &&
+        report.render.msdf_text_renderer_active;
+}
+
+bool test_atlas_forced_msdf_pending_rebake_keeps_committed_frame(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_forced_msdf_surface(window, surface);
+
+    bool skipped = false;
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_msdf_baseline(
+            app,
+            window,
+            surface,
+            19843U,
+            "pending rebake",
+            baseline_report,
+            skipped))
+    {
+        return skipped;
+    }
+    const QImage committed_image = window.grabWindow();
+    const std::uint64_t committed_prepare_count =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface).prepare_count;
+
+    // A draw height in another bake bucket starts an asynchronous atlas
+    // rebuild in the first prepare that sees it. Under the forced MSDF policy
+    // that prepare cannot commit and must keep showing the committed frame.
+    surface.set_font_size(96.0);
+    const QImage rejected_image = window.grabWindow();
+    const term::Qsg_atlas_frame_report rejected_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+
+    bool ok = true;
+    ok &= check(rejected_report.prepare_count > committed_prepare_count &&
+            !rejected_report.prepared_generation_committed &&
+            rejected_report.render.msdf_text_atlas_generation >
+                baseline_report.render.msdf_text_atlas_generation,
+        "atlas forced MSDF rebake rejects the prepare that starts the rebuild");
+    ok &= check_same_frame(committed_image, rejected_image,
+        "atlas forced MSDF rebake keeps drawing the committed frame");
+
+    // Let the rebuild commit, so that its bake does not compete with the next
+    // case's baseline bake.
+    const bool rebuilt = pump_until_msdf_bakes_settle(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                atlas_report_commits_msdf_frame(report, 19843U) &&
+                report.render.msdf_text_atlas_generation >
+                    baseline_report.render.msdf_text_atlas_generation;
+        });
+    ok &= check(rebuilt,
+        "atlas forced MSDF rebake commits the rebuilt atlas once its bake completes");
+    return ok;
+}
+
+bool test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_forced_msdf_surface(window, surface);
+
+    bool skipped = false;
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_msdf_baseline(
+            app,
+            window,
+            surface,
+            19845U,
+            "rejected rebake",
+            baseline_report,
+            skipped))
+    {
+        return skipped;
+    }
+    const QImage committed_image = window.grabWindow();
+    const term::Qsg_atlas_frame_report committed_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+
+    // A draw height above the minimum bake size re-bakes the atlas at the same
+    // texture size, so the texture object and the committed instances stay in
+    // place while the cache holds the new generation. The injected failure
+    // rejects every prepare of the new snapshot, including the one that adopts
+    // the re-baked atlas.
+    constexpr std::uint64_t k_rebake_sequence  = 19846U;
+    constexpr qreal         k_rebake_font_size = 72.0;
+    const auto rebake_snapshot = std::make_shared<const term::Terminal_render_snapshot>(
+        make_atlas_msdf_resource_stability_snapshot(k_rebake_sequence, false));
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
+        k_rebake_sequence);
+    surface.set_font_size(k_rebake_font_size);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(surface, rebake_snapshot);
+    const bool rebake_adopted = pump_until_msdf_bakes_settle(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                atlas_report_matches_sequence(report, k_rebake_sequence) &&
+                report.render.msdf_text_atlas_build_successes_total >
+                    committed_report.render.msdf_text_atlas_build_successes_total;
+        });
+    const QImage rejected_image = window.grabWindow();
+    const term::Qsg_atlas_frame_report rejected_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+
+    bool ok = true;
+    // The rejected frame was fully built from the ready re-baked atlas, so the
+    // injected resource failure is what rejected it.
+    ok &= check(rebake_adopted &&
+            !rejected_report.prepared_generation_committed &&
+            rejected_report.render.msdf_text_atlas_ready &&
+            rejected_report.render.msdf_text_supported_runs > 0 &&
+            rejected_report.render.msdf_text_missed_supported_runs == 0 &&
+            rejected_report.render.msdf_text_atlas_generation >
+                committed_report.render.msdf_text_atlas_generation &&
+            rejected_report.render.msdf_text_atlas_size ==
+                committed_report.render.msdf_text_atlas_size,
+        "atlas forced MSDF rejects the prepare that adopts a same-size rebake");
+    ok &= check(rejected_report.render.msdf_text_atlas_texture_uploads_total ==
+            committed_report.render.msdf_text_atlas_texture_uploads_total,
+        "atlas forced MSDF rejected rebake records no atlas upload");
+    ok &= check_same_frame(committed_image, rejected_image,
+        "atlas forced MSDF rejected rebake keeps drawing the committed frame");
+
+    const bool recovered = pump_until_msdf_bakes_settle(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return atlas_report_commits_msdf_frame(report, k_rebake_sequence);
+        });
+    const QImage recovered_image = window.grabWindow();
+    const term::Qsg_atlas_frame_report recovered_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    ok &= check(recovered &&
+            recovered_report.render.msdf_text_atlas_texture_uploads_total ==
+                committed_report.render.msdf_text_atlas_texture_uploads_total + 1U,
+        "atlas forced MSDF rebake uploads the new atlas once when it commits");
+
+    // A fresh surface that renders the same snapshot at the new size shows the
+    // frame the recovered surface must show.
+    QQuickWindow reference_window;
+    VNM_TerminalSurface reference_surface;
+    configure_atlas_prepare_transaction_forced_msdf_surface(
+        reference_window,
+        reference_surface);
+    reference_surface.set_font_size(k_rebake_font_size);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        reference_surface,
+        rebake_snapshot);
+    reference_window.show();
+    const bool reference_rendered = pump_until_msdf_bakes_settle(
+        app,
+        reference_window,
+        reference_surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return atlas_report_commits_msdf_frame(report, k_rebake_sequence);
+        });
+    const QImage reference_image = reference_window.grabWindow();
+    const term::Qsg_atlas_frame_report reference_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(reference_surface);
+    ok &= check(reference_rendered &&
+            reference_report.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "atlas forced MSDF rebake reference surface uploads its atlas once");
+    ok &= check_same_frame(reference_image, recovered_image,
+        "atlas forced MSDF rebake recovers to the frame a fresh surface renders");
     return ok;
 }
 
@@ -21144,6 +21490,8 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_auto_msdf_buffer_failure_falls_back(app);
     ok &= test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(app);
     ok &= test_atlas_forced_msdf_buffer_failure_does_not_commit(app);
+    ok &= test_atlas_forced_msdf_pending_rebake_keeps_committed_frame(app);
+    ok &= test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(app);
     return ok ? 0 : 1;
 }
 
@@ -21175,6 +21523,8 @@ int test_text_renderer_fallback_contract(
     ok &= test_atlas_auto_msdf_buffer_failure_falls_back(app);
     ok &= test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(app);
     ok &= test_atlas_forced_msdf_buffer_failure_does_not_commit(app);
+    ok &= test_atlas_forced_msdf_pending_rebake_keeps_committed_frame(app);
+    ok &= test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(app);
     return ok ? 0 : 1;
 }
 

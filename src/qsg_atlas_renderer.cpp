@@ -264,7 +264,9 @@ struct Atlas_draw_pass_state
     atlas_pass_range_t cursor_text;
     atlas_pass_range_t msdf_cursor_text;
     atlas_pass_range_t overlay;
-    bool               resources_ready = false;
+    bool               resources_ready               = false;
+    bool               msdf_text_resources_ready     = false;
+    std::uint64_t      msdf_text_uploaded_generation = 0U;
 };
 
 struct Glyph_atlas_runtime_configuration
@@ -2348,13 +2350,8 @@ public:
                     if (has_msdf_text_draw_passes()) {
                         if (rect_ready) {
                             msdf_prepare_resource_attempted = true;
-                            const bool msdf_atlas_ready =
-                                upload_msdf_text_atlas_texture(
-                                    rhi,
-                                    command_buffer,
-                                    result.render);
                             msdf_ready =
-                                msdf_atlas_ready &&
+                                ensure_msdf_text_atlas_texture(rhi) &&
                                 ensure_msdf_text_resources(rhi, target);
                             if (qsg_atlas_should_fail_msdf_resource_prepare_for_sequence(
                                     snapshot_sequence))
@@ -2474,6 +2471,7 @@ public:
             prepared_generation_complete && m_resources_ready;
         const Glyph_atlas_cache_stats prepared_cache_stats = m_cache.stats();
         if (prepared_generation_committed) {
+            record_msdf_text_atlas_upload(rhi, command_buffer, prepare_result.render);
             commit_pending_glyph_resources();
             std::swap(m_committed_cache, m_cache);
             m_cache.reset();
@@ -2600,6 +2598,11 @@ public:
                 const bool stencil_enabled =
                     state != nullptr && state->stencilEnabled();
                 if (stencil_enabled) {
+                    // setStencilRef() applies to the bound pipeline, and render()
+                    // can start with none: an external-rendering predecessor that
+                    // shares this stencil clip clears it, and the scene graph
+                    // reuses the clip without binding another.
+                    command_buffer->setGraphicsPipeline(m_stencil_rect_pipeline);
                     command_buffer->setStencilRef(
                         static_cast<quint32>(state->stencilValue()));
                 }
@@ -2781,6 +2784,15 @@ private:
         return m_msdf_text_cache.ready;
 #else
         return false;
+#endif
+    }
+
+    std::uint64_t msdf_text_uploaded_generation() const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        return m_msdf_text_uploaded_generation;
+#else
+        return 0U;
 #endif
     }
 
@@ -3141,7 +3153,14 @@ private:
         delete_resource(m_pending_stencil_glyph_pipeline);
         delete_resource(m_pending_glyph_pipeline);
         delete_resource(m_pending_glyph_shader_resources);
-        delete_resource(m_pending_coverage_texture);
+        // The pending texture can be the destination of an upload recorded
+        // in the current frame. D3D11 replays that upload through the native
+        // texture pointer at the next command-buffer execution, which is
+        // endFrame() or an earlier beginExternal() or finish(), so retire it
+        // at endFrame().
+        if (QRhiTexture* texture = std::exchange(m_pending_coverage_texture, nullptr)) {
+            texture->deleteLater();
+        }
     }
 
     void commit_pending_glyph_resources()
@@ -3291,12 +3310,8 @@ private:
         return true;
     }
 
-    bool ensure_msdf_text_atlas_texture(QRhi* rhi, bool* out_created = nullptr)
+    bool ensure_msdf_text_atlas_texture(QRhi* rhi)
     {
-        if (out_created != nullptr) {
-            *out_created = false;
-        }
-
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         if (!m_msdf_text_cache.ready || m_msdf_text_cache.atlas.atlas_size <= 0) {
             return false;
@@ -3312,10 +3327,14 @@ private:
             return true;
         }
 
+        // A replacement texture holds no atlas generation until a committing
+        // prepare uploads one, so a rejected prepare leaves the committed MSDF
+        // text undrawn rather than sampling it (restore_draw_pass_state).
         delete_resource(m_stencil_msdf_text_pipeline);
         delete_resource(m_msdf_text_pipeline);
         delete_resource(m_msdf_text_shader_resources);
         delete_resource(m_msdf_text_atlas_texture);
+        m_msdf_text_uploaded_generation = 0U;
 
         QRhiTexture* texture =
             rhi->newTexture(QRhiTexture::RGBA8, atlas_size);
@@ -3325,9 +3344,6 @@ private:
         }
 
         m_msdf_text_atlas_texture = texture;
-        if (out_created != nullptr) {
-            *out_created = true;
-        }
         return true;
 #else
         (void)rhi;
@@ -3335,29 +3351,21 @@ private:
 #endif
     }
 
-    bool upload_msdf_text_atlas_texture(
-        QRhi*                       rhi,
-        QRhiCommandBuffer*          command_buffer,
-        Qsg_atlas_render_summary&   summary)
+    // Only a committing prepare records the atlas upload: the committed MSDF
+    // instances address the texels resident in the texture, and a rejected
+    // prepare must leave them in place. The image aliases the cache bitmap,
+    // which some backends read only when the command buffer executes; the
+    // cache is next replaced by a later prepare.
+    void record_msdf_text_atlas_upload(
+        QRhi*                     rhi,
+        QRhiCommandBuffer*        command_buffer,
+        Qsg_atlas_render_summary& summary)
     {
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        if (!has_msdf_text_draw_passes()) {
-            return true;
-        }
-
-        bool texture_created = false;
-        const bool texture_ready =
-            ensure_msdf_text_atlas_texture(rhi, &texture_created);
-        summary.msdf_text_texture_ready =
-            texture_ready && m_msdf_text_atlas_texture != nullptr;
-        if (!texture_ready) {
-            return false;
-        }
-
-        if (!texture_created &&
+        if (!has_msdf_text_draw_passes() ||
             m_msdf_text_uploaded_generation == m_msdf_text_cache.generation)
         {
-            return true;
+            return;
         }
 
         QImage image(
@@ -3372,12 +3380,10 @@ private:
         m_msdf_text_uploaded_generation = m_msdf_text_cache.generation;
         summary.msdf_text_texture_uploaded = true;
         ++m_msdf_text_counters.atlas_texture_uploads;
-        return true;
 #else
         (void)rhi;
         (void)command_buffer;
         (void)summary;
-        return true;
 #endif
     }
 
@@ -4600,6 +4606,8 @@ private:
             m_msdf_cursor_text_pass,
             m_overlay_pass,
             m_resources_ready,
+            m_msdf_text_resources_ready,
+            msdf_text_uploaded_generation(),
         };
     }
 
@@ -4616,6 +4624,13 @@ private:
         m_msdf_cursor_text_pass = state.msdf_cursor_text;
         m_overlay_pass = state.overlay;
         m_resources_ready = state.resources_ready;
+        // Restore MSDF readiness with the committed draw ranges. A rejected
+        // prepare records no atlas upload, so the committed texels stay
+        // resident unless the attempt replaced the texture itself; the
+        // committed instances must not sample a texture without them.
+        m_msdf_text_resources_ready =
+            state.msdf_text_resources_ready &&
+            state.msdf_text_uploaded_generation == msdf_text_uploaded_generation();
     }
 
     void restore_prepare_layout_state(const Atlas_prepare_layout_state& state)
@@ -5728,18 +5743,19 @@ private:
 
         const std::uint64_t next_generation = m_msdf_text_cache.generation + 1U;
         m_msdf_text_cache = {};
-        m_msdf_text_cache.generation    = next_generation;
-        m_msdf_text_cache.initialized   = true;
-        m_msdf_text_cache.baked_key     = baked_key;
-        m_msdf_text_uploaded_generation = 0U;
-        m_msdf_draw_layout              = {};
+        m_msdf_text_cache.generation  = next_generation;
+        m_msdf_text_cache.initialized = true;
+        m_msdf_text_cache.baked_key   = baked_key;
+        m_msdf_draw_layout            = {};
         // Resource-lifetime split: a baked-atlas rebuild does not delete the MSDF
         // pipelines, shader-resource bindings, or atlas texture here.
         // ensure_msdf_text_atlas_texture() keeps the texture object when its
-        // format and size are unchanged, and only the new bitmap is re-uploaded
-        // because the generation advanced. A font-size change that stays in the
-        // same bake bucket never reaches this branch, so it neither rebuilds nor
-        // re-uploads the atlas.
+        // format and size are unchanged, and the next committing prepare that
+        // draws MSDF text re-uploads only the new bitmap because the generation
+        // advanced. Until then the uploaded generation still names the committed
+        // texels, which a rejected prepare keeps drawing. A font-size change that
+        // stays in the same bake bucket never reaches this branch, so it neither
+        // rebuilds nor re-uploads the atlas.
 
         // One resolution feeds the support gate, the baked key, and this build.
         // A null result means we cannot feed msdfgen, so leave the cache
@@ -7177,12 +7193,6 @@ void qsg_atlas_merge_msdf_text_failure_diagnostics(
     fallback_render.msdf_text_atlas_ready =
         fallback_render.msdf_text_atlas_ready ||
         failed_msdf_render.msdf_text_atlas_ready;
-    fallback_render.msdf_text_texture_ready =
-        fallback_render.msdf_text_texture_ready ||
-        failed_msdf_render.msdf_text_texture_ready;
-    fallback_render.msdf_text_texture_uploaded =
-        fallback_render.msdf_text_texture_uploaded ||
-        failed_msdf_render.msdf_text_texture_uploaded;
     // Carry the per-frame baked-cache event flags so a fallback frame still
     // reports the MSDF build/miss it attempted before falling back. The
     // cumulative *_total counters are re-snapshotted from the persistent
