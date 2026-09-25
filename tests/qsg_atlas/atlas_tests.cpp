@@ -43,6 +43,7 @@
 #include <QQuickWindow>
 #include <QRawFont>
 #include <QRectF>
+#include <QSGRenderNode>
 #include <QSGRendererInterface>
 #include <QSGSimpleRectNode>
 #include <QSGTextNode>
@@ -10750,9 +10751,71 @@ Atlas_host_state_result test_atlas_scissor_host_state(
     return result;
 }
 
-Atlas_host_state_result test_atlas_stencil_host_state(
-    QGuiApplication& app)
+// Without NoExternalRendering the scene graph brackets render() with
+// beginExternal() and endExternal(), which drops the command buffer's cached
+// graphics pipeline. A following batch that shares the stencil clip reuses the
+// stencil contents without drawing them, so its render node starts render()
+// with no pipeline bound.
+class Atlas_external_render_node final : public QSGRenderNode
 {
+public:
+    Atlas_external_render_node(
+        QRectF                            bounds,
+        std::shared_ptr<std::atomic<int>> stencil_renders)
+    :
+        m_bounds(bounds),
+        m_stencil_renders(std::move(stencil_renders))
+    {}
+
+    RenderingFlags flags() const override { return BoundedRectRendering; }
+    QRectF rect() const override { return m_bounds; }
+
+    void render(const RenderState* state) override
+    {
+        if (state != nullptr && state->stencilEnabled()) {
+            m_stencil_renders->fetch_add(1);
+        }
+    }
+
+private:
+    QRectF                            m_bounds;
+    std::shared_ptr<std::atomic<int>> m_stencil_renders;
+};
+
+class Atlas_external_render_item final : public QQuickItem
+{
+public:
+    explicit Atlas_external_render_item(std::shared_ptr<std::atomic<int>> stencil_renders)
+    :
+        m_stencil_renders(std::move(stencil_renders))
+    {
+        setFlag(QQuickItem::ItemHasContents, true);
+    }
+
+protected:
+    QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override
+    {
+        if (old_node != nullptr) {
+            return old_node;
+        }
+        return new Atlas_external_render_node(boundingRect(), m_stencil_renders);
+    }
+
+private:
+    std::shared_ptr<std::atomic<int>> m_stencil_renders;
+};
+
+Atlas_host_state_result test_atlas_stencil_host_state(
+    QGuiApplication& app,
+    bool             external_predecessor)
+{
+    const char* const case_name = external_predecessor
+        ? "external-predecessor-stencil"
+        : "stencil";
+    const std::string prefix = external_predecessor
+        ? "atlas external-predecessor stencil host "
+        : "atlas stencil host ";
+
     QQuickWindow window;
     window.setColor(QColor(4, 8, 12));
     window.resize(280, 220);
@@ -10765,9 +10828,20 @@ Atlas_host_state_result test_atlas_stencil_host_state(
     clip_host.setTransformOrigin(QQuickItem::TopLeft);
     clip_host.setRotation(16.0);
 
+    const auto predecessor_stencil_renders = std::make_shared<std::atomic<int>>(0);
+    std::optional<Atlas_external_render_item> predecessor;
+    if (external_predecessor) {
+        predecessor.emplace(predecessor_stencil_renders);
+        predecessor->setParentItem(&clip_host);
+        predecessor->setSize(clip_host.size());
+    }
+
     VNM_TerminalSurface surface;
     surface.setParentItem(&clip_host);
-    configure_atlas_host_state_surface(surface, QSizeF(130.0, 82.0), 983U);
+    configure_atlas_host_state_surface(
+        surface,
+        QSizeF(130.0, 82.0),
+        external_predecessor ? 986U : 983U);
 
     window.show();
     Atlas_host_state_result result;
@@ -10781,14 +10855,18 @@ Atlas_host_state_result test_atlas_stencil_host_state(
         surface,
         result.capture,
         [&](const Atlas_host_state_capture& capture) {
-            return count_atlas_host_pixels(capture.image, inside_clip) > 20;
+            return
+                (!external_predecessor || predecessor_stencil_renders->load() > 0) &&
+                count_atlas_host_pixels(capture.image, inside_clip) > 20;
         });
     if (!rendered) {
         result.unsupported = atlas_host_backend_unusable(result.capture.report);
         if (!result.unsupported) {
-            std::cerr << "FAIL: atlas stencil host did not render expected "
-                << "captured pixels inside the rotated clip\n";
-            print_atlas_host_state_report("stencil", result.capture);
+            std::cerr << "FAIL: " << prefix << "did not render expected "
+                << "captured pixels inside the rotated clip"
+                << " (predecessor stencil renders="
+                << predecessor_stencil_renders->load() << ")\n";
+            print_atlas_host_state_report(case_name, result.capture);
         }
         return result;
     }
@@ -10802,13 +10880,17 @@ Atlas_host_state_result test_atlas_stencil_host_state(
         clip_host.mapToScene(QPointF(92.0, 45.0)),
         4);
 
-    bool ok = check_atlas_host_state_report("stencil", result.capture);
+    bool ok = check_atlas_host_state_report(case_name, result.capture);
+    if (external_predecessor) {
+        ok &= check(predecessor_stencil_renders->load() > 0,
+            prefix + "renders the predecessor under the clip");
+    }
     ok &= check(count_atlas_host_pixels(result.capture.image, inside_clip) > 20,
-        "atlas stencil host renders inside the rotated clip");
+        prefix + "renders inside the rotated clip");
     ok &= check(count_atlas_host_pixels(result.capture.image, outside_right) == 0,
-        "atlas stencil host rejects pixels right of the rotated clip");
+        prefix + "rejects pixels right of the rotated clip");
     ok &= check(count_atlas_host_pixels(result.capture.image, outside_lower) == 0,
-        "atlas stencil host rejects pixels below the rotated clip body");
+        prefix + "rejects pixels below the rotated clip body");
     result.ok = ok;
     return result;
 }
@@ -10975,7 +11057,10 @@ int test_atlas_host_state_smoke(QGuiApplication& app, const char* backend)
     if (!run_case(test_atlas_scissor_host_state(app))) {
         return k_unsupported_backend_skip_return_code;
     }
-    if (!run_case(test_atlas_stencil_host_state(app))) {
+    if (!run_case(test_atlas_stencil_host_state(app, /*external_predecessor=*/false))) {
+        return k_unsupported_backend_skip_return_code;
+    }
+    if (!run_case(test_atlas_stencil_host_state(app, /*external_predecessor=*/true))) {
         return k_unsupported_backend_skip_return_code;
     }
     if (!run_case(test_atlas_layer_host_state(app))) {

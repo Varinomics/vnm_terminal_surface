@@ -2600,6 +2600,11 @@ public:
                 const bool stencil_enabled =
                     state != nullptr && state->stencilEnabled();
                 if (stencil_enabled) {
+                    // setStencilRef() applies to the bound pipeline, and render()
+                    // can start with none: an external-rendering predecessor that
+                    // shares this stencil clip clears it, and the scene graph
+                    // reuses the clip without binding another.
+                    command_buffer->setGraphicsPipeline(m_stencil_rect_pipeline);
                     command_buffer->setStencilRef(
                         static_cast<quint32>(state->stencilValue()));
                 }
