@@ -141,6 +141,10 @@ private:
     std::vector<std::byte>     m_bytes;
 };
 
+// A read scope reads a record where the ring stores it, and copies only a
+// record that wraps the end of the ring's storage. Either way its bytes are
+// valid until the ring next changes, so a reader takes what it needs before
+// the next commit, discard, resize or clear.
 class Terminal_history_ring_read_scope
 {
 public:
@@ -163,11 +167,16 @@ private:
     explicit Terminal_history_ring_read_scope(Terminal_history_ring_status status);
     Terminal_history_ring_read_scope(
         terminal_history_ring_record_descriptor_t descriptor,
-        std::vector<std::byte>                    bytes);
+        std::vector<std::byte>                    copied_bytes);
+    Terminal_history_ring_read_scope(
+        terminal_history_ring_record_descriptor_t descriptor,
+        std::span<const std::byte>                stored_bytes);
 
     Terminal_history_ring_status              m_status = Terminal_history_ring_status::OUT_OF_LIVE_RANGE;
     terminal_history_ring_record_descriptor_t m_descriptor;
-    std::vector<std::byte>                    m_bytes;
+    // Exactly one of the two holds the record of a successful read.
+    std::vector<std::byte>                    m_copied_bytes;
+    std::span<const std::byte>                m_stored_bytes;
 };
 
 class Terminal_history_ring
@@ -221,6 +230,10 @@ private:
         std::span<const std::byte>                    bytes,
         std::uint64_t                                 expected_byte_sequence,
         terminal_history_ring_record_descriptor_t*    out_descriptor) const;
+
+    Terminal_history_ring_read_scope read_live_record(
+        std::uint64_t byte_sequence,
+        std::uint32_t record_bytes) const;
 
     void write_record_bytes(
         std::uint64_t              byte_sequence,

@@ -244,11 +244,20 @@ Terminal_history_ring_read_scope::Terminal_history_ring_read_scope(
 
 Terminal_history_ring_read_scope::Terminal_history_ring_read_scope(
     terminal_history_ring_record_descriptor_t descriptor,
-    std::vector<std::byte>                    bytes)
+    std::vector<std::byte>                    copied_bytes)
 :
     m_status(Terminal_history_ring_status::OK),
     m_descriptor(descriptor),
-    m_bytes(std::move(bytes))
+    m_copied_bytes(std::move(copied_bytes))
+{}
+
+Terminal_history_ring_read_scope::Terminal_history_ring_read_scope(
+    terminal_history_ring_record_descriptor_t descriptor,
+    std::span<const std::byte>                stored_bytes)
+:
+    m_status(Terminal_history_ring_status::OK),
+    m_descriptor(descriptor),
+    m_stored_bytes(stored_bytes)
 {}
 
 std::span<const std::byte> Terminal_history_ring_read_scope::record() const
@@ -257,7 +266,7 @@ std::span<const std::byte> Terminal_history_ring_read_scope::record() const
         return {};
     }
 
-    return m_bytes;
+    return m_copied_bytes.empty() ? m_stored_bytes : std::span<const std::byte>(m_copied_bytes);
 }
 
 std::span<const std::byte> Terminal_history_ring_read_scope::payload() const
@@ -266,10 +275,9 @@ std::span<const std::byte> Terminal_history_ring_read_scope::payload() const
         return {};
     }
 
-    return {
-        m_bytes.data() + k_terminal_history_ring_record_header_bytes,
-        m_descriptor.payload_bytes,
-    };
+    return record().subspan(
+        k_terminal_history_ring_record_header_bytes,
+        m_descriptor.payload_bytes);
 }
 
 Terminal_history_ring::Terminal_history_ring(terminal_history_ring_config_t config)
@@ -600,17 +608,7 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_record(std::uint64_
         return Terminal_history_ring_read_scope(Terminal_history_ring_status::NOT_RECORD_BOUNDARY);
     }
 
-    std::vector<std::byte> bytes =
-        copy_record_bytes(byte_sequence, descriptor_it->record_bytes);
-
-    terminal_history_ring_record_descriptor_t descriptor;
-    const Terminal_history_ring_status validation_status =
-        validate_record_bytes(bytes, byte_sequence, &descriptor);
-    if (validation_status != Terminal_history_ring_status::OK) {
-        return Terminal_history_ring_read_scope(validation_status);
-    }
-
-    return Terminal_history_ring_read_scope(descriptor, std::move(bytes));
+    return read_live_record(byte_sequence, descriptor_it->record_bytes);
 }
 
 Terminal_history_ring_read_scope Terminal_history_ring::read_record_at_live_index(
@@ -633,11 +631,30 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_record_at_live_inde
             Terminal_history_ring_status::NOT_RECORD_BOUNDARY);
     }
 
-    std::vector<std::byte> bytes =
-        copy_record_bytes(expected.byte_sequence, expected.record_bytes);
+    return read_live_record(expected.byte_sequence, expected.record_bytes);
+}
+
+// A record contiguous in storage is read in place, so a reader that needs only
+// part of a large record does not pay for copying all of it.
+Terminal_history_ring_read_scope Terminal_history_ring::read_live_record(
+    std::uint64_t byte_sequence,
+    std::uint32_t record_bytes) const
+{
     terminal_history_ring_record_descriptor_t descriptor;
+    const std::size_t start = static_cast<std::size_t>(byte_sequence % m_capacity_bytes);
+    if (record_bytes <= m_capacity_bytes - start) {
+        const std::span<const std::byte> stored_bytes(m_storage.data() + start, record_bytes);
+        const Terminal_history_ring_status validation_status =
+            validate_record_bytes(stored_bytes, byte_sequence, &descriptor);
+        if (validation_status != Terminal_history_ring_status::OK) {
+            return Terminal_history_ring_read_scope(validation_status);
+        }
+        return Terminal_history_ring_read_scope(descriptor, stored_bytes);
+    }
+
+    std::vector<std::byte> bytes = copy_record_bytes(byte_sequence, record_bytes);
     const Terminal_history_ring_status validation_status =
-        validate_record_bytes(bytes, expected_byte_sequence, &descriptor);
+        validate_record_bytes(bytes, byte_sequence, &descriptor);
     if (validation_status != Terminal_history_ring_status::OK) {
         return Terminal_history_ring_read_scope(validation_status);
     }
