@@ -3146,7 +3146,14 @@ private:
         delete_resource(m_pending_stencil_glyph_pipeline);
         delete_resource(m_pending_glyph_pipeline);
         delete_resource(m_pending_glyph_shader_resources);
-        delete_resource(m_pending_coverage_texture);
+        // The pending texture can be the destination of an upload recorded
+        // in the current frame. D3D11 replays that upload through the native
+        // texture pointer at the next command-buffer execution, which is
+        // endFrame() or an earlier beginExternal() or finish(), so retire it
+        // at endFrame().
+        if (QRhiTexture* texture = std::exchange(m_pending_coverage_texture, nullptr)) {
+            texture->deleteLater();
+        }
     }
 
     void commit_pending_glyph_resources()
