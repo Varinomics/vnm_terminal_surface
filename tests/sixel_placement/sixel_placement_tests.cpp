@@ -1,0 +1,755 @@
+#include "vnm_terminal/internal/parser_action.h"
+#include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/sixel_decoder.h"
+#include "vnm_terminal/internal/terminal_history_ring.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
+#include "helpers/test_check.h"
+
+#include <QByteArray>
+#include <QImage>
+#include <QString>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <variant>
+#include <vector>
+
+// Oracles, per test: the VT330/VT340 Programmer Reference Manual vol. 2 ch. 14
+// (an image starts at the upper-left corner of the text active position and
+// scrolls the text); the adopted cursor rule V1 (the text cursor ends on the
+// row the top of the final sixel row falls in, at the image's first column),
+// whose Windows side is checked by the ConPTY cursor-sync gate; the owner
+// decisions D1 (an image erases the text it covers) and S4 (images on one row
+// composite); the anchors A1 (one slice per row, owned by the row and then its
+// history record), A2/I5 (the decoded-size cap keeps geometry) and A7/I9 (a
+// row record over the record limit keeps its text and drops its image).
+// Behavior no oracle settles yet is marked provisional where it is asserted.
+
+namespace term = vnm_terminal::internal;
+
+namespace {
+
+using vnm_terminal::test_helpers::check;
+
+constexpr term::terminal_cell_pixel_size_t k_cell{10, 20};
+
+term::Terminal_screen_model make_model(
+    int                                             rows,
+    int                                             columns,
+    std::optional<term::terminal_cell_pixel_size_t> cell            = k_cell,
+    int                                             scrollback_rows = 100,
+    std::size_t                                     capacity_bytes  =
+        term::k_terminal_default_retained_history_capacity_bytes)
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size                       = {rows, columns};
+    config.scrollback_limit                = scrollback_rows;
+    config.cell_pixel_size                 = cell;
+    config.retained_history_capacity_bytes = capacity_bytes;
+    return term::Terminal_screen_model(config);
+}
+
+QByteArray sixel(const QByteArray& parameters, const QByteArray& data)
+{
+    return QByteArray("\x1bP") + parameters + 'q' + data + QByteArray("\x1b\\");
+}
+
+// Register 1 as full red, then `rows` sixel rows of `width` fully set sixels,
+// each but the last followed by a graphics new line.
+QByteArray solid_rows(int width, int rows)
+{
+    QByteArray data("#1;2;100;0;0");
+    for (int row = 0; row < rows; ++row) {
+        data += "#1!" + QByteArray::number(width) + '~';
+        if (row + 1 < rows) {
+            data += '-';
+        }
+    }
+    return data;
+}
+
+QByteArray cursor_to(int row, int column)
+{
+    return "\x1b[" + QByteArray::number(row + 1) + ';' + QByteArray::number(column + 1) + 'H';
+}
+
+// The decoder's own raster for an image, the reference its bands are cut from.
+term::Screen_sixel_image_mutation decoded_image(
+    const QByteArray& parameters,
+    const QByteArray& data)
+{
+    term::Sixel_decoder decoder;
+    std::vector<term::Parser_action> actions;
+    decoder.begin(parameters);
+    decoder.decode(data, actions);
+    decoder.finish(actions);
+    for (const term::Parser_action& action : actions) {
+        if (const auto* mutation = std::get_if<term::Screen_mutation>(&action.payload)) {
+            if (const auto* image = std::get_if<term::Screen_sixel_image_mutation>(mutation)) {
+                return *image;
+            }
+        }
+    }
+    return {};
+}
+
+bool slice_equals_band(
+    const std::shared_ptr<const term::Terminal_image_slice>& slice,
+    const QImage&                                            raster,
+    int                                                      band_top,
+    int                                                      band_width,
+    int                                                      first_column)
+{
+    const int band_height = std::min(k_cell.height, raster.height() - band_top);
+    if (slice == nullptr                        ||
+        slice->first_column    != first_column  ||
+        slice->cell_pixel_size != k_cell        ||
+        slice->pixels.format() != QImage::Format_RGBA8888_Premultiplied ||
+        slice->pixels.width()  != band_width    ||
+        slice->pixels.height() != band_height)
+    {
+        return false;
+    }
+
+    for (int y = 0; y < band_height; ++y) {
+        if (std::memcmp(
+                slice->pixels.constScanLine(y),
+                raster.constScanLine(band_top + y),
+                static_cast<std::size_t>(band_width) * 4U) != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool slices_equal(
+    const std::shared_ptr<const term::Terminal_image_slice>& left,
+    const std::shared_ptr<const term::Terminal_image_slice>& right)
+{
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+
+    return
+        left->first_column    == right->first_column    &&
+        left->cell_pixel_size == right->cell_pixel_size &&
+        left->revision        == right->revision        &&
+        left->pixels          == right->pixels;
+}
+
+int active_row(const term::Terminal_screen_model& model, int row)
+{
+    return model.scrollback_size() + row;
+}
+
+std::shared_ptr<const term::Terminal_image_slice> slice_at(
+    const term::Terminal_screen_model& model,
+    int                                row)
+{
+    return model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, active_row(model, row));
+}
+
+QString history_row_text(const term::Terminal_screen_model& model, int row)
+{
+    const std::optional<std::vector<term::terminal_retained_history_cell_state_for_testing_t>> cells =
+        model.retained_history_row_cells_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+    QString text;
+    if (cells.has_value()) {
+        for (const term::terminal_retained_history_cell_state_for_testing_t& cell : *cells) {
+            text += cell.occupied ? cell.text : QStringLiteral(" ");
+        }
+    }
+    return text.trimmed();
+}
+
+std::vector<term::Terminal_reply> replies_in(const term::Terminal_screen_model_result& result)
+{
+    std::vector<term::Terminal_reply> replies;
+    for (const term::Parser_action& action : result.actions) {
+        if (const auto* reply = std::get_if<term::Terminal_reply>(&action.payload)) {
+            replies.push_back(*reply);
+        }
+    }
+    return replies;
+}
+
+std::vector<term::Parser_payload_diagnostic> diagnostics_in(
+    const term::Terminal_screen_model_result& result)
+{
+    std::vector<term::Parser_payload_diagnostic> diagnostics;
+    for (const term::Parser_action& action : result.actions) {
+        if (const auto* diagnostic = std::get_if<term::Parser_payload_diagnostic>(&action.payload)) {
+            diagnostics.push_back(*diagnostic);
+        }
+    }
+    return diagnostics;
+}
+
+const term::Terminal_render_cell* snapshot_cell(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   row,
+    int                                   column)
+{
+    for (const term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row == row && cell.position.column == column) {
+            return &cell;
+        }
+    }
+    return nullptr;
+}
+
+// An image of three colors whose sixel rows differ in width and pattern, so
+// each band has its own content, with undrawn pixels among the drawn ones.
+QByteArray patterned_rows(int rows)
+{
+    QByteArray data("#1;2;100;0;0#2;2;0;100;0#3;2;0;0;100");
+    for (int row = 0; row < rows; ++row) {
+        data += "#1!" + QByteArray::number(3 + row) + '~';
+        data += "#2!5" + QByteArray(1, static_cast<char>('?' + (1 << (row % 6))));
+        data += "#3!2~";
+        if (row + 1 < rows) {
+            data += '-';
+        }
+    }
+    return data;
+}
+
+bool test_slices_equal_raster_bands()
+{
+    bool ok = true;
+
+    // Seven sixel rows at 1:1 are 42 pixels: bands of 20, 20 and 2 rows.
+    const QByteArray data = patterned_rows(7);
+    const term::Screen_sixel_image_mutation image = decoded_image("9;1", data);
+    ok &= check(image.raster.width() == 16 && image.raster.height() == 42,
+        "patterned reference image decodes to 16 x 42 pixels");
+
+    term::Terminal_screen_model model = make_model(8, 30);
+    model.ingest(cursor_to(2, 3) + sixel("9;1", data));
+
+    for (int band = 0; band < 3; ++band) {
+        ok &= check(slice_equals_band(slice_at(model, 2 + band), image.raster, band * 20, 16, 3),
+            "each text row holds the raster band that falls on it, from the cursor column");
+    }
+    ok &= check(slice_at(model, 1) == nullptr && slice_at(model, 5) == nullptr,
+        "rows the image does not reach hold no slice");
+    ok &= check(slice_at(model, 2)->revision < slice_at(model, 3)->revision &&
+            slice_at(model, 3)->revision < slice_at(model, 4)->revision,
+        "every placed slice takes a new revision");
+
+    // A band in which nothing is drawn leaves its row alone (provisional:
+    // no reference settles an all-transparent band).
+    QByteArray gapped("#1;2;100;0;0#1!4~");
+    gapped += QByteArray(7, '-');
+    gapped += "#1!4~";
+    term::Terminal_screen_model gapped_model = make_model(8, 30);
+    gapped_model.ingest(sixel("9;1", gapped));
+    ok &= check(slice_at(gapped_model, 0) != nullptr &&
+            slice_at(gapped_model, 1) == nullptr &&
+            slice_at(gapped_model, 2) != nullptr,
+        "a band with no drawn pixel places no slice on its row");
+
+    return ok;
+}
+
+bool test_images_clip_at_the_right_margin()
+{
+    bool ok = true;
+
+    const QByteArray data = solid_rows(55, 1);
+    const term::Screen_sixel_image_mutation image = decoded_image("9;1", data);
+    term::Terminal_screen_model model = make_model(4, 30);
+    model.ingest(cursor_to(0, 27) + sixel("9;1", data));
+    ok &= check(slice_equals_band(slice_at(model, 0), image.raster, 0, 30, 27),
+        "an image is cut at the right margin, keeping only the columns on the grid");
+    return ok;
+}
+
+bool test_cursor_follows_the_final_sixel_row()
+{
+    bool ok = true;
+
+    struct Cursor_case
+    {
+        const char* name;
+        QByteArray  parameters;
+        QByteArray  data;
+        int         expected_row;
+    };
+
+    // Rows are relative to an origin at (2, 4) on a 20-row grid, so nothing
+    // scrolls; cells are 20 pixels high.
+    const std::vector<Cursor_case> cases = {
+        {"one sixel row at 1:1 leaves the cursor on the origin row",
+            "9;1", solid_rows(3, 1), 0},
+        {"three sixel rows at 2:1 put the final row's top at 24 pixels",
+            "0;1", solid_rows(3, 3), 1},
+        {"two sixel rows at 3:1 put the final row's top at 18 pixels",
+            "3;1", solid_rows(3, 2), 0},
+        {"two sixel rows at 5:1 put the final row's top at 30 pixels",
+            "2;1", solid_rows(3, 2), 1},
+        {"ten sixel rows at 1:1 put the final row's top at 54 pixels",
+            "9;1", solid_rows(3, 10), 2},
+        {"two sixel rows at 2:1 put the final row's top at 12 pixels",
+            "0;1", solid_rows(3, 2), 0},
+        {"a trailing graphics new line counts: 2:1 rows end at 24 pixels",
+            "0;1", solid_rows(3, 2) + '-', 1},
+    };
+
+    for (const Cursor_case& cursor_case : cases) {
+        term::Terminal_screen_model model = make_model(20, 30);
+        model.ingest(cursor_to(2, 4) + sixel(cursor_case.parameters, cursor_case.data));
+        ok &= check(model.cursor_position().row    == 2 + cursor_case.expected_row &&
+                model.cursor_position().column == 4,
+            cursor_case.name);
+    }
+
+    // A cursor that does not move keeps a pending wrap; one that moves drops it.
+    term::Terminal_screen_model wrap_model = make_model(20, 10);
+    wrap_model.ingest(QByteArray("0123456789") + sixel("9;1", solid_rows(3, 1)) + "X");
+    ok &= check(wrap_model.row_text(1) == QStringLiteral("X"),
+        "an image that leaves the cursor in place keeps the pending wrap");
+    term::Terminal_screen_model moved_model = make_model(20, 10);
+    moved_model.ingest(QByteArray("0123456789") + sixel("0;1", solid_rows(3, 3)) + "X");
+    ok &= check(moved_model.cursor_position().row == 1 &&
+            moved_model.row_text(1).endsWith(QStringLiteral("X")) &&
+            moved_model.row_text(2).isEmpty(),
+        "an image that moves the cursor drops the pending wrap");
+
+    return ok;
+}
+
+bool test_images_scroll_the_region_into_history()
+{
+    bool ok = true;
+
+    // Six 20-pixel bands from the bottom row of a three-row screen: the region
+    // scrolls five times, and the first three bands reach history.
+    const QByteArray data = solid_rows(12, 20);
+    const term::Screen_sixel_image_mutation image = decoded_image("9;1", data);
+    term::Terminal_screen_model model = make_model(3, 10);
+    model.ingest(QByteArray("top\r\nmid\r\nbottom\x1b[1;1H\x1b[3;1H") + sixel("9;1", data));
+    ok &= check(model.scrollback_size() == 5,
+        "an image taller than the screen scrolls the screen into history");
+    ok &= check(model.row_text(0).isEmpty() && model.cursor_position().row == 2,
+        "the cursor ends on the row of the final sixel row's top");
+    for (int band = 0; band < 3; ++band) {
+        ok &= check(slice_equals_band(
+                model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 2 + band),
+                image.raster,
+                band * 20,
+                12,
+                0),
+            "bands scrolled off the screen reach history with their rows");
+    }
+    for (int band = 3; band < 6; ++band) {
+        ok &= check(slice_equals_band(slice_at(model, band - 3), image.raster, band * 20, 12, 0),
+            "the last bands stay on the screen");
+    }
+
+    // Inside DECSTBM the region scrolls and nothing reaches history. The
+    // scroll counts are provisional until the ConPTY cursor-sync gate.
+    term::Terminal_screen_model region_model = make_model(6, 10);
+    region_model.ingest(
+        QByteArray("r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5\x1b[2;4r\x1b[4;1H") + sixel("9;1", data));
+    ok &= check(region_model.scrollback_size() == 0 &&
+            region_model.row_text(0) == QStringLiteral("r0") &&
+            region_model.row_text(4) == QStringLiteral("r4") &&
+            region_model.row_text(5) == QStringLiteral("r5"),
+        "an image inside a scroll region scrolls only the region, into no history");
+    ok &= check(region_model.cursor_position().row == 3,
+        "the cursor ends inside the region, on the final sixel row's top");
+    ok &= check(slice_equals_band(slice_at(region_model, 3), image.raster, 100, 12, 0),
+        "the region's last row holds the image's last band");
+
+    // An image that would start below the bottom margin is dropped, as
+    // OpenConsole drops it (provisional until the cursor-sync gate).
+    term::Terminal_screen_model below_model = make_model(6, 10);
+    below_model.ingest(QByteArray("\x1b[2;4r\x1b[6;3H") + sixel("9;1", solid_rows(12, 4)));
+    ok &= check(below_model.cursor_position().row    == 5 &&
+            below_model.cursor_position().column == 2 &&
+            slice_at(below_model, 5) == nullptr,
+        "an image starting below the bottom margin is not placed and leaves the cursor");
+
+    return ok;
+}
+
+bool test_sixel_display_mode()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(5, 10);
+    std::vector<term::Terminal_reply> replies = replies_in(model.ingest("\x1b[?80$p"));
+    ok &= check(replies.size() == 1U && replies[0].wire_bytes == QByteArray("\x1b[?80;2$y"),
+        "DECRQM reports DECSDM reset by default");
+
+    model.ingest(QByteArray("\x1b[?80h\x1b[2;4r\x1b[?6h\x1b[2;3H"));
+    replies = replies_in(model.ingest("\x1b[?80$p"));
+    ok &= check(replies.size() == 1U && replies[0].wire_bytes == QByteArray("\x1b[?80;1$y"),
+        "DECRQM reports DECSDM set");
+
+    const term::terminal_grid_position_t cursor_before = model.cursor_position();
+    const QByteArray data = solid_rows(12, 20);
+    const term::Screen_sixel_image_mutation image = decoded_image("9;1", data);
+    model.ingest(sixel("9;1", data));
+    for (int row = 0; row < 5; ++row) {
+        ok &= check(slice_equals_band(slice_at(model, row), image.raster, row * 20, 12, 0),
+            "DECSDM places the image at the page home whatever the margins and origin mode");
+    }
+    ok &= check(model.scrollback_size() == 0,
+        "DECSDM clips an image at the bottom of the page instead of scrolling");
+    ok &= check(model.cursor_position().row    == cursor_before.row &&
+            model.cursor_position().column == cursor_before.column,
+        "DECSDM leaves the cursor where it was");
+
+    model.ingest(QByteArray("\x1b[?80l"));
+    replies = replies_in(model.ingest("\x1b[?80$p"));
+    ok &= check(replies.size() == 1U && replies[0].wire_bytes == QByteArray("\x1b[?80;2$y"),
+        "DECRQM reports DECSDM reset again");
+
+    replies = replies_in(model.ingest("\x1b[?1070$p"));
+    ok &= check(replies.size() == 1U && replies[0].wire_bytes == QByteArray("\x1b[?1070;3$y"),
+        "DECRQM reports private color registers as permanently set");
+    const term::Terminal_screen_model_result set_result = model.ingest("\x1b[?1070l");
+    ok &= check(diagnostics_in(set_result).size() == 1U &&
+            diagnostics_in(set_result)[0].code == term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
+        "setting private color registers is diagnosed as unsupported");
+    replies = replies_in(model.ingest("\x1b[?1070$p"));
+    ok &= check(replies.size() == 1U && replies[0].wire_bytes == QByteArray("\x1b[?1070;3$y"),
+        "private color registers stay set");
+
+    return ok;
+}
+
+bool test_images_erase_the_text_they_cover()
+{
+    bool ok = true;
+
+    // "ab" plain, "cd" red, "ef" linked, "g", a wide glyph, "j".
+    term::Terminal_screen_model model = make_model(3, 12);
+    model.ingest(QByteArray(
+        "ab\x1b[31mcd\x1b[m\x1b]8;;https://example.test/\x1b\\ef\x1b]8;;\x1b\\g"
+        "\xe7\x95\x8cj"));
+    const std::uint64_t generation_before =
+        model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            active_row(model, 0)).content_generation;
+
+    // Columns 2 and 3 drawn, column 4 left transparent, columns 5 to 7 drawn,
+    // column 7 by a single pixel column.
+    model.ingest(cursor_to(0, 2) + sixel("9;1", "#1;2;100;0;0#1!20~!10?#1!21~"));
+
+    ok &= check(model.row_text(0) == QStringLiteral("ab  e    j"),
+        "covered cells lose their text, a transparent column keeps it");
+    ok &= check(model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            active_row(model, 0)).content_generation > generation_before,
+        "erasing text under an image advances the row's content generation");
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(1U);
+    const term::Terminal_render_cell* red_cell    = snapshot_cell(snapshot, 0, 2);
+    const term::Terminal_render_cell* linked_cell = snapshot_cell(snapshot, 0, 4);
+    ok &= check(red_cell != nullptr && red_cell->style_id != term::k_default_terminal_style_id,
+        "a covered cell keeps its style (provisional)");
+    ok &= check(snapshot_cell(snapshot, 0, 5) == nullptr,
+        "a covered linked cell loses its hyperlink (provisional)");
+    ok &= check(linked_cell != nullptr && linked_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "an uncovered linked cell keeps its hyperlink");
+    ok &= check(snapshot_cell(snapshot, 0, 8) == nullptr,
+        "a wide glyph with one covered cell is cleared whole");
+
+    return ok;
+}
+
+bool test_images_on_one_row_composite()
+{
+    bool ok = true;
+
+    const QByteArray first_data  = solid_rows(30, 1);
+    const QByteArray second_data = "#2;2;0;100;0#2!5?!35~-#2!40~";
+    const term::Screen_sixel_image_mutation first  = decoded_image("9;1", first_data);
+    const term::Screen_sixel_image_mutation second = decoded_image("9;1", second_data);
+
+    term::Terminal_screen_model model = make_model(3, 20);
+    model.ingest(sixel("9;1", first_data));
+    const std::uint64_t first_revision = slice_at(model, 0)->revision;
+    model.ingest(cursor_to(0, 2) + sixel("9;1", second_data));
+
+    // Reference: the second image's drawn pixels over the first, over the
+    // union of their columns.
+    QImage expected(60, 12, QImage::Format_RGBA8888_Premultiplied);
+    expected.fill(0U);
+    for (int y = 0; y < first.raster.height(); ++y) {
+        std::memcpy(expected.scanLine(y), first.raster.constScanLine(y), 30U * 4U);
+    }
+    for (int y = 0; y < second.raster.height(); ++y) {
+        const auto* source = reinterpret_cast<const std::uint32_t*>(second.raster.constScanLine(y));
+        auto*       target = reinterpret_cast<std::uint32_t*>(expected.scanLine(y)) + 20;
+        for (int x = 0; x < second.raster.width(); ++x) {
+            if (source[x] != 0U) {
+                target[x] = source[x];
+            }
+        }
+    }
+
+    const std::shared_ptr<const term::Terminal_image_slice> slice = slice_at(model, 0);
+    ok &= check(slice != nullptr &&
+            slice->first_column == 0 &&
+            slice->cell_pixel_size == k_cell &&
+            slice->pixels == expected,
+        "a second image on a row composites over the first into one slice");
+    ok &= check(slice != nullptr && slice->revision > first_revision,
+        "the composite is a new slice with a new revision");
+
+    // A row's image keeps one cell size: an image placed on another cell is
+    // resampled to the new one first (pixel values provisional).
+    term::Terminal_screen_model resized = make_model(3, 20);
+    resized.ingest(sixel("9;1", first_data));
+    resized.set_cell_pixel_size({5, 10});
+    resized.ingest(cursor_to(0, 8) + sixel("9;1", solid_rows(10, 1)));
+    const std::shared_ptr<const term::Terminal_image_slice> mixed = slice_at(resized, 0);
+    ok &= check(mixed != nullptr &&
+            mixed->cell_pixel_size == term::terminal_cell_pixel_size_t{5, 10} &&
+            mixed->first_column == 0 &&
+            mixed->pixels.width() == 50 &&
+            mixed->pixels.height() == 6,
+        "a composite of images on different cells is kept at the newest cell");
+
+    return ok;
+}
+
+bool test_images_without_geometry_or_pixels()
+{
+    bool ok = true;
+
+    // No cell pixel size: nothing to place against (provisional).
+    term::Terminal_screen_model headless = make_model(3, 10, std::nullopt);
+    const term::Terminal_screen_model_result result =
+        headless.ingest(QByteArray("ab") + sixel("0;1", solid_rows(4, 8)));
+    const std::vector<term::Parser_payload_diagnostic> diagnostics = diagnostics_in(result);
+    ok &= check(diagnostics.size() == 1U &&
+            diagnostics[0].code == term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE &&
+            diagnostics[0].family == term::Parser_sequence_family::DCS,
+        "an image without a cell pixel size is one unsupported DCS diagnostic");
+    ok &= check(headless.cursor_position().row == 0 && headless.cursor_position().column == 2 &&
+            headless.scrollback_size() == 0 &&
+            headless.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0) == nullptr,
+        "an image without a cell pixel size places nothing and moves nothing");
+
+    // Over the decoded-size cap (1 MiB ring: 131072 bytes) the image keeps
+    // its geometry: it scrolls and moves the cursor but stores no pixels.
+    term::Terminal_screen_model capped = make_model(5, 30, k_cell, 100, 1024U * 1024U);
+    const term::Terminal_screen_model_result capped_result =
+        capped.ingest(sixel("9;1", solid_rows(200, 34)));
+    ok &= check(diagnostics_in(capped_result).size() == 1U &&
+            diagnostics_in(capped_result)[0].code ==
+                term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED,
+        "an image over the decoded-size cap is diagnosed once");
+    ok &= check(capped.scrollback_size() == 6 && capped.cursor_position().row == 3,
+        "an image over the cap still scrolls and moves the cursor");
+    bool capped_has_slice = false;
+    for (int row = 0; row < capped.scrollback_size() + 5; ++row) {
+        capped_has_slice = capped_has_slice ||
+            capped.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row) != nullptr;
+    }
+    ok &= check(!capped_has_slice, "an image over the cap stores no pixels anywhere");
+
+    // An image that draws nothing still moves the cursor by its sixel rows.
+    term::Terminal_screen_model empty = make_model(5, 30);
+    empty.ingest(cursor_to(1, 3) + sixel("0;1", "--"));
+    ok &= check(empty.cursor_position().row == 2 && empty.cursor_position().column == 3 &&
+            slice_at(empty, 1) == nullptr && slice_at(empty, 2) == nullptr,
+        "an empty image moves the cursor by its graphics new lines and stores nothing");
+
+    // Geometry far past the screen does not scroll without end: once the
+    // region and the scrollback limit are blank, further scrolls change nothing.
+    term::Terminal_screen_model runaway = make_model(4, 10, k_cell, 10);
+    runaway.ingest(QByteArray("keep\r\n") + sixel("9;1", QByteArray("\"32767;1") + QByteArray(5, '-')));
+    ok &= check(runaway.scrollback_size() == 10 && runaway.visible_text().trimmed().isEmpty(),
+        "a runaway image height leaves a blank screen and a full blank history");
+
+    return ok;
+}
+
+bool test_image_rows_move_and_die_with_their_rows()
+{
+    bool ok = true;
+
+    const QByteArray image = sixel("9;1", solid_rows(12, 1));
+
+    term::Terminal_screen_model model = make_model(4, 10);
+    model.ingest(cursor_to(1, 0) + image);
+    const std::shared_ptr<const term::Terminal_image_slice> placed = slice_at(model, 1);
+    ok &= check(placed != nullptr, "the moving-row fixture places one slice");
+
+    model.ingest("\x1b[T");
+    ok &= check(slice_at(model, 2) == placed && slice_at(model, 1) == nullptr,
+        "SD moves the slice down with its row");
+    model.ingest("\x1b[S");
+    ok &= check(slice_at(model, 1) == placed && slice_at(model, 2) == nullptr,
+        "SU moves the slice up with its row");
+    model.ingest(QByteArray("\x1b[1;1H\x1b[L"));
+    ok &= check(slice_at(model, 2) == placed && slice_at(model, 0) == nullptr,
+        "IL moves the slice down with its row");
+    model.ingest(QByteArray("\x1b[1;1H\x1b[M"));
+    ok &= check(slice_at(model, 1) == placed && slice_at(model, 3) == nullptr,
+        "DL moves the slice up with its row");
+    model.ingest(QByteArray("\x1b[2;1H\x1b[M"));
+    bool any_slice = false;
+    for (int row = 0; row < 4; ++row) {
+        any_slice = any_slice || slice_at(model, row) != nullptr;
+    }
+    ok &= check(!any_slice, "a deleted row takes its slice with it");
+
+    // A slice that scrolls into history decodes as the live slice it was.
+    term::Terminal_screen_model history_model = make_model(3, 10);
+    history_model.ingest(image);
+    const std::shared_ptr<const term::Terminal_image_slice> live = slice_at(history_model, 0);
+    history_model.ingest("\r\n\r\n\r\n");
+    ok &= check(history_model.scrollback_size() == 1 &&
+            slices_equal(
+                history_model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0),
+                live),
+        "a history row decodes to the slice its live row held");
+    history_model.ingest("\x1b[3J");
+    ok &= check(history_model.scrollback_size() == 0,
+        "ED3 clears history, image rows included");
+
+    // The alternate screen places images the same way, never feeds history,
+    // and drops its images when it is cleared; primary images stay.
+    term::Terminal_screen_model alternate = make_model(3, 10);
+    alternate.ingest(image);
+    const std::shared_ptr<const term::Terminal_image_slice> primary_slice = slice_at(alternate, 0);
+    alternate.ingest(QByteArray("\x1b[?1049h\x1b[3;1H") + sixel("9;1", solid_rows(12, 10)));
+    ok &= check(alternate.scrollback_size() == 0,
+        "scrolls on the alternate screen never feed history");
+    ok &= check(alternate.image_slice_for_testing(term::Terminal_buffer_id::ALTERNATE, 2) != nullptr,
+        "the alternate screen holds its own image rows");
+    ok &= check(alternate.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0) == primary_slice,
+        "primary image rows are untouched while the alternate screen is active");
+    alternate.ingest("\x1b[?1049l");
+    ok &= check(alternate.image_slice_for_testing(term::Terminal_buffer_id::ALTERNATE, 2) == nullptr &&
+            slice_at(alternate, 0) == primary_slice,
+        "leaving a cleared alternate screen drops its images and keeps the primary's");
+
+    return ok;
+}
+
+bool test_placement_marks_rows_dirty()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(6, 10);
+    model.ingest("\x1b[3;1H");
+    const std::uint64_t generation_before =
+        model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            active_row(model, 3)).content_generation;
+    const term::Terminal_screen_model_result result =
+        model.ingest(sixel("9;1", solid_rows(12, 6)));
+    ok &= check(result.terminal_content_changed, "placing an image changes terminal content");
+    ok &= check(std::find(result.dirty_rows.begin(), result.dirty_rows.end(), 2) != result.dirty_rows.end() &&
+            std::find(result.dirty_rows.begin(), result.dirty_rows.end(), 3) != result.dirty_rows.end(),
+        "every row an image lands on is dirty");
+    ok &= check(model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            active_row(model, 3)).content_generation == generation_before,
+        "an image over no text leaves the row's content generation alone");
+
+    return ok;
+}
+
+// The record limit is a eighth of the ring: 131072 bytes at 1 MiB. A 1638 x 20
+// image is 131040 bytes and passes the decoder cap, but its row record adds a
+// header, the section header, the cells and the ring framing.
+bool test_oversized_image_rows_keep_their_text_in_history()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(4, 170, k_cell, 100, 1024U * 1024U);
+    const term::Terminal_screen_model_result result = model.ingest(
+        cursor_to(0, 165) + QByteArray("KEPT") + cursor_to(0, 0) + sixel("1;0", "\"1;1;1638;20"));
+    ok &= check(diagnostics_in(result).empty(), "the near-cap image passes the decoder cap");
+    ok &= check(slice_at(model, 0) != nullptr && slice_at(model, 0)->pixels.width() == 1638,
+        "the near-cap image is placed on its row");
+
+    model.ingest("\r\n\r\n\r\n\r\n");
+    ok &= check(model.scrollback_size() == 1, "the image row scrolls into history");
+    ok &= check(history_row_text(model, 0) == QStringLiteral("KEPT"),
+        "a row whose image makes its record too large keeps its text in history");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0) == nullptr,
+        "and drops its image");
+
+    return ok;
+}
+
+bool test_capacity_shrink_keeps_text_rows_around_an_oversized_image()
+{
+    bool ok = true;
+
+    // 16 x 32 cells: an 1400 x 32 image row is 179200 pixel bytes, over the
+    // 131072 byte record limit of a 1 MiB ring; a 100 x 32 one is not.
+    const term::terminal_cell_pixel_size_t cell{16, 32};
+    term::Terminal_screen_model model = make_model(5, 90, cell, 100);
+    model.ingest(QByteArray("older-0\r\nolder-1\r\n"));
+    model.ingest(cursor_to(2, 88) + QByteArray("IM") + cursor_to(2, 0) + sixel("1;0", "\"1;1;1400;32"));
+    model.ingest(cursor_to(3, 10) + QByteArray("small") + cursor_to(3, 0) + sixel("1;0", "\"1;1;100;32"));
+    model.ingest(cursor_to(4, 0) + QByteArray("newer\r\n\r\n\r\n\r\n\r\n"));
+
+    ok &= check(model.scrollback_size() == 5, "the shrink fixture scrolls five rows into history");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 2) != nullptr &&
+            model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 3) != nullptr,
+        "both image rows reach history with their images");
+
+    model.set_retained_history_capacity_bytes(1024U * 1024U);
+    ok &= check(model.scrollback_size() == 5,
+        "shrinking below an image row's record keeps every row");
+    ok &= check(history_row_text(model, 0) == QStringLiteral("older-0") &&
+            history_row_text(model, 1) == QStringLiteral("older-1") &&
+            history_row_text(model, 2) == QStringLiteral("IM") &&
+            history_row_text(model, 3) == QStringLiteral("small") &&
+            history_row_text(model, 4) == QStringLiteral("newer"),
+        "rows older than the oversized image row keep their text");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 2) == nullptr,
+        "the image that no longer fits a record is dropped");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 3) != nullptr,
+        "an image that still fits keeps its pixels");
+
+    for (int row = 0; row < model.scrollback_size(); ++row) {
+        const std::optional<term::terminal_history_handle_t> handle =
+            model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, row);
+        const term::Terminal_retained_line_lookup_result lookup = handle.has_value()
+            ? model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *handle)
+            : term::Terminal_retained_line_lookup_result{};
+        ok &= check(lookup.resolution_status == term::Terminal_history_resolution_status::OK &&
+                lookup.exact_match &&
+                lookup.exact_logical_row == row,
+            "each kept row's new handle resolves to that row");
+    }
+
+    return ok;
+}
+
+}
+
+int main()
+{
+    bool ok = true;
+    ok &= test_slices_equal_raster_bands();
+    ok &= test_images_clip_at_the_right_margin();
+    ok &= test_cursor_follows_the_final_sixel_row();
+    ok &= test_images_scroll_the_region_into_history();
+    ok &= test_sixel_display_mode();
+    ok &= test_images_erase_the_text_they_cover();
+    ok &= test_images_on_one_row_composite();
+    ok &= test_images_without_geometry_or_pixels();
+    ok &= test_image_rows_move_and_die_with_their_rows();
+    ok &= test_placement_marks_rows_dirty();
+    ok &= test_oversized_image_rows_keep_their_text_in_history();
+    ok &= test_capacity_shrink_keeps_text_rows_around_an_oversized_image();
+    return ok ? 0 : 1;
+}

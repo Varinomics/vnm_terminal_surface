@@ -160,6 +160,16 @@ alternate buffers, scrollback, cursor state, tab stops, modes, SGR styles,
 colors, title/icon state, hyperlinks, wide and combining cell state,
 synchronized output state, and render snapshot production.
 
+A decoded sixel image is placed against the cell pixel size and cut into one
+immutable `Terminal_image_slice` (`render_snapshot.h`) per text row it covers;
+there is no image store. The row owns its slice, which moves and dies with the
+row and reaches retained history with it. A history row record carries its
+slice in a presence-flagged section, so image-free records keep their exact
+encoding, and a decode materializes the pixels only when a reader asks for
+them. Each slice records the cell size it was placed on and a model-lifetime
+revision, so a renderer can scale it and key a cache on row identity and
+revision.
+
 Terminal cell widths come from generated Unicode 16.0.0 tables in
 `unicode_width_tables`. Ambiguous East Asian Width characters are narrow,
 combining marks and variation selectors are zero-width, default emoji

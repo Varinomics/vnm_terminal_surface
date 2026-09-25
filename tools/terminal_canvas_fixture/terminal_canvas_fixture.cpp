@@ -1,9 +1,11 @@
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -11,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -110,6 +113,7 @@ void print_usage()
         << "       vnm_terminal_canvas_fixture --sync-raw-resize-gate <checkpoint-path>\n"
         << "       vnm_terminal_canvas_fixture --quick-exit\n"
         << "       vnm_terminal_canvas_fixture --write-start-marker <path>\n"
+        << "       vnm_terminal_canvas_fixture --sixel-cursor-sync <case> <report-path>\n"
         << "       vnm_terminal_canvas_fixture --echo-environment <name> [name...]\n"
         << "       vnm_terminal_canvas_fixture --echo-argv [args...]\n";
 }
@@ -1640,6 +1644,65 @@ int run_quick_exit()
     return write_all_stdout("quick-exit\r\n") ? 0 : 68;
 }
 
+// Writes one sixel cursor-sync case, then reports the console cursor that the
+// console host computed for it, relative to the window, as "<row> <column>".
+// The report is renamed into place so the test never reads it half written,
+// and the fixture then waits for one input byte, so the test samples its own
+// cursor while nothing else is written. Only a console host has a cursor to
+// read this way.
+int run_sixel_cursor_sync(std::string_view case_name, const std::string& report_path)
+{
+#if defined(_WIN32)
+    const std::vector<term::Terminal_canvas_fixture_sixel_cursor_case> cases =
+        term::terminal_canvas_fixture_sixel_cursor_cases();
+    const auto found = std::find_if(
+        cases.begin(),
+        cases.end(),
+        [case_name](const term::Terminal_canvas_fixture_sixel_cursor_case& sixel_case) {
+            return sixel_case.name == case_name;
+        });
+    if (found == cases.end()) {
+        std::cerr << "unknown sixel cursor case: " << case_name << '\n';
+        return 92;
+    }
+
+    if (!configure_interactive_console()) {
+        return 93;
+    }
+    if (!write_all_stdout(found->payload)) {
+        return 94;
+    }
+
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
+        return 95;
+    }
+
+    const std::string partial_path = report_path + ".partial";
+    {
+        std::ofstream report(partial_path, std::ios::binary);
+        report << info.dwCursorPosition.Y - info.srWindow.Top << ' '
+            << info.dwCursorPosition.X - info.srWindow.Left << '\n';
+        if (!report.good()) {
+            return 96;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(partial_path, report_path, rename_error);
+    if (rename_error) {
+        return 97;
+    }
+
+    unsigned char byte = 0U;
+    return std::fread(&byte, 1U, 1U, stdin) == 1U ? 0 : 98;
+#else
+    static_cast<void>(case_name);
+    static_cast<void>(report_path);
+    std::cerr << "--sixel-cursor-sync needs a console host\n";
+    return 92;
+#endif
+}
+
 int run_write_start_marker(const std::string& marker_path)
 {
     if (!write_checkpoint_file(marker_path)) {
@@ -1826,6 +1889,10 @@ int main(int argc, char** argv)
 
     if (argc == 3 && argument_equals(argv[1], "--write-start-marker")) {
         return run_write_start_marker(argv[2]);
+    }
+
+    if (argc == 4 && argument_equals(argv[1], "--sixel-cursor-sync")) {
+        return run_sixel_cursor_sync(argv[2], argv[3]);
     }
 
     print_usage();

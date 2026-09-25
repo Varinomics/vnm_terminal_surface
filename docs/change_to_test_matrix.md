@@ -30,6 +30,7 @@ against an app build that consumes this surface.
 | Search, scrollback match identity, and search overlays | `vnm_terminal_search_index`, `vnm_terminal_backend_session`, `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, `vnm_terminal_custom_titlebar_integration` | surface + application |
 | Screen model, parser, and escape-sequence behavior | `vnm_terminal_screen_basic`, `vnm_terminal_screen_operations`, `vnm_terminal_screen_alternate`, `vnm_terminal_screen_sgr`, `vnm_terminal_terminal_modes`, `vnm_terminal_viewport`, `vnm_terminal_sequence_matrix`, `vnm_terminal_parser_ir`, `vnm_terminal_parser_randomized`, `vnm_terminal_sixel_decoder` | surface |
 | XTWINOPS text-area resize arbitration | `vnm_terminal_backend_session`, `vnm_terminal_surface_host`, `vnm_terminal_screen_operations`, `vnm_terminal_sequence_matrix` | surface |
+| Sixel image placement and image rows (slices, DECSDM, text under images, history image section, record-limit drops) | `vnm_terminal_sixel_placement`, `vnm_terminal_history_row_record_codec`, `vnm_terminal_sixel_decoder`, `vnm_terminal_screen_operations`, `vnm_terminal_sequence_matrix`, `vnm_terminal_windows_conpty_sixel_cursor_sync` | surface |
 | Cell pixel size (CSI 14 t and CSI 16 t replies, POSIX winsize pixels, backend cell geometry) | `vnm_terminal_screen_operations`, `vnm_terminal_parser_ir`, `vnm_terminal_backend_session`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_qt_metrics`, `vnm_terminal_qt_metrics_scaled`, `vnm_terminal_sequence_matrix` | surface |
 | CLI / application behavior | `vnm_terminal_smoke`, `vnm_terminal_help_*`, `vnm_terminal_rejects_*` | application |
 | Metrics and diagnostics output | `vnm_terminal_qt_metrics`, `vnm_terminal_qt_metrics_scaled`, `vnm_terminal_diagnostics_text_layout`, `vnm_terminal_diagnostics_schema_sync` | surface |
@@ -51,7 +52,11 @@ against an app build that consumes this surface.
 - The parser subsystem is covered by `vnm_terminal_parser_ir` (IR contract),
   `vnm_terminal_parser_randomized` (randomized corpus), and
   `vnm_terminal_sixel_decoder` (sixel DCS dispatch, decoding, and the decoded-size
-  cap). `vnm_terminal_input_encoder`
+  cap). `vnm_terminal_sixel_placement` covers where the model puts a decoded
+  image and how image rows move into history, and
+  `vnm_terminal_windows_conpty_sixel_cursor_sync` checks on Windows that the
+  model's cursor after an image matches the cursor OpenConsole computes for the
+  same image behind the packaged ConPTY. `vnm_terminal_input_encoder`
   covers key, mouse, paste, and focus encoding and is the companion to
   `vnm_terminal_surface_host` for input changes.
 - `vnm_terminal_sequence_matrix` checks the supported/ignored/rejected sequence

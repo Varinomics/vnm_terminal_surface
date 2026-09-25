@@ -585,9 +585,12 @@ bool test_model_supplies_the_cap()
     bool ok = true;
 
     // The cap is the retained history's largest record and follows the ring
-    // capacity, including a change while an image streams.
+    // capacity, including a change while an image streams. The model has a
+    // cell pixel size, so the images are placed and the cap's diagnostic is
+    // the only one.
     term::Terminal_screen_model_config config;
-    config.grid_size = {24, 80};
+    config.grid_size       = {24, 80};
+    config.cell_pixel_size = term::terminal_cell_pixel_size_t{10, 20};
     term::Terminal_screen_model model(config);
 
     const std::size_t small_limit = term::terminal_history_ring_max_record_bytes(

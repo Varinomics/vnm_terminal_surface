@@ -11,9 +11,13 @@
 #include <QByteArray>
 #include <QChar>
 #include <QDateTime>
+#include <QImage>
 #include <QStringList>
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -313,6 +317,63 @@ const QString& printable_ascii_cell_text(QChar character)
 
     return strings[static_cast<std::size_t>(
         character.unicode() - k_printable_ascii_first)];
+}
+
+// Draws a band over its row's earlier image, drawn pixels over earlier ones,
+// into one image over the union of their columns. An earlier image placed on
+// another cell is first resampled to this one, the size a renderer draws it
+// at, so a row's image keeps a single cell size.
+QImage composite_image_band(
+    const Terminal_image_slice& earlier,
+    const QImage&               band,
+    int                         band_first_column,
+    terminal_cell_pixel_size_t  cell,
+    int&                        out_first_column)
+{
+    QImage earlier_pixels = earlier.pixels;
+    if (earlier.cell_pixel_size != cell) {
+        const double x_scale       = static_cast<double>(cell.width)  / earlier.cell_pixel_size.width;
+        const double y_scale       = static_cast<double>(cell.height) / earlier.cell_pixel_size.height;
+        const int    scaled_width  = static_cast<int>(std::lround(earlier_pixels.width()  * x_scale));
+        const int    scaled_height = static_cast<int>(std::lround(earlier_pixels.height() * y_scale));
+        earlier_pixels = earlier_pixels
+            .scaled(
+                std::max(1, scaled_width),
+                std::clamp(scaled_height, 1, cell.height),
+                Qt::IgnoreAspectRatio,
+                Qt::FastTransformation)
+            .convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+    }
+
+    out_first_column = std::min(earlier.first_column, band_first_column);
+    const int earlier_x = (earlier.first_column - out_first_column) * cell.width;
+    const int band_x    = (band_first_column    - out_first_column) * cell.width;
+    const int width     = std::max(earlier_x + earlier_pixels.width(), band_x + band.width());
+    const int height    = std::max(earlier_pixels.height(), band.height());
+
+    QImage combined(width, height, QImage::Format_RGBA8888_Premultiplied);
+    // QImage reports a failed allocation with a null image, not an exception.
+    if (combined.isNull() || earlier_pixels.isNull()) {
+        throw std::bad_alloc();
+    }
+    combined.fill(0U);
+
+    for (int y = 0; y < earlier_pixels.height(); ++y) {
+        std::memcpy(
+            combined.scanLine(y) + static_cast<std::size_t>(earlier_x) * sizeof(std::uint32_t),
+            earlier_pixels.constScanLine(y),
+            static_cast<std::size_t>(earlier_pixels.width()) * sizeof(std::uint32_t));
+    }
+    for (int y = 0; y < band.height(); ++y) {
+        auto*       target = reinterpret_cast<std::uint32_t*>(combined.scanLine(y)) + band_x;
+        const auto* source = reinterpret_cast<const std::uint32_t*>(band.constScanLine(y));
+        for (int x = 0; x < band.width(); ++x) {
+            if (source[x] != 0U) {
+                target[x] = source[x];
+            }
+        }
+    }
+    return combined;
 }
 
 bool action_is_session_visible(const Parser_action& action)
@@ -731,7 +792,7 @@ void Terminal_screen_model::apply_action(
     }
 
     std::visit(
-        [this](const auto& mutation) {
+        [this, &generated_actions](const auto& mutation) {
             using mutation_t = std::decay_t<decltype(mutation)>;
             if constexpr (std::is_same_v<mutation_t, Screen_print_text_mutation>) {
                 VNM_TERMINAL_PROFILE_SCOPE(
@@ -798,9 +859,9 @@ void Terminal_screen_model::apply_action(
             }
             else
             if constexpr (std::is_same_v<mutation_t, Screen_sixel_image_mutation>) {
-                // Images are not placed on the grid: a decoded image changes
-                // no screen state, cursor included.
-                static_cast<void>(mutation);
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::apply_action::sixel_image");
+                place_sixel_image(mutation, generated_actions);
             }
             else {
                 static_assert(
@@ -2833,7 +2894,8 @@ Terminal_screen_model::retained_row_record_metadata_for_testing(
 
     const std::optional<retained_row_record_t> retained_record =
         m_primary_backing.materialize_retained_history_record(
-            static_cast<std::size_t>(logical_row));
+            static_cast<std::size_t>(logical_row),
+            Terminal_history_row_record_image_decode::SKIP_PIXELS);
     return retained_record.has_value()
         ? std::optional<terminal_retained_row_record_metadata_t>(retained_record->metadata)
         : std::nullopt;
@@ -2853,7 +2915,8 @@ Terminal_screen_model::retained_history_row_cells_for_testing(
 
     const std::optional<retained_row_record_t> retained_record =
         m_primary_backing.materialize_retained_history_record(
-            static_cast<std::size_t>(logical_row));
+            static_cast<std::size_t>(logical_row),
+            Terminal_history_row_record_image_decode::SKIP_PIXELS);
     if (!retained_record.has_value()) {
         return std::nullopt;
     }
@@ -2873,6 +2936,34 @@ Terminal_screen_model::retained_history_row_cells_for_testing(
         cells.push_back(std::move(state));
     }
     return cells;
+}
+
+std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_for_testing(
+    Terminal_buffer_id buffer_id,
+    int                logical_row) const
+{
+    if (logical_row < 0) {
+        return nullptr;
+    }
+
+    if (buffer_id == Terminal_buffer_id::ALTERNATE) {
+        const Terminal_screen_row* row = alternate_active_row(active_grid_row_t{logical_row});
+        return row != nullptr ? row->image_slice : nullptr;
+    }
+
+    if (logical_row < scrollback_size()) {
+        const std::optional<retained_row_record_t> retained_record =
+            m_primary_backing.materialize_retained_history_record(
+                static_cast<std::size_t>(logical_row),
+                Terminal_history_row_record_image_decode::DECODE_PIXELS);
+        return retained_record.has_value() ? retained_record->row.image_slice : nullptr;
+    }
+
+    const std::optional<active_grid_row_t> active_row =
+        active_grid_row_from_primary_backing(primary_backing_row_t{logical_row});
+    return active_row.has_value()
+        ? primary_active_grid_rows()[static_cast<std::size_t>(active_row->value)].image_slice
+        : nullptr;
 }
 
 bool Terminal_screen_model::retained_line_descriptor_logical_row(
@@ -3035,13 +3126,15 @@ Terminal_screen_model::Retained_history_storage::resize_capacity(
 void Terminal_screen_model::Retained_history_storage::
     track_record_in_reserved_index_slot(
         terminal_history_handle_t                history_handle,
-        Terminal_history_row_record_payload_kind payload_kind) noexcept
+        Terminal_history_row_record_payload_kind payload_kind,
+        bool                                     has_image_section) noexcept
 {
     Q_ASSERT(!index.empty());
 
-    index.back().history_handle = history_handle;
-    index.back().payload_kind   = payload_kind;
-    index.back().ordinal        = next_ordinal++;
+    index.back().history_handle    = history_handle;
+    index.back().payload_kind      = payload_kind;
+    index.back().ordinal           = next_ordinal++;
+    index.back().has_image_section = has_image_section;
 
     switch (payload_kind) {
         case Terminal_history_row_record_payload_kind::GENERIC_COMPACT:
@@ -3112,7 +3205,8 @@ int Terminal_screen_model::Primary_backing_buffer::retained_history_size() const
 
 std::optional<Terminal_screen_model::retained_row_record_t>
 Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_record(
-    std::size_t index) const
+    std::size_t                              index,
+    Terminal_history_row_record_image_decode image_decode) const
 {
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_record");
@@ -3126,7 +3220,7 @@ Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_reco
     const Terminal_history_ring_read_scope read =
         retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
     const Terminal_history_row_record_decode_result decoded =
-        decode_terminal_history_row_record(read, handle);
+        decode_terminal_history_row_record(read, image_decode, handle);
     if (decoded.status != Terminal_history_row_record_codec_status::OK) {
         throw_retained_history_storage_failure();
     }
@@ -3163,14 +3257,31 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
     identity.epoch        = k_terminal_history_retained_identity_epoch;
     identity.row_sequence = history_record.provenance.retained_line_id;
 
+    const auto record_is_oversized = [](const Terminal_history_row_record_append_result& append) {
+        return
+            append.status      == Terminal_history_row_record_codec_status::RING_RESERVE_FAILED &&
+            append.ring_status == Terminal_history_ring_status::OVERSIZE_RECORD;
+    };
+
     retained_history.ensure_allocated();
     retained_history.index.emplace_back();
     Terminal_history_row_record_append_result append;
+    bool image_slice_dropped = false;
     try {
         append = encode_terminal_history_row_record_to_ring(
             *retained_history.ring,
             history_record,
             identity);
+        // A row whose image leaves its record over the ring's record limit
+        // keeps its text: the image is what makes it too large.
+        if (record_is_oversized(append) && history_record.image_slice != nullptr) {
+            history_record.image_slice.reset();
+            image_slice_dropped = true;
+            append = encode_terminal_history_row_record_to_ring(
+                *retained_history.ring,
+                history_record,
+                identity);
+        }
     }
     catch (...) {
         retained_history.index.pop_back();
@@ -3178,9 +3289,7 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
     }
     if (append.status != Terminal_history_row_record_codec_status::OK) {
         retained_history.index.pop_back();
-        if (append.status == Terminal_history_row_record_codec_status::RING_RESERVE_FAILED &&
-            append.ring_status == Terminal_history_ring_status::OVERSIZE_RECORD)
-        {
+        if (record_is_oversized(append)) {
             retained_history_append_result_t result;
             result.record_discarded = true;
             return result;
@@ -3190,10 +3299,12 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
 
     retained_history.track_record_in_reserved_index_slot(
         append.history_handle,
-        append.payload_kind);
+        append.payload_kind,
+        history_record.image_slice != nullptr);
     retained_history_append_result_t result;
-    result.appended_handle  = append.history_handle;
-    result.appended_ordinal = retained_history.index.back().ordinal;
+    result.appended_handle     = append.history_handle;
+    result.appended_ordinal    = retained_history.index.back().ordinal;
+    result.image_slice_dropped = image_slice_dropped;
     if (append.commit.tail_advanced) {
         result.evicted_handles = prune_retained_history_rows_outside_live_window();
     }
@@ -3236,10 +3347,26 @@ Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_history_r
     return discarded_handles;
 }
 
-std::vector<terminal_history_handle_t>
+Terminal_screen_model::Retained_history_capacity_resize_result
 Terminal_screen_model::Primary_backing_buffer::resize_retained_history_capacity(
     std::size_t capacity_bytes)
 {
+    // The ring keeps the newest records that fit and stops at the first one
+    // over the new record limit, so a single image row over it would take all
+    // older history with it. When an image is what makes a record too large,
+    // the rows are re-encoded without that image instead.
+    if (retained_history.ring != nullptr) {
+        const std::size_t new_max_record_bytes = terminal_history_ring_max_record_bytes(
+            terminal_history_ring_aligned_capacity(capacity_bytes));
+        for (const auto& entry : retained_history.index) {
+            if (entry.has_image_section &&
+                entry.history_handle.record_bytes > new_max_record_bytes)
+            {
+                return rebuild_retained_history_without_oversized_images(capacity_bytes);
+            }
+        }
+    }
+
     const terminal_history_ring_resize_result_t resize_result =
         retained_history.resize_capacity(capacity_bytes);
     if (resize_result.status != Terminal_history_ring_status::OK) {
@@ -3252,7 +3379,92 @@ Terminal_screen_model::Primary_backing_buffer::resize_retained_history_capacity(
         return {};
     }
 
-    return prune_retained_history_rows_outside_live_window();
+    return {prune_retained_history_rows_outside_live_window(), false};
+}
+
+Terminal_screen_model::Retained_history_capacity_resize_result
+Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_oversized_images(
+    std::size_t capacity_bytes)
+{
+    VNM_TERMINAL_PROFILE_SCOPE(
+        "Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_oversized_images");
+
+    struct Kept_record
+    {
+        Terminal_history_row_record record;
+        std::size_t                 index = 0U;
+    };
+
+    // Choose the kept rows as the ring would, newest first, stopping at the
+    // first record still over the record limit or at the capacity, but with
+    // each oversized image dropped from its row first.
+    const std::size_t new_capacity = terminal_history_ring_aligned_capacity(capacity_bytes);
+    const std::size_t new_max_record_bytes = terminal_history_ring_max_record_bytes(new_capacity);
+    std::vector<Kept_record> kept;
+    std::size_t kept_bytes = 0U;
+    for (std::size_t index = retained_history.index.size(); index-- > 0U;) {
+        const terminal_history_handle_t handle = retained_history.index[index].history_handle;
+        const Terminal_history_ring_read_scope read =
+            retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
+        Terminal_history_row_record_decode_result decoded = decode_terminal_history_row_record(
+            read,
+            Terminal_history_row_record_image_decode::DECODE_PIXELS,
+            handle);
+        if (decoded.status != Terminal_history_row_record_codec_status::OK) {
+            throw_retained_history_storage_failure();
+        }
+
+        std::size_t record_bytes = handle.record_bytes;
+        if (record_bytes > new_max_record_bytes && decoded.record.image_slice != nullptr) {
+            record_bytes -= terminal_history_row_record_image_section_bytes(
+                *decoded.record.image_slice);
+            decoded.record.image_slice.reset();
+        }
+        if (record_bytes > new_max_record_bytes ||
+            kept_bytes   > new_capacity - record_bytes)
+        {
+            break;
+        }
+
+        kept.push_back({std::move(decoded.record), index});
+        kept_bytes += record_bytes;
+    }
+
+    retained_history.ring->clear();
+    const terminal_history_ring_resize_result_t resize_result =
+        retained_history.resize_capacity(capacity_bytes);
+    if (resize_result.status != Terminal_history_ring_status::OK) {
+        throw_retained_history_storage_failure();
+    }
+
+    // Re-encode oldest first. The kept records fit the new capacity together,
+    // so no append evicts another; each keeps its ordinal and row sequence.
+    for (auto it = kept.rbegin(); it != kept.rend(); ++it) {
+        auto& entry = retained_history.index[it->index];
+        const Terminal_history_row_record_append_result append =
+            encode_terminal_history_row_record_to_ring(
+                *retained_history.ring,
+                it->record,
+                {k_terminal_history_retained_identity_epoch, entry.history_handle.row_sequence});
+        if (append.status != Terminal_history_row_record_codec_status::OK ||
+            append.commit.tail_advanced)
+        {
+            throw_retained_history_storage_failure();
+        }
+
+        entry.history_handle    = append.history_handle;
+        entry.has_image_section = it->record.image_slice != nullptr;
+    }
+
+    const std::size_t dropped_rows = retained_history.index.size() - kept.size();
+    Retained_history_capacity_resize_result result;
+    result.retained_handles_replaced = true;
+    result.evicted_handles.reserve(dropped_rows);
+    for (std::size_t index = 0U; index < dropped_rows; ++index) {
+        result.evicted_handles.push_back(retained_history.index[index].history_handle);
+    }
+    retained_history.discard_index_prefix(dropped_rows);
+    return result;
 }
 
 void Terminal_screen_model::Primary_backing_buffer::clear_retained_history()
@@ -3834,6 +4046,7 @@ void Terminal_screen_model::replace_row_with_erased_retained_line(Terminal_scree
 {
     fill_row_with_erased_cells(row.cells);
     row.soft_wrap_columns = 0;
+    row.image_slice.reset();
     replace_retained_line_id(row);
 }
 
@@ -4302,18 +4515,29 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
     }
 
     const int scrollback_rows_before = scrollback_size();
-    const std::vector<terminal_history_handle_t> evicted_handles =
+    const Retained_history_capacity_resize_result resize =
         m_primary_backing.resize_retained_history_capacity(aligned_capacity);
     m_config.retained_history_capacity_bytes = aligned_capacity;
     m_parser.set_sixel_raster_limit_bytes(terminal_history_ring_max_record_bytes(
         m_primary_backing.retained_history.capacity_bytes));
-    for (const terminal_history_handle_t handle : evicted_handles) {
+    for (const terminal_history_handle_t handle : resize.evicted_handles) {
         erase_retained_lookup_entry(
             Terminal_buffer_id::PRIMARY,
             handle.row_sequence);
     }
+    if (resize.retained_handles_replaced) {
+        for (const auto& entry : m_primary_backing.retained_history.index) {
+            const auto found = m_primary_retained_lookup_index.history_by_row_sequence.find(
+                entry.history_handle.row_sequence);
+            if (found != m_primary_retained_lookup_index.history_by_row_sequence.end() &&
+                found->second.history_ordinal == entry.ordinal)
+            {
+                found->second.history_handle = entry.history_handle;
+            }
+        }
+    }
 
-    const int evicted_rows = static_cast<int>(evicted_handles.size());
+    const int evicted_rows = static_cast<int>(resize.evicted_handles.size());
     m_scrollback_evicted_rows = evicted_rows;
     if (evicted_rows > 0) {
         record_primary_history_delta(
@@ -5689,6 +5913,15 @@ void Terminal_screen_model::apply_dec_private_mode(
             // This follows the xterm DECNKM polarity used by modern TUI software.
             set_application_keypad_mode(enabled);
             return;
+        case 80:
+            // DECSDM set places sixel images at the page home without
+            // scrolling, the polarity of xterm and OpenConsole.
+            m_sixel_display_mode = enabled;
+            return;
+        case 1070:
+            // Sixel color registers are always private to each image.
+            generated_actions.push_back(make_private_mode_diagnostic(mode, sequence));
+            return;
         case 47:
             if (enabled) {
                 enter_alternate_screen(false, mode);
@@ -5785,6 +6018,10 @@ int Terminal_screen_model::dec_private_mode_status(int mode) const
             return m_modes.autowrap ? 1 : 2;
         case 66:
             return m_application_keypad ? 1 : 2;
+        case 80:
+            return m_sixel_display_mode ? 1 : 2;
+        case 1070:
+            return 3;
         case 47:
         case 1047:
         case 1049: return m_active_buffer_id == Terminal_buffer_id::ALTERNATE ? 1 : 2;
@@ -5922,6 +6159,15 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
                     source,
                     hyperlink_identity_keys,
                     active_hyperlink_identity_keys_by_id));
+        }
+        if (append.image_slice_dropped && interaction_trace_enabled()) {
+            record_interaction_trace(
+                "history",
+                "image-slice-dropped",
+                QStringLiteral("retained_line_id=%1 image_bytes=%2 max_record_bytes=%3")
+                    .arg(row.retained_line_provenance.retained_line_id)
+                    .arg(terminal_history_row_record_image_section_bytes(*row.image_slice))
+                    .arg(m_primary_backing.retained_history.ring->max_record_bytes()));
         }
         if (append.record_discarded) {
             ++m_scrollback_evicted_rows;
@@ -6627,11 +6873,7 @@ void Terminal_screen_model::advance_row()
     m_pending_wrap = false;
 
     if (m_cursor.row == m_scroll_bottom) {
-        scroll_up_region(
-            m_scroll_top,
-            m_scroll_bottom,
-            m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
-                m_scroll_top == 0);
+        scroll_active_region_up();
         mark_cursor_dirty();
         return;
     }
@@ -6641,6 +6883,241 @@ void Terminal_screen_model::advance_row()
         mark_cursor_dirty();
         return;
     }
+}
+
+// One line feed's worth of scrolling at the bottom margin: only a primary
+// screen region that starts at the top row feeds history.
+void Terminal_screen_model::scroll_active_region_up()
+{
+    scroll_up_region(
+        m_scroll_top,
+        m_scroll_bottom,
+        m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
+            m_scroll_top == 0);
+}
+
+void Terminal_screen_model::place_sixel_image(
+    const Screen_sixel_image_mutation& image,
+    std::vector<Parser_action>&        generated_actions)
+{
+    // Only the cell pixel size says which text rows an image covers. Without
+    // it the image is dropped whole, cursor movement included, the way the
+    // CSI 14 t and CSI 16 t pixel reports are unsupported then.
+    if (!m_config.cell_pixel_size.has_value()) {
+        generated_actions.push_back(make_unsupported_sequence_diagnostic(
+            QStringLiteral("DCS sixel"),
+            Parser_sequence_family::DCS,
+            0U,
+            0U,
+            Parser_recovery_strategy::DISCARD_STRING));
+        return;
+    }
+
+    const terminal_cell_pixel_size_t cell = *m_config.cell_pixel_size;
+    const int band_count = image.raster.isNull()
+        ? 0
+        : (image.raster.height() + cell.height - 1) / cell.height;
+
+    // DECSDM set: the image starts at the page home whatever the origin mode
+    // and margins say, never scrolls, is clipped at the bottom of the page and
+    // leaves the cursor where it was.
+    if (m_sixel_display_mode) {
+        for (int band = 0; band < std::min(band_count, m_config.grid_size.rows); ++band) {
+            place_image_band(image.raster, band * cell.height, band, 0, cell);
+        }
+        return;
+    }
+
+    // Otherwise the image starts at the cursor. As in OpenConsole, an image
+    // that would start below the bottom margin is dropped whole.
+    const terminal_grid_position_t origin = m_cursor;
+    if (origin.row > m_scroll_bottom) {
+        return;
+    }
+
+    // The VT340 puts the text cursor on the row that the top of the final
+    // sixel row falls in, at the image's first column, and scrolls the region
+    // just enough for that whole sixel row to fit above the bottom margin.
+    const std::int64_t final_sixel_row_bottom =
+        static_cast<std::int64_t>(image.final_cursor_y) +
+        static_cast<std::int64_t>(6 * image.pixel_aspect_ratio);
+    const std::int64_t covered_rows =
+        (final_sixel_row_bottom + cell.height - 1) / cell.height;
+    const std::int64_t scroll_count = std::max<std::int64_t>(
+        0,
+        origin.row + covered_rows - 1 - m_scroll_bottom);
+
+    // Each band is placed before any scroll moves it, so the bands a region
+    // at the top of the screen scrolls off reach history with their rows.
+    // Bands left over once the region has scrolled enough are clipped.
+    std::int64_t scrolls = 0;
+    for (int band = 0; band < band_count; ++band) {
+        std::int64_t row = origin.row + band - scrolls;
+        if (row > m_scroll_bottom) {
+            if (scrolls == scroll_count) {
+                break;
+            }
+            scroll_active_region_up();
+            ++scrolls;
+            row = m_scroll_bottom;
+        }
+        place_image_band(
+            image.raster,
+            band * cell.height,
+            static_cast<int>(row),
+            origin.column,
+            cell);
+    }
+
+    // The image's geometry may ask for far more scrolls than its pixels fill.
+    // Once the region has scrolled its full height it is blank, and once the
+    // scrollback limit more have fed history, so is all of history; further
+    // scrolls change nothing, so they are skipped. The cursor row still
+    // follows the full count.
+    const bool scrolls_feed_history =
+        m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
+        m_scroll_top == 0;
+    const std::int64_t state_changing_scrolls =
+        static_cast<std::int64_t>(m_scroll_bottom - m_scroll_top + 1) +
+        (scrolls_feed_history ? m_config.scrollback_limit : 0);
+    const std::int64_t trailing_scrolls =
+        std::min(scroll_count - scrolls, state_changing_scrolls);
+    for (std::int64_t step = 0; step < trailing_scrolls; ++step) {
+        scroll_active_region_up();
+    }
+
+    const std::int64_t cursor_row = std::clamp<std::int64_t>(
+        origin.row - scroll_count + image.final_cursor_y / cell.height,
+        0,
+        m_config.grid_size.rows - 1);
+    if (scroll_count > 0 || cursor_row != origin.row) {
+        mark_cursor_dirty();
+        m_cursor.row   = static_cast<int>(cursor_row);
+        m_pending_wrap = false;
+        mark_cursor_dirty();
+    }
+}
+
+void Terminal_screen_model::place_image_band(
+    const QImage&              raster,
+    int                        band_top,
+    int                        row,
+    int                        first_column,
+    terminal_cell_pixel_size_t cell)
+{
+    // Clip at the right margin, and copy the band out of the decoder's raster,
+    // which may be a view keeping a larger capacity buffer alive.
+    const int band_width = static_cast<int>(std::min<std::int64_t>(
+        raster.width(),
+        static_cast<std::int64_t>(m_config.grid_size.columns - first_column) * cell.width));
+    const int band_height  = std::min(cell.height, raster.height() - band_top);
+    const int band_columns = (band_width + cell.width - 1) / cell.width;
+
+    QImage band(band_width, band_height, QImage::Format_RGBA8888_Premultiplied);
+    // QImage reports a failed allocation with a null image, not an exception.
+    if (band.isNull()) {
+        throw std::bad_alloc();
+    }
+
+    // A cell is covered when its block receives at least one drawn pixel;
+    // undrawn pixels are all zero.
+    std::vector<unsigned char> covered_columns(static_cast<std::size_t>(band_columns), 0U);
+    bool any_covered = false;
+    for (int y = 0; y < band_height; ++y) {
+        const auto* source =
+            reinterpret_cast<const std::uint32_t*>(raster.constScanLine(band_top + y));
+        std::memcpy(
+            band.scanLine(y),
+            source,
+            static_cast<std::size_t>(band_width) * sizeof(std::uint32_t));
+        for (int column = 0; column < band_columns; ++column) {
+            if (covered_columns[static_cast<std::size_t>(column)] != 0U) {
+                continue;
+            }
+            const int x_end = std::min(band_width, (column + 1) * cell.width);
+            for (int x = column * cell.width; x < x_end; ++x) {
+                if (source[x] != 0U) {
+                    covered_columns[static_cast<std::size_t>(column)] = 1U;
+                    any_covered = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // A band with nothing drawn leaves the row as it was.
+    if (!any_covered) {
+        return;
+    }
+
+    // Text under an image would draw over it, so a covered cell loses its
+    // text and hyperlink and keeps its style, the way an erase leaves a cell;
+    // a wide glyph with a covered cell is cleared whole.
+    Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+    std::vector<Cell> before_cells;
+    for (int index = 0; index < band_columns; ++index) {
+        if (covered_columns[static_cast<std::size_t>(index)] == 0U) {
+            continue;
+        }
+
+        const int base_column = cell_base_column_in_row(screen_row, first_column + index);
+        const Cell& base_cell = screen_row.cells[static_cast<std::size_t>(base_column)];
+        const int span_end = std::min(
+            m_config.grid_size.columns,
+            base_column + std::max(1, base_cell.display_width));
+        Cell cleared;
+        if (base_cell.style_id != k_default_terminal_style_id) {
+            cleared.occupied = true;
+            cleared.style_id = base_cell.style_id;
+        }
+
+        for (int column = base_column; column < span_end; ++column) {
+            Cell& cell_to_clear = screen_row.cells[static_cast<std::size_t>(column)];
+            const bool already_cleared =
+                cell_to_clear.occupied          == cleared.occupied          &&
+                cell_to_clear.style_id          == cleared.style_id          &&
+                cell_to_clear.hyperlink_id      == cleared.hyperlink_id      &&
+                cell_to_clear.wide_continuation == cleared.wide_continuation &&
+                cell_to_clear.display_width     == cleared.display_width     &&
+                cell_to_clear.text              == cleared.text;
+            if (already_cleared) {
+                continue;
+            }
+            if (before_cells.empty()) {
+                before_cells = screen_row.cells;
+            }
+            cell_to_clear = cleared;
+        }
+    }
+    if (!before_cells.empty()) {
+        advance_row_content_generation_if_changed(screen_row, before_cells);
+    }
+
+    int slice_first_column = first_column;
+    if (screen_row.image_slice != nullptr) {
+        band = composite_image_band(
+            *screen_row.image_slice,
+            band,
+            first_column,
+            cell,
+            slice_first_column);
+    }
+    screen_row.image_slice = make_image_slice(std::move(band), slice_first_column, cell);
+    mark_terminal_content_changed();
+    mark_dirty(row);
+}
+
+std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_slice(
+    QImage                     pixels,
+    int                        first_column,
+    terminal_cell_pixel_size_t cell_pixel_size)
+{
+    return std::make_shared<const Terminal_image_slice>(Terminal_image_slice{
+        std::move(pixels),
+        first_column,
+        cell_pixel_size,
+        m_next_image_slice_revision++,
+    });
 }
 
 void Terminal_screen_model::backspace()
@@ -7823,6 +8300,7 @@ Terminal_history_row_record Terminal_screen_model::history_row_record_from_retai
     history_record.style_table = retained_record.style_table;
     history_record.hyperlink_identity_keys = retained_record.hyperlink_identity_keys;
     history_record.metadata = retained_record.metadata;
+    history_record.image_slice = retained_record.row.image_slice;
     history_record.cells.reserve(retained_record.row.cells.size());
 
     for (const Cell& cell : retained_record.row.cells) {
@@ -7849,6 +8327,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
     retained_record.style_table = history_record.style_table;
     retained_record.hyperlink_identity_keys = history_record.hyperlink_identity_keys;
     retained_record.metadata = history_record.metadata;
+    retained_record.row.image_slice = history_record.image_slice;
     retained_record.row.cells.reserve(history_record.cells.size());
 
     for (std::size_t index = 0; index < history_record.cells.size(); ++index) {
@@ -8121,7 +8600,8 @@ Terminal_screen_model::primary_backing_row(primary_backing_row_t row) const
             VNM_TERMINAL_PROFILE_SCOPE(
                 "Terminal_screen_model::primary_backing_row::retained_history_materialize");
             retained_record = m_primary_backing.materialize_retained_history_record(
-                static_cast<std::size_t>(row.value));
+                static_cast<std::size_t>(row.value),
+                Terminal_history_row_record_image_decode::SKIP_PIXELS);
         }
         return retained_record.has_value()
             ? std::optional<Terminal_screen_row>(std::move(retained_record->row))
@@ -8265,7 +8745,8 @@ bool Terminal_screen_model::search_row_text_impl(
     if (logical_row < scrollback_size()) {
         std::optional<retained_row_record_t> record =
             m_primary_backing.materialize_retained_history_record(
-                static_cast<std::size_t>(logical_row));
+                static_cast<std::size_t>(logical_row),
+                Terminal_history_row_record_image_decode::SKIP_PIXELS);
         if (!record.has_value()) {
             return false;
         }

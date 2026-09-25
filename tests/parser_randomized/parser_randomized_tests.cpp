@@ -2191,6 +2191,9 @@ Test_case make_dcs_test_case(
     Test_case test_case;
     test_case.name                           = name;
     test_case.config                         = {term::terminal_grid_size_t{2, 12}, 4, 4};
+    // With a cell pixel size a sixel image is placed, so its chunking is
+    // checked through placement too and adds no diagnostic of its own.
+    test_case.config.cell_pixel_size         = term::terminal_cell_pixel_size_t{10, 20};
     test_case.bytes                          = QByteArrayLiteral("A") + dcs + QByteArrayLiteral("B");
     test_case.expected_visible_text_utf8     = QByteArrayLiteral("AB\n");
     test_case.has_expected_visible_text_utf8 = true;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -362,6 +364,140 @@ terminal_canvas_fixture_behavior_smoke_cases()
             "1b5b353b31481b5b313b34721b5b343b31480d0a4e4558541b5b721b5b353b3148",
         },
     };
+
+    return cases;
+}
+
+// One case of the sixel cursor-sync gate: through the packaged ConPTY the
+// child writes the payload, setup and one sixel image, and reports where
+// OpenConsole left its cursor, which the session's model cursor must match.
+struct Terminal_canvas_fixture_sixel_cursor_case
+{
+    std::string        name;
+    std::string        payload;
+    // Zero keeps the session's default retained history capacity.
+    std::size_t        retained_history_capacity_bytes = 0U;
+    // Recorded, not asserted: no adopted rule covers the case yet.
+    bool               observation_only                = false;
+};
+
+// Written for a 24 x 80 screen and the fixed 10 x 20 cell OpenConsole places
+// images on.
+inline std::vector<Terminal_canvas_fixture_sixel_cursor_case>
+terminal_canvas_fixture_sixel_cursor_cases()
+{
+    const auto cursor_to = [](int row, int column) {
+        return "\x1b[" + std::to_string(row + 1) + ';' + std::to_string(column + 1) + 'H';
+    };
+    const auto image = [](std::string_view parameters, const std::string& data) {
+        return "\x1bP" + std::string(parameters) + 'q' + data + "\x1b\\";
+    };
+    // Register 1 as red, then `rows` sixel rows of `width` copies of one sixel,
+    // each row but the last followed by a graphics new line.
+    const auto sixel_rows = [](int width, int rows, char sixel = '~') {
+        std::string data = "#1;2;100;0;0";
+        for (int row = 0; row < rows; ++row) {
+            data += "#1!" + std::to_string(width) + sixel;
+            if (row + 1 < rows) {
+                data += '-';
+            }
+        }
+        return data;
+    };
+
+    std::vector<Terminal_canvas_fixture_sixel_cursor_case> cases;
+
+    // Images of one, two and five 20-pixel bands at each pixel aspect ratio,
+    // from a row close enough to the bottom that the taller ones scroll. At
+    // 5:1 one full sixel row is already two bands, so the one-band image
+    // draws only the top pixel row of its sixels.
+    struct band_case_t
+    {
+        const char* aspect;
+        const char* parameters;
+        int         rows;
+        char        sixel;
+        int         bands;
+    };
+    const band_case_t band_cases[] = {
+        {"1:1", "7;1", 3,  '~', 1},
+        {"1:1", "7;1", 6,  '~', 2},
+        {"1:1", "7;1", 16, '~', 5},
+        {"2:1", "0;1", 1,  '~', 1},
+        {"2:1", "0;1", 3,  '~', 2},
+        {"2:1", "0;1", 8,  '~', 5},
+        {"3:1", "3;1", 1,  '~', 1},
+        {"3:1", "3;1", 2,  '~', 2},
+        {"3:1", "3;1", 5,  '~', 5},
+        {"5:1", "2;1", 1,  '@', 1},
+        {"5:1", "2;1", 1,  '~', 2},
+        {"5:1", "2;1", 3,  '~', 5},
+    };
+    for (const band_case_t& band_case : band_cases) {
+        const std::string data = sixel_rows(30, band_case.rows, band_case.sixel);
+        cases.push_back({
+            std::to_string(band_case.bands) + " band(s) at " + band_case.aspect,
+            cursor_to(20, 5) + image(band_case.parameters, data),
+        });
+    }
+
+    cases.push_back({
+        "raster attributes 1;1 over P1 0",
+        cursor_to(20, 5) + image("0;1", "\"1;1;30;18" + sixel_rows(30, 3)),
+    });
+    cases.push_back({
+        "raster attributes 3;2 round up to 2:1",
+        cursor_to(20, 5) + image("7;1", "\"3;2;30;36" + sixel_rows(30, 3)),
+    });
+    cases.push_back({
+        "trailing graphics new line",
+        cursor_to(20, 5) + image("0;1", sixel_rows(30, 2) + '-'),
+    });
+    cases.push_back({
+        "DECSDM set",
+        "\x1b[?80h" + cursor_to(10, 10) + image("7;1", sixel_rows(30, 16)),
+    });
+    cases.push_back({
+        "DECSDM reset",
+        "\x1b[?80l" + cursor_to(10, 10) + image("7;1", sixel_rows(30, 16)),
+    });
+    cases.push_back({
+        "bottom margin of the full screen",
+        cursor_to(23, 0) + image("7;1", sixel_rows(30, 16)),
+    });
+    cases.push_back({
+        "bottom margin of a scroll region",
+        "\x1b[5;15r" + cursor_to(14, 0) + image("7;1", sixel_rows(30, 16)),
+    });
+    cases.push_back({
+        "origin below the scroll region",
+        "\x1b[5;15r" + cursor_to(20, 3) + image("7;1", sixel_rows(30, 6)),
+    });
+    cases.push_back({
+        "origin above the scroll region, overflowing it",
+        "\x1b[10;15r" + cursor_to(5, 0) + image("7;1", sixel_rows(30, 40)),
+        0U,
+        true,
+    });
+    cases.push_back({
+        "empty image at the bottom",
+        cursor_to(23, 0) + image("0;1", "---"),
+    });
+    // 200 x 204 pixels is 163200 bytes, over the 131072 byte cap of a 1 MiB
+    // retained history ring; OpenConsole shows it whole.
+    cases.push_back({
+        "image over the decoded-size cap",
+        cursor_to(5, 0) + image("7;1", sixel_rows(200, 34)),
+        1024U * 1024U,
+    });
+    cases.push_back({
+        "CAN in the middle of an image",
+        cursor_to(10, 5) + "\x1bP7;1q" + sixel_rows(30, 3) + '\x18',
+    });
+    cases.push_back({
+        "pending wrap and one band, then text",
+        cursor_to(10, 0) + std::string(80, 'x') + image("7;1", sixel_rows(30, 3)) + 'X',
+    });
 
     return cases;
 }

@@ -326,6 +326,26 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_sixel_decoder>"
 )
 
+add_executable(vnm_terminal_sixel_placement
+    sixel_placement/sixel_placement_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_sixel_placement PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_sixel_placement PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_sixel_placement
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_sixel_placement>"
+)
+
 add_executable(vnm_terminal_unicode_width
     unicode_width/unicode_width_tests.cpp
 )
@@ -2229,6 +2249,20 @@ if(WIN32)
     )
 
     add_test(
+        NAME vnm_terminal_windows_conpty_sixel_cursor_sync
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --sixel-cursor-sync
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+    )
+    set_tests_properties(vnm_terminal_windows_conpty_sixel_cursor_sync PROPERTIES
+        LABELS "conformance;windows;conpty;sixel"
+        TIMEOUT 180
+    )
+
+    add_test(
         NAME vnm_terminal_windows_conpty_async_resize_stop
         COMMAND
             "${CMAKE_COMMAND}" -E env
@@ -2349,6 +2383,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_profiler
     vnm_terminal_parser_ir
     vnm_terminal_sixel_decoder
+    vnm_terminal_sixel_placement
     vnm_terminal_unicode_width
     vnm_terminal_unicode_width_tables
     vnm_terminal_history_ring

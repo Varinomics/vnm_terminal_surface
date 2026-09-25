@@ -4,9 +4,12 @@
 #include "vnm_terminal/internal/unicode_width.h"
 
 #include <QByteArrayView>
+#include <QImage>
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -25,15 +28,23 @@ constexpr std::uint32_t k_row_record_header_bytes = 100U;
 constexpr std::uint32_t k_payload_kind_mask = 0x0fU;
 constexpr std::uint32_t k_row_record_flag_ambiguous_content_stamp = 0x10U;
 constexpr std::uint32_t k_row_record_flag_content_origin_spans = 0x20U;
+// A row that shows an image carries it in a presence-flagged section, so the
+// record version and every image-free row stay as they were.
+constexpr std::uint32_t k_row_record_flag_image_section = 0x40U;
 constexpr std::uint32_t k_row_record_known_flags_mask =
     k_payload_kind_mask |
     k_row_record_flag_ambiguous_content_stamp |
-    k_row_record_flag_content_origin_spans;
+    k_row_record_flag_content_origin_spans |
+    k_row_record_flag_image_section;
 constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
 constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
 constexpr std::size_t k_encoded_style_bytes = 16U;
 constexpr std::size_t k_encoded_content_origin_span_bytes = 35U;
 constexpr std::size_t k_content_origin_span_count_bytes = 4U;
+// First column (4), cell width and height (2 + 2), pixel width and height
+// (4 + 4) and revision (8); the pixel rows follow, packed at width x 4 bytes.
+constexpr std::size_t k_image_section_fixed_bytes = 24U;
+constexpr std::size_t k_image_section_pixel_bytes = 4U;
 
 constexpr std::uint8_t k_opcode_default_blank = 0x00U;
 constexpr std::uint8_t k_opcode_wide_continuation = 0x01U;
@@ -97,6 +108,16 @@ struct row_record_header_t
     std::uint16_t                 wrap_state = 0U;
     std::uint16_t                 provenance_source = 0U;
     std::uint16_t                 style_count = 0U;
+};
+
+struct image_section_header_t
+{
+    std::uint32_t                 first_column = 0U;
+    std::uint16_t                 cell_width = 0U;
+    std::uint16_t                 cell_height = 0U;
+    std::uint32_t                 pixel_width = 0U;
+    std::uint32_t                 pixel_height = 0U;
+    std::uint64_t                 revision = 0U;
 };
 
 bool checked_add(std::size_t& total, std::size_t value)
@@ -278,6 +299,17 @@ public:
         return true;
     }
 
+    bool write_raw(const uchar* bytes, std::size_t byte_count)
+    {
+        if (!can_write(byte_count)) {
+            return false;
+        }
+
+        std::memcpy(m_bytes.data() + m_offset, bytes, byte_count);
+        m_offset += byte_count;
+        return true;
+    }
+
     bool write_width_coded(std::uint32_t value, std::uint8_t width_code)
     {
         if (!width_code_is_valid(width_code)) {
@@ -368,6 +400,27 @@ public:
         bytes = QByteArray(
             reinterpret_cast<const char*>(m_bytes.data() + m_offset),
             static_cast<qsizetype>(byte_count));
+        m_offset += byte_count;
+        return true;
+    }
+
+    bool read_raw(std::size_t byte_count, uchar* bytes)
+    {
+        if (!can_read(byte_count)) {
+            return false;
+        }
+
+        std::memcpy(bytes, m_bytes.data() + m_offset, byte_count);
+        m_offset += byte_count;
+        return true;
+    }
+
+    bool skip(std::size_t byte_count)
+    {
+        if (!can_read(byte_count)) {
+            return false;
+        }
+
         m_offset += byte_count;
         return true;
     }
@@ -738,6 +791,174 @@ Terminal_history_row_record_codec_status read_content_origin_span_table(
         previous_end = span_end;
     }
 
+    return Terminal_history_row_record_codec_status::OK;
+}
+
+// The one geometry rule for an image section, checked where a section is
+// encoded and where one is read back, so every section the encoder writes
+// decodes. A slice may reach past its row's source width once the grid has
+// narrowed, so its span is bounded only by the widest supported row. The
+// bound also keeps the section size well inside std::size_t: the pixel width
+// stays under 4096 x 65535 and the height at or under 65535.
+bool image_section_geometry_is_valid(const image_section_header_t& section)
+{
+    if (section.cell_width   == 0U || section.cell_height  == 0U ||
+        section.pixel_width  == 0U || section.pixel_height == 0U ||
+        section.pixel_height > section.cell_height)
+    {
+        return false;
+    }
+
+    const std::uint64_t column_span =
+        (static_cast<std::uint64_t>(section.pixel_width) + section.cell_width - 1U) /
+        section.cell_width;
+    return
+        static_cast<std::uint64_t>(section.first_column) + column_span <=
+        static_cast<std::uint64_t>(k_terminal_screen_model_max_columns);
+}
+
+std::size_t image_section_bytes(std::uint64_t pixel_width, std::uint64_t pixel_height)
+{
+    return static_cast<std::size_t>(
+        k_image_section_fixed_bytes + pixel_width * pixel_height * k_image_section_pixel_bytes);
+}
+
+Terminal_history_row_record_codec_status image_section_header_from_slice(
+    const Terminal_image_slice& slice,
+    image_section_header_t&     section)
+{
+    if (slice.pixels.format() != QImage::Format_RGBA8888_Premultiplied) {
+        return Terminal_history_row_record_codec_status::INVALID_ARGUMENT;
+    }
+
+    const terminal_cell_pixel_size_t cell = slice.cell_pixel_size;
+    if (slice.first_column   < 0 || cell.width          <= 0 || cell.height <= 0 ||
+        slice.pixels.width() <= 0 || slice.pixels.height() <= 0)
+    {
+        return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+
+    if (cell.width  > std::numeric_limits<std::uint16_t>::max() ||
+        cell.height > std::numeric_limits<std::uint16_t>::max())
+    {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+
+    section.first_column = static_cast<std::uint32_t>(slice.first_column);
+    section.cell_width   = static_cast<std::uint16_t>(cell.width);
+    section.cell_height  = static_cast<std::uint16_t>(cell.height);
+    section.pixel_width  = static_cast<std::uint32_t>(slice.pixels.width());
+    section.pixel_height = static_cast<std::uint32_t>(slice.pixels.height());
+    section.revision     = slice.revision;
+    return image_section_geometry_is_valid(section)
+        ? Terminal_history_row_record_codec_status::OK
+        : Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+}
+
+Terminal_history_row_record_codec_status validate_and_measure_image_section(
+    const Terminal_history_row_record& record,
+    std::size_t&                       encoded_bytes)
+{
+    encoded_bytes = 0U;
+    if (record.image_slice == nullptr) {
+        return Terminal_history_row_record_codec_status::OK;
+    }
+
+    image_section_header_t section;
+    const Terminal_history_row_record_codec_status status =
+        image_section_header_from_slice(*record.image_slice, section);
+    if (status == Terminal_history_row_record_codec_status::OK) {
+        encoded_bytes = image_section_bytes(section.pixel_width, section.pixel_height);
+    }
+    return status;
+}
+
+bool write_image_section(Byte_writer& writer, const Terminal_history_row_record& record)
+{
+    if (record.image_slice == nullptr) {
+        return true;
+    }
+
+    const Terminal_image_slice& slice = *record.image_slice;
+    image_section_header_t section;
+    if (image_section_header_from_slice(slice, section) !=
+            Terminal_history_row_record_codec_status::OK ||
+        !writer.write_u32(section.first_column) ||
+        !writer.write_u16(section.cell_width)   ||
+        !writer.write_u16(section.cell_height)  ||
+        !writer.write_u32(section.pixel_width)  ||
+        !writer.write_u32(section.pixel_height) ||
+        !writer.write_u64(section.revision))
+    {
+        return false;
+    }
+
+    // RGBA8888 is byte ordered, so each scanline is already the packed row.
+    const std::size_t row_bytes = section.pixel_width * k_image_section_pixel_bytes;
+    for (int y = 0; y < slice.pixels.height(); ++y) {
+        if (!writer.write_raw(slice.pixels.constScanLine(y), row_bytes)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool read_image_section_header(Byte_reader& reader, image_section_header_t& section)
+{
+    return
+        reader.read_u32(section.first_column) &&
+        reader.read_u16(section.cell_width)   &&
+        reader.read_u16(section.cell_height)  &&
+        reader.read_u32(section.pixel_width)  &&
+        reader.read_u32(section.pixel_height) &&
+        reader.read_u64(section.revision);
+}
+
+// Runs after validate_payload_counts, which has checked the section geometry
+// and that its pixel rows lie inside the payload.
+Terminal_history_row_record_codec_status read_image_section(
+    Byte_reader&                             reader,
+    const row_record_header_t&               header,
+    Terminal_history_row_record_image_decode image_decode,
+    Terminal_history_row_record&             record)
+{
+    if ((header.flags & k_row_record_flag_image_section) == 0U) {
+        return Terminal_history_row_record_codec_status::OK;
+    }
+
+    image_section_header_t section;
+    if (!read_image_section_header(reader, section)) {
+        return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+    }
+
+    const std::size_t row_bytes = section.pixel_width * k_image_section_pixel_bytes;
+    if (image_decode == Terminal_history_row_record_image_decode::SKIP_PIXELS) {
+        return reader.skip(row_bytes * section.pixel_height)
+            ? Terminal_history_row_record_codec_status::OK
+            : Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+    }
+
+    QImage pixels(
+        static_cast<int>(section.pixel_width),
+        static_cast<int>(section.pixel_height),
+        QImage::Format_RGBA8888_Premultiplied);
+    // QImage reports a failed allocation with a null image, not an exception.
+    if (pixels.isNull()) {
+        throw std::bad_alloc();
+    }
+
+    for (int y = 0; y < pixels.height(); ++y) {
+        if (!reader.read_raw(row_bytes, pixels.scanLine(y))) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+    }
+
+    record.image_slice = std::make_shared<const Terminal_image_slice>(Terminal_image_slice{
+        std::move(pixels),
+        static_cast<int>(section.first_column),
+        {section.cell_width, section.cell_height},
+        section.revision,
+    });
     return Terminal_history_row_record_codec_status::OK;
 }
 
@@ -1194,7 +1415,15 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
     if (origin_span_status != Terminal_history_row_record_codec_status::OK) {
         return origin_span_status;
     }
-    if (!checked_add(payload_bytes, content_origin_span_bytes)) {
+    std::size_t image_section_bytes = 0U;
+    const Terminal_history_row_record_codec_status image_status =
+        validate_and_measure_image_section(record, image_section_bytes);
+    if (image_status != Terminal_history_row_record_codec_status::OK) {
+        return image_status;
+    }
+    if (!checked_add(payload_bytes, content_origin_span_bytes) ||
+        !checked_add(payload_bytes, image_section_bytes))
+    {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
 
@@ -1208,7 +1437,9 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
     }
 
     payload_bytes = k_row_record_header_bytes;
-    if (!checked_add(payload_bytes, content_origin_span_bytes)) {
+    if (!checked_add(payload_bytes, content_origin_span_bytes) ||
+        !checked_add(payload_bytes, image_section_bytes))
+    {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
     const Terminal_history_row_record_codec_status table_status =
@@ -1520,6 +1751,9 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     if (!record.content_origin_spans.empty()) {
         header.flags |= k_row_record_flag_content_origin_spans;
     }
+    if (record.image_slice != nullptr) {
+        header.flags |= k_row_record_flag_image_section;
+    }
     header.epoch = identity.epoch;
     header.byte_sequence = byte_sequence;
     header.row_sequence = identity.row_sequence;
@@ -1542,6 +1776,12 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     }
 
     if (!write_content_origin_span_table(writer, record)) {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+
+    // The section precedes the styles: it cannot go last, because a prefix
+    // plain-ASCII row takes every remaining byte as its cell stream.
+    if (!write_image_section(writer, record)) {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
 
@@ -1676,8 +1916,29 @@ Terminal_history_row_record_codec_status validate_payload_counts(
         }
     }
 
+    std::size_t image_section_table_bytes = 0U;
+    if ((header.flags & k_row_record_flag_image_section) != 0U) {
+        const std::size_t image_section_offset =
+            k_row_record_header_bytes + content_origin_span_table_bytes;
+        Byte_reader image_section_reader(payload.subspan(image_section_offset));
+        image_section_header_t section;
+        if (!read_image_section_header(image_section_reader, section)) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+        if (!image_section_geometry_is_valid(section)) {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+
+        image_section_table_bytes =
+            image_section_bytes(section.pixel_width, section.pixel_height);
+        if (image_section_table_bytes > payload.size() - image_section_offset) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+    }
+
     std::size_t minimum_payload_bytes = k_row_record_header_bytes;
-    if (!checked_add(minimum_payload_bytes, content_origin_span_table_bytes))
+    if (!checked_add(minimum_payload_bytes, content_origin_span_table_bytes) ||
+        !checked_add(minimum_payload_bytes, image_section_table_bytes))
     {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
@@ -2190,8 +2451,17 @@ Terminal_history_row_record_append_result encode_terminal_history_row_record_to_
     return result;
 }
 
+std::size_t terminal_history_row_record_image_section_bytes(
+    const Terminal_image_slice& slice)
+{
+    return image_section_bytes(
+        static_cast<std::uint64_t>(slice.pixels.width()),
+        static_cast<std::uint64_t>(slice.pixels.height()));
+}
+
 Terminal_history_row_record_decode_result decode_terminal_history_row_record(
     const Terminal_history_ring_read_scope&  read_scope,
+    Terminal_history_row_record_image_decode image_decode,
     std::optional<terminal_history_handle_t> expected_handle)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_row_record_codec::decode_from_ring_read");
@@ -2209,11 +2479,13 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record(
             read_scope.record_bytes(),
             read_scope.payload(),
         },
+        image_decode,
         expected_handle);
 }
 
 Terminal_history_row_record_decode_result decode_terminal_history_row_record_payload(
     terminal_history_row_record_payload_view_t payload_view,
+    Terminal_history_row_record_image_decode   image_decode,
     std::optional<terminal_history_handle_t>   expected_handle)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_row_record_codec::decode_payload");
@@ -2275,6 +2547,11 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
     record.metadata.wrap_state = *wrap;
 
     result.status = read_content_origin_span_table(reader, header, record);
+    if (result.status != Terminal_history_row_record_codec_status::OK) {
+        return result;
+    }
+
+    result.status = read_image_section(reader, header, image_decode, record);
     if (result.status != Terminal_history_row_record_codec_status::OK) {
         return result;
     }

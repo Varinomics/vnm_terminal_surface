@@ -9,6 +9,7 @@
 #include "vnm_terminal/internal/viewport_contract.h"
 #include <QByteArray>
 #include <QChar>
+#include <QImage>
 #include <QString>
 #include <QStringView>
 #include <QtGlobal>
@@ -396,6 +397,27 @@ struct Terminal_render_cell
 };
 
 static_assert(sizeof(Terminal_render_cell) <= 48U);
+
+// One text row's share of a sixel image. Its pixels start at the top left
+// corner of first_column, in RGBA8888 premultiplied device pixels measured
+// against cell_pixel_size, the cell the image was placed on; a renderer scales
+// them to the cell it draws. The model owns a slice through its row, and then
+// through that row's history record; snapshots and the history encoder share
+// it read-only. A slice never changes: a changed row image is a new slice with
+// a new revision, so row identity plus revision keys any cached copy of it.
+struct Terminal_image_slice
+{
+    QImage                     pixels;
+    int                        first_column = 0;
+    terminal_cell_pixel_size_t cell_pixel_size;
+    std::uint64_t              revision     = 0U;
+};
+
+// The columns a slice covers, a partly covered last cell included.
+inline int terminal_image_slice_column_span(const Terminal_image_slice& slice)
+{
+    return (slice.pixels.width() + slice.cell_pixel_size.width - 1) / slice.cell_pixel_size.width;
+}
 
 struct Terminal_render_cursor
 {

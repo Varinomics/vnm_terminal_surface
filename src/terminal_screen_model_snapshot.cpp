@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 
 #include <QByteArray>
 #include <QChar>
@@ -402,7 +403,8 @@ Terminal_screen_model::viewport_row_provenance(
     if (backing_row->value < scrollback_size()) {
         const std::optional<retained_row_record_t> retained_record =
             m_primary_backing.materialize_retained_history_record(
-                static_cast<std::size_t>(backing_row->value));
+                static_cast<std::size_t>(backing_row->value),
+                Terminal_history_row_record_image_decode::SKIP_PIXELS);
         return retained_record.has_value()
             ? std::optional<Terminal_retained_line_provenance>(
                 retained_record->row.retained_line_provenance)
@@ -613,7 +615,8 @@ Terminal_screen_model::viewport_row_cells(
             VNM_TERMINAL_PROFILE_SCOPE(
                 "Terminal_screen_model::viewport_row_cells::retained_history_materialize");
             retained_record = m_primary_backing.materialize_retained_history_record(
-                static_cast<std::size_t>(backing_row->value));
+                static_cast<std::size_t>(backing_row->value),
+                Terminal_history_row_record_image_decode::SKIP_PIXELS);
         }
         if (!retained_record.has_value()) {
             return std::nullopt;

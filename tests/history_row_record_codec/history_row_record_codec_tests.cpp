@@ -2,11 +2,15 @@
 #include "helpers/test_check.h"
 
 #include <QByteArray>
+#include <QImage>
 #include <QString>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <iostream>
 #include <limits>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -201,11 +205,74 @@ bool origin_spans_equal(
     return true;
 }
 
+bool image_pixels_equal(const QImage& left, const QImage& right)
+{
+    if (left.format() != right.format() ||
+        left.width()  != right.width()  ||
+        left.height() != right.height())
+    {
+        return false;
+    }
+
+    const std::size_t row_bytes = static_cast<std::size_t>(left.width()) * 4U;
+    for (int y = 0; y < left.height(); ++y) {
+        if (std::memcmp(left.constScanLine(y), right.constScanLine(y), row_bytes) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool image_slices_equal(
+    const std::shared_ptr<const term::Terminal_image_slice>& left,
+    const std::shared_ptr<const term::Terminal_image_slice>& right)
+{
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+
+    return
+        left->first_column    == right->first_column    &&
+        left->cell_pixel_size == right->cell_pixel_size &&
+        left->revision        == right->revision        &&
+        image_pixels_equal(left->pixels, right->pixels);
+}
+
+// Opaque pixels with a pattern, and every third one undrawn, so both the
+// drawn colors and the zero pixels have to survive a round trip.
+std::shared_ptr<const term::Terminal_image_slice> make_test_image_slice(
+    int                              width,
+    int                              height,
+    int                              first_column,
+    term::terminal_cell_pixel_size_t cell,
+    std::uint64_t                    revision)
+{
+    QImage pixels(width, height, QImage::Format_RGBA8888_Premultiplied);
+    for (int y = 0; y < height; ++y) {
+        uchar* line = pixels.scanLine(y);
+        for (int x = 0; x < width; ++x) {
+            const bool drawn = (x + y) % 3 != 0;
+            line[x * 4 + 0] = drawn ? static_cast<uchar>(x * 17) : 0U;
+            line[x * 4 + 1] = drawn ? static_cast<uchar>(y * 29) : 0U;
+            line[x * 4 + 2] = drawn ? static_cast<uchar>(0x80U)  : 0U;
+            line[x * 4 + 3] = drawn ? static_cast<uchar>(0xffU)  : 0U;
+        }
+    }
+
+    return std::make_shared<const term::Terminal_image_slice>(term::Terminal_image_slice{
+        std::move(pixels),
+        first_column,
+        cell,
+        revision,
+    });
+}
+
 bool records_equal(
     const term::Terminal_history_row_record& left,
     const term::Terminal_history_row_record& right)
 {
     return
+        image_slices_equal(left.image_slice, right.image_slice) &&
         left.cells.size() == right.cells.size() &&
         std::equal(
             left.cells.begin(),
@@ -242,7 +309,10 @@ term::Terminal_history_row_record_decode_result append_and_decode(
 
     const term::Terminal_history_ring_read_scope read =
         ring.read_record(append.commit.byte_sequence);
-    return term::decode_terminal_history_row_record(read, append.history_handle);
+    return term::decode_terminal_history_row_record(
+        read,
+        term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
+        append.history_handle);
 }
 
 std::vector<std::byte> payload_bytes(
@@ -315,6 +385,7 @@ term::Terminal_history_row_record_decode_result decode_mutated_payload(
             record_bytes_for_payload(payload),
             payload,
         },
+        term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
         std::nullopt);
 }
 
@@ -655,7 +726,10 @@ bool test_ambiguous_provenance_and_origin_spans_round_trip()
     const term::Terminal_history_ring_read_scope generic_read =
         ring.read_record(generic_append.commit.byte_sequence);
     const term::Terminal_history_row_record_decode_result generic_decoded =
-        term::decode_terminal_history_row_record(generic_read, generic_append.history_handle);
+        term::decode_terminal_history_row_record(
+            generic_read,
+            term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
+            generic_append.history_handle);
     ok &= check(generic_append.status == term::Terminal_history_row_record_codec_status::OK &&
             generic_decoded.status == term::Terminal_history_row_record_codec_status::OK,
         "generic compact payload encodes and decodes mixed-origin metadata");
@@ -1703,6 +1777,7 @@ bool test_header_and_handle_validation_failures()
                 read.record_bytes(),
                 bad_header,
             },
+            term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
             append.history_handle);
     ok &= check(header_failure.status ==
             term::Terminal_history_row_record_codec_status::INVALID_HEADER,
@@ -1717,7 +1792,7 @@ bool test_header_and_handle_validation_failures()
         "decode rejects the previous payload layout instead of defaulting absent provenance");
 
     std::vector<std::byte> bad_flags = payload;
-    write_le_u32(bad_flags, k_header_flags_offset, 0x40U);
+    write_le_u32(bad_flags, k_header_flags_offset, 0x80U);
     const term::Terminal_history_row_record_decode_result flags_failure =
         decode_mutated_payload(read, bad_flags);
     ok &= check(flags_failure.status ==
@@ -1727,7 +1802,10 @@ bool test_header_and_handle_validation_failures()
     term::terminal_history_handle_t wrong_generation = append.history_handle;
     ++wrong_generation.content_generation;
     const term::Terminal_history_row_record_decode_result generation_failure =
-        term::decode_terminal_history_row_record(read, wrong_generation);
+        term::decode_terminal_history_row_record(
+            read,
+            term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
+            wrong_generation);
     ok &= check(generation_failure.status ==
             term::Terminal_history_row_record_codec_status::CONTENT_GENERATION_MISMATCH,
         "decode validates expected content generation");
@@ -1739,6 +1817,7 @@ bool test_header_and_handle_validation_failures()
                 read.record_bytes() + 1U,
                 payload,
             },
+            term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
             std::nullopt);
     ok &= check(size_failure.status ==
             term::Terminal_history_row_record_codec_status::RECORD_SIZE_MISMATCH,
@@ -1780,6 +1859,7 @@ bool test_materialized_decode_owns_data_after_read_scope_and_eviction()
             ring.read_record(first_append.commit.byte_sequence);
         materialized = term::decode_terminal_history_row_record(
             read,
+            term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
             first_append.history_handle);
     }
     ok &= check(materialized.status == term::Terminal_history_row_record_codec_status::OK,
@@ -1809,6 +1889,403 @@ bool test_materialized_decode_owns_data_after_read_scope_and_eviction()
             materialized.record.hyperlink_identity_keys.at(k_first_hyperlink_ref) ==
                 QByteArrayLiteral("uri:https://example.test/owned"),
         "decoded materialization remains owned after read-scope end and ring eviction");
+
+    return ok;
+}
+
+struct Byte_identity_fixture
+{
+    const char*                                  name;
+    term::Terminal_history_row_record            record;
+    term::terminal_history_row_record_identity_t identity;
+    QByteArray                                   expected_hex;
+};
+
+// Image-free rows must encode exactly as they did before the optional image
+// section existed. The expected bytes were captured from the codec before that
+// section was added, so any drift in the shared layout fails here.
+bool test_image_free_records_encode_byte_identically()
+{
+    bool ok = true;
+
+    std::vector<Byte_identity_fixture> fixtures;
+
+    term::Terminal_history_row_record prefix_ascii = make_base_record(
+        301U,
+        7U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        8);
+    prefix_ascii.provenance.content_stamp_ms = 1764000000123LL;
+    for (const QChar character : QStringLiteral("hello")) {
+        prefix_ascii.cells.push_back(make_cell(QString(character), 1, true));
+    }
+    prefix_ascii.cells.resize(8U);
+    fixtures.push_back({
+        "prefix plain ASCII row",
+        prefix_ascii,
+        make_identity(3U, 301U),
+        QByteArrayLiteral(
+            "524852560400010064000000690000009100000001000000030000000000000000000000000000002d01000000000000"
+            "07000000000000002d0100000000000007000000000000007be897b69a01000008000000080000000000000000000000"
+            "0000000068656c6c6f"),
+    });
+
+    term::Terminal_history_row_record generic = make_base_record(
+        302U,
+        11U,
+        term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        7);
+    generic.provenance.content_stamp_ms = 1764000000456LL;
+    generic.metadata.wrap_state = term::Terminal_retained_row_wrap_state::SOFT_WRAP;
+    generic.style_table.push_back(red_style());
+    generic.style_table.push_back(palette_style());
+    generic.hyperlink_identity_keys.emplace(
+        k_first_hyperlink_ref,
+        QByteArrayLiteral("uri:https://example.test/wide"));
+    generic.hyperlink_identity_keys.emplace(
+        k_second_hyperlink_ref,
+        QByteArrayLiteral("uri:https://example.test/clipped"));
+    generic.cells.push_back(make_cell(QString::fromUtf8("\xc3\xa9"), 1, true, 1U));
+    generic.cells.push_back(make_cell(QStringLiteral(" "), 1, false, 2U));
+    generic.cells.push_back(make_cell(
+        QString::fromUtf8("\xe7\x95\x8c"),
+        2,
+        true,
+        1U,
+        k_first_hyperlink_ref));
+    generic.cells.push_back(make_wide_continuation(1U, k_first_hyperlink_ref));
+    generic.cells.push_back(make_cell(
+        QString::fromUtf8("\xe4\xb8\x80"),
+        1,
+        true,
+        term::k_default_terminal_style_id,
+        k_second_hyperlink_ref));
+    generic.cells.push_back(make_cell(QStringLiteral("Z"), 1, true));
+    generic.cells.resize(7U);
+    fixtures.push_back({
+        "generic row with styles, hyperlinks, wide and clipped cells",
+        generic,
+        make_identity(3U, 302U),
+        QByteArrayLiteral(
+            "524852560400010064000000e30000000b01000000000000030000000000000000000000000000002e01000000000000"
+            "0b000000000000002e010000000000000b00000000000000c8e997b69a01000007000000070000000200000000000100"
+            "010002000200000000ccff00000000000000000001010000000000000000000000000000011d7572693a68747470733a"
+            "2f2f6578616d706c652e746573742f7769646501207572693a68747470733a2f2f6578616d706c652e746573742f636c"
+            "697070656402050201c3a902140202c50503020101e7958c010281040302e4b8805a00"),
+    });
+
+    term::Terminal_history_row_record origin_spans = make_base_record(
+        303U,
+        13U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        4);
+    origin_spans.provenance.content_stamp_ms = 1764000000789LL;
+    for (const QChar character : QStringLiteral("ABCD")) {
+        origin_spans.cells.push_back(make_cell(QString(character), 1, true));
+    }
+    origin_spans.content_origin_spans = {
+        make_origin_span(
+            0,
+            2,
+            71U,
+            81U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+            1764000000789LL),
+        make_origin_span(
+            2,
+            2,
+            72U,
+            82U,
+            term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+            1764000000790LL),
+    };
+    fixtures.push_back({
+        "row with content-origin spans",
+        origin_spans,
+        make_identity(3U, 303U),
+        QByteArrayLiteral(
+            "524852560400010064000000b2000000da00000021000000030000000000000000000000000000002f01000000000000"
+            "0d000000000000002f010000000000000d0000000000000015eb97b69a01000004000000040000000000000000000000"
+            "0000000002000000000000000200000047000000000000005100000000000000000015eb97b69a010000010200000002"
+            "00000048000000000000005200000000000000010016eb97b69a0100000141424344"),
+    });
+
+    term::Terminal_history_row_record ambiguous_stamp = make_base_record(
+        304U,
+        17U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        3);
+    ambiguous_stamp.provenance.content_stamp_is_unambiguous = false;
+    for (const QChar character : QStringLiteral("xyz")) {
+        ambiguous_stamp.cells.push_back(make_cell(QString(character), 1, true));
+    }
+    fixtures.push_back({
+        "row with an ambiguous content stamp",
+        ambiguous_stamp,
+        make_identity(3U, 304U),
+        QByteArrayLiteral(
+            "524852560400010064000000670000008f00000011000000030000000000000000000000000000003001000000000000"
+            "110000000000000030010000000000001100000000000000000000000000000003000000030000000000000000000000"
+            "0000000078797a"),
+    });
+
+    for (const Byte_identity_fixture& fixture : fixtures) {
+        term::Terminal_history_ring ring({4096U, 4096U});
+        const term::Terminal_history_row_record_append_result append =
+            term::encode_terminal_history_row_record_to_ring(
+                ring,
+                fixture.record,
+                fixture.identity);
+        if (!check(append.status == term::Terminal_history_row_record_codec_status::OK,
+                fixture.name))
+        {
+            ok = false;
+            continue;
+        }
+
+        const std::vector<std::byte> payload = payload_bytes(ring, append);
+        const QByteArray actual_hex = QByteArray(
+            reinterpret_cast<const char*>(payload.data()),
+            static_cast<qsizetype>(payload.size())).toHex();
+        if (actual_hex != fixture.expected_hex) {
+            std::cerr << "FAIL: " << fixture.name << " encodes differently; actual hex: "
+                << actual_hex.constData() << '\n';
+            ok = false;
+        }
+    }
+
+    return ok;
+}
+
+constexpr std::uint32_t k_image_section_flag = 0x40U;
+constexpr std::size_t k_image_section_first_column_offset = 0U;
+constexpr std::size_t k_image_section_cell_height_offset  = 6U;
+constexpr std::size_t k_image_section_pixel_width_offset  = 8U;
+constexpr std::size_t k_image_section_pixel_height_offset = 12U;
+constexpr std::size_t k_image_section_fixed_bytes         = 24U;
+
+bool test_image_section_round_trips()
+{
+    bool ok = true;
+    const term::terminal_cell_pixel_size_t cell{4, 6};
+
+    term::Terminal_history_ring ring({65536U, 65536U});
+    term::Terminal_history_row_record generic = make_base_record(
+        401U,
+        5U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        6);
+    generic.style_table.push_back(red_style());
+    generic.cells.push_back(make_cell(QString::fromUtf8("\xc3\xa9"), 1, true, 1U));
+    generic.cells.resize(6U);
+    generic.content_origin_spans = {
+        make_origin_span(
+            0,
+            1,
+            91U,
+            92U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+            1764000001000LL),
+    };
+    generic.image_slice = make_test_image_slice(13, 5, 2, cell, 77U);
+
+    term::Terminal_history_row_record_append_result append;
+    const term::Terminal_history_row_record_decode_result decoded =
+        append_and_decode(ring, generic, make_identity(7U, 401U), append);
+    ok &= check(decoded.status == term::Terminal_history_row_record_codec_status::OK,
+        "a generic row with origin spans and an image section decodes");
+    ok &= check(records_equal(decoded.record, generic),
+        "the image section round-trips pixels, first column, cell size and revision");
+    const std::vector<std::byte> generic_payload = payload_bytes(ring, append);
+    ok &= check((read_le_u32(generic_payload, k_header_flags_offset) & k_image_section_flag) != 0U,
+        "a row with an image sets the image section flag");
+
+    term::Terminal_history_row_record generic_without_image = generic;
+    generic_without_image.image_slice.reset();
+    term::Terminal_history_ring image_free_ring({65536U, 65536U});
+    term::Terminal_history_row_record_append_result image_free_append;
+    (void)append_and_decode(
+        image_free_ring,
+        generic_without_image,
+        make_identity(7U, 401U),
+        image_free_append);
+    ok &= check(generic_payload.size() ==
+            payload_bytes(image_free_ring, image_free_append).size() +
+            term::terminal_history_row_record_image_section_bytes(*generic.image_slice),
+        "the image section adds exactly its own bytes to the record");
+
+    const term::Terminal_history_ring_read_scope generic_read =
+        ring.read_record(append.commit.byte_sequence);
+    const term::Terminal_history_row_record_decode_result skipped =
+        term::decode_terminal_history_row_record(
+            generic_read,
+            term::Terminal_history_row_record_image_decode::SKIP_PIXELS,
+            append.history_handle);
+    ok &= check(skipped.status == term::Terminal_history_row_record_codec_status::OK &&
+            records_equal(skipped.record, generic_without_image),
+        "a decode that skips pixels reads the rest of the row and no image");
+
+    // The prefix plain-ASCII reader takes every remaining byte as cells, so
+    // the section has to sit before them. The slice here also reaches past
+    // the row's source width, as it may once the grid has narrowed.
+    term::Terminal_history_row_record prefix = make_base_record(
+        402U,
+        6U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        5);
+    for (const QChar character : QStringLiteral("abc")) {
+        prefix.cells.push_back(make_cell(QString(character), 1, true));
+    }
+    prefix.cells.resize(5U);
+    prefix.image_slice = make_test_image_slice(16, 6, 3, cell, 78U);
+
+    term::Terminal_history_row_record_append_result prefix_append;
+    const term::Terminal_history_row_record_decode_result prefix_decoded =
+        append_and_decode(ring, prefix, make_identity(7U, 402U), prefix_append);
+    ok &= check(prefix_decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+            records_equal(prefix_decoded.record, prefix),
+        "a prefix plain-ASCII row round-trips with an image section");
+    ok &= check(payload_kind(payload_bytes(ring, prefix_append)) ==
+            k_payload_kind_prefix_plain_ascii,
+        "an image section leaves the prefix plain-ASCII cell encoding in use");
+
+    const term::Terminal_history_ring_read_scope prefix_read =
+        ring.read_record(prefix_append.commit.byte_sequence);
+    const term::Terminal_history_row_record_decode_result prefix_skipped =
+        term::decode_terminal_history_row_record(
+            prefix_read,
+            term::Terminal_history_row_record_image_decode::SKIP_PIXELS,
+            prefix_append.history_handle);
+    ok &= check(prefix_skipped.status == term::Terminal_history_row_record_codec_status::OK &&
+            prefix_skipped.record.image_slice == nullptr &&
+            prefix_skipped.record.cells.size() == 5U &&
+            prefix_skipped.record.cells[2].text == QStringLiteral("c"),
+        "skipping the pixels of a prefix plain-ASCII row still reads its cells");
+
+    return ok;
+}
+
+bool test_image_section_rejects_malformed_sections()
+{
+    bool ok = true;
+    const term::terminal_cell_pixel_size_t cell{4, 6};
+
+    term::Terminal_history_row_record base = make_base_record(
+        411U,
+        1U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        4);
+    base.cells.push_back(make_cell(QStringLiteral("a"), 1, true));
+    base.cells.push_back(make_cell(QStringLiteral("b"), 1, true));
+    base.cells.resize(4U);
+
+    const auto encode_status = [&](std::shared_ptr<const term::Terminal_image_slice> slice) {
+        term::Terminal_history_ring ring({65536U, 65536U});
+        term::Terminal_history_row_record record = base;
+        record.image_slice = std::move(slice);
+        return term::encode_terminal_history_row_record_to_ring(
+            ring,
+            record,
+            make_identity(8U, 411U)).status;
+    };
+
+    QImage argb_pixels(4, 2, QImage::Format_ARGB32_Premultiplied);
+    argb_pixels.fill(0xff102030U);
+    ok &= check(encode_status(std::make_shared<const term::Terminal_image_slice>(
+            term::Terminal_image_slice{std::move(argb_pixels), 0, cell, 1U})) ==
+            term::Terminal_history_row_record_codec_status::INVALID_ARGUMENT,
+        "encode rejects slice pixels in a format other than RGBA8888 premultiplied");
+    ok &= check(encode_status(std::make_shared<const term::Terminal_image_slice>(
+            term::Terminal_image_slice{QImage(), 0, cell, 1U})) !=
+            term::Terminal_history_row_record_codec_status::OK,
+        "encode rejects a slice with no pixels");
+    ok &= check(encode_status(make_test_image_slice(4, 7, 0, cell, 1U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "encode rejects a slice taller than its cell");
+    ok &= check(encode_status(make_test_image_slice(4, 2, 0, {0, 6}, 1U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "encode rejects a slice on a zero-width cell");
+    ok &= check(encode_status(make_test_image_slice(5, 2, 4095, cell, 1U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "encode rejects a slice reaching past column 4096");
+    ok &= check(encode_status(make_test_image_slice(4, 2, 4095, cell, 1U)) ==
+            term::Terminal_history_row_record_codec_status::OK,
+        "encode accepts a slice ending exactly at column 4096");
+
+    term::Terminal_history_ring ring({65536U, 65536U});
+    term::Terminal_history_row_record record = base;
+    record.image_slice = make_test_image_slice(8, 3, 1, cell, 5U);
+    term::Terminal_history_row_record_append_result append;
+    const term::Terminal_history_row_record_decode_result decoded =
+        append_and_decode(ring, record, make_identity(8U, 412U), append);
+    ok &= check(decoded.status == term::Terminal_history_row_record_codec_status::OK,
+        "malformed-section fixture decodes before mutation");
+    const term::Terminal_history_ring_read_scope read =
+        ring.read_record(append.commit.byte_sequence);
+    const std::vector<std::byte> payload = payload_bytes(ring, append);
+
+    const auto decode_both_ways = [&](const std::vector<std::byte>& mutated) {
+        const term::Terminal_history_row_record_decode_result with_pixels =
+            decode_mutated_payload(read, mutated);
+        const term::Terminal_history_row_record_decode_result without_pixels =
+            term::decode_terminal_history_row_record_payload(
+                {
+                    read.byte_sequence(),
+                    record_bytes_for_payload(mutated),
+                    mutated,
+                },
+                term::Terminal_history_row_record_image_decode::SKIP_PIXELS,
+                std::nullopt);
+        return with_pixels.status == without_pixels.status
+            ? with_pixels.status
+            : term::Terminal_history_row_record_codec_status::OK;
+    };
+    const auto with_section_u16 = [&](std::size_t offset, std::uint16_t value) {
+        std::vector<std::byte> mutated = payload;
+        write_le_u16(mutated, k_header_bytes + offset, value);
+        return mutated;
+    };
+    const auto with_section_u32 = [&](std::size_t offset, std::uint32_t value) {
+        std::vector<std::byte> mutated = payload;
+        write_le_u32(mutated, k_header_bytes + offset, value);
+        return mutated;
+    };
+
+    ok &= check(decode_both_ways(with_section_u32(k_image_section_pixel_height_offset, 0U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode rejects a section with no pixel rows, pixels skipped or not");
+    ok &= check(decode_both_ways(with_section_u16(k_image_section_cell_height_offset, 0U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode rejects a section on a zero-height cell");
+    ok &= check(decode_both_ways(with_section_u32(k_image_section_pixel_height_offset, 7U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode rejects a section taller than its cell");
+    ok &= check(decode_both_ways(with_section_u32(k_image_section_first_column_offset, 4095U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode rejects a section reaching past column 4096");
+    ok &= check(decode_both_ways(with_section_u32(k_image_section_pixel_height_offset, 6U)) ==
+            term::Terminal_history_row_record_codec_status::TRUNCATED_RECORD,
+        "decode rejects a section declaring more pixel rows than the record holds");
+    ok &= check(decode_both_ways(with_section_u32(k_image_section_pixel_width_offset, 4U)) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode rejects a section declaring fewer pixels than the record holds");
+
+    std::vector<std::byte> truncated_section(
+        payload.begin(),
+        payload.begin() + static_cast<std::ptrdiff_t>(k_header_bytes + k_image_section_fixed_bytes - 4U));
+    refresh_payload_size_fields(truncated_section);
+    ok &= check(decode_both_ways(truncated_section) ==
+            term::Terminal_history_row_record_codec_status::TRUNCATED_RECORD,
+        "decode reports a truncated section header");
+
+    std::vector<std::byte> unflagged_section = payload;
+    write_le_u32(
+        unflagged_section,
+        k_header_flags_offset,
+        read_le_u32(payload, k_header_flags_offset) & ~k_image_section_flag);
+    ok &= check(decode_both_ways(unflagged_section) ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "decode does not read section bytes as cells when the flag is missing");
 
     return ok;
 }
@@ -1866,5 +2343,8 @@ int main()
     ok &= test_header_and_handle_validation_failures();
     ok &= test_materialized_decode_owns_data_after_read_scope_and_eviction();
     ok &= test_row_record_oversize_hard_fails_before_publication();
+    ok &= test_image_free_records_encode_byte_identically();
+    ok &= test_image_section_round_trips();
+    ok &= test_image_section_rejects_malformed_sections();
     return ok ? 0 : 1;
 }

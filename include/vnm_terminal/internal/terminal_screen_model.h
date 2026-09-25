@@ -15,6 +15,7 @@
 #include <QByteArray>
 #include <QByteArrayView>
 #include <QChar>
+#include <QImage>
 #include <QString>
 #include <QStringView>
 #include <QtGlobal>
@@ -36,6 +37,7 @@ namespace vnm_terminal::internal {
 class Terminal_history_ring;
 struct Terminal_history_row_record;
 enum class Terminal_history_row_record_payload_kind : std::uint32_t;
+enum class Terminal_history_row_record_image_decode;
 
 using terminal_snapshot_style_id_map_t =
     std::map<terminal_text_style_lookup_key_t, Terminal_style_id>;
@@ -720,6 +722,10 @@ public:
         retained_history_row_cells_for_testing(
             Terminal_buffer_id         buffer_id,
             int                        logical_row) const;
+    // A retained row's slice comes back decoded from its history record.
+    std::shared_ptr<const Terminal_image_slice> image_slice_for_testing(
+        Terminal_buffer_id             buffer_id,
+        int                            logical_row) const;
     void set_next_hyperlink_id_for_testing(Terminal_hyperlink_id id);
     Terminal_hyperlink_id current_hyperlink_id_for_testing() const;
     Terminal_hyperlink_id next_hyperlink_id_for_testing() const;
@@ -764,6 +770,10 @@ private:
         // Zero is a hard boundary; otherwise this many cells continue into
         // the next row. A wide glyph can leave an unused cell at the margin.
         int                               soft_wrap_columns = 0;
+        // Null when the row shows no image, a moved-from row included. The
+        // row owns its image; it moves and dies with the row.
+        std::shared_ptr<const Terminal_image_slice>
+                                            image_slice;
     };
 
     struct retained_row_record_t
@@ -780,6 +790,16 @@ private:
         std::uint64_t                            appended_ordinal = 0U;
         std::vector<terminal_history_handle_t>   evicted_handles;
         bool                                     record_discarded = false;
+        // The row kept its text without its image, which made the record too large.
+        bool                                     image_slice_dropped = false;
+    };
+
+    struct Retained_history_capacity_resize_result
+    {
+        std::vector<terminal_history_handle_t>   evicted_handles;
+        // The rows kept were re-encoded, so every retained record has a new
+        // handle; ordinals and row sequences are unchanged.
+        bool                                     retained_handles_replaced = false;
     };
 
     struct active_grid_row_t
@@ -862,6 +882,9 @@ private:
             terminal_history_handle_t history_handle;
             Terminal_history_row_record_payload_kind payload_kind{};
             std::uint64_t             ordinal = 0U;
+            // Lets a capacity shrink tell, without decoding, whether a record
+            // too large for the new capacity could keep its text.
+            bool                      has_image_section = false;
         };
 
         Retained_history_storage();
@@ -878,7 +901,8 @@ private:
             std::size_t capacity_bytes);
         void track_record_in_reserved_index_slot(
             terminal_history_handle_t                history_handle,
-            Terminal_history_row_record_payload_kind payload_kind) noexcept;
+            Terminal_history_row_record_payload_kind payload_kind,
+            bool                                     has_image_section) noexcept;
         void discard_index_prefix(std::size_t record_count) const noexcept;
 
         std::unique_ptr<Terminal_history_ring>
@@ -932,7 +956,8 @@ private:
         bool retained_history_empty() const;
         int retained_history_size() const;
         std::optional<retained_row_record_t> materialize_retained_history_record(
-            std::size_t index) const;
+            std::size_t                              index,
+            Terminal_history_row_record_image_decode image_decode) const;
         std::optional<terminal_history_handle_t> retained_history_handle_at_index(
             std::size_t index) const;
 
@@ -940,8 +965,10 @@ private:
             retained_row_record_t row);
         std::vector<terminal_history_handle_t>
             discard_oldest_retained_history_records(int row_count);
-        std::vector<terminal_history_handle_t>
+        Retained_history_capacity_resize_result
             resize_retained_history_capacity(std::size_t capacity_bytes);
+        Retained_history_capacity_resize_result
+            rebuild_retained_history_without_oversized_images(std::size_t capacity_bytes);
         void clear_retained_history();
         std::vector<terminal_history_handle_t>
             prune_retained_history_rows_outside_live_window() const;
@@ -1368,6 +1395,24 @@ private:
     void line_feed();
     void wrap_line();
     void advance_row();
+    void scroll_active_region_up();
+
+    void place_sixel_image(
+        const Screen_sixel_image_mutation& image,
+        std::vector<Parser_action>&        generated_actions);
+
+    void place_image_band(
+        const QImage&                  raster,
+        int                            band_top,
+        int                            row,
+        int                            first_column,
+        terminal_cell_pixel_size_t     cell);
+
+    std::shared_ptr<const Terminal_image_slice> make_image_slice(
+        QImage                         pixels,
+        int                            first_column,
+        terminal_cell_pixel_size_t     cell_pixel_size);
+
     void backspace();
     void horizontal_tab();
     void mark_cursor_dirty();
@@ -1639,6 +1684,12 @@ private:
     // DECPAM/DECPNM/DECNKM affect input encoding only, so they stay outside
     // the render snapshot mode state and do not invalidate render output.
     bool                            m_application_keypad = false;
+    // DECSDM (?80) only decides where later sixel images go, so it stays
+    // outside the render snapshot mode state as well.
+    bool                            m_sixel_display_mode = false;
+    // Every new image slice takes the next revision, so a revision identifies
+    // slice content for the lifetime of the model.
+    std::uint64_t                   m_next_image_slice_revision = 1U;
     int                             m_active_alternate_mode = 0;
     Terminal_hyperlink_id           m_current_hyperlink_id = k_no_terminal_hyperlink_id;
     Terminal_hyperlink_id           m_next_hyperlink_id = 1U;

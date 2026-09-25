@@ -473,7 +473,10 @@ benchmark_measurement_t benchmark_materialization()
                 const term::Terminal_history_ring_read_scope read =
                     ring.read_record(handle.byte_sequence);
                 const term::Terminal_history_row_record_decode_result decoded =
-                    term::decode_terminal_history_row_record(read, handle);
+                    term::decode_terminal_history_row_record(
+                        read,
+                        term::Terminal_history_row_record_image_decode::SKIP_PIXELS,
+                        handle);
                 if (decoded.status != term::Terminal_history_row_record_codec_status::OK) {
                     payload.ok = report_failure(
                         "materialization benchmark decode failed");

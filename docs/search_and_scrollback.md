@@ -99,6 +99,17 @@ prevents that exact bounded proof, the result is `SOURCE_UNAVAILABLE`; this is
 intentionally different from `NO_MATCH`. Hidden output becomes searchable only
 after the hold releases and a content snapshot is published.
 
+## Images In Scrollback
+
+A row that shows part of a sixel image keeps it when it scrolls into retained
+history, inside the same byte budget as text, so image rows evict older history
+sooner than text rows do. Search sees only a row's text. A row whose record
+would exceed the ring's record limit, an eighth of its capacity, keeps its
+text and drops its image, both when it is appended and when the capacity
+shrinks. Such a shrink re-encodes the rows it keeps, so their retained history
+handles change: a current search match on them no longer proves its identity,
+and search resolves it again as after any other lost identity.
+
 ## Rendering
 
 Visible matches use `search_match_spans`, distinct normal/current colors, and

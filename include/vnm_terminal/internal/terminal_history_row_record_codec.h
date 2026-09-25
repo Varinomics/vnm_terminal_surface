@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/selection_contract.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_hyperlink.h"
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -68,6 +70,20 @@ struct Terminal_history_row_record
                                    hyperlink_identity_keys;
     terminal_retained_row_record_metadata_t
                                    metadata;
+    // Encoded in an optional section only a row with an image carries, so
+    // image-free rows keep their exact encoding. A decode that skips pixels
+    // leaves it null whether or not the record has the section.
+    std::shared_ptr<const Terminal_image_slice>
+                                   image_slice;
+};
+
+// Most readers want a row's text, and a row's image can be most of its record,
+// so a decode materializes the image section only on request. Skipped pixels
+// are still validated against the section's declared size.
+enum class Terminal_history_row_record_image_decode
+{
+    SKIP_PIXELS,
+    DECODE_PIXELS,
 };
 
 struct terminal_history_row_record_identity_t
@@ -115,11 +131,18 @@ Terminal_history_row_record_append_result encode_terminal_history_row_record_to_
 
 Terminal_history_row_record_decode_result decode_terminal_history_row_record(
     const Terminal_history_ring_read_scope&      read_scope,
+    Terminal_history_row_record_image_decode     image_decode,
     std::optional<terminal_history_handle_t>     expected_handle = std::nullopt);
 
 Terminal_history_row_record_decode_result decode_terminal_history_row_record_payload(
     terminal_history_row_record_payload_view_t   payload_view,
+    Terminal_history_row_record_image_decode     image_decode,
     std::optional<terminal_history_handle_t>     expected_handle = std::nullopt);
+
+// The bytes a record's image section adds for this slice; a record that drops
+// its slice shrinks by exactly this much.
+std::size_t terminal_history_row_record_image_section_bytes(
+    const Terminal_image_slice&                  slice);
 
 terminal_history_prefix_plain_ascii_retention_estimate_t
 make_terminal_history_prefix_plain_ascii_retention_estimate(

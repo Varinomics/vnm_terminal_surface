@@ -128,12 +128,12 @@ sequence: DCS P1 ; P2 ; P3 q sixel data ST, as ESC P and ESC \ or as C1 controls
 feature: sixel graphics image
 status: supported
 action_category: screen-mutation
-behavior: a header of digits and semicolons ending in q streams the data to a decoder as it arrives, and ST yields one decoded image of RGBA8 pixels in sixel device pixels with its extent, final sixel cursor row top, and pixel aspect ratio; data characters ? to ~ are six pixels with the least significant bit on top; ! repeats the next data character; # selects, or defines in HLS or RGB percent and selects, one of 256 color registers private to the image and starting from the VT340 default color map; " sets the aspect ratio and the background raster size; $ returns to the left of the sixel line and - moves to the next one; P1 picks the aspect ratio from the manual table, P2 1 leaves undrawn pixels transparent while 0, 2 and other values paint them and the declared raster with register 0, and P3 is ignored; the image is not placed on the grid
-host_policy: none
+behavior: a header of digits and semicolons ending in q streams the data to a decoder as it arrives, and ST yields one decoded image of RGBA8 pixels in sixel device pixels with its extent, final sixel cursor row top, and pixel aspect ratio; data characters ? to ~ are six pixels with the least significant bit on top; ! repeats the next data character; # selects, or defines in HLS or RGB percent and selects, one of 256 color registers private to the image and starting from the VT340 default color map; " sets the aspect ratio and the background raster size; $ returns to the left of the sixel line and - moves to the next one; P1 picks the aspect ratio from the manual table, P2 1 leaves undrawn pixels transparent while 0, 2 and other values paint them and the declared raster with register 0, and P3 is ignored; the image is placed with its upper-left corner at the cursor, each text row taking the band of pixel rows that falls on it; the scroll region scrolls as far as the image's final sixel row needs to fit, and the text cursor ends on the row the top of the final sixel row falls in, a trailing graphics new line included, at the image's first column; DECSDM set places images per dec-private-80 instead
+host_policy: the cell pixel size (csi-window-op-16) sets the pixel rows each text row takes
 payload_limit: raw sixel data unbounded and never buffered; decoded image bounded by dcs-sixel-decoded-limit
 recovery: ESC [ or C1 CSI inside the data abandons the image and resets to ground
 reply: no-reply
-diagnostic: DCS recovery diagnostic when a CSI abandons the image; limit diagnostic per dcs-sixel-decoded-limit
+diagnostic: DCS recovery diagnostic when a CSI abandons the image; limit diagnostic per dcs-sixel-decoded-limit; unsupported DCS sixel diagnostic for an image that arrives with no cell pixel size
 oracle: dec-vt330-vt340-graphics-manual
 
 ## dcs-sixel-product-decisions
@@ -144,7 +144,7 @@ sequence: DCS P1 ; P2 ; P3 q sixel data ST
 feature: sixel behavior the manual leaves open
 status: supported
 action_category: screen-mutation
-behavior: raster attributes apply only before the first data character or graphics new line, so an image has one aspect ratio; Pan/Pad is rounded up, as OpenConsole does, where the manual says nearest, and an omitted or zero Pad keeps the ratio; P1 above 9 is 1:1; data drawn before a color is selected uses register 15; color numbers past 255 wrap; registers 16 to 255 start with the VT340 map repeated; a register color is taken when a sixel is drawn, while the background takes register 0 as it stands at ST; the extent covers the drawn pixels and, with a background, the declared raster; numeric parameters saturate at 32767; other bytes are ignored
+behavior: raster attributes apply only before the first data character or graphics new line, so an image has one aspect ratio; Pan/Pad is rounded up, as OpenConsole does, where the manual says nearest, and an omitted or zero Pad keeps the ratio; P1 above 9 is 1:1; data drawn before a color is selected uses register 15; color numbers past 255 wrap; registers 16 to 255 start with the VT340 map repeated; a register color is taken when a sixel is drawn, while the background takes register 0 as it stands at ST; the extent covers the drawn pixels and, with a background, the declared raster; numeric parameters saturate at 32767; other bytes are ignored; with no cell pixel size known the image is dropped, cursor movement included; an image that would start below the bottom margin is dropped, as OpenConsole drops it; the image is clipped at the right margin, and a band with no drawn pixel leaves its row alone; a cell that receives a drawn pixel loses its text and hyperlink and keeps its style, a wide glyph whole; an image over an earlier image on the same row draws its drawn pixels over the earlier ones, which are first resampled to the new cell pixel size if theirs differs; the aspect ratio is not clamped to the scroll region height, which OpenConsole does, so the cursor can differ from OpenConsole's only for ratios above (region rows x 20) / 6; each text row keeps at most one image, which moves and dies with the row and reaches history with it, and a row whose history record would exceed the record limit (dcs-sixel-decoded-limit) keeps its text and drops its image, at append and when the ring shrinks
 host_policy: none
 payload_limit: decoded image bounded by dcs-sixel-decoded-limit
 recovery: CAN or SUB inside the data abandons the image without a diagnostic and returns to ground; other string families keep CAN and SUB as payload
@@ -599,6 +599,38 @@ recovery: malformed mode ignored
 reply: DECRQM private mode reply
 diagnostic: malformed mode diagnostic
 oracle: xterm-409-reference
+
+## dec-private-80
+
+id: dec-private-80
+family: CSI
+sequence: DECSET/DECRST ?80
+feature: sixel display mode (DECSDM)
+status: supported
+action_category: mode-mutation
+behavior: set places later sixel images at the page home whatever the origin mode and margins say, never scrolls for them, clips them at the bottom of the page and leaves the cursor where it was; reset, the default, places them at the cursor per dcs-sixel-image; the polarity is xterm's and OpenConsole's, where the VT340 manual's chapter 14 wording reads the other way
+host_policy: none
+payload_limit: none
+recovery: malformed mode ignored
+reply: DECRQM private mode reply, 1 set and 2 reset
+diagnostic: malformed mode diagnostic
+oracle: xterm-409-reference
+
+## dec-private-1070
+
+id: dec-private-1070
+family: CSI
+sequence: DECSET/DECRST ?1070
+feature: private sixel color registers
+status: ignored
+action_category: ignored-with-diagnostic
+behavior: sixel color registers are always private to each image, so setting or resetting the mode changes nothing
+host_policy: none
+payload_limit: none
+recovery: mode ignored and parser continues
+reply: DECRQM private mode reply, 3 permanently set
+diagnostic: unsupported DEC private mode diagnostic
+oracle: product-decision-vnm-terminal
 
 ## dec-private-1005
 

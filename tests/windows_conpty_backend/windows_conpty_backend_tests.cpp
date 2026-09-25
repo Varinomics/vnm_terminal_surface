@@ -1596,6 +1596,156 @@ bool test_cell_pixel_size_query_round_trips_through_conpty(const QString& fixtur
     return ok;
 }
 
+// Cursor movements that ConPTY itself wrote after the image started; with none
+// the model had to reach the child's cursor on its own.
+int cursor_moves_after_image(const QByteArray& output)
+{
+    const qsizetype image_start = output.lastIndexOf(QByteArrayLiteral("\x1bP"));
+    if (image_start < 0) {
+        return 0;
+    }
+
+    int moves = 0;
+    for (qsizetype index = output.indexOf("\x1b[", image_start);
+         index >= 0;
+         index = output.indexOf("\x1b[", index + 2))
+    {
+        qsizetype final_index = index + 2;
+        while (final_index < output.size() &&
+               ((output[final_index] >= '0' && output[final_index] <= '9') ||
+                output[final_index] == ';' || output[final_index] == '?'))
+        {
+            ++final_index;
+        }
+        if (final_index < output.size() &&
+            std::string_view("HfABCDdG").find(output[final_index]) != std::string_view::npos)
+        {
+            ++moves;
+        }
+    }
+    return moves;
+}
+
+// The sixel cursor-sync gate. OpenConsole moves its own cursor past a sixel
+// image, while ConPTY forwards the image unanswered, so the model must reach
+// the same cell by itself or later cursor-relative output lands elsewhere.
+// Each case runs in a fresh session: the child writes it through the packaged
+// ConPTY, reports its console cursor and waits, and the model cursor is
+// sampled once the output has settled. Observation cases are only recorded.
+bool test_sixel_cursor_stays_in_sync_with_openconsole(const QString& fixture_path)
+{
+    bool ok = true;
+    QTemporaryDir report_dir;
+    if (!check(report_dir.isValid(), "sixel cursor-sync report directory is created")) {
+        return false;
+    }
+
+    int case_index = 0;
+    for (const term::Terminal_canvas_fixture_sixel_cursor_case& sixel_case :
+        term::terminal_canvas_fixture_sixel_cursor_cases())
+    {
+        const QString name = QString::fromStdString(sixel_case.name);
+        const QString report_path =
+            report_dir.filePath(QStringLiteral("sixel-cursor-%1.txt").arg(case_index++));
+        const std::string label = "sixel cursor sync, " + sixel_case.name;
+
+        term::Terminal_session_config config;
+        config.trace_output_chunk_limit = 4096U;
+        config.backend_event_notifier   = [] {};
+        if (sixel_case.retained_history_capacity_bytes != 0U) {
+            config.retained_history_capacity_bytes = sixel_case.retained_history_capacity_bytes;
+        }
+        term::Terminal_session session(term::make_windows_conpty_backend(), config);
+        if (!check(session.start(launch_config(
+                    fixture_path,
+                    {QStringLiteral("--sixel-cursor-sync"), name, report_path})).code ==
+                term::Terminal_session_result_code::ACCEPTED,
+                label + ": session starts"))
+        {
+            ok = false;
+            continue;
+        }
+
+        const auto output = [&] {
+            QByteArray bytes;
+            for (const QByteArray& chunk : session.output_chunks()) {
+                bytes += chunk;
+            }
+            return bytes;
+        };
+
+        // Settled: the child has reported and ConPTY has sent nothing new for
+        // a while, so the model has applied everything the image produced.
+        const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        qsizetype  observed_size  = -1;
+        auto       observed_since = std::chrono::steady_clock::now();
+        bool       settled        = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            session.process_backend_callback_events();
+            const qsizetype size = output().size();
+            const auto      now  = std::chrono::steady_clock::now();
+            if (size != observed_size) {
+                observed_size  = size;
+                observed_since = now;
+            }
+            else
+            if (QFileInfo::exists(report_path) &&
+                now - observed_since >= std::chrono::milliseconds(300))
+            {
+                settled = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ok &= check(settled, label + ": the child reports and the output settles");
+
+        int console_row    = -1;
+        int console_column = -1;
+        QFile report(report_path);
+        if (report.open(QIODevice::ReadOnly)) {
+            const QList<QByteArray> fields = report.readAll().trimmed().split(' ');
+            if (fields.size() == 2) {
+                console_row    = fields[0].toInt();
+                console_column = fields[1].toInt();
+            }
+        }
+        const std::optional<term::Terminal_render_snapshot> snapshot =
+            session.latest_render_snapshot();
+        const int model_row    = snapshot.has_value() ? snapshot->cursor.position.row    : -1;
+        const int model_column = snapshot.has_value() ? snapshot->cursor.position.column : -1;
+        const bool match =
+            console_row >= 0 && model_row == console_row && model_column == console_column;
+
+        const QByteArray received = output();
+        std::cout << "sixel cursor sync | " << sixel_case.name
+            << " | console " << console_row << ',' << console_column
+            << " | model " << model_row << ',' << model_column
+            << " | " << (match ? "match" : "MISMATCH")
+            << (sixel_case.observation_only ? " (observation)" : "")
+            << " | image forwarded: " << (received.contains("\x1bP") ? "yes" : "no")
+            << " | ConPTY cursor moves after the image: " << cursor_moves_after_image(received)
+            << '\n';
+        if (!sixel_case.observation_only) {
+            ok &= check(match, label + ": the model cursor matches OpenConsole's");
+        }
+
+        ok &= check(session.write_user_bytes("q").code ==
+                term::Terminal_session_result_code::ACCEPTED,
+            label + ": the child is released");
+        const auto exit_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        while (!session.exit_status().has_value() &&
+               std::chrono::steady_clock::now() < exit_deadline)
+        {
+            session.process_backend_callback_events();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ok &= check(session.exit_status().has_value() && session.exit_status()->exit_code == 0,
+            label + ": the child exits cleanly");
+    }
+
+    return ok;
+}
+
 int run_paste_input_reader(const QString& output_path)
 {
     const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
@@ -5820,6 +5970,12 @@ int main(int argc, char** argv)
         bool ok = test_compatibility_window_stays_hidden(fixture_path, false);
         ok &= test_compatibility_window_stays_hidden(fixture_path, true);
         ok &= wait_for_console_host_children_to_exit("compatibility window");
+        return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--sixel-cursor-sync") {
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        bool ok = test_sixel_cursor_stays_in_sync_with_openconsole(fixture_path);
+        ok &= wait_for_console_host_children_to_exit("sixel cursor sync");
         return ok ? 0 : 1;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--native-cmd-script") {
