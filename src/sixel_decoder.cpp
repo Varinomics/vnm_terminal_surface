@@ -441,25 +441,30 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
 
     // Grow geometrically so an image that arrives one sixel or one band at a
     // time costs amortized linear copying, but never hold more than the cap.
-    // Where doubling would pass the cap, the other dimension narrows to the
-    // request and the growing one takes what the cap has left, not exactly
-    // the request: otherwise every later band copies the whole raster again.
-    // Height wins when both grow, since images arrive band by band. The
-    // request covers every drawn pixel and fits the cap, so narrowing a
-    // dimension down to it loses none.
     const std::int64_t limit = limit_pixels();
     std::int64_t grown_width  = capacity_width;
     std::int64_t grown_height = capacity_height;
     if (width  > capacity_width)  { grown_width  = std::max(width,  capacity_width  * 2); }
     if (height > capacity_height) { grown_height = std::max(height, capacity_height * 2); }
+
+    // Near the cap, a dimension that is not growing keeps its capacity when
+    // the growing one still fits beside it, and the growing one takes what
+    // the cap leaves. Otherwise the slack the cap leaves around the request
+    // is split evenly between the two dimensions, so an image that widens
+    // and deepens band by band halves that slack with each copy instead of
+    // copying on every band. The request covers every drawn pixel and fits
+    // the cap, so narrowing a dimension down towards it loses none.
     if (grown_width * grown_height > limit) {
-        if (height > capacity_height) {
-            grown_width  = width;
-            grown_height = std::max(height, std::min(grown_height, limit / grown_width));
+        if (height <= capacity_height && capacity_height * width <= limit) {
+            grown_width = limit / capacity_height;
+        }
+        else
+        if (width <= capacity_width && capacity_width * height <= limit) {
+            grown_height = limit / capacity_width;
         }
         else {
-            grown_height = height;
-            grown_width  = std::max(width, std::min(grown_width, limit / grown_height));
+            grown_width  = width + (limit / height - width) / 2;
+            grown_height = limit / grown_width;
         }
     }
 

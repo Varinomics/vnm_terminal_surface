@@ -28,6 +28,14 @@ class Sixel_decoder
 public:
     Sixel_decoder();
 
+    // The decoder draws through a pointer into its raster. A copy would share
+    // that buffer implicitly and write through the original's pointer; a
+    // move takes the buffer itself along, so the pointer stays valid.
+    Sixel_decoder(const Sixel_decoder&)            = delete;
+    Sixel_decoder& operator=(const Sixel_decoder&) = delete;
+    Sixel_decoder(Sixel_decoder&&)                 = default;
+    Sixel_decoder& operator=(Sixel_decoder&&)      = default;
+
     void set_raster_limit_bytes(std::size_t limit_bytes) { m_limit_bytes = limit_bytes; }
 
     bool active() const { return m_active; }

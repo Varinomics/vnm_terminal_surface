@@ -524,6 +524,62 @@ bool test_sixel_decoded_size_cap()
     return ok;
 }
 
+bool test_sixel_growth_near_the_cap()
+{
+    bool ok = true;
+
+    // Images without raster attributes grow the buffer as they draw. Close to
+    // the cap it is reshaped rather than doubled, and every drawn pixel has to
+    // survive each reshape.
+    constexpr std::size_t k_limit = 65536U;
+    term::Terminal_byte_stream_parser parser;
+    parser.set_sixel_raster_limit_bytes(k_limit);
+    const auto decode = [&](const QByteArray& data, const std::string& label) {
+        const std::vector<term::Parser_action>              actions = parser.ingest(sixel_dcs("0;1", data));
+        const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+        ok &= check(images.size() == 1U,              label + ": one image");
+        ok &= check(diagnostics_in(actions).empty(), label + ": within the cap");
+        return images.empty() ? term::Screen_sixel_image_mutation{} : images.front();
+    };
+
+    // Widening and deepening together: band k is 4 (k + 1) pixels wide,
+    // ending at 104 x 156 pixels, 99% of the cap.
+    QByteArray staircase("\"1;1#1;2;100;0;0");
+    for (int band = 0; band < 26; ++band) {
+        staircase.append('!' + QByteArray::number(4 * (band + 1)) + "~-");
+    }
+    const term::Screen_sixel_image_mutation stairs = decode(staircase, "staircase");
+    ok &= check_size(stairs, 104, 156, "staircase");
+    for (int band = 0; band < 26; ++band) {
+        const int         right = 4 * (band + 1);
+        const std::string label = "staircase band " + std::to_string(band);
+        ok &= check_pixel(stairs, right - 1, 6 * band,     k_red, label);
+        ok &= check_pixel(stairs, right - 1, 6 * band + 5, k_red, label);
+        if (right < 104) {
+            ok &= check_pixel(stairs, right, 6 * band, k_transparent, label);
+        }
+    }
+
+    // Deepening at a fixed width, ending at 40 x 408 pixels.
+    QByteArray column("\"1;1#1;2;100;0;0");
+    for (int band = 0; band < 68; ++band) {
+        column.append("!40~-");
+    }
+    const term::Screen_sixel_image_mutation deep = decode(column, "column");
+    ok &= check_size(deep, 40, 408, "column");
+    ok &= check_pixel(deep, 0,  0,   k_red, "column");
+    ok &= check_pixel(deep, 39, 407, k_red, "column");
+
+    // Widening at a fixed height, ending at 2648 x 6 pixels.
+    const term::Screen_sixel_image_mutation wide =
+        decode("\"1;1#1;2;100;0;0!2048~!600~", "row");
+    ok &= check_size(wide, 2648, 6, "row");
+    ok &= check_pixel(wide, 0,    0, k_red, "row");
+    ok &= check_pixel(wide, 2647, 5, k_red, "row");
+
+    return ok;
+}
+
 bool test_model_supplies_the_cap()
 {
     bool ok = true;
@@ -576,6 +632,7 @@ int main()
     ok &= test_sixel_aspect_ratio();
     ok &= test_sixel_background();
     ok &= test_sixel_decoded_size_cap();
+    ok &= test_sixel_growth_near_the_cap();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }
