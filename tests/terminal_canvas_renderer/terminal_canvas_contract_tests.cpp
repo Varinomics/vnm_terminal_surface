@@ -3,6 +3,8 @@
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
 #include <QGuiApplication>
+#include <QColor>
+#include <QImage>
 #include <QMetaObject>
 #include <QPointer>
 #include <QTimer>
@@ -375,6 +377,73 @@ bool test_content_extent_properties_and_atomic_lifecycle()
     return ok;
 }
 
+bool test_image_records_are_atomic_and_capability_local()
+{
+    bool ok = true;
+    VNM_TerminalCanvas canvas;
+    auto frame = make_frame(30U);
+    QImage pixels(30, 20, QImage::Format_RGBA8888_Premultiplied);
+    pixels.fill(QColor(200, 40, 40));
+    frame->images.emplace();
+    frame->images->rows.push_back({1, 2, 10, 20, 7U, pixels});
+    ok &= check(canvas.set_canvas_frame(frame), "image-bearing frame is accepted");
+    ok &= check(canvas.content_bottom_row_exclusive() == 2,
+        "visible images contribute to the presentation bottom");
+    pixels.fill(QColor(20, 160, 80));
+    ok &= check(canvas.canvas_frame()->images->rows.front().pixels.pixelColor(0, 0) ==
+            QColor(200, 40, 40),
+        "installed immutable pixels survive caller mutation");
+
+    auto clipped = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    clipped->images->rows.front().first_column = frame->columns;
+    ok &= check(canvas.set_canvas_frame(clipped) && canvas.content_bottom_row_exclusive() == 1,
+        "an image beyond a narrowed grid is clipped without expanding the visible content");
+
+    for (int malformed = 0; malformed < 5; ++malformed) {
+        auto invalid = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+        invalid->sequence += static_cast<std::uint64_t>(malformed + 1);
+        auto& slice = invalid->images->rows.front();
+        switch (malformed) {
+            case 0: slice.row = frame->rows;                                      break;
+            case 1: slice.cell_pixel_width = 0;                                   break;
+            case 2: slice.first_column = std::numeric_limits<int>::max();           break;
+            case 3: slice.cell_pixel_height = 19;                                  break;
+            case 4: invalid->images->rows.push_back(slice);                        break;
+            default: break;
+        }
+        ok &= check(canvas.set_canvas_frame(invalid) &&
+                canvas.frame_sequence() == invalid->sequence &&
+                canvas.canvas_frame()->images->status ==
+                    vnm_terminal::Terminal_canvas_images_status::INVALID &&
+                canvas.canvas_frame()->images->rows.empty() &&
+                canvas.content_bottom_row_exclusive() == 1,
+            "malformed image metadata retires only images and installs current text");
+    }
+
+    auto unknown = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    ++unknown->images->record_version;
+    ok &= check(canvas.set_canvas_frame(unknown) &&
+            canvas.content_bottom_row_exclusive() == 1 &&
+            canvas.canvas_frame()->images->record_version == unknown->images->record_version,
+        "unknown image versions are retained and do not obstruct text");
+
+    auto over_limit = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    over_limit->images->status = vnm_terminal::Terminal_canvas_images_status::OVER_LIMIT;
+    over_limit->images->rows.clear();
+    ok &= check(canvas.set_canvas_frame(over_limit) &&
+            canvas.canvas_frame()->images->status ==
+                vnm_terminal::Terminal_canvas_images_status::OVER_LIMIT &&
+            canvas.content_bottom_row_exclusive() == 1,
+        "transport image limits stay explicit without rejecting text");
+
+    auto text = make_frame(40U);
+    ok &= check(canvas.set_canvas_frame(text) && !canvas.canvas_frame()->images,
+        "a publication without images atomically retires the prior image record");
+    ok &= check(canvas.set_canvas_frame({}) && !canvas.canvas_frame(),
+        "clearing the canvas releases image and text ownership together");
+    return ok;
+}
+
 bool test_cursor_blink_phase_and_lifecycle()
 {
     bool             ok = true;
@@ -480,6 +549,7 @@ int main(int argc, char** argv)
     bool            ok = true;
     ok &= test_frame_contract_and_text_bounds();
     ok &= test_content_extent_properties_and_atomic_lifecycle();
+    ok &= test_image_records_are_atomic_and_capability_local();
     ok &= test_cursor_blink_phase_and_lifecycle();
     return ok ? 0 : 1;
 }

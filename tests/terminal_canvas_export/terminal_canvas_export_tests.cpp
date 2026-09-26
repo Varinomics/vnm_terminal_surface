@@ -615,16 +615,13 @@ bool canvas_cells_equal(
     return true;
 }
 
-// S10: a canvas frame is text only, so a snapshot's row images are left out
-// and its text exports exactly as it would without them.
-bool test_row_images_export_as_text()
+bool test_row_images_export_with_publication()
 {
     bool                ok = true;
     VNM_TerminalSurface surface;
 
     auto plain = make_snapshot(2, 6);
     plain->cells.push_back(make_cell(0, 0, QStringLiteral("a")));
-    plain->cells.push_back(make_cell(1, 4, QStringLiteral("b")));
     auto with_image = std::make_shared<term::Terminal_render_snapshot>(*plain);
     QImage pixels(30, 20, QImage::Format_RGBA8888_Premultiplied);
     pixels.fill(QColor(200, 40, 40));
@@ -632,12 +629,12 @@ bool test_row_images_export_as_text()
         *with_image,
         1,
         std::make_shared<const term::Terminal_image_slice>(
-            term::Terminal_image_slice{std::move(pixels), 1, {10, 20}, 3U}));
+            term::Terminal_image_slice{pixels, 1, {10, 20}, 3U}));
 
     const vnm_terminal::Terminal_canvas_export_result plain_result =
-        export_snapshot(surface, std::move(plain));
+        export_snapshot(surface, plain);
     const vnm_terminal::Terminal_canvas_export_result image_result =
-        export_snapshot(surface, std::move(with_image));
+        export_snapshot(surface, with_image);
     ok &= check(
         plain_result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
         image_result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
@@ -654,7 +651,46 @@ bool test_row_images_export_as_text()
         plain_result.frame->content_extent.has_value() &&
         image_result.frame->content_extent->content_bottom_row_exclusive ==
             plain_result.frame->content_extent->content_bottom_row_exclusive,
-        "a row image leaves the exported text and its extent as they are without it");
+        "image capability preserves the independent text/cursor extent contract");
+    ok &= check(
+        plain_result.frame->images && plain_result.frame->images->rows.empty() &&
+        plain_result.frame->images->status == vnm_terminal::Terminal_canvas_images_status::AVAILABLE,
+        "an image-free publication explicitly clears prior images");
+    if (!check(image_result.frame->images && image_result.frame->images->rows.size() == 1U,
+            "an image publication exports its row slice"))
+    {
+        return false;
+    }
+    const auto& exported = image_result.frame->images->rows.front();
+    ok &= check(
+        image_result.frame->images->record_version == vnm_terminal::k_terminal_canvas_images_version &&
+        image_result.frame->images->status == vnm_terminal::Terminal_canvas_images_status::AVAILABLE &&
+        exported.row == 1 && exported.first_column == 1 &&
+        exported.cell_pixel_width == 10 && exported.cell_pixel_height == 20 &&
+        exported.revision == 3U && exported.pixels == pixels,
+        "export preserves source RGBA pixels, cell scale, row, column and revision");
+
+    pixels.fill(QColor(20, 160, 80));
+    const auto cleared = export_snapshot(surface, plain);
+    ok &= check(
+        cleared.frame && cleared.frame->images && cleared.frame->images->rows.empty() &&
+        exported.pixels.pixelColor(0, 0) == QColor(200, 40, 40),
+        "new publications and caller pixel mutation do not alter an exported frame");
+
+    auto invalid = std::make_shared<term::Terminal_render_snapshot>(*with_image);
+    term::set_render_snapshot_row_image(
+        *invalid,
+        1,
+        std::make_shared<const term::Terminal_image_slice>(
+            term::Terminal_image_slice{pixels, 1, {10, 20}, 0U}));
+    const auto invalid_result = export_snapshot(surface, std::move(invalid));
+    ok &= check(
+        invalid_result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
+        invalid_result.frame && invalid_result.frame->images &&
+        invalid_result.frame->images->status == vnm_terminal::Terminal_canvas_images_status::INVALID &&
+        invalid_result.frame->images->rows.empty() &&
+        canvas_cells_equal(invalid_result.frame->cells, plain_result.frame->cells),
+        "invalid source images are explicit and leave the publication's text available");
     return ok;
 }
 
@@ -673,6 +709,6 @@ int main(int argc, char** argv)
     ok &= test_content_extent_uses_semantic_cells_cursor_and_viewport();
     ok &= test_exact_bounds_and_one_over_fail_closed();
     ok &= test_text_bounds_fail_closed_without_truncation();
-    ok &= test_row_images_export_as_text();
+    ok &= test_row_images_export_with_publication();
     return ok ? 0 : 1;
 }

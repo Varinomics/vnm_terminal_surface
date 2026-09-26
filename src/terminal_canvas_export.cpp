@@ -20,6 +20,10 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
+static_assert(
+    vnm_terminal::k_terminal_canvas_image_column_limit ==
+        term::k_terminal_image_slice_column_limit);
+
 std::uint16_t canvas_color_reference(const term::Terminal_color_ref& color)
 {
     switch (color.kind) {
@@ -206,6 +210,33 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         ? Terminal_canvas_buffer::ALTERNATE_BUFFER
         : Terminal_canvas_buffer::PRIMARY_BUFFER;
     frame->content_extent = content_extent;
+
+    frame->images.emplace();
+    if (!snapshot->visible_row_images.empty()) {
+        if (snapshot->visible_row_images.size() != static_cast<std::size_t>(frame->rows)) {
+            frame->images->status = Terminal_canvas_images_status::INVALID;
+        }
+        else {
+            for (int row = 0; row < frame->rows; ++row) {
+                const auto& slice = snapshot->visible_row_images[static_cast<std::size_t>(row)];
+                if (slice == nullptr) {
+                    continue;
+                }
+                frame->images->rows.push_back({
+                    row,
+                    slice->first_column,
+                    slice->cell_pixel_size.width,
+                    slice->cell_pixel_size.height,
+                    slice->revision,
+                    slice->pixels,
+                });
+            }
+            if (!terminal_canvas_images_are_valid(*frame->images, frame->rows)) {
+                frame->images->status = Terminal_canvas_images_status::INVALID;
+                frame->images->rows.clear();
+            }
+        }
+    }
 
     return {
         Terminal_canvas_export_status::OK,
