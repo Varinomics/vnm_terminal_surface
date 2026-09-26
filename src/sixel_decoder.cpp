@@ -161,27 +161,6 @@ bool is_parameter_byte(unsigned char byte)
 // Cropping by copy would move up to the whole cap in the drain slice that
 // sees ST, so the image views the extent of the capacity buffer instead, and
 // the view owns that buffer.
-// Holds a call's budget for the raster growth it may cause, and lets go of it
-// however the call ends.
-class Budget_scope final
-{
-public:
-    Budget_scope(Sixel_work_budget*& slot, Sixel_work_budget* budget)
-    :
-        m_slot(slot)
-    {
-        m_slot = budget;
-    }
-
-    ~Budget_scope() { m_slot = nullptr; }
-
-    Budget_scope(const Budget_scope&)            = delete;
-    Budget_scope& operator=(const Budget_scope&) = delete;
-
-private:
-    Sixel_work_budget*& m_slot;
-};
-
 QImage view_of_extent(QImage capacity, int width, int height)
 {
     if (capacity.width() == width && capacity.height() == height) {
@@ -246,7 +225,6 @@ qsizetype Sixel_decoder::decode(
     Terminal_utf8_scan_state*    string_scan)
 {
     qsizetype consumed = 0;
-    Budget_scope budget_scope(m_budget, budget);
     for (; consumed < data.size(); ++consumed) {
         const unsigned char byte = static_cast<unsigned char>(data[consumed]);
 
@@ -266,12 +244,16 @@ qsizetype Sixel_decoder::decode(
             continue;
         }
 
-        // A draw or a graphics new line is paid for before anything changes,
-        // so a byte the budget cannot pay for is left whole for later.
+        // A byte's work is paid for before anything changes: its draw or
+        // graphics new line, and the raster reservations it causes, whether
+        // by completing raster attributes or by drawing past the capacity. A
+        // byte the budget cannot pay for is left whole for later, with the
+        // command it would complete.
         const bool data_byte = byte >= k_sixel_data_first && byte <= k_sixel_data_last;
         const std::uint64_t cost =
-            data_byte   ? draw_cost(byte - k_sixel_data_first) :
-            byte == '-' ? band_expansion_cost()                : 0U;
+            (data_byte   ? draw_cost(byte - k_sixel_data_first) :
+             byte == '-' ? band_expansion_cost()                : 0U) +
+            reservation_cost(byte);
         if (cost > 0U && !try_charge_sixel_work(budget, cost)) {
             break;
         }
@@ -310,16 +292,16 @@ std::uint64_t Sixel_decoder::finish_cost() const
 
 void Sixel_decoder::finish(std::vector<Parser_action>& actions, Sixel_work_budget* budget)
 {
-    Budget_scope budget_scope(m_budget, budget);
-
     // A command still collecting parameters completes at the terminator, so
     // a trailing color definition applies. A repeat has nothing to repeat.
+    const std::uint64_t reserved_before = m_reserved_pixels;
     finish_command();
 
-    // The cap may have shrunk since the image last grew.
+    // The cap may have shrunk since the image last grew. The end is one step
+    // that always runs, so what it allocates is charged afterwards.
     grow_extent_within_limit();
     if (budget != nullptr) {
-        budget->charge_after(finish_cost());
+        budget->charge_after(finish_cost() + (m_reserved_pixels - reserved_before));
     }
     expand_band();
     emit_limit_diagnostic(actions);
@@ -543,14 +525,16 @@ void Sixel_decoder::next_line()
     m_y             = advanced(m_y, k_sixel_row_pixels * m_pixel_aspect_ratio);
 }
 
-void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
+std::optional<std::pair<std::int64_t, std::int64_t>> Sixel_decoder::grown_capacity(
+    std::int64_t capacity_width,
+    std::int64_t capacity_height,
+    std::int64_t width,
+    std::int64_t height) const
 {
-    const std::int64_t capacity_width  = m_raster.width();
-    const std::int64_t capacity_height = m_raster.height();
     if (width  == 0 || height == 0 ||
         (width <= capacity_width && height <= capacity_height))
     {
-        return;
+        return std::nullopt;
     }
 
     // Grow geometrically so an image that arrives one sixel or one band at a
@@ -581,6 +565,87 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
             grown_height = limit / grown_width;
         }
     }
+    return std::pair{grown_width, grown_height};
+}
+
+// What the raster reservations one byte causes will allocate, worked out
+// before anything changes, so that the byte is paid for whole or left whole:
+// the raster attributes it completes (a declared transparent raster, or a
+// background raster's extent) and the extent its draw reaches. It follows
+// apply_raster_attributes, draw_sixel and grow_extent_within_limit step by
+// step, on copies of the state they change.
+std::uint64_t Sixel_decoder::reservation_cost(unsigned char byte) const
+{
+    std::int64_t  capacity_width  = m_raster.width();
+    std::int64_t  capacity_height = m_raster.height();
+    std::int64_t  extent_width    = m_extent_width;
+    std::int64_t  extent_height   = m_extent_height;
+    std::int64_t  aspect          = m_pixel_aspect_ratio;
+    bool          limit_exceeded  = m_limit_exceeded;
+    std::uint64_t cost            = 0U;
+    const auto reserve_to = [&](std::int64_t width, std::int64_t height) {
+        if (const auto grown = grown_capacity(capacity_width, capacity_height, width, height)) {
+            capacity_width  = grown->first;
+            capacity_height = grown->second;
+            cost += static_cast<std::uint64_t>(capacity_width * capacity_height);
+        }
+    };
+    const auto grow_to_extent = [&]() {
+        if (limit_exceeded) {
+            return;
+        }
+        if (extent_width * extent_height <= limit_pixels()) {
+            reserve_to(extent_width, extent_height);
+            return;
+        }
+        limit_exceeded  = true;
+        capacity_width  = 0;
+        capacity_height = 0;
+    };
+
+    if (m_command == Command::RASTER_ATTRIBUTES && !m_raster_locked) {
+        if (m_parameters[1] > 0) {
+            aspect = std::max(1, (m_parameters[0] + m_parameters[1] - 1) / m_parameters[1]);
+        }
+        const std::int64_t declared_width  = m_parameters[2] > 0 ? m_parameters[2] : m_declared_width;
+        const std::int64_t declared_height = m_parameters[3] > 0 ? m_parameters[3] : m_declared_height;
+        if (m_background_fill) {
+            extent_width  = std::max(extent_width,  declared_width);
+            extent_height = std::max(extent_height, declared_height);
+            grow_to_extent();
+        }
+        else
+        if (declared_width * declared_height <= limit_pixels()) {
+            reserve_to(declared_width, declared_height);
+        }
+    }
+
+    const int bits = byte >= k_sixel_data_first && byte <= k_sixel_data_last
+        ? byte - k_sixel_data_first
+        : 0;
+    if (bits != 0) {
+        const int repeat = m_command == Command::REPEAT ? std::max(m_parameters[0], 1) : 1;
+        extent_width  = std::max(extent_width,  advanced(m_x, repeat));
+        extent_height = std::max(
+            extent_height,
+            advanced(
+                m_y,
+                static_cast<std::int64_t>(std::bit_width(static_cast<unsigned int>(bits))) * aspect));
+        grow_to_extent();
+    }
+    return cost;
+}
+
+// Reservations are paid for by the byte that causes them (reservation_cost),
+// or by an image end afterwards; this only allocates, and counts.
+void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
+{
+    const std::optional<std::pair<std::int64_t, std::int64_t>> capacity =
+        grown_capacity(m_raster.width(), m_raster.height(), width, height);
+    if (!capacity.has_value()) {
+        return;
+    }
+    const auto [grown_width, grown_height] = *capacity;
 
     QImage grown;
     if (m_raster.isNull()) {
@@ -595,9 +660,7 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
     if (grown.isNull()) {
         throw std::bad_alloc();
     }
-    if (m_budget != nullptr) {
-        m_budget->charge_after(static_cast<std::uint64_t>(grown_width * grown_height));
-    }
+    m_reserved_pixels += static_cast<std::uint64_t>(grown_width * grown_height);
 
     m_raster        = std::move(grown);
     m_pixels        = reinterpret_cast<std::uint32_t*>(m_raster.bits());

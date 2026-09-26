@@ -1150,6 +1150,80 @@ bool test_sixel_budget_steps_match_a_whole_parse()
     return ok;
 }
 
+// A raster reservation is paid for before it allocates. Raster attributes
+// that alternate between two shapes each replace a near-cap transparent
+// raster, which no draw or graphics new line pays for; a budget that cannot
+// pay for the next reservation leaves the byte that would complete the
+// attributes, and the command it completes, for a later call. So a call makes
+// at most one such allocation after its first charge, at a unit budget and at
+// a drain step's budget, and the steps parse exactly as a whole parse does.
+bool test_sixel_raster_reservations_are_budgeted()
+{
+    bool ok = true;
+
+    const QByteArray alternation("\"1;1;32000;64#0\"1;1;64;32000#0");
+    const QByteArray cancelled = QByteArray("\x1bP0;1q") + alternation.repeated(8) + QByteArray("\x18");
+    // Where each raster attribute command completes: at the byte after its
+    // parameters.
+    std::vector<qsizetype> completions;
+    for (qsizetype index = cancelled.indexOf('"'); index >= 0; index = cancelled.indexOf('"', index + 1)) {
+        completions.push_back(cancelled.indexOf('#', index));
+    }
+
+    for (const std::uint64_t units : {1ULL, 2000000ULL}) {
+        const std::string label = "alternating rasters at " + std::to_string(units) + " units";
+        term::Terminal_byte_stream_parser parser;
+        qsizetype offset = 0;
+        int most_per_call = 0;
+        int calls = 0;
+        for (; offset < cancelled.size() && calls < 1000; ++calls) {
+            const qsizetype before = offset;
+            term::Sixel_work_budget budget(units);
+            (void)parser.ingest(cancelled, offset, &budget);
+            const int completed = static_cast<int>(std::count_if(
+                completions.begin(),
+                completions.end(),
+                [before, offset](qsizetype completion) {
+                    return completion >= before && completion < offset;
+                }));
+            most_per_call = std::max(most_per_call, completed);
+        }
+        ok &= check(offset == cancelled.size(), label + ": the whole string is parsed");
+        ok &= check(most_per_call == 1 && calls >= static_cast<int>(completions.size()),
+            label + ": each call completes at most one reserving raster command");
+    }
+
+    // Cut into two windows around every completion, and stepped at a unit
+    // budget, the string parses exactly as whole.
+    const QByteArray ended = QByteArray("\x1bP0;1q") + alternation.repeated(3) +
+        QByteArray("#1;2;100;0;0#1~~\x1b\\") + QByteArray("B");
+    std::vector<qsizetype> splits;
+    for (qsizetype index = ended.indexOf('"'); index >= 0; index = ended.indexOf('"', index + 1)) {
+        const qsizetype completion = ended.indexOf('#', index);
+        splits.insert(splits.end(), {completion - 1, completion, completion + 1});
+    }
+    const std::vector<term::Parser_action> whole = parse(ended);
+    bool same_as_whole = images_in(whole).size() == 1U;
+    for (const qsizetype split : splits) {
+        term::Terminal_byte_stream_parser parser;
+        std::vector<term::Parser_action> stepped;
+        for (const QByteArrayView window : {
+                QByteArrayView(ended).first(split), QByteArrayView(ended).sliced(split)})
+        {
+            qsizetype offset = 0;
+            for (int step = 0; offset < window.size() && step < 1000; ++step) {
+                term::Sixel_work_budget budget(1U);
+                const std::vector<term::Parser_action> actions = parser.ingest(window, offset, &budget);
+                stepped.insert(stepped.end(), actions.begin(), actions.end());
+            }
+        }
+        same_as_whole = same_as_whole && same_actions(stepped, whole);
+    }
+    ok &= check(same_as_whole,
+        "unit steps cut around every raster completion keep every action exactly");
+    return ok;
+}
+
 // An image end is one step that always runs, whatever is left of the budget:
 // it fills and expands the raster, charges that afterwards, and the draws of
 // the next image wait for a later step.
@@ -1248,6 +1322,7 @@ int main()
     ok &= test_parser_stops_after_each_image_across_chunks();
     ok &= test_sixel_budget_steps_match_a_whole_parse();
     ok &= test_sixel_image_end_is_one_step();
+    ok &= test_sixel_raster_reservations_are_budgeted();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }
