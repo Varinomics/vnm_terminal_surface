@@ -1,4 +1,6 @@
 include("${VNM_TOOLCHAIN_CONTEXT}")
+include("${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
+set(package_prefix_path "${install_dir};${CMAKE_PREFIX_PATH}")
 foreach(required_var IN ITEMS
     package_binary_dir
     package_version
@@ -98,7 +100,7 @@ if(NOT EXISTS "${installed_font_metrics_header}")
         "${installed_font_metrics_header}")
 endif()
 
-set(configure_args)
+set(configure_args -C "${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
 vnm_append_toolchain_args(configure_args)
 
 set(single_config_generator ON)
@@ -147,7 +149,7 @@ function(expect_package_version_request request expected_success)
             ${configure_args}
             -S "${version_source_dir}"
             -B "${version_binary_dir}"
-            "-DCMAKE_PREFIX_PATH=${install_dir}"
+            "-DCMAKE_PREFIX_PATH=${package_prefix_path}"
         RESULT_VARIABLE version_configure_result
         OUTPUT_VARIABLE version_configure_stdout
         ERROR_VARIABLE version_configure_stderr)
@@ -183,7 +185,7 @@ execute_process(
         ${configure_args}
         -S "${consumer_source_dir}"
         -B "${consumer_binary_dir}"
-        "-DCMAKE_PREFIX_PATH=${install_dir}"
+        "-DCMAKE_PREFIX_PATH=${package_prefix_path}"
     RESULT_VARIABLE configure_result
     OUTPUT_VARIABLE configure_stdout
     ERROR_VARIABLE configure_stderr)

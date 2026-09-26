@@ -1,4 +1,6 @@
 include("${VNM_TOOLCHAIN_CONTEXT}")
+include("${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
+set(package_prefix_path "${mismatch_install_dir};${CMAKE_PREFIX_PATH}")
 foreach(required_var IN ITEMS
     package_binary_dir
     install_dir
@@ -108,7 +110,7 @@ endif()
 
 file(WRITE "${package_config_path}" "${mismatched_package_config_text}")
 
-set(configure_args)
+set(configure_args -C "${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
 vnm_append_toolchain_args(configure_args)
 
 if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
@@ -128,7 +130,7 @@ execute_process(
         ${configure_args}
         -S "${consumer_source_dir}"
         -B "${consumer_binary_dir}"
-        "-DCMAKE_PREFIX_PATH=${mismatch_install_dir}"
+        "-DCMAKE_PREFIX_PATH=${package_prefix_path}"
     RESULT_VARIABLE configure_result
     OUTPUT_VARIABLE configure_stdout
     ERROR_VARIABLE configure_stderr)

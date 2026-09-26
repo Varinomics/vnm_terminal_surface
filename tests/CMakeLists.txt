@@ -1,5 +1,14 @@
 include("${PROJECT_SOURCE_DIR}/cmake/vnm_cmake_dependency.cmake")
 vnm_write_toolchain_context("${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake")
+set(vnm_package_dependency_context "${CMAKE_CURRENT_BINARY_DIR}/package-dependencies.cmake")
+file(WRITE "${vnm_package_dependency_context}"
+    "set(CMAKE_PREFIX_PATH [==[${CMAKE_PREFIX_PATH}]==] CACHE STRING \"\" FORCE)\n")
+foreach(package IN ITEMS vnm_msdf_text Freetype msdfgen Qt6 vnm_process_custody)
+    if(${package}_DIR AND NOT "${${package}_DIR}" MATCHES "-NOTFOUND$")
+        file(APPEND "${vnm_package_dependency_context}"
+            "set(${package}_DIR [==[${${package}_DIR}]==] CACHE PATH \"\" FORCE)\n")
+    endif()
+endforeach()
 
 set(vnm_terminal_qsg_atlas_report_timeout_seconds 240)
 
@@ -2519,6 +2528,7 @@ add_test(
     NAME vnm_terminal_surface_package_consumer_builds
     COMMAND
         "${CMAKE_COMMAND}"
+        "-DVNM_PACKAGE_DEPENDENCY_CONTEXT=${vnm_package_dependency_context}"
         "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
         "-Dpackage_version=${PROJECT_VERSION}"
@@ -2552,6 +2562,7 @@ add_test(
     NAME vnm_terminal_surface_renderer_only_package_consumer_builds
     COMMAND
         "${CMAKE_COMMAND}"
+        "-DVNM_PACKAGE_DEPENDENCY_CONTEXT=${vnm_package_dependency_context}"
         "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dsource_dir=${PROJECT_SOURCE_DIR}"
         "-Dproducer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_producer"
@@ -2575,6 +2586,7 @@ add_test(
     NAME vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch
     COMMAND
         "${CMAKE_COMMAND}"
+        "-DVNM_PACKAGE_DEPENDENCY_CONTEXT=${vnm_package_dependency_context}"
         "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
         "-Dinstall_config=$<CONFIG>"

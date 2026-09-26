@@ -1,4 +1,6 @@
 include("${VNM_TOOLCHAIN_CONTEXT}")
+include("${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
+set(package_prefix_path "${install_dir};${CMAKE_PREFIX_PATH}")
 cmake_minimum_required(VERSION 3.21)
 
 foreach(required_variable IN ITEMS
@@ -17,7 +19,7 @@ file(REMOVE_RECURSE
     "${install_dir}"
     "${consumer_binary_dir}")
 
-set(configure_args)
+set(configure_args -C "${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
 vnm_append_toolchain_args(configure_args)
 if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
     list(APPEND configure_args "-DQt6_DIR=${qt6_dir}")
@@ -73,6 +75,7 @@ execute_process(
         -B "${producer_binary_dir}"
         -DBUILD_TESTING=OFF
         -DVNM_TERMINAL_SURFACE_BUILD_TESTING=OFF
+        -DVNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON
         -DVNM_TERMINAL_SURFACE_BUILD_FULL=OFF
         -DVNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER=OFF
         ${build_type_args}
@@ -142,7 +145,7 @@ execute_process(
         -S "${consumer_source_dir}"
         -B "${consumer_binary_dir}"
         ${build_type_args}
-        "-DCMAKE_PREFIX_PATH=${install_dir}"
+        "-DCMAKE_PREFIX_PATH=${package_prefix_path}"
         -DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE
         -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE
         -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=TRUE
