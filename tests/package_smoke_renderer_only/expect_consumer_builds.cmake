@@ -72,7 +72,7 @@ endif()
 set(producer_configure_args)
 if(DEFINED vnm_fonts_source_dir AND NOT "${vnm_fonts_source_dir}" STREQUAL "")
     list(APPEND producer_configure_args
-        "-DVNM_FONTS_SOURCE_DIR=${vnm_fonts_source_dir}")
+        "-DFETCHCONTENT_SOURCE_DIR_VNM_FONTS=${vnm_fonts_source_dir}")
 endif()
 
 execute_process(

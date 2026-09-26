@@ -50,8 +50,7 @@ set(VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR "" CACHE PATH
     "Optional vnm_msdf_text source checkout used by the MSDF text renderer.")
 set(VNM_QT_DISPATCH_SOURCE_DIR "" CACHE PATH
     "Optional path to a local vnm_qt_dispatch source checkout.")
-set(VNM_FONTS_SOURCE_DIR "" CACHE PATH
-    "Optional path to a local vnm_fonts source checkout.")
+
 mark_as_advanced(
     VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
     VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS
@@ -130,33 +129,12 @@ endif()
 # "Ubuntu Sans Mono derivative vnm"; consumers use the family returned by the
 # registry rather than spelling a local fallback. It is added by several
 # dependency paths during one configure, so it guards its own repeated inclusion.
-if(NOT TARGET vnm::fonts)
-    if(VNM_FONTS_SOURCE_DIR)
-        if(NOT EXISTS "${VNM_FONTS_SOURCE_DIR}/CMakeLists.txt")
-            message(FATAL_ERROR
-                "VNM_FONTS_SOURCE_DIR does not contain a "
-                "vnm_fonts CMakeLists.txt:\n"
-                "  ${VNM_FONTS_SOURCE_DIR}")
-        endif()
-        FetchContent_Declare(vnm_terminal_surface_fonts
-            SOURCE_DIR "${VNM_FONTS_SOURCE_DIR}"
-            BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/vnm_fonts-build")
-    else()
-        FetchContent_Declare(vnm_terminal_surface_fonts
-            GIT_REPOSITORY "https://github.com/Varinomics/vnm_fonts.git"
-            GIT_TAG master
-            GIT_SHALLOW FALSE
-            BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/vnm_fonts-build")
-    endif()
-    FetchContent_MakeAvailable(vnm_terminal_surface_fonts)
-endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_cmake_dependency.cmake")
+vnm_acquire_owned_dependency(NAME vnm_fonts
+    GIT_REPOSITORY https://github.com/Varinomics/vnm_fonts.git
+    TARGET vnm::fonts)
 
-if(NOT TARGET vnm::fonts)
-    message(FATAL_ERROR
-        "vnm_fonts target is unavailable after dependency discovery. It "
-        "defines vnm::fonts only where Qt6 Core and Gui are found, which this "
-        "project has already required above.")
-endif()
+
 
 if(COMMAND vnm_fonts_install_package)
     vnm_fonts_install_package()
