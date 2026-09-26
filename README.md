@@ -21,6 +21,13 @@ For the packaged terminal application and screenshots, see
   supported protocol surface and recovery behavior.
 - Native process hosting per platform: ConPTY on Windows and PTY on Linux and
   macOS, with resize propagation and process lifecycle signals.
+- Sixel graphics: images decode as their data streams in and show as
+  per-row slices that scroll into history with their rows, within a
+  decoded-size cap. The matrix rows for the
+  [image](docs/terminal_sequence_matrix.md#dcs-sixel-image), its
+  [product decisions](docs/terminal_sequence_matrix.md#dcs-sixel-product-decisions)
+  and the [decoded-size limit](docs/terminal_sequence_matrix.md#dcs-sixel-decoded-limit)
+  give the contract.
 - Explicit text semantics: Qt IME commit/preedit handling and an owned
   [Unicode 16.0 cell-width policy](docs/unicode_width_policy.md) that is
   independent of rendering-library glyph metrics.

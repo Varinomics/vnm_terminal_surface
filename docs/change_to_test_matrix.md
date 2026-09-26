@@ -41,6 +41,8 @@ against an app build that consumes this surface.
 
 ## Notes On Specific Targets
 
+- Image pass pixels are verified only by the D3D11 `vnm_terminal_qsg_atlas_*`
+  tests; the GLSL and MSL variants of `atlas_image.frag` run in no gate.
 - The POSIX and Windows backend targets are platform-gated. The surface registers
   `vnm_terminal_posix_pty_backend` only on Linux and macOS and
   `vnm_terminal_windows_conpty_backend` only on Windows. Run the one that matches

@@ -185,7 +185,10 @@ a fixed 10x20 cell through `fixed_cell_pixel_size`: OpenConsole places sixel
 images on that cell and moves its own cursor by it, whatever the host renders.
 The session answers CSI 14 t and CSI 16 t with that cell instead of the
 display's, so every Windows client reads virtual pixel sizes, and it does not
-forward the display's cell to the backend.
+forward the display's cell to the backend. OpenConsole also keeps the text an
+image covers, which the model erases, so a ConPTY repaint prints that text
+again and the model then clears the image pixels under it, as printing does
+per `dcs-sixel-product-decisions` in the sequence matrix.
 
 ## Interrupt (Ctrl+C)
 

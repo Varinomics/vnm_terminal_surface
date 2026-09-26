@@ -5537,8 +5537,7 @@ bool test_sixel_capability_replies()
                 height > 0 && height <= 480 &&
                 width * height * 4 <= 131072,
             "the capped geometry fits both the text area and the decoded-size cap");
-        // Provisional: that the fit keeps the text area's shape is the
-        // implementer's choice, not a confirmed contract.
+        // The fit keeps the text area's shape, as csi-xtsmgraphics states.
         ok &= check(wire_bytes == QByteArrayLiteral("\x1b[?2;0;233;140S"),
             "the capped geometry keeps the text area's shape");
     }

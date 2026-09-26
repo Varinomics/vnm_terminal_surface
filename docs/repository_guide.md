@@ -145,6 +145,11 @@ CTest names are the stable way to find a test. The main families are:
   alternate screen, private modes, and viewport control.
 - `vnm_terminal_backend_session`, `vnm_terminal_windows_conpty_backend`, and
   `vnm_terminal_posix_pty_backend`: session and platform backend behavior.
+- `vnm_terminal_sixel_decoder`, `vnm_terminal_sixel_placement`, and the
+  Windows-only `vnm_terminal_windows_conpty_sixel_cursor_sync`: sixel
+  decoding and its decoded-size cap, image placement and image rows in
+  history, and the model's cursor after an image checked against
+  OpenConsole's through the packaged ConPTY.
 - `vnm_terminal_qt_*`, `vnm_terminal_render_*`,
   `vnm_terminal_qsg_*`, and `vnm_terminal_shaping_contract`: metrics, render
   snapshots, render frames, atlas QSG rendering, and shaping checks.
