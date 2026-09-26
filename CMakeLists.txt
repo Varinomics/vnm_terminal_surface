@@ -252,6 +252,8 @@ target_include_directories(vnm_terminal_surface_renderer PUBLIC
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
 )
 
+target_compile_features(vnm_terminal_surface_renderer PUBLIC cxx_std_20)
+
 target_link_libraries(vnm_terminal_surface_renderer PUBLIC
     ${vnm_terminal_qt_targets}
     ${vnm_terminal_lcd_contract_link}
