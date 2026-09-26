@@ -734,6 +734,74 @@ bool test_capacity_shrink_keeps_text_rows_around_an_oversized_image()
     return ok;
 }
 
+bool test_capacity_shrink_rebuilds_a_nearly_full_ring()
+{
+    bool ok = true;
+
+    // A 2 MiB ring (record limit 256 KiB) filled past its capacity with 16 x
+    // 32 cell rows: 1400 x 32 images (179200 pixel bytes, over the 128 KiB
+    // limit of a 1 MiB ring), two 1000 x 32 images (128000 bytes, under it)
+    // and a text row per round, each image row labeled beside its image.
+    const term::terminal_cell_pixel_size_t cell{16, 32};
+    term::Terminal_screen_model model = make_model(5, 100, cell, 5000, 2U * 1024U * 1024U);
+    for (int round = 0; round < 8; ++round) {
+        const QByteArray number = QByteArray::number(round);
+        model.ingest(cursor_to(4, 0) + "text-" + number + "\r\n");
+        model.ingest(cursor_to(4, 88) + "big-" + number + cursor_to(4, 0) +
+            sixel("1;0", "\"1;1;1400;32") + "\r\n");
+        for (const char* part : {"a", "b"}) {
+            model.ingest(cursor_to(4, 64) + "small-" + number + '-' + part + cursor_to(4, 0) +
+                sixel("1;0", "\"1;1;1000;32") + "\r\n");
+        }
+    }
+
+    std::vector<QString> texts_before;
+    for (int row = 0; row < model.scrollback_size(); ++row) {
+        texts_before.push_back(history_row_text(model, row));
+    }
+    ok &= check(!texts_before.empty() && texts_before.front() != QStringLiteral("text-0"),
+        "the 2 MiB ring has evicted its oldest rows before the shrink");
+
+    model.set_retained_history_capacity_bytes(1024U * 1024U);
+    const int kept = model.scrollback_size();
+    ok &= check(kept > 0 && kept < static_cast<int>(texts_before.size()),
+        "the shrink keeps as many of the newest rows as the new capacity holds");
+    ok &= check(model.retained_history_diagnostics().retained_record_bytes <= 1024U * 1024U,
+        "the kept records fit the new capacity");
+
+    bool texts_kept = true;
+    bool images_fit = true;
+    for (int row = 0; row < kept; ++row) {
+        const QString text = history_row_text(model, row);
+        texts_kept = texts_kept &&
+            text == texts_before[texts_before.size() - static_cast<std::size_t>(kept - row)];
+        const std::shared_ptr<const term::Terminal_image_slice> slice =
+            model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+        images_fit = images_fit &&
+            (text.startsWith(QStringLiteral("big-"))   ? slice == nullptr :
+             text.startsWith(QStringLiteral("small-")) ? slice != nullptr :
+                                                         slice == nullptr);
+
+        const std::optional<term::terminal_history_handle_t> handle =
+            model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, row);
+        const term::Terminal_retained_line_lookup_result lookup = handle.has_value()
+            ? model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *handle)
+            : term::Terminal_retained_line_lookup_result{};
+        ok &= check(lookup.exact_match && lookup.exact_logical_row == row,
+            "each row kept by a rebuild resolves to itself");
+    }
+    ok &= check(texts_kept, "the kept rows are the newest rows, in order, text intact");
+    ok &= check(images_fit,
+        "images over the new record limit are dropped and images under it are kept");
+
+    const QString top_row = model.row_text(0).trimmed();
+    model.ingest(cursor_to(4, 0) + "after-shrink\r\n");
+    ok &= check(model.scrollback_size() == kept + 1 && history_row_text(model, kept) == top_row,
+        "the rebuilt ring takes new rows");
+
+    return ok;
+}
+
 // One sixel row of `cells` ten-pixel blocks, each in its own color, so a
 // moved or cleared block shows in the pixels.
 QByteArray striped_cells(int cells)
@@ -1062,6 +1130,7 @@ int main()
     ok &= test_placement_marks_rows_dirty();
     ok &= test_oversized_image_rows_keep_their_text_in_history();
     ok &= test_capacity_shrink_keeps_text_rows_around_an_oversized_image();
+    ok &= test_capacity_shrink_rebuilds_a_nearly_full_ring();
     ok &= test_text_writes_and_erases_clear_image_cells();
     ok &= test_ich_and_dch_move_image_columns();
     ok &= test_image_rows_start_their_own_logical_lines();

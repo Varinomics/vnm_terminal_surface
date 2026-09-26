@@ -3442,30 +3442,28 @@ Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_
         kept_bytes += record_bytes;
     }
 
-    retained_history.ring->clear();
-    const terminal_history_ring_resize_result_t resize_result =
-        retained_history.resize_capacity(capacity_bytes);
-    if (resize_result.status != Terminal_history_ring_status::OK) {
-        throw_retained_history_storage_failure();
-    }
-
-    // Re-encode oldest first. The kept records fit the new capacity together,
-    // so no append evicts another; each keeps its ordinal and row sequence.
-    for (auto it = kept.rbegin(); it != kept.rend(); ++it) {
-        auto& entry = retained_history.index[it->index];
+    // Re-encode oldest first into a ring of the new capacity. The kept
+    // records fit it together, so no append evicts another; each keeps its
+    // ordinal and row sequence. Until the swap below nothing the model reads
+    // has changed, so a failure here leaves history as it was.
+    std::unique_ptr<Terminal_history_ring> ring = make_retained_history_ring(new_capacity);
+    std::vector<terminal_history_handle_t> kept_handles(kept.size());
+    for (std::size_t kept_index = kept.size(); kept_index-- > 0U;) {
+        const Kept_record& kept_record = kept[kept_index];
         const Terminal_history_row_record_append_result append =
             encode_terminal_history_row_record_to_ring(
-                *retained_history.ring,
-                it->record,
-                {k_terminal_history_retained_identity_epoch, entry.history_handle.row_sequence});
+                *ring,
+                kept_record.record,
+                {
+                    k_terminal_history_retained_identity_epoch,
+                    retained_history.index[kept_record.index].history_handle.row_sequence,
+                });
         if (append.status != Terminal_history_row_record_codec_status::OK ||
             append.commit.tail_advanced)
         {
             throw_retained_history_storage_failure();
         }
-
-        entry.history_handle    = append.history_handle;
-        entry.has_image_section = it->record.image_slice != nullptr;
+        kept_handles[kept_index] = append.history_handle;
     }
 
     const std::size_t dropped_rows = retained_history.index.size() - kept.size();
@@ -3474,6 +3472,15 @@ Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_
     result.evicted_handles.reserve(dropped_rows);
     for (std::size_t index = 0U; index < dropped_rows; ++index) {
         result.evicted_handles.push_back(retained_history.index[index].history_handle);
+    }
+
+    // The swap and the index updates below cannot throw.
+    retained_history.ring           = std::move(ring);
+    retained_history.capacity_bytes = retained_history.ring->capacity_bytes();
+    for (std::size_t kept_index = 0U; kept_index < kept.size(); ++kept_index) {
+        auto& entry = retained_history.index[kept[kept_index].index];
+        entry.history_handle    = kept_handles[kept_index];
+        entry.has_image_section = kept[kept_index].record.image_slice != nullptr;
     }
     retained_history.discard_index_prefix(dropped_rows);
     return result;
@@ -7058,14 +7065,21 @@ void Terminal_screen_model::place_image_band(
     const int band_width = static_cast<int>(std::min<std::int64_t>(
         raster.width(),
         static_cast<std::int64_t>(m_config.grid_size.columns - first_column) * cell.width));
-    const int band_height  = std::min(cell.height, raster.height() - band_top);
-    const int band_columns = (band_width + cell.width - 1) / cell.width;
+    const int band_height = std::min(cell.height, raster.height() - band_top);
 
-    QImage band(band_width, band_height, QImage::Format_RGBA8888_Premultiplied);
+    // The band is laid out as the slice it may become, so its columns come
+    // from the one slice rule; make_image_slice gives it a revision.
+    Terminal_image_slice band{
+        QImage(band_width, band_height, QImage::Format_RGBA8888_Premultiplied),
+        first_column,
+        cell,
+        0U,
+    };
     // QImage reports a failed allocation with a null image, not an exception.
-    if (band.isNull()) {
+    if (band.pixels.isNull()) {
         throw std::bad_alloc();
     }
+    const int band_columns = terminal_image_slice_column_span(band);
 
     // A cell is covered when its block receives at least one drawn pixel;
     // undrawn pixels are all zero.
@@ -7075,7 +7089,7 @@ void Terminal_screen_model::place_image_band(
         const auto* source =
             reinterpret_cast<const std::uint32_t*>(raster.constScanLine(band_top + y));
         std::memcpy(
-            band.scanLine(y),
+            band.pixels.scanLine(y),
             source,
             static_cast<std::size_t>(band_width) * sizeof(std::uint32_t));
         for (int column = 0; column < band_columns; ++column) {
@@ -7150,14 +7164,14 @@ void Terminal_screen_model::place_image_band(
 
     int slice_first_column = first_column;
     if (screen_row.image_slice != nullptr) {
-        band = composite_image_band(
+        band.pixels = composite_image_band(
             *screen_row.image_slice,
-            band,
+            band.pixels,
             first_column,
             cell,
             slice_first_column);
     }
-    screen_row.image_slice = make_image_slice(std::move(band), slice_first_column, cell);
+    screen_row.image_slice = make_image_slice(std::move(band.pixels), slice_first_column, cell);
     mark_terminal_content_changed();
     mark_dirty(row);
 }
