@@ -895,7 +895,9 @@ bool write_shell_pixel_size()
 #endif
 
 // Asks for the cell size with CSI 16 t and reads the reply through its final
-// byte. The bound keeps a reply that never ends from hanging the fixture.
+// byte. Only a reply of the shape CSI 6 ; height ; width t succeeds; any other
+// fails, as does one with no final byte within the bound that keeps a reply
+// that never ends from hanging the fixture.
 bool query_cell_size(std::vector<unsigned char>& reply)
 {
     if (!write_all_stdout("\x1b[16t")) {
@@ -905,13 +907,30 @@ bool query_cell_size(std::vector<unsigned char>& reply)
     constexpr std::size_t k_max_reply_bytes = 32U;
     do {
         unsigned char byte = 0U;
-        if (std::fread(&byte, 1U, 1U, stdin) != 1U) {
+        if (reply.size() == k_max_reply_bytes || std::fread(&byte, 1U, 1U, stdin) != 1U) {
             return false;
         }
         reply.push_back(byte);
     }
-    while (reply.back() != 't' && reply.size() < k_max_reply_bytes);
-    return true;
+    while (reply.back() != 't');
+
+    const std::string_view text(reinterpret_cast<const char*>(reply.data()), reply.size());
+    constexpr std::string_view k_prefix = "\x1b[6;";
+    if (!text.starts_with(k_prefix)) {
+        return false;
+    }
+    std::size_t index = k_prefix.size();
+    for (const char separator : {';', 't'}) {
+        const std::size_t digits = index;
+        while (index < text.size() && text[index] >= '0' && text[index] <= '9') {
+            ++index;
+        }
+        if (index == digits || index == text.size() || text[index] != separator) {
+            return false;
+        }
+        ++index;
+    }
+    return index == text.size();
 }
 
 int run_shell_cell_size_query()

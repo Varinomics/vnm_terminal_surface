@@ -17,6 +17,8 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -96,6 +98,119 @@ std::vector<term::Parser_action> parse(const QByteArray& bytes)
 {
     term::Terminal_byte_stream_parser parser;
     return ingest_all(parser, bytes);
+}
+
+// Every field of every action payload, so that two action lists compare
+// exactly, payloads and order.
+auto fields(const term::Screen_print_text_mutation& mutation)
+{
+    return std::tie(mutation.text, mutation.row, mutation.column, mutation.printable_ascii_only);
+}
+auto fields(const term::Screen_carriage_return_mutation&) { return std::tuple<>(); }
+auto fields(const term::Screen_line_feed_mutation&)       { return std::tuple<>(); }
+auto fields(const term::Screen_backspace_mutation&)       { return std::tuple<>(); }
+auto fields(const term::Screen_horizontal_tab_mutation&)  { return std::tuple<>(); }
+auto fields(const term::Screen_bell_mutation&)            { return std::tuple<>(); }
+auto fields(const term::Screen_set_title_mutation& mutation)     { return std::tie(mutation.title); }
+auto fields(const term::Screen_set_icon_name_mutation& mutation) { return std::tie(mutation.icon_name); }
+auto fields(const term::Screen_set_hyperlink_mutation& mutation) { return std::tie(mutation.identity_key); }
+auto fields(const term::Screen_sixel_image_mutation& image)
+{
+    return std::tie(
+        image.raster, image.width, image.height, image.final_cursor_y, image.pixel_aspect_ratio);
+}
+auto fields(const term::Terminal_sgr_operation& operation)
+{
+    return std::tie(
+        operation.kind,
+        operation.attributes,
+        operation.color.kind,
+        operation.color.palette_index,
+        operation.color.rgba);
+}
+auto fields(const term::Parser_control_sequence& sequence)
+{
+    return std::tie(
+        sequence.family,
+        sequence.action,
+        sequence.parameters,
+        sequence.private_marker,
+        sequence.intermediates,
+        sequence.final_bytes,
+        sequence.payload,
+        sequence.terminator,
+        sequence.raw_bytes);
+}
+auto fields(const term::Terminal_reply& reply)
+{
+    return std::tie(reply.wire_bytes, reply.source_sequence, reply.kind, reply.source_family);
+}
+auto fields(const term::Terminal_color_query& query)
+{
+    return std::tie(query.kind, query.palette_index, query.source_sequence);
+}
+auto fields(const term::Parser_payload_diagnostic& diagnostic)
+{
+    return std::tie(
+        diagnostic.code,
+        diagnostic.source_sequence,
+        diagnostic.raw_payload_size,
+        diagnostic.limit_bytes,
+        diagnostic.family,
+        diagnostic.recovery);
+}
+auto fields(const term::Parser_notification& notification)
+{
+    return std::tie(notification.kind, notification.text, notification.rows, notification.columns);
+}
+auto fields(const term::Terminal_osc52_write_request& request)
+{
+    return std::tie(
+        request.request_id,
+        request.target_selection,
+        request.decoded_payload,
+        request.raw_payload_size,
+        request.source_sequence);
+}
+
+bool same(const term::Terminal_sgr_sequence& left, const term::Terminal_sgr_sequence& right)
+{
+    return left.raw_parameters == right.raw_parameters &&
+        std::equal(
+            left.operations.begin(), left.operations.end(),
+            right.operations.begin(), right.operations.end(),
+            [](const term::Terminal_sgr_operation& l, const term::Terminal_sgr_operation& r) {
+                return fields(l) == fields(r);
+            });
+}
+
+template <typename T>
+bool same(const T& left, const T& right)
+{
+    return fields(left) == fields(right);
+}
+
+template <typename... Types>
+bool same(const std::variant<Types...>& left, const std::variant<Types...>& right)
+{
+    return left.index() == right.index() &&
+        std::visit(
+            [&right](const auto& left_value) {
+                return same(left_value, std::get<std::decay_t<decltype(left_value)>>(right));
+            },
+            left);
+}
+
+bool same_actions(
+    const std::vector<term::Parser_action>& left,
+    const std::vector<term::Parser_action>& right)
+{
+    return std::equal(
+        left.begin(), left.end(),
+        right.begin(), right.end(),
+        [](const term::Parser_action& l, const term::Parser_action& r) {
+            return same(l.payload, r.payload);
+        });
 }
 
 // Decodes a string that must yield exactly one image and no diagnostic.
@@ -806,30 +921,58 @@ bool test_sixel_image_boundary()
     ok &= check(mid_image.sixel_image_boundary(QByteArray("\\tail")) == 1,
         "mid-image a leading backslash may complete the terminator");
 
-    // Cutting a stream at successive boundaries leaves at most one image per
-    // chunk, ending it, and the same actions as parsing the stream whole.
-    const QByteArray stream = "A" + image + image + QByteArray("\x1b]2;t\x1b\\") + image + "B";
-    term::Terminal_byte_stream_parser whole;
-    term::Terminal_byte_stream_parser cut;
-    const std::vector<term::Parser_action> whole_actions = ingest_all(whole, stream);
-    std::vector<term::Parser_action> cut_actions;
-    for (qsizetype offset = 0; offset < stream.size();) {
-        const QByteArrayView rest     = QByteArrayView(stream).sliced(offset);
-        const qsizetype      boundary = cut.sixel_image_boundary(rest);
-        const std::vector<term::Parser_action> chunk_actions = ingest_all(cut, rest.first(boundary));
-        const std::vector<term::Screen_sixel_image_mutation> chunk_images = images_in(chunk_actions);
-        ok &= check(chunk_images.size() <= 1U, "a bounded chunk holds at most one image");
-        if (!chunk_images.empty()) {
-            ok &= check(images_in({chunk_actions.back()}).size() == 1U,
-                "a bounded chunk ends with its image");
+    // A caller cuts each window of bytes it receives at successive
+    // boundaries. For every split of a stream into two windows, including
+    // one inside each terminator, which leaves its ESC pending in the parser,
+    // the cuts leave at most one image per chunk, ending it, and exactly the
+    // actions of parsing the same windows uncut. The stream has images ended
+    // by both ST forms, a cancelled image, one a CSI abandons, an OSC ended by
+    // ST and a query.
+    const QByteArray image_8bit_st("\x1bPq#1;2;100;0;0~~\x9c");
+    const QByteArray stream =
+        "A" + image + image_8bit_st + QByteArray("\x1b]2;t\x1b\\") +
+        QByteArray("\x1bPq~\x18") + QByteArray("\x1bPq~\x1b[1m") + image + "\x1b[cB";
+    const auto parse_windows = [](const QByteArray& bytes, qsizetype split, bool cut, bool& bounded) {
+        term::Terminal_byte_stream_parser parser;
+        std::vector<term::Parser_action> actions;
+        for (const QByteArrayView window : {
+            QByteArrayView(bytes).first(split), QByteArrayView(bytes).sliced(split)})
+        {
+            for (qsizetype offset = 0; offset < window.size();) {
+                const QByteArrayView rest  = window.sliced(offset);
+                const qsizetype      chunk = cut ? parser.sixel_image_boundary(rest) : rest.size();
+                const std::vector<term::Parser_action> chunk_actions =
+                    ingest_all(parser, rest.first(chunk));
+                const std::size_t chunk_images = images_in(chunk_actions).size();
+                bounded = bounded && chunk_images <= 1U &&
+                    (chunk_images == 0U || images_in({chunk_actions.back()}).size() == 1U);
+                actions.insert(actions.end(), chunk_actions.begin(), chunk_actions.end());
+                offset += chunk;
+            }
         }
-        cut_actions.insert(cut_actions.end(), chunk_actions.begin(), chunk_actions.end());
-        offset += boundary;
+        return actions;
+    };
+
+    bool bounded       = true;
+    bool same_as_uncut = true;
+    for (qsizetype split = 0; split <= stream.size(); ++split) {
+        bool unused = true;
+        const std::vector<term::Parser_action> uncut = parse_windows(stream, split, false, unused);
+        const std::vector<term::Parser_action> cut   = parse_windows(stream, split, true,  bounded);
+        same_as_uncut = same_as_uncut && images_in(uncut).size() == 3U && same_actions(cut, uncut);
     }
-    ok &= check(images_in(cut_actions).size() == 3U && images_in(whole_actions).size() == 3U,
-        "cutting at boundaries keeps every image");
-    ok &= check(cut_actions.size() == whole_actions.size(),
-        "cutting at boundaries keeps every action");
+    ok &= check(bounded, "a bounded chunk holds at most one image, as its last action");
+    ok &= check(same_as_uncut, "cutting at boundaries keeps every action exactly");
+
+    // The split inside the first terminator leaves its ESC pending, and the
+    // backslash that completes it is the next window's first boundary.
+    const qsizetype pending_escape_split = 1 + image.size() - 1;
+    term::Terminal_byte_stream_parser pending_escape;
+    ingest_all(pending_escape, QByteArrayView(stream).first(pending_escape_split));
+    ok &= check(
+        stream.at(pending_escape_split) == '\\' &&
+            pending_escape.sixel_image_boundary(QByteArrayView(stream).sliced(pending_escape_split)) == 1,
+        "a pending ESC and a leading backslash end the image");
     return ok;
 }
 
