@@ -24,6 +24,18 @@ constexpr unsigned char  k_sixel_data_last       = 0x7eU;
 // and no register number, aspect ratio or color coordinate needs more.
 constexpr int k_sixel_parameter_limit = 32767;
 
+// The image cursor and extent saturate at the largest value the image
+// carries. Repeats and graphics new lines move the cursor without bound and
+// the cap only ever holds the extent, so this keeps both extents below 2^31,
+// their product below 2^62 and the decoded size below 2^64.
+constexpr std::int64_t k_sixel_geometry_limit = std::numeric_limits<int>::max();
+
+// A cursor position moved by at most one repeat or one sixel row.
+std::int64_t advanced(std::int64_t position, std::int64_t distance)
+{
+    return std::min(position + distance, k_sixel_geometry_limit);
+}
+
 // Data drawn before any color is selected uses the last register of the
 // VT340's sixteen, as the hardware does according to microsoft/terminal.
 constexpr int k_sixel_default_register = 15;
@@ -145,11 +157,6 @@ bool is_parameter_byte(unsigned char byte)
     return (byte >= '0' && byte <= '9') || byte == ';';
 }
 
-int saturated_int(std::int64_t value)
-{
-    return static_cast<int>(std::min<std::int64_t>(value, std::numeric_limits<int>::max()));
-}
-
 // The capacity usually outgrows the extent when no raster size was declared.
 // Cropping by copy would move up to the whole cap in the drain slice that
 // sees ST, so the image views the extent of the capacity buffer instead, and
@@ -255,9 +262,9 @@ void Sixel_decoder::finish(std::vector<Parser_action>& actions)
     emit_limit_diagnostic(actions);
 
     Screen_sixel_image_mutation image;
-    image.width              = saturated_int(m_extent_width);
-    image.height             = saturated_int(m_extent_height);
-    image.final_cursor_y     = saturated_int(m_y);
+    image.width              = static_cast<int>(m_extent_width);
+    image.height             = static_cast<int>(m_extent_height);
+    image.final_cursor_y     = static_cast<int>(m_y);
     image.pixel_aspect_ratio = m_pixel_aspect_ratio;
 
     if (!m_limit_exceeded && m_extent_width > 0 && m_extent_height > 0) {
@@ -398,8 +405,8 @@ void Sixel_decoder::draw_sixel(int bits, int repeat)
         const std::int64_t drawn_rows =
             static_cast<std::int64_t>(std::bit_width(static_cast<unsigned int>(bits))) *
             m_pixel_aspect_ratio;
-        m_extent_width  = std::max(m_extent_width,  m_x + repeat);
-        m_extent_height = std::max(m_extent_height, m_y + drawn_rows);
+        m_extent_width  = std::max(m_extent_width,  advanced(m_x, repeat));
+        m_extent_height = std::max(m_extent_height, advanced(m_y, drawn_rows));
         grow_extent_within_limit();
 
         if (!m_limit_exceeded) {
@@ -418,14 +425,14 @@ void Sixel_decoder::draw_sixel(int bits, int repeat)
         }
     }
 
-    m_x += repeat;
+    m_x = advanced(m_x, repeat);
 }
 
 void Sixel_decoder::next_line()
 {
     m_raster_locked = true;
     m_x             = 0;
-    m_y            += k_sixel_row_pixels * m_pixel_aspect_ratio;
+    m_y             = advanced(m_y, k_sixel_row_pixels * m_pixel_aspect_ratio);
 }
 
 void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
@@ -498,8 +505,11 @@ void Sixel_decoder::grow_extent_within_limit()
         return;
     }
 
+    // Unsigned, since four times a product of two saturated extents can pass
+    // 2^63; it stays below 2^64.
     m_limit_exceeded = true;
-    m_exceeded_bytes = static_cast<std::size_t>(extent_pixels * k_sixel_bytes_per_pixel);
+    m_exceeded_bytes = static_cast<std::size_t>(
+        static_cast<std::uint64_t>(extent_pixels) * static_cast<std::uint64_t>(k_sixel_bytes_per_pixel));
     release();
 }
 

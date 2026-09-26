@@ -9,7 +9,10 @@
 #include <QString>
 #include <QtGui/qrgb.h>
 #include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <variant>
@@ -580,6 +583,46 @@ bool test_sixel_growth_near_the_cap()
     return ok;
 }
 
+bool test_sixel_geometry_saturates()
+{
+    bool ok = true;
+
+    // Repeats of blank sixels, graphics new lines and a large aspect ratio
+    // move the image cursor far past anything an image holds: here the extent
+    // reaches 2^30 x 2^34 pixels, whose product is 2^64. The geometry
+    // saturates at the largest value the image carries, the cap trips, and
+    // the image still ends with that geometry for placement.
+    QByteArray data("\"16384;1");
+    data.append(QByteArray(174762, '-'));
+    for (int i = 0; i < 32769; ++i) {
+        data.append("!32767?");
+    }
+    data.append('G');
+
+    std::vector<term::Parser_action> actions;
+    try {
+        actions = parse(sixel_dcs("0;1", data));
+    }
+    catch (const std::exception& error) {
+        return check(false, std::string("far geometry: decoding threw ") + error.what());
+    }
+
+    constexpr int           k_int_max        = std::numeric_limits<int>::max();
+    constexpr std::uint64_t k_expected_bytes = (1ULL << 30U) * static_cast<std::uint64_t>(k_int_max) * 4ULL;
+    ok &= check_over_cap(
+        actions,
+        static_cast<std::size_t>(k_expected_bytes),
+        term::terminal_history_ring_max_record_bytes(
+            term::k_terminal_default_retained_history_capacity_bytes),
+        1 << 30,
+        k_int_max,
+        "far geometry");
+    const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+    ok &= check(!images.empty() && images[0].final_cursor_y == k_int_max,
+        "far geometry: the cursor saturates");
+    return ok;
+}
+
 bool test_model_supplies_the_cap()
 {
     bool ok = true;
@@ -636,6 +679,7 @@ int main()
     ok &= test_sixel_background();
     ok &= test_sixel_decoded_size_cap();
     ok &= test_sixel_growth_near_the_cap();
+    ok &= test_sixel_geometry_saturates();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }
