@@ -757,6 +757,82 @@ bool test_sixel_cap_trips_inside_a_scaled_band()
     return ok;
 }
 
+bool test_sixel_image_boundary()
+{
+    bool ok = true;
+
+    // A caller that yields after each image ends its chunk at the boundary:
+    // never past the terminator of the first image in the chunk, and early at
+    // worst.
+    const QByteArray image = sixel_dcs({}, "~");
+    term::Terminal_byte_stream_parser idle;
+    ok &= check(idle.sixel_image_boundary("plain text") == 10, "text has no boundary");
+    ok &= check(idle.sixel_image_boundary("A" + image + "B" + image) == 1 + image.size(),
+        "the boundary follows the first image's terminator");
+    const QByteArray title("\x1b]2;title\x1b\\");
+    ok &= check(idle.sixel_image_boundary(title + image) == title.size() + image.size(),
+        "a terminator before any DCS is no boundary");
+    ok &= check(idle.sixel_image_boundary(QByteArray("\x90q~\x9crest", 8)) == 4,
+        "the C1 forms bound an image too");
+    ok &= check(idle.sixel_image_boundary(QByteArray("x\\y")) == 3,
+        "a backslash outside any DCS is no boundary");
+    const QByteArray other_dcs("\x1bP$qm\x1b\\");
+    ok &= check(idle.sixel_image_boundary(other_dcs + "x") == other_dcs.size() + 1 &&
+            idle.sixel_image_boundary(other_dcs + image + "x") ==
+                other_dcs.size() + image.size(),
+        "a DCS that is not sixel is no boundary");
+
+    // A header the parser already buffers decides the DCS just the same.
+    term::Terminal_byte_stream_parser sixel_header;
+    ingest_all(sixel_header, QByteArray("\x1bP0;1"));
+    ok &= check(sixel_header.sixel_image_boundary(QByteArray("q~\x1b\\tail")) == 4,
+        "a buffered header that ends in q starts an image");
+    term::Terminal_byte_stream_parser other_header;
+    ingest_all(other_header, QByteArray("\x1bP0;1"));
+    ok &= check(other_header.sixel_image_boundary(QByteArray("z\x1b\\") + image + "x") ==
+            3 + image.size(),
+        "a buffered header that ends otherwise is no image");
+    term::Terminal_byte_stream_parser other_payload;
+    ingest_all(other_payload, QByteArray("\x1bPzz"));
+    ok &= check(other_payload.sixel_image_boundary(QByteArray("\x1b\\tail")) == 6,
+        "the end of a DCS in progress that is not sixel is no boundary");
+
+    // Mid-image, the next terminator ends it, including one whose ESC the
+    // caller or the parser still holds.
+    term::Terminal_byte_stream_parser mid_image;
+    ingest_all(mid_image, QByteArray("\x1bPq~~"));
+    ok &= check(mid_image.sixel_image_boundary(QByteArray("~\x1b\\tail")) == 3,
+        "mid-image the terminator is the boundary");
+    ok &= check(mid_image.sixel_image_boundary(QByteArray("\\tail")) == 1,
+        "mid-image a leading backslash may complete the terminator");
+
+    // Cutting a stream at successive boundaries leaves at most one image per
+    // chunk, ending it, and the same actions as parsing the stream whole.
+    const QByteArray stream = "A" + image + image + QByteArray("\x1b]2;t\x1b\\") + image + "B";
+    term::Terminal_byte_stream_parser whole;
+    term::Terminal_byte_stream_parser cut;
+    const std::vector<term::Parser_action> whole_actions = ingest_all(whole, stream);
+    std::vector<term::Parser_action> cut_actions;
+    for (qsizetype offset = 0; offset < stream.size();) {
+        const QByteArrayView rest     = QByteArrayView(stream).sliced(offset);
+        const qsizetype      boundary = cut.sixel_image_boundary(rest);
+        const std::vector<term::Parser_action> chunk_actions = ingest_all(cut, rest.first(boundary));
+        const std::vector<term::Screen_sixel_image_mutation> chunk_images = images_in(chunk_actions);
+        ok &= check(chunk_images.size() <= 1U, "a bounded chunk holds at most one image");
+        if (!chunk_images.empty()) {
+            ok &= check(images_in({chunk_actions.back()}).size() == 1U,
+                "a bounded chunk ends with its image");
+        }
+        cut_actions.insert(cut_actions.end(), chunk_actions.begin(), chunk_actions.end());
+        offset += boundary;
+    }
+    ok &= check(images_in(cut_actions).size() == 3U && images_in(whole_actions).size() == 3U,
+        "cutting at boundaries keeps every image");
+    ok &= check(cut_actions.size() == whole_actions.size(),
+        "cutting at boundaries keeps every action");
+    return ok;
+}
+
 bool test_sixel_header_limit_is_chunk_independent()
 {
     bool ok = true;
@@ -1008,6 +1084,7 @@ int main()
     ok &= test_sixel_header_limit_is_chunk_independent();
     ok &= test_parser_stops_after_each_image();
     ok &= test_parser_stops_after_each_image_across_chunks();
+    ok &= test_sixel_image_boundary();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }

@@ -949,6 +949,43 @@ bool parse_sgr_parameter_groups(
     return finish_group();
 }
 
+qsizetype Terminal_byte_stream_parser::sixel_image_boundary(QByteArrayView bytes) const
+{
+    // Only a string terminator ends an image, and only one that ends a sixel
+    // DCS: the image in progress, or a DCS whose header, here or already
+    // buffered, ends in 'q'. The caller may hold the bytes just before these
+    // as well as the parser, so a leading 'P' or backslash counts as following
+    // an ESC. Once in an image the scan leaves it only at a terminator, and
+    // any such byte counts as one: these only end chunks early.
+    enum class Scan_state { OUTSIDE_IMAGE, DCS_HEADER, IMAGE };
+    Scan_state state = Scan_state::OUTSIDE_IMAGE;
+    if (m_string_family == Parser_sequence_family::DCS) {
+        state = m_sixel_decoder.active() ? Scan_state::IMAGE
+              : m_dcs_header_pending     ? Scan_state::DCS_HEADER
+              :                            Scan_state::OUTSIDE_IMAGE;
+    }
+
+    for (qsizetype i = 0; i < bytes.size(); ++i) {
+        const unsigned char byte         = byte_at(bytes, i);
+        const bool          after_escape = i == 0 || byte_at(bytes, i - 1) == 0x1bU;
+        if (state == Scan_state::IMAGE) {
+            if (byte == 0x9cU || (byte == '\\' && after_escape)) {
+                return i + 1;
+            }
+        }
+        else
+        if (byte == 0x90U || (byte == 'P' && after_escape)) {
+            state = Scan_state::DCS_HEADER;
+        }
+        else
+        if (state == Scan_state::DCS_HEADER && !dcs_header_continues(byte)) {
+            state = byte == 'q' ? Scan_state::IMAGE : Scan_state::OUTSIDE_IMAGE;
+        }
+    }
+
+    return bytes.size();
+}
+
 std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
     QByteArrayView bytes,
     qsizetype&     offset)
