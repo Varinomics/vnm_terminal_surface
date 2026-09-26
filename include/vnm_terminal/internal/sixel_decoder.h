@@ -63,6 +63,7 @@ private:
     void apply_color_introducer();
     void apply_raster_attributes();
     void draw_sixel(int bits, int repeat);
+    void expand_band();
     void next_line();
     void reserve(std::int64_t width, std::int64_t height);
     void grow_extent_within_limit();
@@ -88,6 +89,8 @@ private:
     std::int64_t               m_y                   = 0;
     std::int64_t               m_extent_width        = 0;
     std::int64_t               m_extent_height       = 0;
+    std::int64_t               m_band_width          = 0;
+    int                        m_band_drawn_bits     = 0;
 
     QImage                     m_raster;
     std::uint32_t*             m_pixels              = nullptr;

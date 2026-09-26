@@ -259,6 +259,7 @@ void Sixel_decoder::finish(std::vector<Parser_action>& actions)
 
     // The cap may have shrunk since the image last grew.
     grow_extent_within_limit();
+    expand_band();
     emit_limit_diagnostic(actions);
 
     Screen_sixel_image_mutation image;
@@ -361,8 +362,8 @@ void Sixel_decoder::apply_color_introducer()
 void Sixel_decoder::apply_raster_attributes()
 {
     // The manual has raster attributes precede the sixel data. Holding to
-    // that keeps one pixel aspect ratio for the whole image, which lets
-    // placement reduce it exactly by dropping repeated rows.
+    // that keeps one pixel aspect ratio for the whole image, so every band
+    // expands its rows by the same amount.
     if (m_raster_locked) {
         return;
     }
@@ -410,6 +411,8 @@ void Sixel_decoder::draw_sixel(int bits, int repeat)
         grow_extent_within_limit();
 
         if (!m_limit_exceeded) {
+            m_band_width       = std::max(m_band_width, m_x + repeat);
+            m_band_drawn_bits |= bits;
             const std::uint32_t color = m_registers[static_cast<std::size_t>(m_selected_register)];
             for (int bit = 0; bit < k_sixel_row_pixels; ++bit) {
                 if ((bits & (1 << bit)) == 0) {
@@ -418,9 +421,7 @@ void Sixel_decoder::draw_sixel(int bits, int repeat)
 
                 std::uint32_t* first_row =
                     m_pixels + (m_y + bit * m_pixel_aspect_ratio) * m_stride_pixels + m_x;
-                for (int i = 0; i < m_pixel_aspect_ratio; ++i) {
-                    std::fill_n(first_row + i * m_stride_pixels, repeat, color);
-                }
+                std::fill_n(first_row, repeat, color);
             }
         }
     }
@@ -428,8 +429,32 @@ void Sixel_decoder::draw_sixel(int bits, int repeat)
     m_x = advanced(m_x, repeat);
 }
 
+void Sixel_decoder::expand_band()
+{
+    // Color passes can repaint a band many times before DECGNL or ST. Only
+    // its six source rows need those writes; repeat their final colors once
+    // the band closes so aspect scaling never multiplies overdraw work.
+    if (m_pixel_aspect_ratio > 1) {
+        for (int bit = 0; bit < k_sixel_row_pixels; ++bit) {
+            if ((m_band_drawn_bits & (1 << bit)) == 0) {
+                continue;
+            }
+
+            std::uint32_t* first_row =
+                m_pixels + (m_y + bit * m_pixel_aspect_ratio) * m_stride_pixels;
+            for (int i = 1; i < m_pixel_aspect_ratio; ++i) {
+                std::copy_n(first_row, m_band_width, first_row + i * m_stride_pixels);
+            }
+        }
+    }
+
+    m_band_width      = 0;
+    m_band_drawn_bits = 0;
+}
+
 void Sixel_decoder::next_line()
 {
+    expand_band();
     m_raster_locked = true;
     m_x             = 0;
     m_y             = advanced(m_y, k_sixel_row_pixels * m_pixel_aspect_ratio);
@@ -534,9 +559,11 @@ void Sixel_decoder::emit_limit_diagnostic(std::vector<Parser_action>& actions)
 
 void Sixel_decoder::release()
 {
-    m_raster        = QImage();
-    m_pixels        = nullptr;
-    m_stride_pixels = 0;
+    m_raster          = QImage();
+    m_pixels          = nullptr;
+    m_stride_pixels   = 0;
+    m_band_width      = 0;
+    m_band_drawn_bits = 0;
 }
 
 }

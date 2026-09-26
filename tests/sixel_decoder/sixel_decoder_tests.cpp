@@ -16,6 +16,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -318,6 +319,76 @@ bool test_sixel_carriage_return_and_next_line()
 
     const term::Screen_sixel_image_mutation tall = single_image(sixel_dcs({}, "~-"), "2:1 line", ok);
     ok &= check(tall.final_cursor_y == 12, "a 2:1 sixel line is twelve pixels");
+
+    return ok;
+}
+
+bool test_sixel_scaled_color_passes()
+{
+    bool ok = true;
+
+    // Ch. 14: color passes overwrite set pixels, '$' stays in the same band,
+    // and '-' closes it. Every vertically repeated row must contain the
+    // final color, including gaps, partial passes and the band ending at ST.
+    for (const int aspect : {1, 2, 5, 17}) {
+        for (const bool background : {false, true}) {
+            QByteArray data = '"' + QByteArray::number(aspect) + ";1";
+            if (background) {
+                data += ";6;" + QByteArray::number(12 * aspect + 1);
+            }
+            data += "#1;2;100;0;0!3~-#2;2;0;0;100!5t$#3;2;0;100;0?A$#1!2@#0;2;100;100;100";
+            const QByteArray bytes = sixel_dcs(background ? "0;0" : "0;1", data);
+            for (const qsizetype chunk_size : {qsizetype{1}, bytes.size()}) {
+                const std::string label =
+                    "scaled color passes " + std::to_string(aspect) +
+                    (background ? " opaque" : " transparent") +
+                    " chunk " + std::to_string(chunk_size);
+                term::Terminal_byte_stream_parser parser;
+                std::vector<term::Parser_action> actions;
+                for (qsizetype offset = 0; offset < bytes.size(); offset += chunk_size) {
+                    for (term::Parser_action& action : ingest_all(parser, bytes.sliced(offset, chunk_size))) {
+                        actions.push_back(std::move(action));
+                    }
+                }
+
+                const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+                ok &= check(images.size() == 1U,              label + ": one image");
+                ok &= check(diagnostics_in(actions).empty(), label + ": no diagnostic");
+                if (images.size() != 1U) {
+                    continue;
+                }
+
+                const auto& image  = images.front();
+                const int   width  = background ? 6 : 5;
+                const int   height = 12 * aspect + (background ? 1 : 0);
+                const QRgb  clear  = background ? k_white : k_transparent;
+                ok &= check_size(image, width, height, label);
+                ok &= check(image.final_cursor_y == 6 * aspect, label + ": final band cursor");
+                for (int y = 0; y < height; ++y) {
+                    const int source_row = y / aspect;
+                    for (int x = 0; x < width; ++x) {
+                        QRgb expected = clear;
+                        if (source_row < 6 && x < 3) {
+                            expected = k_red;
+                        }
+                        else
+                        if (source_row == 6 && x < 5) {
+                            expected = x < 2 ? k_red : k_blue;
+                        }
+                        else
+                        if (source_row == 7 && x == 1) {
+                            expected = k_green;
+                        }
+                        else
+                        if ((source_row == 8 || source_row == 10 || source_row == 11) && x < 5) {
+                            expected = k_blue;
+                        }
+                        ok &= check_pixel(image, x, y, expected, label);
+                    }
+                }
+            }
+        }
+    }
 
     return ok;
 }
@@ -764,6 +835,7 @@ int main()
     ok &= test_sixel_aborts();
     ok &= test_sixel_data_characters();
     ok &= test_sixel_carriage_return_and_next_line();
+    ok &= test_sixel_scaled_color_passes();
     ok &= test_sixel_colors();
     ok &= test_sixel_aspect_ratio();
     ok &= test_sixel_background();
