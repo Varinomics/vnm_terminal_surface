@@ -404,7 +404,8 @@ static_assert(sizeof(Terminal_render_cell) <= 48U);
 // them to the cell it draws. The model owns a slice through its row, and then
 // through that row's history record; snapshots and the history encoder share
 // it read-only. A slice never changes: a changed row image is a new slice with
-// a new revision, so row identity plus revision keys any cached copy of it.
+// a new revision, unique in the process, so the revision alone keys any cached
+// copy of it, also across sessions; a slice decoded from history keeps it.
 struct Terminal_image_slice
 {
     QImage                     pixels;
@@ -418,6 +419,21 @@ inline int terminal_image_slice_column_span(const Terminal_image_slice& slice)
 {
     return (slice.pixels.width() + slice.cell_pixel_size.width - 1) / slice.cell_pixel_size.width;
 }
+
+// The widest row the model supports. A slice may reach past a grid that has
+// narrowed since it was placed, and a renderer clips it there, but a slice
+// never reaches past this column.
+constexpr int k_terminal_image_slice_column_limit = 4096;
+
+enum class Terminal_render_image_status
+{
+    OK,
+    INVALID_ROW_COUNT,
+    INVALID_PIXELS,
+    INVALID_CELL_PIXEL_SIZE,
+    INVALID_PIXEL_SIZE,
+    INVALID_COLUMN_SPAN,
+};
 
 struct Terminal_render_cursor
 {
@@ -558,6 +574,10 @@ struct Terminal_render_snapshot
     std::vector<Terminal_text_style>                   styles;
     std::vector<Terminal_render_cell>                  cells;
     std::vector<Terminal_render_line_provenance>       visible_line_provenance;
+    // Empty unless a visible row shows an image; then one entry per grid row,
+    // null for a row without one. Slices are immutable and shared by reference.
+    std::vector<std::shared_ptr<const Terminal_image_slice>>
+                                                       visible_row_images;
     std::vector<Terminal_render_dirty_row_range>       dirty_row_ranges;
     std::vector<Terminal_render_hyperlink_metadata>    hyperlinks;
     Terminal_render_cursor                             cursor;
@@ -806,6 +826,39 @@ inline bool render_snapshot_row_is_viewable(
     return row >= 0 && row < render_snapshot_viewable_row_count(snapshot);
 }
 
+// Null when the row shows no image.
+inline std::shared_ptr<const Terminal_image_slice> render_snapshot_row_image(
+    const Terminal_render_snapshot& snapshot,
+    int                             row)
+{
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    if (!render_snapshot_row_is_viewable(snapshot, row) ||
+        row_index >= snapshot.visible_row_images.size())
+    {
+        return nullptr;
+    }
+
+    return snapshot.visible_row_images[row_index];
+}
+
+// The one way producers give a row its image, so a snapshot without images
+// keeps the field empty.
+inline void set_render_snapshot_row_image(
+    Terminal_render_snapshot&                   snapshot,
+    int                                         row,
+    std::shared_ptr<const Terminal_image_slice> slice)
+{
+    if (slice == nullptr) {
+        return;
+    }
+
+    Q_ASSERT(render_snapshot_row_is_viewable(snapshot, row));
+    if (snapshot.visible_row_images.empty()) {
+        snapshot.visible_row_images.resize(static_cast<std::size_t>(snapshot.grid_size.rows));
+    }
+    snapshot.visible_row_images[static_cast<std::size_t>(row)] = std::move(slice);
+}
+
 inline bool render_cell_text_has_non_space(const Terminal_render_cell_text& text)
 {
     const std::optional<ushort> single_code_unit = text.single_code_unit();
@@ -984,6 +1037,11 @@ public:
             : nullptr;
     }
 
+    std::shared_ptr<const Terminal_image_slice> image() const
+    {
+        return render_snapshot_row_image(*m_snapshot, m_row);
+    }
+
     bool dirty() const
     {
         return render_snapshot_row_is_dirty(*m_snapshot, m_row);
@@ -1121,6 +1179,11 @@ public:
         }
 
         return row_at_unchecked(row).provenance_or_null();
+    }
+
+    std::shared_ptr<const Terminal_image_slice> image_at(int row) const
+    {
+        return render_snapshot_row_image(m_snapshot, row);
     }
 
     const_iterator begin() const { return const_iterator(*this, 0); }
@@ -1541,6 +1604,57 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
     }
 
     return {};
+}
+
+// A row's image is checked apart from validate_render_snapshot, which ignores
+// images: images are an optional capability, so a bad one must not reject the
+// text of its snapshot, and a consumer drops only the image of a row that
+// fails here. A row without an image is OK. A slice may start past the grid.
+inline Terminal_render_image_status validate_render_snapshot_row_image(
+    const Terminal_render_snapshot& snapshot,
+    int                             row)
+{
+    Q_ASSERT(render_snapshot_row_is_viewable(snapshot, row));
+
+    const std::vector<std::shared_ptr<const Terminal_image_slice>>& images =
+        snapshot.visible_row_images;
+    if (images.empty()) {
+        return Terminal_render_image_status::OK;
+    }
+
+    if (images.size() != static_cast<std::size_t>(snapshot.grid_size.rows)) {
+        return Terminal_render_image_status::INVALID_ROW_COUNT;
+    }
+
+    const Terminal_image_slice* slice = images[static_cast<std::size_t>(row)].get();
+    if (slice == nullptr) {
+        return Terminal_render_image_status::OK;
+    }
+
+    if (slice->pixels.isNull() ||
+        slice->pixels.format() != QImage::Format_RGBA8888_Premultiplied)
+    {
+        return Terminal_render_image_status::INVALID_PIXELS;
+    }
+
+    if (!is_valid_cell_pixel_size(slice->cell_pixel_size)) {
+        return Terminal_render_image_status::INVALID_CELL_PIXEL_SIZE;
+    }
+
+    // A slice is one text row's share of an image, so at most one cell high.
+    if (slice->pixels.height() > slice->cell_pixel_size.height) {
+        return Terminal_render_image_status::INVALID_PIXEL_SIZE;
+    }
+
+    const std::int64_t cell_width  = slice->cell_pixel_size.width;
+    const std::int64_t column_span = (slice->pixels.width() + cell_width - 1) / cell_width;
+    if (slice->first_column < 0 ||
+        slice->first_column + column_span > k_terminal_image_slice_column_limit)
+    {
+        return Terminal_render_image_status::INVALID_COLUMN_SPAN;
+    }
+
+    return Terminal_render_image_status::OK;
 }
 
 }

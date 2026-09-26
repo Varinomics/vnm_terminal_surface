@@ -15,6 +15,7 @@
 #include <QStringList>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -7181,11 +7182,15 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_sl
     int                        first_column,
     terminal_cell_pixel_size_t cell_pixel_size)
 {
+    // Every new slice takes the next revision, which identifies its content. A
+    // renderer keys cached copies on it and outlives a session and its model,
+    // so revisions are unique across all models in the process.
+    static std::atomic<std::uint64_t> next_revision{1U};
     return std::make_shared<const Terminal_image_slice>(Terminal_image_slice{
         std::move(pixels),
         first_column,
         cell_pixel_size,
-        m_next_image_slice_revision++,
+        next_revision.fetch_add(1U, std::memory_order_relaxed),
     });
 }
 

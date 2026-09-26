@@ -14,6 +14,10 @@
 
 namespace vnm_terminal::internal {
 
+static_assert(
+    k_terminal_image_slice_column_limit == k_terminal_screen_model_max_columns,
+    "a snapshot accepts a slice exactly as far right as the model can place one");
+
 namespace {
 
 bool is_high_surrogate(QChar character)
@@ -233,6 +237,10 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                     snapshot_style_ids,
                     snapshot_hyperlink_ids,
                     active_identity_keys_by_id);
+                set_render_snapshot_row_image(
+                    snapshot,
+                    snapshot_row.value,
+                    std::move(row_cells->image_slice));
             }
 
             std::optional<Terminal_retained_line_provenance> provenance;
@@ -599,7 +607,10 @@ Terminal_screen_model::viewport_row_cells(
         const Terminal_screen_row* active_row =
             alternate_active_row(active_grid_row_t{row.value});
         return active_row != nullptr
-            ? std::optional<Viewport_row_cells>(Viewport_row_cells{&active_row->cells})
+            ? std::optional<Viewport_row_cells>(Viewport_row_cells{
+                .borrowed_cells = &active_row->cells,
+                .image_slice    = active_row->image_slice,
+            })
             : std::nullopt;
     }
 
@@ -614,9 +625,11 @@ Terminal_screen_model::viewport_row_cells(
         {
             VNM_TERMINAL_PROFILE_SCOPE(
                 "Terminal_screen_model::viewport_row_cells::retained_history_materialize");
+            // A history row's image exists only as its record's pixels, so a
+            // visible one is decoded into a new slice with its stored revision.
             retained_record = m_primary_backing.materialize_retained_history_record(
                 static_cast<std::size_t>(backing_row->value),
-                Terminal_history_row_record_image_decode::SKIP_PIXELS);
+                Terminal_history_row_record_image_decode::DECODE_PIXELS);
         }
         if (!retained_record.has_value()) {
             return std::nullopt;
@@ -628,6 +641,7 @@ Terminal_screen_model::viewport_row_cells(
             std::move(retained_record->style_table);
         result.owned_hyperlink_identity_keys =
             std::move(retained_record->hyperlink_identity_keys);
+        result.image_slice = std::move(retained_record->row.image_slice);
         return result;
     }
 
@@ -636,7 +650,10 @@ Terminal_screen_model::viewport_row_cells(
     };
     const Terminal_screen_row& active =
         primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
-    return Viewport_row_cells{&active.cells};
+    return Viewport_row_cells{
+        .borrowed_cells = &active.cells,
+        .image_slice    = active.image_slice,
+    };
 }
 
 Terminal_style_id Terminal_screen_model::snapshot_style_id_for_cell(

@@ -1,7 +1,9 @@
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 #include "helpers/test_check.h"
 
+#include <QImage>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -3084,6 +3086,275 @@ bool test_invert_brightness_is_a_gpu_render_option()
     return ok;
 }
 
+// Image quads. Oracles: S3 (a slice's texels are device pixels of the cell it
+// was placed on and scale to the cell drawn now); the grid geometry (a row's
+// image starts at its first column and is cut where the grid or the item
+// ends); S5 and D1 (images are a layer of their own that adds quads and
+// changes no other primitive); the capability rule (a bad image is dropped
+// alone and never rejects its snapshot).
+
+std::shared_ptr<const term::Terminal_image_slice> image_slice(
+    int                               width,
+    int                               height,
+    int                               first_column,
+    term::terminal_cell_pixel_size_t  cell,
+    std::uint64_t                     revision)
+{
+    QImage pixels(width, height, QImage::Format_RGBA8888_Premultiplied);
+    pixels.fill(QColor(40, 120, 200));
+    return std::make_shared<const term::Terminal_image_slice>(term::Terminal_image_slice{
+        std::move(pixels),
+        first_column,
+        cell,
+        revision,
+    });
+}
+
+bool rects_near(const QRectF& actual, const QRectF& expected)
+{
+    constexpr qreal k_tolerance = 0.000000001;
+    return
+        std::abs(actual.x()      - expected.x())      < k_tolerance &&
+        std::abs(actual.y()      - expected.y())      < k_tolerance &&
+        std::abs(actual.width()  - expected.width())  < k_tolerance &&
+        std::abs(actual.height() - expected.height()) < k_tolerance;
+}
+
+const term::Terminal_render_image_quad* image_quad_for_row(
+    const term::Terminal_render_frame& frame,
+    int                                row)
+{
+    for (const term::Terminal_render_image_quad& quad : frame.image_quads) {
+        if (quad.row == row) {
+            return &quad;
+        }
+    }
+
+    return nullptr;
+}
+
+bool layer_descriptors_equal(
+    const term::Terminal_render_layer_descriptors& left,
+    const term::Terminal_render_layer_descriptors& right)
+{
+    return
+        left.text_key                == right.text_key                &&
+        left.background_key          == right.background_key          &&
+        left.graphic_key             == right.graphic_key             &&
+        left.decoration_key          == right.decoration_key          &&
+        left.cursor_inverse_text_key == right.cursor_inverse_text_key &&
+        left.selection_key           == right.selection_key           &&
+        left.ime_preedit_key         == right.ime_preedit_key         &&
+        left.visual_bell_key         == right.visual_bell_key         &&
+        left.hyperlink_underline_key == right.hyperlink_underline_key &&
+        left.style_color_key         == right.style_color_key         &&
+        left.reverse_video_key       == right.reverse_video_key       &&
+        left.render_options_key      == right.render_options_key      &&
+        left.cell_metrics_key        == right.cell_metrics_key;
+}
+
+bool row_paint_keys_equal(
+    const term::Terminal_render_row_descriptor& left,
+    const term::Terminal_render_row_descriptor& right)
+{
+    return
+        left.row                     == right.row                     &&
+        left.text_key                == right.text_key                &&
+        left.background_key          == right.background_key          &&
+        left.graphic_key             == right.graphic_key             &&
+        left.decoration_key          == right.decoration_key          &&
+        left.cursor_inverse_text_key == right.cursor_inverse_text_key &&
+        left.selection_key           == right.selection_key           &&
+        left.ime_preedit_key         == right.ime_preedit_key         &&
+        left.hyperlink_underline_key == right.hyperlink_underline_key;
+}
+
+bool test_image_quads_scale_from_the_placing_cell_to_the_drawn_cell()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 12});
+    snapshot.cursor.visible = false;
+    const std::shared_ptr<const term::Terminal_image_slice> slice =
+        image_slice(30, 20, 2, {10, 20}, 7U);
+    term::set_render_snapshot_row_image(snapshot, 1, slice);
+
+    struct Scale_case
+    {
+        const char*                   name;
+        term::terminal_cell_metrics_t cell_metrics;
+        QRectF                        rect;
+    };
+    const std::vector<Scale_case> cases = {
+        {"texels map one to one onto the cell they were placed on",
+            {10.0, 20.0, 14.0, 6.0}, QRectF(20.0, 20.0, 30.0, 20.0)},
+        {"a 10x20 cell's texels shrink onto a 9x18 cell",
+            {9.0,  18.0, 13.0, 5.0}, QRectF(18.0, 18.0, 27.0, 18.0)},
+        {"a larger font scales the texels up",
+            {12.0, 24.0, 17.0, 7.0}, QRectF(24.0, 24.0, 36.0, 24.0)},
+        {"at a device pixel ratio of 2 a texel is half a logical pixel",
+            {5.0,  10.0, 7.0,  3.0}, QRectF(10.0, 10.0, 15.0, 10.0)},
+    };
+    for (const Scale_case& scale_case : cases) {
+        const term::Terminal_render_frame frame =
+            build_with_metrics(snapshot, scale_case.cell_metrics);
+        const term::Terminal_render_image_quad* quad = image_quad_for_row(frame, 1);
+        ok &= check(
+            frame.image_quads.size() == 1U &&
+                quad != nullptr &&
+                rects_near(quad->rect, scale_case.rect) &&
+                rects_near(quad->source_rect, QRectF(0.0, 0.0, 30.0, 20.0)) &&
+                quad->slice == slice &&
+                frame.stats.image_quads_emitted == 1 &&
+                frame.stats.images_rejected == 0,
+            scale_case.name);
+    }
+
+    return ok;
+}
+
+bool test_image_quads_are_cut_where_the_grid_or_item_ends()
+{
+    bool ok = true;
+
+    // Eight columns of 10 logical pixels end at 80, inside the 160-pixel item.
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 8});
+    snapshot.cursor.visible = false;
+    term::set_render_snapshot_row_image(snapshot, 0, image_slice(40, 20, 6, {10, 20}, 1U));
+    term::set_render_snapshot_row_image(snapshot, 1, image_slice(40, 20, 8, {10, 20}, 2U));
+    term::set_render_snapshot_row_image(snapshot, 2, image_slice(40, 7,  0, {10, 20}, 3U));
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    const term::Terminal_render_image_quad* cut = image_quad_for_row(frame, 0);
+    ok &= check(cut != nullptr &&
+            rects_near(cut->rect,        QRectF(60.0, 0.0, 20.0, 20.0)) &&
+            rects_near(cut->source_rect, QRectF(0.0,  0.0, 20.0, 20.0)),
+        "an image reaching past the last column is cut there, with its texels");
+    ok &= check(image_quad_for_row(frame, 1) == nullptr && frame.stats.images_rejected == 0,
+        "an image starting past a narrowed grid draws nothing and is not an error");
+    const term::Terminal_render_image_quad* short_band = image_quad_for_row(frame, 2);
+    ok &= check(short_band != nullptr &&
+            rects_near(short_band->rect,        QRectF(0.0, 40.0, 40.0, 7.0)) &&
+            rects_near(short_band->source_rect, QRectF(0.0, 0.0,  40.0, 7.0)),
+        "a band shorter than its cell is drawn from the top of its row");
+
+    // Scaled, a cut keeps the texels in proportion: 9 logical pixels per 10
+    // texels, and the grid ends at 72.
+    const term::Terminal_render_frame scaled =
+        build_with_metrics(snapshot, {9.0, 18.0, 13.0, 5.0});
+    const term::Terminal_render_image_quad* scaled_cut  = image_quad_for_row(scaled, 0);
+    const term::Terminal_render_image_quad* scaled_band = image_quad_for_row(scaled, 2);
+    ok &= check(scaled_cut != nullptr &&
+            rects_near(scaled_cut->rect,        QRectF(54.0, 0.0, 18.0, 18.0)) &&
+            rects_near(scaled_cut->source_rect, QRectF(0.0,  0.0, 20.0, 20.0)),
+        "a scaled image is cut at the grid with the texels that fall inside it");
+    ok &= check(scaled_band != nullptr &&
+            rects_near(scaled_band->rect, QRectF(0.0, 36.0, 36.0, 6.3)),
+        "a short band scales like a full one");
+
+    // Twenty columns end at 200, past the 160-pixel item, whose edge cuts.
+    term::Terminal_render_snapshot wide = empty_snapshot({1, 20});
+    wide.cursor.visible = false;
+    term::set_render_snapshot_row_image(wide, 0, image_slice(40, 20, 14, {10, 20}, 4U));
+    const term::Terminal_render_frame wide_frame = build(wide);
+    ok &= check(wide_frame.image_quads.size() == 1U &&
+            rects_near(wide_frame.image_quads.front().rect,        QRectF(140.0, 0.0, 20.0, 20.0)) &&
+            rects_near(wide_frame.image_quads.front().source_rect, QRectF(0.0,   0.0, 20.0, 20.0)),
+        "an image is cut at the item's edge when the item ends inside the grid");
+
+    return ok;
+}
+
+bool test_invalid_row_images_are_dropped_alone()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 12});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({{1, 0}, QStringLiteral("A")});
+    QImage straight_alpha(20, 20, QImage::Format_RGBA8888);
+    straight_alpha.fill(QColor(10, 20, 30));
+    term::set_render_snapshot_row_image(snapshot, 0, image_slice(20, 20, 0, {10, 20}, 1U));
+    term::set_render_snapshot_row_image(
+        snapshot,
+        1,
+        std::make_shared<const term::Terminal_image_slice>(
+            term::Terminal_image_slice{std::move(straight_alpha), 2, {10, 20}, 2U}));
+    term::set_render_snapshot_row_image(snapshot, 2, image_slice(20, 20, 4, {10, 20}, 3U));
+
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "a snapshot with an invalid image is still a valid snapshot");
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.image_quads.size() == 2U &&
+            image_quad_for_row(frame, 0) != nullptr &&
+            image_quad_for_row(frame, 1) == nullptr &&
+            image_quad_for_row(frame, 2) != nullptr &&
+            frame.stats.images_rejected == 1,
+        "a row whose image fails its check loses only that image, and the loss is counted");
+    ok &= check(frame.text_runs.size() == 1U && frame.text_runs.front().row == 1,
+        "the text of the row that lost its image still renders");
+
+    // Two entries for three rows: no entry can be trusted to name its row.
+    term::Terminal_render_snapshot miscounted = snapshot;
+    miscounted.visible_row_images.pop_back();
+    const term::Terminal_render_frame miscounted_frame = build(miscounted);
+    ok &= check(miscounted_frame.image_quads.empty() &&
+            miscounted_frame.stats.images_rejected == 2,
+        "an image field that does not match the grid rows draws no image");
+
+    return ok;
+}
+
+bool test_images_add_only_quads_and_extend_only_their_rows_content_keys()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot base = empty_snapshot({3, 12});
+    term::Terminal_text_style colored = term::make_default_terminal_text_style();
+    colored.foreground = term::make_rgb_terminal_color_ref(0xffcc0000U);
+    colored.background = term::make_rgb_terminal_color_ref(0xff0030ccU);
+    base.styles.push_back(colored);
+    base.cells.push_back({{0, 0}, QStringLiteral("a"), 0U, 1, false, 1U});
+    base.cells.push_back({{1, 5}, QStringLiteral("b")});
+    base.cells.push_back({{2, 1}, QStringLiteral("c"), 0U, 1, false, 1U});
+    base.cursor.position        = {1, 5};
+    base.dirty_row_ranges       = {{0, 3}};
+    base.visible_line_provenance = {{0, 11U, 1U}, {1, 12U, 1U}, {2, 13U, 1U}};
+    base.selection_spans.push_back({{}, 2, 0, 4});
+
+    term::Terminal_render_snapshot with_image = base;
+    term::set_render_snapshot_row_image(with_image, 1, image_slice(40, 20, 3, {10, 20}, 9U));
+
+    const term::Terminal_render_frame frame       = build(base);
+    const term::Terminal_render_frame image_frame = build(with_image);
+    ok &= check(frame.image_quads.empty() && image_frame.image_quads.size() == 1U,
+        "only the snapshot with an image yields an image quad");
+    ok &= check(layer_descriptors_equal(frame.layer_descriptors, image_frame.layer_descriptors) &&
+            frame.text_style_key == image_frame.text_style_key,
+        "an image changes no text, background, graphic, decoration, cursor, selection or "
+        "overlay primitive");
+    ok &= check(render_rect_sequences_match(image_frame.background_rects, frame.background_rects) &&
+            render_rect_sequences_match(image_frame.selection_rects, frame.selection_rects) &&
+            image_frame.cursors.size() == frame.cursors.size() &&
+            image_frame.cursor_text_runs.size() == frame.cursor_text_runs.size(),
+        "an image adds no background, selection or cursor primitive");
+
+    bool keys_match = frame.row_descriptors.size() == image_frame.row_descriptors.size();
+    for (std::size_t index = 0U; keys_match && index < frame.row_descriptors.size(); ++index) {
+        const term::Terminal_render_row_descriptor& plain = frame.row_descriptors[index];
+        const term::Terminal_render_row_descriptor& image = image_frame.row_descriptors[index];
+        const bool content_key_equal = plain.content_identity_key == image.content_identity_key;
+        keys_match =
+            row_paint_keys_equal(plain, image) &&
+            content_key_equal == (plain.row != 1);
+    }
+    ok &= check(keys_match,
+        "only the image row's content key changes, and no row's paint keys do");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -3128,5 +3399,9 @@ int main()
     ok &= test_content_layer_descriptor_build_can_be_skipped_for_state_only_frame();
     ok &= test_viewport_empty_and_dirty_ranges();
     ok &= test_invert_brightness_is_a_gpu_render_option();
+    ok &= test_image_quads_scale_from_the_placing_cell_to_the_drawn_cell();
+    ok &= test_image_quads_are_cut_where_the_grid_or_item_ends();
+    ok &= test_invalid_row_images_are_dropped_alone();
+    ok &= test_images_add_only_quads_and_extend_only_their_rows_content_keys();
     return ok ? 0 : 1;
 }

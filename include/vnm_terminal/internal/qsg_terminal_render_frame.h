@@ -10,6 +10,7 @@
 #include <QString>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -155,6 +156,18 @@ struct Terminal_render_cursor_primitive
     Terminal_cursor_shape      kind               = Terminal_cursor_shape::BLOCK;
     QRectF                     rect;
     QColor                     color;
+};
+
+// One viewport row's image. rect is in logical pixels, source_rect in texels
+// of slice->pixels; the two differ in scale when the slice was placed on a
+// cell of another pixel size than the one drawn now. slice->revision
+// identifies the texels for any cached copy.
+struct Terminal_render_image_quad
+{
+    int                                          row = 0;
+    QRectF                                       rect;
+    QRectF                                       source_rect;
+    std::shared_ptr<const Terminal_image_slice>  slice;
 };
 
 struct Terminal_render_row_descriptor
@@ -348,6 +361,8 @@ struct terminal_render_frame_stats_t
     int                                            decoration_rects_emitted        = 0;
     int                                            cursor_rects_emitted            = 0;
     int                                            overlay_rects_emitted           = 0;
+    int                                            image_quads_emitted             = 0;
+    int                                            images_rejected                 = 0;
     int                                            row_descriptors_built           = 0;
     int                                            layer_descriptors_built         = 0;
 };
@@ -369,6 +384,7 @@ struct Terminal_render_frame
     std::vector<Terminal_render_decoration>        decorations;
     std::vector<Terminal_render_cursor_primitive>  cursors;
     std::vector<Terminal_render_rect>              overlay_rects;
+    std::vector<Terminal_render_image_quad>        image_quads;
     std::vector<Terminal_render_dirty_row_range>   dirty_row_ranges;
     std::vector<Terminal_render_row_descriptor>    row_descriptors;
     Terminal_render_layer_descriptors              layer_descriptors;

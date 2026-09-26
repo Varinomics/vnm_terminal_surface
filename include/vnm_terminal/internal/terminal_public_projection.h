@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/render_snapshot.h"
+#include <memory>
 #include <optional>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,9 @@ struct Terminal_public_projection_row
     // copied viewport. Full-row captures prove the true retained-line ordinal.
     bool                                 visual_fragment_index_is_exact = false;
     std::vector<Terminal_render_cell>    cells;
+    // Null when the row shows no image.
+    std::shared_ptr<const Terminal_image_slice>
+                                         image;
 };
 
 struct Terminal_public_projection_row_metadata

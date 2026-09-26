@@ -625,7 +625,8 @@ installs `vnm_terminal/backend_output_capture.h`,
 subtree through
 `vnm_terminal_surface::vnm_terminal_surface`. Embedders that consume the
 installed package therefore cannot include internal headers and must rely on
-these public targets and headers. Renderer diagnostics are exposed through the
+these public targets and headers. A canvas frame, exported or rendered, carries
+text only: sixel images the surface shows are not part of it. Renderer diagnostics are exposed through the
 public `qsg_atlas` serializer.
 Internal headers carry no source- or binary-stability guarantee and may change
 without notice.

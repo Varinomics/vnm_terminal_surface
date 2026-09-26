@@ -31,6 +31,7 @@ struct Terminal_canvas_export_result
 // Call on the surface's owning thread. The returned frame owns all of its data;
 // later surface publications cannot mutate a previously returned frame. Text
 // that exceeds either published limit fails explicitly and is never truncated.
+// The frame carries text only: images the surface shows are not exported.
 Terminal_canvas_export_result export_terminal_canvas_frame(
     const VNM_TerminalSurface& surface);
 

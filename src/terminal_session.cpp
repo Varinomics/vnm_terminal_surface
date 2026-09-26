@@ -168,12 +168,17 @@ std::uint64_t render_cell_text_payload_bytes(const Terminal_render_cell_text& te
     return fallback != nullptr ? string_payload_bytes(*fallback) : 0U;
 }
 
-std::uint64_t render_snapshot_payload_bytes(const Terminal_render_snapshot& snapshot)
+// Snapshots share image slices with each other, so a slice already in
+// counted_images adds nothing.
+std::uint64_t render_snapshot_payload_bytes(
+    const Terminal_render_snapshot&         snapshot,
+    std::set<const Terminal_image_slice*>&  counted_images)
 {
     std::uint64_t bytes =
         vector_payload_bytes(snapshot.styles)                  +
         vector_payload_bytes(snapshot.cells)                   +
         vector_payload_bytes(snapshot.visible_line_provenance) +
+        vector_payload_bytes(snapshot.visible_row_images)      +
         vector_payload_bytes(snapshot.dirty_row_ranges)        +
         vector_payload_bytes(snapshot.hyperlinks)              +
         vector_payload_bytes(snapshot.selection_spans)         +
@@ -186,6 +191,11 @@ std::uint64_t render_snapshot_payload_bytes(const Terminal_render_snapshot& snap
     for (const Terminal_render_snapshot_row_content row : rows) {
         for (const Terminal_render_cell& cell : row) {
             bytes += render_cell_text_payload_bytes(cell.text);
+        }
+    }
+    for (const std::shared_ptr<const Terminal_image_slice>& image : snapshot.visible_row_images) {
+        if (image != nullptr && counted_images.insert(image.get()).second) {
+            bytes += static_cast<std::uint64_t>(image->pixels.sizeInBytes());
         }
     }
     return bytes;
@@ -202,12 +212,13 @@ retained_render_snapshot_stats_t retained_render_snapshot_stats(
     const std::shared_ptr<const Terminal_render_snapshot>& latest_content)
 {
     retained_render_snapshot_stats_t stats;
+    std::set<const Terminal_image_slice*> counted_images;
     if (latest_render != nullptr) {
-        stats.payload_bytes += render_snapshot_payload_bytes(*latest_render);
+        stats.payload_bytes += render_snapshot_payload_bytes(*latest_render, counted_images);
         ++stats.generation_count;
     }
     if (latest_content != nullptr && latest_content.get() != latest_render.get()) {
-        stats.payload_bytes += render_snapshot_payload_bytes(*latest_content);
+        stats.payload_bytes += render_snapshot_payload_bytes(*latest_content, counted_images);
         ++stats.generation_count;
     }
     return stats;
@@ -462,6 +473,7 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
             cell.position.row = viewport_row;
             snapshot.cells.push_back(std::move(cell));
         }
+        set_render_snapshot_row_image(snapshot, viewport_row, projection_row.image);
     }
 
     const bool cursor_was_visible = snapshot.cursor.visible;
@@ -1255,6 +1267,11 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     snapshot.modes                   = public_snapshot.modes;
     const Terminal_render_snapshot_row_content_view public_rows(public_snapshot);
     snapshot.cells = cells_adapted_to_grid(public_rows, grid_size);
+    // Rows keep their images like their cells; a renderer clips an image that
+    // now reaches past the grid.
+    for (int row = 0; row < std::min(public_rows.row_count(), grid_size.rows); ++row) {
+        set_render_snapshot_row_image(snapshot, row, public_rows.image_at(row));
+    }
     record_consumer_materialization(
         profile_stats,
         Terminal_render_snapshot_materialization_reason::GEOMETRY_DERIVED_SNAPSHOT,
