@@ -187,6 +187,13 @@ vnm_terminal_msdf_text_make_available(
     REQUIRED_BY "LCD display resolution"
     SOURCE_DIR_VAR VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
     USE_SYSTEM_LIBS "${VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS}")
+get_target_property(vnm_terminal_msdf_text_package_dependency vnm_msdf_text::qt_lcd IMPORTED)
+set(vnm_terminal_lcd_contract_link vnm_msdf_text::lcd_contract)
+set(vnm_terminal_qt_lcd_link vnm_msdf_text::qt_lcd)
+if(NOT vnm_terminal_msdf_text_package_dependency)
+    set(vnm_terminal_lcd_contract_link "$<BUILD_INTERFACE:vnm_msdf_text::lcd_contract>")
+    set(vnm_terminal_qt_lcd_link "$<BUILD_INTERFACE:vnm_msdf_text::qt_lcd>")
+endif()
 
 set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/terminal_canvas_appearance.h
@@ -247,7 +254,7 @@ target_include_directories(vnm_terminal_surface_renderer PUBLIC
 
 target_link_libraries(vnm_terminal_surface_renderer PUBLIC
     ${vnm_terminal_qt_targets}
-    vnm_msdf_text::lcd_contract
+    ${vnm_terminal_lcd_contract_link}
 )
 
 target_link_libraries(vnm_terminal_surface_renderer PRIVATE
@@ -421,7 +428,7 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 target_link_libraries(vnm_terminal_surface PRIVATE
     Qt6::GuiPrivate
     Qt6::QuickPrivate
-    vnm_msdf_text::qt_lcd
+    ${vnm_terminal_qt_lcd_link}
     vnm_qt_dispatch::vnm_qt_dispatch
 )
 if(vnm_terminal_surface_process_custody_required)
@@ -518,10 +525,10 @@ install(TARGETS
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
 
-if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package_dependency)
+if(NOT vnm_terminal_msdf_text_package_dependency)
     install(CODE [[
         message(FATAL_ERROR
-            "Installing vnm_terminal_surface with MSDF requires packaged "
+            "Installing vnm_terminal_surface requires packaged LCD components from "
             "vnm_msdf_text. Reconfigure with "
             "-DVNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON and provide "
             "vnm_msdf_text_DIR or CMAKE_PREFIX_PATH.")
