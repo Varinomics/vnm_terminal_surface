@@ -46,6 +46,11 @@ scroll policy when a hold begins
   carry `basis = PUBLIC_PROJECTION` and `purpose = SCROLL` (see
   `render_snapshot_contract.md`), use the primary buffer only, and never
   reveal unpublished hold content.
+  The projection is captured whole at hold entry, synchronously: every
+  retained history row is copied, image rows decoded. It is a known cost this
+  opt-in policy carries, outside the drain's sixel budget: with a history ring
+  holding eight cap-size (8 MiB) sixel images, one capture took 15 to 24 ms
+  and kept about 7 MB of image pixels alive for the hold.
 
 The policy in effect for a hold is the policy latched at hold entry:
 `effective_synchronized_output_scroll_policy()` returns the latched value

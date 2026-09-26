@@ -66,9 +66,11 @@ Writable Qt properties:
   `DEFER_UNTIL_CONTENT_PUBLICATION`; public scroll APIs and app chrome remain
   visually deferred until content is published. `IMMEDIATE_PUBLIC_PROJECTION`
   is opt-in and scrolls a copied public projection without exposing hidden live
-  rows. Policy changes during an active hold are latched: the current hold keeps
-  its entry policy, a diagnostic is recorded, and the next hold uses the new
-  policy.
+  rows; copying that projection at each hold entry is a synchronous cost that
+  grows with retained history, image rows included (see
+  `synchronized_output.md`). Policy changes during an active hold are latched:
+  the current hold keeps its entry policy, a diagnostic is recorded, and the
+  next hold uses the new policy.
 - `textAreaResizePolicy` is `APPLICATION_CONTROLLED` (the default) or
   `DISABLED`, and controls whether XTWINOPS `CSI 8 ; rows ; columns t` may move
   the text area. Hosts set `DISABLED` whenever the window manager owns their
