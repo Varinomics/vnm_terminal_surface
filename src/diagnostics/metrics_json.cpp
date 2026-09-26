@@ -133,6 +133,13 @@ QJsonObject atlas_capabilities_json(const internal::Qsg_atlas_render_summary& su
     return object;
 }
 
+QJsonObject atlas_image_summary_json(const internal::Qsg_atlas_image_summary& summary)
+{
+    QJsonObject object;
+    detail::emit_metrics_json(object, summary, detail::atlas_image_metrics());
+    return object;
+}
+
 QJsonObject atlas_render_summary_json(
     const internal::Qsg_atlas_render_summary& summary)
 {
@@ -391,6 +398,7 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
     object.insert(
         QStringLiteral("capabilities"),
         atlas_capabilities_json(report.render));
+    object.insert(QStringLiteral("images"), atlas_image_summary_json(report.render.images));
     object.insert(
         QStringLiteral("producer"),
         atlas_producer_summary_json(report.producer));

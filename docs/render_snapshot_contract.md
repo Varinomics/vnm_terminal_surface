@@ -174,7 +174,8 @@ Images are an optional capability, so `validate_render_snapshot` ignores them
 and a bad image never rejects the text of its snapshot. A consumer checks a
 row's image with `validate_render_snapshot_row_image`, which returns its own
 `Terminal_render_image_status`: the field size must be zero or the row count
-(`INVALID_ROW_COUNT`), the pixels non-null RGBA8888 premultiplied
+(`INVALID_ROW_COUNT`), the revision non-zero, since renderers key cached texels
+on it (`INVALID_REVISION`), the pixels non-null RGBA8888 premultiplied
 (`INVALID_PIXELS`), the placing cell size positive
 (`INVALID_CELL_PIXEL_SIZE`), the height at most one cell
 (`INVALID_PIXEL_SIZE`), and the columns inside `[0, 4096]`

@@ -41,6 +41,12 @@ desktop GLSL `120`, `130`, `150`, and `330` targets so Qt can select it on
 desktop OpenGL. Bake it with `--glsl "120,130,150,300 es,330"` to retain the
 required ES target without generating ES 1.00 source.
 
+The image fragment (`atlas_image.frag.qsb`) runs behind `atlas_glyph.vert`, so
+it carries the same `300 es` target and no `100 es` one, and the desktop GLSL
+`120`, `130`, `150`, and `330` targets of the alpha fragment: bake it with
+`--glsl "120,130,150,300 es,330" --hlsl 50 --msl 12`. Its inputs keep the vertex
+outputs' names, which older GLSL targets link by name.
+
 Dual-source atlas fragment shader packages must carry OpenGL GLSL 330 targets
 and patched GLSL 150 replacements from the corresponding `.glsl150.frag`
 source files. Qt Shader Baker's generated GLSL 150 output drops the explicit
@@ -105,6 +111,20 @@ contract.
 `QImage` and `QPainter` are acceptable for test framebuffer readback and narrow
 diagnostics. They are not the production terminal-row renderer and are not a
 `QImage`-to-texture text route.
+
+Sixel images are the one `QImage`-to-texture route, and they are never text.
+Each visible row's image slice (`Terminal_render_frame::image_quads`) is
+uploaded once, unchanged, into an RGBA8 texture of its own, keyed by the slice
+revision, and drawn with linear filtering by `atlas_image.frag`: its
+premultiplied texels times the inherited opacity, never brightness-inverted.
+The image pass draws after cell backgrounds and before selection, search,
+preedit, text, decorations, cursors, and the visual bell, so overlays stay
+visible over images; the model erases the text of cells an image covers, so
+text and image pixels do not share a cell. The textures the committed frame
+draws are kept; other image textures stay for reuse up to a fixed byte limit,
+least recently used first out. Only a committing prepare creates, uploads, or
+retires image textures, and a failed image resource drops images only, never
+the frame's text.
 
 The GPU glyph-atlas renderer caches glyphs rasterized by Qt's font engine
 (`QRawFont::alphaMapForGlyph`) into atlas textures and composites cells through
