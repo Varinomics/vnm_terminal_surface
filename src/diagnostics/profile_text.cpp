@@ -510,6 +510,8 @@ void append_qsg_atlas_profile_section(
         });
     stream << "  capabilities\n";
     detail::emit_metrics_text(stream, report.render, detail::atlas_capabilities_metrics());
+    stream << "  images\n";
+    detail::emit_metrics_text(stream, report.render.images, detail::atlas_image_metrics());
 }
 
 }

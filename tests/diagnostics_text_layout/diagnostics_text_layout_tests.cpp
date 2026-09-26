@@ -291,6 +291,62 @@ bool test_capabilities_golden()
     return ok;
 }
 
+// Images: 11 counters and a trailing bool.
+term::Qsg_atlas_image_summary make_images_fixture()
+{
+    term::Qsg_atlas_image_summary s;
+    s.quads             = 6101;
+    s.rejected          = 6102;
+    s.draws             = 6103;
+    s.texture_creations = 6104;
+    s.uploaded_bytes    = 6105U;
+    s.evictions         = 6106;
+    s.cached_textures   = 6107;
+    s.cached_bytes      = 6108U;
+    s.pinned_bytes      = 6109U;
+    s.oversized_skips   = 6110;
+    s.resource_failures = 6111;
+    s.pipeline_ready    = true;
+    return s;
+}
+
+std::vector<Oracle_field> images_oracle()
+{
+    return {
+        oracle_counter("quads",             6101),
+        oracle_counter("rejected",          6102),
+        oracle_counter("draws",             6103),
+        oracle_counter("texture_creations", 6104),
+        oracle_counter("uploaded_bytes",    6105),
+        oracle_counter("evictions",         6106),
+        oracle_counter("cached_textures",   6107),
+        oracle_counter("cached_bytes",      6108),
+        oracle_counter("pinned_bytes",      6109),
+        oracle_counter("oversized_skips",   6110),
+        oracle_counter("resource_failures", 6111),
+        oracle_bool("pipeline_ready",       true),
+    };
+}
+
+bool test_images_golden()
+{
+    const term::Qsg_atlas_image_summary fixture = make_images_fixture();
+    const std::vector<Oracle_field> oracle = images_oracle();
+
+    QString     text;
+    QTextStream stream(&text);
+    detail::emit_metrics_text(stream, fixture, detail::atlas_image_metrics());
+    stream.flush();
+
+    QJsonObject object;
+    detail::emit_metrics_json(object, fixture, detail::atlas_image_metrics());
+
+    bool ok = true;
+    ok &= check_block_text("images", text, oracle);
+    ok &= check_block_json("images", object, oracle);
+    return ok;
+}
+
 // Warm-lazy: three table segments split by the two one-off elapsed-ms doubles.
 // Two bools (warm_completed, warm_page_pressure) exercise the BOOL kind.
 term::Qsg_atlas_warm_lazy_summary make_warm_lazy_fixture()
@@ -547,6 +603,7 @@ int main()
     ok &= test_producer_golden();
     ok &= test_coverage_golden();
     ok &= test_capabilities_golden();
+    ok &= test_images_golden();
     ok &= test_warm_lazy_golden();
     ok &= test_report_overlap_golden();
     ok &= test_retained_history_golden();

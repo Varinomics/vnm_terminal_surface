@@ -7331,6 +7331,88 @@ bool test_shader_package_variant_contract()
     return ok;
 }
 
+// The image fragment pairs with atlas_glyph.vert, so it carries the same GLES
+// target, and the desktop GLSL targets the glyph alpha fragment carries
+// (docs/qt_rendering_policy.md).
+bool test_image_shader_package_variant_contract()
+{
+    QShader image_fragment;
+    if (!load_shader_package(
+            ":/vnm_terminal_surface/shaders/atlas_image.frag.qsb",
+            image_fragment))
+    {
+        return false;
+    }
+
+    bool ok = true;
+    ok &= check(glsl_es_versions(image_fragment) == std::set<int>{300},
+        "image fragment package has only the GLES 3.0 target of the glyph vertex");
+    ok &= check(
+        shader_has_glsl_desktop_variant(image_fragment, 120) &&
+            shader_has_glsl_desktop_variant(image_fragment, 130) &&
+            shader_has_glsl_desktop_variant(image_fragment, 150) &&
+            shader_has_glsl_desktop_variant(image_fragment, 330),
+        "image fragment package provides desktop GLSL variants");
+    ok &= check(
+        image_fragment.availableShaders().contains(
+            QShaderKey(QShader::HlslShader, QShaderVersion(50))) &&
+            image_fragment.availableShaders().contains(
+                QShaderKey(QShader::MslShader, QShaderVersion(12))),
+        "image fragment package provides the HLSL and MSL targets of the glyph fragments");
+
+    const QByteArray es_300 = image_fragment.shader(
+        QShaderKey(QShader::GlslShader, QShaderVersion(300, QShaderVersion::GlslEs))).shader();
+    ok &= check(
+        es_300.startsWith(QByteArrayLiteral("#version 300 es")) &&
+            es_300.contains(QByteArrayLiteral("sampler2D")) &&
+            es_300.contains(QByteArrayLiteral("fragment_uv")) &&
+            es_300.contains(QByteArrayLiteral("fragment_color")),
+        "image GLES fragment samples a 2D texture through the glyph vertex outputs");
+    return ok;
+}
+
+// Oracle: I4 (the image texture cache is droppable; the committed frame's
+// textures are pinned; the rest stay least recently used first under a bound).
+bool test_image_texture_cache()
+{
+    bool ok = true;
+    term::Qsg_atlas_image_texture_cache<int> cache(100U);
+    cache.insert(1U, 10, 40U);
+    cache.insert(2U, 20, 40U);
+    cache.insert(3U, 30, 40U);
+    ok &= check(cache.pin({3U}).empty() && cache.size() == 3U &&
+            cache.bytes() == 120U && cache.pinned_bytes() == 40U,
+        "image cache keeps unpinned textures within its byte limit");
+
+    cache.insert(4U, 40, 40U);
+    const std::vector<int> evicted = cache.pin({4U});
+    ok &= check(evicted == std::vector<int>{10} && cache.find(1U) == nullptr &&
+            cache.find(3U) != nullptr && *cache.find(3U) == 30,
+        "image cache evicts the least recently used unpinned texture first");
+
+    // Pinning 2 makes it more recently used than 3, which then goes first.
+    ok &= check(cache.pin({2U}).empty(), "image cache keeps a repinned texture");
+    cache.insert(5U, 50, 40U);
+    ok &= check(cache.pin({5U}) == std::vector<int>{30},
+        "image cache orders unpinned textures by their last use");
+
+    term::Qsg_atlas_image_texture_cache<int> pinned_only(0U);
+    pinned_only.insert(7U, 70, 1000U);
+    pinned_only.insert(8U, 80, 1000U);
+    ok &= check(pinned_only.pin({7U, 8U}).empty() && pinned_only.size() == 2U &&
+            pinned_only.pinned_bytes() == 2000U,
+        "image cache never evicts a pinned texture, whatever its bytes");
+    ok &= check(pinned_only.pin({8U}) == std::vector<int>{70} && pinned_only.size() == 1U,
+        "image cache evicts a texture once the committed frame stops drawing it");
+
+    std::vector<int> released = cache.take_all();
+    std::sort(released.begin(), released.end());
+    ok &= check(released == std::vector<int>{20, 40, 50} && cache.size() == 0U &&
+            cache.bytes() == 0U && cache.find(4U) == nullptr,
+        "releasing the image cache hands back every texture and forgets them");
+    return ok;
+}
+
 bool test_source_posture()
 {
     QByteArray atlas_source;
@@ -11027,6 +11109,133 @@ Atlas_host_state_result test_atlas_layer_toggle_host_state(
     return result;
 }
 
+// A row's image slice of one premultiplied color, `columns` cells wide and a
+// full cell high; the first `transparent_columns` cells are fully transparent.
+std::shared_ptr<const term::Terminal_image_slice> make_atlas_test_image_slice(
+    int                              columns,
+    term::terminal_cell_pixel_size_t cell,
+    int                              first_column,
+    QColor                           color,
+    std::uint64_t                    revision,
+    int                              transparent_columns = 0)
+{
+    QImage pixels(columns * cell.width, cell.height, QImage::Format_RGBA8888_Premultiplied);
+    pixels.fill(color);
+    const qsizetype transparent_bytes =
+        static_cast<qsizetype>(transparent_columns) * cell.width * 4;
+    for (int y = 0; y < pixels.height(); ++y) {
+        std::memset(pixels.scanLine(y), 0, static_cast<std::size_t>(transparent_bytes));
+    }
+    return std::make_shared<const term::Terminal_image_slice>(term::Terminal_image_slice{
+        std::move(pixels),
+        first_column,
+        cell,
+        revision,
+    });
+}
+
+int count_atlas_pixels_near(const QImage& image, QRect area, QColor color)
+{
+    int count = 0;
+    area = area.intersected(image.rect());
+    for (int y = area.top(); y <= area.bottom(); ++y) {
+        for (int x = area.left(); x <= area.right(); ++x) {
+            if (pixel_delta(image.pixelColor(x, y), color) <= 24) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+// Oracle: f0c627a (each pass binds its own pipeline under a stencil clip, also
+// after an external-rendering predecessor under the clip dropped the bound one).
+Atlas_host_state_result test_atlas_image_stencil_host_state(QGuiApplication& app)
+{
+    const std::string prefix = "atlas image stencil host ";
+    const QColor      image_color(230, 20, 220);
+
+    QQuickWindow window;
+    window.setColor(QColor(4, 8, 12));
+    window.resize(280, 220);
+
+    QQuickItem clip_host;
+    clip_host.setParentItem(window.contentItem());
+    clip_host.setPosition(QPointF(80.0, 54.0));
+    clip_host.setSize(QSizeF(70.0, 54.0));
+    clip_host.setClip(true);
+    clip_host.setTransformOrigin(QQuickItem::TopLeft);
+    clip_host.setRotation(16.0);
+
+    const auto predecessor_stencil_renders = std::make_shared<std::atomic<int>>(0);
+    Atlas_external_render_item predecessor(predecessor_stencil_renders);
+    predecessor.setParentItem(&clip_host);
+    predecessor.setSize(clip_host.size());
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(&clip_host);
+    configure_atlas_host_state_surface(surface, QSizeF(130.0, 82.0), 987U);
+    // The slices are placed on a 10x20 cell; the renderer scales them to the
+    // surface's cell, so both rows are covered whatever the font.
+    term::Terminal_render_snapshot snapshot = make_atlas_host_state_snapshot(988U);
+    for (int row = 0; row < 2; ++row) {
+        term::set_render_snapshot_row_image(
+            snapshot,
+            row,
+            make_atlas_test_image_slice(8, {10, 20}, 0, image_color, 9870U + row));
+    }
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot)));
+
+    window.show();
+    Atlas_host_state_result result;
+    const QRect inside_clip = atlas_host_sample_rect_for_scene_point(
+        window,
+        clip_host.mapToScene(QPointF(30.0, 25.0)),
+        4);
+    const bool rendered = pump_atlas_host_state_surface(
+        app,
+        window,
+        surface,
+        result.capture,
+        [&](const Atlas_host_state_capture& capture) {
+            return
+                predecessor_stencil_renders->load() > 0 &&
+                capture.report.render.images.draws == 2 &&
+                count_atlas_pixels_near(capture.image, inside_clip, image_color) > 20;
+        });
+    if (!rendered) {
+        result.unsupported = atlas_host_backend_unusable(result.capture.report);
+        if (!result.unsupported) {
+            std::cerr << "FAIL: " << prefix << "did not render image pixels inside the "
+                << "rotated clip (image draws=" << result.capture.report.render.images.draws
+                << " failures=" << result.capture.report.render.images.resource_failures
+                << ")\n";
+            print_atlas_host_state_report("image-stencil", result.capture);
+        }
+        return result;
+    }
+
+    const QRect outside_right = atlas_host_sample_rect_for_scene_point(
+        window,
+        clip_host.mapToScene(QPointF(100.0, 12.0)),
+        4);
+    const QRect outside_lower = atlas_host_sample_rect_for_scene_point(
+        window,
+        clip_host.mapToScene(QPointF(92.0, 45.0)),
+        4);
+
+    bool ok = check_atlas_host_state_report("image-stencil", result.capture);
+    ok &= check(count_atlas_pixels_near(result.capture.image, inside_clip, image_color) > 20,
+        prefix + "draws the image inside the rotated clip");
+    ok &= check(count_atlas_pixels_near(result.capture.image, outside_right, image_color) == 0 &&
+            count_atlas_pixels_near(result.capture.image, outside_lower, image_color) == 0,
+        prefix + "rejects image pixels outside the rotated clip");
+    result.ok = ok;
+    return result;
+}
+
 int test_atlas_host_state_smoke(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
@@ -11063,6 +11272,9 @@ int test_atlas_host_state_smoke(QGuiApplication& app, const char* backend)
         return k_unsupported_backend_skip_return_code;
     }
     if (!run_case(test_atlas_layer_toggle_host_state(app))) {
+        return k_unsupported_backend_skip_return_code;
+    }
+    if (!run_case(test_atlas_image_stencil_host_state(app))) {
         return k_unsupported_backend_skip_return_code;
     }
 
@@ -21303,6 +21515,541 @@ int test_atlas_arc_row_provenance(QGuiApplication& app, const char* backend)
     return test_atlas_rect_row_stable_graphic_arc_update(app, true) ? 0 : 1;
 }
 
+// The image pass fixtures use the prepare-transaction surface (glyph text,
+// Campbell), a steady cursor, and a text frame that commits before any image.
+struct Atlas_image_fixture
+{
+    term::terminal_cell_metrics_t    metrics;
+    term::terminal_cell_pixel_size_t device_cell;
+    qreal                            dpr = 1.0;
+    term::Qsg_atlas_frame_report     baseline;
+};
+
+term::Terminal_render_snapshot make_atlas_image_text_snapshot(std::uint64_t sequence)
+{
+    term::Terminal_render_snapshot snapshot = make_pixel_base_snapshot({3, 10}, sequence);
+    snapshot.cells.push_back(
+        make_pixel_cell(2, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
+    return snapshot;
+}
+
+bool seed_atlas_image_fixture(
+    QGuiApplication&      app,
+    QQuickWindow&         window,
+    VNM_TerminalSurface&  surface,
+    std::uint64_t         sequence,
+    Atlas_image_fixture&  fixture)
+{
+    configure_atlas_prepare_transaction_surface(window, surface);
+    surface.set_cursor_blink_enabled(false);
+    term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(surface, true);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_image_text_snapshot(sequence)));
+    window.show();
+    const bool committed = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                atlas_report_render_state_ready(report)  &&
+                report.prepared_generation_committed     &&
+                report.render_snapshot_sequence == sequence;
+        });
+    fixture.baseline = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    fixture.metrics  = term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
+    fixture.dpr      = pixel_window_device_pixel_ratio(window);
+    fixture.device_cell = {
+        static_cast<int>(std::lround(fixture.metrics.width  * fixture.dpr)),
+        static_cast<int>(std::lround(fixture.metrics.height * fixture.dpr)),
+    };
+    return check(committed, "atlas image fixture commits its text baseline");
+}
+
+bool publish_atlas_image_snapshot(
+    QGuiApplication&                      app,
+    QQuickWindow&                         window,
+    VNM_TerminalSurface&                  surface,
+    const term::Terminal_render_snapshot& snapshot,
+    term::Qsg_atlas_frame_report&         report,
+    int                                   expected_draws)
+{
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+    const bool committed = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& current) {
+            return
+                atlas_report_render_state_ready(current)                  &&
+                current.prepared_generation_committed                     &&
+                current.render_snapshot_sequence == snapshot.metadata.sequence &&
+                current.render.images.draws == expected_draws;
+        });
+    report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    return committed;
+}
+
+QColor atlas_image_cell_color(
+    const QImage&                image,
+    const Atlas_image_fixture&   fixture,
+    int                          row,
+    int                          column)
+{
+    return image.pixelColor(
+        static_cast<int>(std::floor((column + 0.5) * fixture.device_cell.width)),
+        static_cast<int>(std::floor((row    + 0.5) * fixture.device_cell.height)));
+}
+
+bool colors_near(const QColor& actual, const QColor& expected)
+{
+    return pixel_delta(actual, expected) <= 2;
+}
+
+// Oracles: the grid geometry at 1:1 (texels land on their cells' device
+// pixels), S5 (images draw over cell backgrounds and under selection and the
+// cursor), D1 (a transparent pixel shows its cell's background), and D7
+// (images are never brightness-inverted).
+bool test_atlas_image_pass_draws_between_backgrounds_and_overlays(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20100U, fixture)) {
+        return false;
+    }
+
+    bool ok = true;
+    const term::Qsg_atlas_image_summary& text_only = fixture.baseline.render.images;
+    ok &= check(text_only.quads == 0 && text_only.cached_textures == 0 &&
+            !text_only.pipeline_ready,
+        "a text-only frame creates no image resources");
+
+    const QColor red(220, 30, 30);
+    const QColor blue(30, 40, 220);
+    const QColor styled_background(47, 111, 176);
+    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(20101U);
+    snapshot.styles.push_back(rgb_style(0xffccccccU, 0xff2f6fb0U));
+    for (int column = 2; column < 6; ++column) {
+        snapshot.cells.push_back(make_pixel_cell(1, column, QStringLiteral(" "), 1, 1U));
+    }
+    std::sort(
+        snapshot.cells.begin(),
+        snapshot.cells.end(),
+        [](const term::Terminal_render_cell& left, const term::Terminal_render_cell& right) {
+            return term::render_snapshot_cell_is_strictly_after(right, left);
+        });
+    term::set_render_snapshot_row_image(
+        snapshot, 0, make_atlas_test_image_slice(3, fixture.device_cell, 2, red, 20101001U));
+    term::set_render_snapshot_row_image(
+        snapshot, 1, make_atlas_test_image_slice(4, fixture.device_cell, 2, blue, 20101002U, 2));
+    snapshot.selection_spans.push_back({
+        {{0, 4}, {0, 7}, term::Terminal_selection_mode::NORMAL},
+        0,
+        4,
+        3,
+    });
+    snapshot.cursor.visible       = true;
+    snapshot.cursor.blink_enabled = false;
+    snapshot.cursor.position      = {0, 3};
+
+    term::Qsg_atlas_frame_report report;
+    const bool drawn = publish_atlas_image_snapshot(app, window, surface, snapshot, report, 2);
+    const QImage image = window.grabWindow();
+    ok &= check(drawn && report.render.images.pipeline_ready &&
+            report.render.images.cached_textures == 2 &&
+            report.render.images.resource_failures == 0,
+        "atlas image frame draws both row images");
+    if (!drawn || image.isNull()) {
+        return false;
+    }
+
+    const QColor background = atlas_image_cell_color(image, fixture, 2, 9);
+    const QColor selection  = atlas_image_cell_color(image, fixture, 0, 5);
+    const QColor cursor     =
+        QColor::fromRgba(term::find_color_scheme(u"Campbell")->cursor_rgba);
+    ok &= check(colors_near(atlas_image_cell_color(image, fixture, 0, 2), red),
+        "an image cell shows the image color");
+    ok &= check(colors_near(atlas_image_cell_color(image, fixture, 0, 1), background) &&
+            colors_near(atlas_image_cell_color(image, fixture, 0, 7), background),
+        "the cells beside an image show the background");
+
+    // Row 0 starts at column 2; row 1 ends after column 5.
+    const int image_left   = 2 * fixture.device_cell.width;
+    const int image_right  = 6 * fixture.device_cell.width;
+    const int row_0_center = fixture.device_cell.height / 2;
+    const int row_1_center = fixture.device_cell.height + fixture.device_cell.height / 2;
+    ok &= check(colors_near(image.pixelColor(image_left, row_0_center), red) &&
+            colors_near(image.pixelColor(image_left - 1, row_0_center), background) &&
+            colors_near(image.pixelColor(image_right - 1, row_1_center), blue) &&
+            colors_near(image.pixelColor(image_right, row_1_center), background),
+        "at 1:1 an image covers exactly the device pixels of its cells");
+    ok &= check(colors_near(atlas_image_cell_color(image, fixture, 0, 4), selection) &&
+            !colors_near(selection, red),
+        "selection draws over an image cell");
+    ok &= check(colors_near(atlas_image_cell_color(image, fixture, 0, 3), cursor),
+        "the block cursor draws over an image cell");
+    ok &= check(colors_near(atlas_image_cell_color(image, fixture, 1, 2), styled_background) &&
+            colors_near(atlas_image_cell_color(image, fixture, 1, 3), styled_background),
+        "transparent image pixels show the styled cell background under them");
+    ok &= check(colors_near(atlas_image_cell_color(image, fixture, 1, 4), blue) &&
+            colors_near(atlas_image_cell_color(image, fixture, 1, 5), blue),
+        "opaque image pixels cover the styled cell background");
+
+    surface.set_invert_brightness(true);
+    ++snapshot.metadata.sequence;
+    const bool inverted_drawn =
+        publish_atlas_image_snapshot(app, window, surface, snapshot, report, 2);
+    const QImage inverted = window.grabWindow();
+    ok &= check(inverted_drawn && !inverted.isNull() &&
+            !colors_near(atlas_image_cell_color(inverted, fixture, 2, 9), background) &&
+            colors_near(atlas_image_cell_color(inverted, fixture, 0, 2), red) &&
+            colors_near(atlas_image_cell_color(inverted, fixture, 1, 4), blue),
+        "brightness inversion changes the background and leaves images as they are");
+    return ok;
+}
+
+// Oracle: I4 (a revision's texels are uploaded once). A repeat frame and a
+// history row decoded again into a new image with the same revision upload
+// nothing; only a new revision creates a texture.
+bool test_atlas_image_textures_upload_once_per_revision(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20110U, fixture)) {
+        return false;
+    }
+
+    const QColor red(220, 30, 30);
+    const std::shared_ptr<const term::Terminal_image_slice> slice =
+        make_atlas_test_image_slice(2, fixture.device_cell, 1, red, 20110001U);
+    const std::uint64_t slice_bytes =
+        static_cast<std::uint64_t>(slice->pixels.width()) *
+        static_cast<std::uint64_t>(slice->pixels.height()) * 4U;
+    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(20111U);
+    term::set_render_snapshot_row_image(snapshot, 0, slice);
+
+    bool ok = true;
+    term::Qsg_atlas_frame_report first;
+    ok &= check(publish_atlas_image_snapshot(app, window, surface, snapshot, first, 1) &&
+            first.render.images.cached_textures == 1 &&
+            first.render.images.cached_bytes == slice_bytes &&
+            first.render.images.pinned_bytes == slice_bytes,
+        "the first image frame keeps one pinned texture of the slice's size");
+
+    ++snapshot.metadata.sequence;
+    term::Qsg_atlas_frame_report repeat;
+    ok &= check(publish_atlas_image_snapshot(app, window, surface, snapshot, repeat, 1) &&
+            repeat.render.images.texture_creations == 0 &&
+            repeat.render.images.uploaded_bytes == 0U &&
+            repeat.render.images.cached_textures == 1,
+        "a repeat image frame uploads nothing");
+
+    term::Terminal_render_snapshot decoded = snapshot;
+    ++decoded.metadata.sequence;
+    decoded.visible_row_images.clear();
+    term::set_render_snapshot_row_image(
+        decoded,
+        0,
+        std::make_shared<const term::Terminal_image_slice>(term::Terminal_image_slice{
+            slice->pixels.copy(),
+            slice->first_column,
+            slice->cell_pixel_size,
+            slice->revision,
+        }));
+    term::Qsg_atlas_frame_report decoded_report;
+    ok &= check(publish_atlas_image_snapshot(app, window, surface, decoded, decoded_report, 1) &&
+            decoded_report.render.images.texture_creations == 0 &&
+            decoded_report.render.images.uploaded_bytes == 0U,
+        "an image decoded again with the same revision uploads nothing");
+
+    term::Terminal_render_snapshot changed = decoded;
+    ++changed.metadata.sequence;
+    changed.visible_row_images.clear();
+    term::set_render_snapshot_row_image(
+        changed, 0, make_atlas_test_image_slice(2, fixture.device_cell, 1, red, 20110002U));
+    term::Qsg_atlas_frame_report changed_report;
+    ok &= check(publish_atlas_image_snapshot(app, window, surface, changed, changed_report, 1) &&
+            changed_report.render.images.cached_textures == 2 &&
+            changed_report.render.images.pinned_bytes == slice_bytes &&
+            changed_report.render.images.cached_bytes == 2U * slice_bytes,
+        "a new revision creates a texture and keeps the replaced one for reuse");
+
+    // Capability-local: a slice wider than the largest texture is skipped,
+    // and the frame still draws its other image and its text.
+    QRhi* const rhi = window_rhi(window);
+    const int texture_size_max = rhi != nullptr ? rhi->resourceLimit(QRhi::TextureSizeMax) : 0;
+    ok &= check(texture_size_max > 0, "the image test window reports its largest texture");
+    if (texture_size_max > 0) {
+        // An 8-pixel cell keeps the slice inside the snapshot's column limit.
+        const term::terminal_cell_pixel_size_t wide_slice_cell{8, fixture.device_cell.height};
+        QImage wide(texture_size_max + 1, wide_slice_cell.height, QImage::Format_RGBA8888_Premultiplied);
+        wide.fill(red);
+        term::Terminal_render_snapshot oversized = changed;
+        ++oversized.metadata.sequence;
+        term::set_render_snapshot_row_image(
+            oversized,
+            1,
+            std::make_shared<const term::Terminal_image_slice>(
+                term::Terminal_image_slice{std::move(wide), 0, wide_slice_cell, 20110003U}));
+        term::Qsg_atlas_frame_report oversized_report;
+        ok &= check(
+            publish_atlas_image_snapshot(app, window, surface, oversized, oversized_report, 1) &&
+                oversized_report.render.images.quads == 2 &&
+                oversized_report.render.images.oversized_skips == 1 &&
+                oversized_report.render.images.resource_failures == 0 &&
+                oversized_report.frame_build.glyph_instances > 0,
+            "a slice wider than the largest texture is skipped and costs nothing else");
+    }
+    return ok;
+}
+
+// Oracle: the prepare transaction (bb88754): a rejected prepare changes no
+// image texture and draws the committed frame, images included, pixel for
+// pixel.
+bool test_atlas_rejected_prepare_keeps_committed_images(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20120U, fixture)) {
+        return false;
+    }
+
+    term::Terminal_render_snapshot committed = make_atlas_image_text_snapshot(20121U);
+    term::set_render_snapshot_row_image(
+        committed,
+        0,
+        make_atlas_test_image_slice(3, fixture.device_cell, 2, QColor(220, 30, 30), 20121001U));
+    term::Qsg_atlas_frame_report committed_report;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, committed, committed_report, 1),
+            "atlas image transaction commits its image baseline"))
+    {
+        return false;
+    }
+    const QImage committed_image = window.grabWindow();
+
+    term::Terminal_render_snapshot rejected = make_atlas_image_text_snapshot(20122U);
+    rejected.cells.push_back(
+        make_pixel_cell(2, 3, QStringLiteral("Z"), 1, term::k_default_terminal_style_id));
+    term::set_render_snapshot_row_image(
+        rejected,
+        1,
+        make_atlas_test_image_slice(3, fixture.device_cell, 4, QColor(30, 40, 220), 20122001U));
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(20122U);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(rejected));
+    term::Qsg_atlas_frame_report failed_report;
+    const bool failed_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        committed_report.prepare_count,
+        20122U,
+        failed_report);
+    // Grab while the failure is still armed, so the frame is the rejected
+    // attempt's retained frame.
+    const QImage rejected_image = window.grabWindow();
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+
+    bool ok = true;
+    ok &= check(failed_prepared && !failed_report.prepared_generation_committed &&
+            failed_report.render_snapshot_sequence == 20121U &&
+            failed_report.render.images.quads == 1,
+        "a rejected image prepare keeps rendering the committed frame");
+    ok &= check(failed_prepared &&
+            failed_report.render.images.texture_creations == 0 &&
+            failed_report.render.images.uploaded_bytes == 0U &&
+            failed_report.render.images.cached_textures == 1,
+        "a rejected prepare creates and uploads no image texture");
+    ok &= check_same_frame(committed_image, rejected_image,
+        "a rejected prepare keeps the committed images pixel for pixel");
+
+    term::Qsg_atlas_frame_report recovered;
+    ok &= check(publish_atlas_image_snapshot(app, window, surface, rejected, recovered, 1) &&
+            recovered.render.images.cached_textures == 2,
+        "the prepare after the failure commits the new image");
+    return ok;
+}
+
+// Processes events without asking for a frame, so only the surface's own
+// requests, such as its bounded prepare retry, can prepare one.
+bool pump_atlas_idle_until(
+    QGuiApplication&                                                 app,
+    VNM_TerminalSurface&                                             surface,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>& predicate,
+    int                                                              timeout_ms = 3000)
+{
+    QElapsedTimer deadline;
+    deadline.start();
+    while (deadline.elapsed() < timeout_ms) {
+        app.processEvents(QEventLoop::AllEvents, 5);
+        if (predicate(term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface))) {
+            return true;
+        }
+        QThread::msleep(1);
+    }
+    return false;
+}
+
+// Publishes one image row over text while image textures fail to create, and
+// waits for the prepare that commits the text.
+bool publish_atlas_failing_image_frame(
+    QGuiApplication&               app,
+    QQuickWindow&                  window,
+    VNM_TerminalSurface&           surface,
+    const Atlas_image_fixture&     fixture,
+    std::uint64_t                  sequence,
+    QColor                         color,
+    term::Qsg_atlas_frame_report&  report)
+{
+    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(sequence);
+    term::set_render_snapshot_row_image(
+        snapshot,
+        0,
+        make_atlas_test_image_slice(3, fixture.device_cell, 2, color, sequence * 1000U));
+    term::qsg_atlas_fail_image_texture_create_for_testing(true);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot)));
+    const bool committed = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& current) {
+            return
+                current.prepared_generation_committed &&
+                current.render_snapshot_sequence == sequence;
+        });
+    report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    return
+        committed                                   &&
+        report.frame_build.glyph_instances > 0      &&
+        report.render.images.quads == 1             &&
+        report.render.images.resource_failures == 1 &&
+        report.render.images.draws == 0;
+}
+
+struct Atlas_image_fault_guard
+{
+    ~Atlas_image_fault_guard()
+    {
+        term::qsg_atlas_fail_image_texture_create_for_testing(false);
+        term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    }
+};
+
+// Oracles: the capability rule (a failed image resource costs images only; the
+// frame still commits its text) and I4 (the next publish after the failure
+// passes draws the image).
+bool test_atlas_failed_image_texture_keeps_text_and_recovers(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20130U, fixture)) {
+        return false;
+    }
+    const Atlas_image_fault_guard fault_guard;
+
+    const QColor red(220, 30, 30);
+    term::Qsg_atlas_frame_report failed;
+    const bool text_committed =
+        publish_atlas_failing_image_frame(app, window, surface, fixture, 20131U, red, failed);
+    const QImage failed_image = window.grabWindow();
+    term::qsg_atlas_fail_image_texture_create_for_testing(false);
+
+    bool ok = true;
+    ok &= check(text_committed,
+        "a failed image texture leaves the frame committed with its text");
+    ok &= check(!failed_image.isNull() &&
+            !colors_near(atlas_image_cell_color(failed_image, fixture, 0, 2), red),
+        "a failed image texture draws no image pixels");
+
+    term::Terminal_render_snapshot next = make_atlas_image_text_snapshot(20132U);
+    term::set_render_snapshot_row_image(
+        next, 0, make_atlas_test_image_slice(3, fixture.device_cell, 2, red, 20131U * 1000U));
+    term::Qsg_atlas_frame_report recovered;
+    const bool drawn = publish_atlas_image_snapshot(app, window, surface, next, recovered, 1);
+    const QImage recovered_image = window.grabWindow();
+    ok &= check(drawn && recovered.render.images.resource_failures == 0 &&
+            !recovered_image.isNull() &&
+            colors_near(atlas_image_cell_color(recovered_image, fixture, 0, 2), red),
+        "the next publish draws the image once the failure passes");
+    return ok;
+}
+
+// Oracle: the bounded prepare retry belongs to rejected prepares. A frame that
+// committed its text but not its images must neither prepare frames on its own
+// nor spend that retry budget, so a later rejected prepare still recovers.
+bool test_atlas_lasting_image_failure_leaves_text_retries(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20140U, fixture)) {
+        return false;
+    }
+    const Atlas_image_fault_guard fault_guard;
+
+    term::Qsg_atlas_frame_report failed;
+    bool ok = check(
+        publish_atlas_failing_image_frame(
+            app, window, surface, fixture, 20141U, QColor(220, 30, 30), failed),
+        "a lasting image failure leaves the frame committed with its text");
+
+    // Let frames the publishing pump asked for finish, then watch longer than
+    // the rest of the retry schedule (its last two delays are 256 and 512 ms).
+    const auto pump_idle_for = [&](int milliseconds) {
+        pump_atlas_idle_until(
+            app,
+            surface,
+            [](const term::Qsg_atlas_frame_report&) { return false; },
+            milliseconds);
+    };
+    pump_idle_for(300);
+    const term::Qsg_atlas_frame_report quiet =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    pump_idle_for(1500);
+    const term::Qsg_atlas_frame_report settled =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    ok &= check(settled.prepare_count == quiet.prepare_count,
+        "a lasting image failure prepares no frames of its own");
+
+    // A rejected prepare of the same content now needs the bounded retry.
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(20141U);
+    surface.update();
+    window.requestUpdate();
+    const bool rejected = pump_atlas_idle_until(
+        app,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                report.prepare_count > settled.prepare_count &&
+                !report.prepared_generation_committed;
+        });
+    const term::Qsg_atlas_frame_report rejected_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    const bool retried = pump_atlas_idle_until(
+        app,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                report.prepare_count > rejected_report.prepare_count &&
+                report.prepared_generation_committed;
+        });
+    ok &= check(rejected && retried,
+        "a rejected prepare after a lasting image failure still recovers through its retry");
+    return ok;
+}
+
 int test_atlas_report(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
@@ -21403,6 +22150,9 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_msdf_resource_stability(app);
     ok &= test_atlas_msdf_zoom_reuses_baked_atlas(app);
     ok &= test_atlas_msdf_zoom_crosses_bake_bucket(app);
+    ok &= test_atlas_image_pass_draws_between_backgrounds_and_overlays(app);
+    ok &= test_atlas_image_textures_upload_once_per_revision(app);
+    ok &= test_atlas_rejected_prepare_keeps_committed_images(app);
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
     const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
@@ -21668,6 +22418,8 @@ bool run_unit_tests()
 {
     bool ok = true;
     ok &= test_shader_package_variant_contract();
+    ok &= test_image_shader_package_variant_contract();
+    ok &= test_image_texture_cache();
     ok &= test_source_posture();
     ok &= test_font_file_bytes_for_font();
     ok &= test_cache_key_includes_physical_size_and_face();
@@ -21754,6 +22506,8 @@ int main(int argc, char** argv)
         }
         bool ok = test_atlas_persistent_rect_failure_is_bounded(app);
         ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
+        ok &= test_atlas_failed_image_texture_keeps_text_and_recovers(app);
+        ok &= test_atlas_lasting_image_failure_leaves_text_retries(app);
         return ok ? 0 : 1;
     }
     if (post_verification_failure_contract) {

@@ -3884,15 +3884,20 @@ bool test_row_image_check_leaves_snapshot_validation_alone()
         image.fill(0U);
         return image;
     };
-    const auto with_image = [&](QImage image, int first_column, term::terminal_cell_pixel_size_t cell) {
-        term::Terminal_render_snapshot snapshot = plain;
-        term::set_render_snapshot_row_image(
-            snapshot,
-            1,
-            std::make_shared<const term::Terminal_image_slice>(
-                term::Terminal_image_slice{std::move(image), first_column, cell, 5U}));
-        return snapshot;
-    };
+    const auto with_image = [&](
+            QImage                           image,
+            int                              first_column,
+            term::terminal_cell_pixel_size_t cell,
+            std::uint64_t                    revision = 5U)
+        {
+            term::Terminal_render_snapshot snapshot = plain;
+            term::set_render_snapshot_row_image(
+                snapshot,
+                1,
+                std::make_shared<const term::Terminal_image_slice>(
+                    term::Terminal_image_slice{std::move(image), first_column, cell, revision}));
+            return snapshot;
+        };
 
     constexpr QImage::Format k_premultiplied = QImage::Format_RGBA8888_Premultiplied;
     using Status = term::Terminal_render_image_status;
@@ -3909,6 +3914,8 @@ bool test_row_image_check_leaves_snapshot_validation_alone()
             with_image(pixels(30, 20, k_premultiplied), 8,    {10, 20}), Status::OK},
         {"a slice ending on the column limit passes",
             with_image(pixels(30, 20, k_premultiplied), 4093, {10, 20}), Status::OK},
+        {"a slice without a revision fails, since cached texels are keyed on it",
+            with_image(pixels(30, 20, k_premultiplied), 0,    {10, 20}, 0U), Status::INVALID_REVISION},
         {"a null image fails",
             with_image(QImage(),                         0,    {10, 20}), Status::INVALID_PIXELS},
         {"straight alpha fails",

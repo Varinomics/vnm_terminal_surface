@@ -269,6 +269,33 @@ summarize the current atlas warm epoch, while `lazy_*` counters and
 | `dual_source_blend_factors_available` | Bool | None | Unstable |
 | `dual_source_blend_factors_runtime_probe` | Bool | None | Unstable |
 
+### Atlas image block (JSON key `images`, TEXT header `images`)
+
+The image pass of the latest prepare. Only a committing prepare changes image
+textures, so a rejected prepare reports its quads and zero draws, creations,
+uploads and evictions. Like the other draw counters of a prepare report, such
+as the render summary's `draw_calls`, `draws` describes the prepare itself: a
+rejected prepare reports no image draws while `render()` keeps drawing the
+committed frame, its images included. The `cached_*` and `pinned_bytes` fields describe the
+image textures kept after the prepare, keyed by image slice revision;
+`resource_failures` counts images a failed resource kept from the frame, and
+`oversized_skips` counts slices wider or taller than the largest texture.
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `quads` | Counter | Count | Unstable |
+| `rejected` | Counter | Count | Unstable |
+| `draws` | Counter | Count | Unstable |
+| `texture_creations` | Counter | Count | Unstable |
+| `uploaded_bytes` | Counter | Bytes | Unstable |
+| `evictions` | Counter | Count | Unstable |
+| `cached_textures` | Counter | Count | Unstable |
+| `cached_bytes` | Counter | Bytes | Unstable |
+| `pinned_bytes` | Counter | Bytes | Unstable |
+| `oversized_skips` | Counter | Count | Unstable |
+| `resource_failures` | Counter | Count | Unstable |
+| `pipeline_ready` | Bool | None | Unstable |
+
 ### Atlas top-level overlap (`qsg_atlas` TEXT section / top-level JSON object)
 
 The frame-report counter fields that overlap between the top-level JSON object

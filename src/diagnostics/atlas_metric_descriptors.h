@@ -199,6 +199,41 @@ atlas_capabilities_metrics()
         capabilities_table::k_table);
 }
 
+// Atlas image block: 11 plain counters and one BOOL flag.
+namespace image_table {
+using Stats = internal::Qsg_atlas_image_summary;
+#define VNM_ATLAS_COUNTER(field) \
+    counter_metric<Stats>(#field, [](const Stats& s) -> std::uint64_t { \
+        return static_cast<std::uint64_t>(s.field); })
+#define VNM_ATLAS_BOOL(field) \
+    bool_metric<Stats>(#field, [](const Stats& s) -> bool { return s.field; })
+
+inline constexpr Metric_descriptor<Stats> k_table[] = {
+    VNM_ATLAS_COUNTER(quads),
+    VNM_ATLAS_COUNTER(rejected),
+    VNM_ATLAS_COUNTER(draws),
+    VNM_ATLAS_COUNTER(texture_creations),
+    VNM_ATLAS_COUNTER(uploaded_bytes),
+    VNM_ATLAS_COUNTER(evictions),
+    VNM_ATLAS_COUNTER(cached_textures),
+    VNM_ATLAS_COUNTER(cached_bytes),
+    VNM_ATLAS_COUNTER(pinned_bytes),
+    VNM_ATLAS_COUNTER(oversized_skips),
+    VNM_ATLAS_COUNTER(resource_failures),
+    VNM_ATLAS_BOOL(pipeline_ready),
+};
+
+#undef VNM_ATLAS_BOOL
+#undef VNM_ATLAS_COUNTER
+}
+
+inline std::span<const Metric_descriptor<internal::Qsg_atlas_image_summary>>
+atlas_image_metrics()
+{
+    return std::span<const Metric_descriptor<internal::Qsg_atlas_image_summary>>(
+        image_table::k_table);
+}
+
 // Atlas top-level frame-report counters that overlap between the JSON top-level
 // object and the TEXT top-level section with the same name and a plain field
 // read. These two runs are contiguous in both serializers but separated there

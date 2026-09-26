@@ -90,6 +90,13 @@ std::vector<std::string> atlas_capabilities_keys()
     return keys;
 }
 
+std::vector<std::string> atlas_image_keys()
+{
+    std::vector<std::string> keys;
+    append_table_keys(keys, detail::atlas_image_metrics());
+    return keys;
+}
+
 std::vector<std::string> atlas_top_level_overlap_keys()
 {
     std::vector<std::string> keys;
@@ -373,6 +380,11 @@ int main(int argc, char** argv)
         3,
         "Atlas capabilities block (JSON key `capabilities`, TEXT header `capabilities`)",
         atlas_capabilities_keys());
+    ok &= check_documented_section(
+        document,
+        3,
+        "Atlas image block (JSON key `images`, TEXT header `images`)",
+        atlas_image_keys());
     ok &= check_documented_section(
         document,
         3,

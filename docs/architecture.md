@@ -254,7 +254,10 @@ owns per-frame vectors of rects, arcs, text runs, cursor primitives,
 decorations, overlays, image quads, and dirty row ranges. An image quad places
 one row's slice in logical pixels, scaled from the cell the slice was placed on
 to the current cell and cut where the grid ends; the snapshot contract
-describes how a bad image is dropped alone.
+describes how a bad image is dropped alone. The render node draws image quads
+in their own pass, after cell backgrounds and before selection and text, from
+one texture per slice revision that only a committing prepare creates or
+uploads.
 
 `Terminal_render_frame::text_runs` is the canonical renderer input for terminal
 text. `Terminal_render_frame::cursor_text_runs` carries cursor inverse-text

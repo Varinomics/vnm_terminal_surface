@@ -75,6 +75,7 @@ signals:
 namespace {
 
 std::atomic_bool s_fail_rect_buffer_create = false;
+std::atomic_bool s_fail_image_texture_create = false;
 std::atomic<std::uint64_t> s_fail_resource_prepare_snapshot_sequence = 0U;
 std::atomic<std::uint64_t> s_fail_msdf_resource_prepare_snapshot_sequence = 0U;
 std::atomic<std::uint64_t> s_fail_msdf_text_buffer_update_snapshot_sequence = 0U;
@@ -91,6 +92,8 @@ constexpr const char* k_atlas_glyph_alpha_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_glyph_alpha.frag.qsb";
 constexpr const char* k_atlas_dual_source_probe_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_dual_source_probe.frag.qsb";
+constexpr const char* k_atlas_image_fragment_shader_path =
+    ":/vnm_terminal_surface/shaders/atlas_image.frag.qsb";
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 constexpr const char* k_atlas_msdf_text_vertex_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_msdf_text.vert.qsb";
@@ -124,6 +127,10 @@ constexpr std::uint64_t k_atlas_bytes_per_canvas_cell = 2U * 1024U;
 constexpr std::uint64_t k_atlas_cache_byte_limit =
     static_cast<std::uint64_t>(vnm_terminal::k_terminal_canvas_max_cells) *
     k_atlas_bytes_per_canvas_cell;
+// Image textures kept for reuse beyond the ones the committed frame draws:
+// two images of the largest decoded size.
+constexpr std::uint64_t k_atlas_image_cache_unpinned_byte_limit = 16U * 1024U * 1024U;
+constexpr std::uint64_t k_atlas_image_bytes_per_texel           = 4U;
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 namespace msdf_text = vnm::msdf_text;
@@ -198,6 +205,19 @@ static_assert(offsetof(atlas_msdf_uniform_t, lcd_subpixel_order) == 76);
 static_assert(offsetof(atlas_msdf_uniform_t, framebuffer_y_up) == 80);
 static_assert(offsetof(atlas_msdf_uniform_t, ndc_y_up)      == 84);
 static_assert(sizeof(atlas_msdf_uniform_t)                  == 88);
+
+// One image quad of the frame, ready to draw once its texture exists.
+struct Atlas_image_draw
+{
+    std::shared_ptr<const Terminal_image_slice> slice;
+    atlas_glyph_instance_t                      instance;
+};
+
+struct Atlas_image_texture
+{
+    QRhiTexture*                texture  = nullptr;
+    QRhiShaderResourceBindings* bindings = nullptr;
+};
 
 struct atlas_pass_range_t
 {
@@ -2472,6 +2492,7 @@ public:
         const Glyph_atlas_cache_stats prepared_cache_stats = m_cache.stats();
         if (prepared_generation_committed) {
             record_msdf_text_atlas_upload(rhi, command_buffer, prepare_result.render);
+            commit_image_pass(rhi, command_buffer, target, prepare_result.render);
             commit_pending_glyph_resources();
             std::swap(m_committed_cache, m_cache);
             m_cache.reset();
@@ -2514,6 +2535,7 @@ public:
             m_dual_source_blend_factors_probe_completed;
         prepare_result.render.dual_source_blend_factors_available =
             m_dual_source_blend_factors_available;
+        record_image_cache_summary(prepare_result.render.images);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         // Tally exactly one baked-cache outcome per frame: a miss if the baked
         // atlas had to be rebuilt this frame (the flag is set at the rebuild site
@@ -2553,6 +2575,10 @@ public:
                 prepare_result.warm_lazy,
                 prepared_generation_committed);
         }
+        // A committed frame whose image resources failed still committed its
+        // text, so the shared retry budget resets as for any committed frame.
+        // Its images are retried by the next prepare the surface asks for; a
+        // lasting image failure must not spend that budget or keep repainting.
         if (prepared_generation_committed) {
             m_retry->reset();
         }
@@ -2608,6 +2634,7 @@ public:
                 }
 
                 draw_rect_pass(command_buffer, m_background_pass, stencil_enabled);
+                draw_image_pass(command_buffer, stencil_enabled);
                 draw_rect_pass(command_buffer, m_selection_pass, stencil_enabled);
                 draw_rect_pass(command_buffer, m_graphic_pass, stencil_enabled);
                 draw_glyph_pass(command_buffer, m_text_pass, stencil_enabled);
@@ -2657,6 +2684,7 @@ private:
     void release_gpu_resources()
     {
         discard_pending_glyph_resources();
+        release_image_resources();
         delete_resource(m_stencil_msdf_text_pipeline);
         delete_resource(m_msdf_text_pipeline);
         delete_resource(m_stencil_glyph_pipeline);
@@ -4304,6 +4332,9 @@ private:
             result.render.background_rects_after_coalescing;
 
         m_background_pass = append_rect_pass(background_rects, opacity);
+        m_image_draw_plan = image_draw_plan(render_frame.image_quads, opacity);
+        result.render.images.quads    = static_cast<int>(render_frame.image_quads.size());
+        result.render.images.rejected = render_frame.stats.images_rejected;
         m_selection_pass  = append_rect_pass(render_frame.selection_rects, opacity);
         m_graphic_pass    = append_graphic_pass(render_frame, opacity);
         const atlas_text_pass_ranges_t text_passes = append_text_pass(
@@ -6913,6 +6944,367 @@ private:
             pass.count);
     }
 
+    // Images sit above cell backgrounds and below selection, text and
+    // cursors (S5). Each image has its own texture and so its own bindings.
+    void draw_image_pass(
+        QRhiCommandBuffer* command_buffer,
+        bool               stencil_enabled)
+    {
+        if (m_image_draw_bindings.empty()) {
+            return;
+        }
+
+        command_buffer->setGraphicsPipeline(
+            stencil_enabled ? m_stencil_image_pipeline : m_image_pipeline);
+        for (std::size_t index = 0U; index < m_image_draw_bindings.size(); ++index) {
+            command_buffer->setShaderResources(m_image_draw_bindings[index]);
+            const quint32 instance_offset =
+                static_cast<quint32>(index * sizeof(atlas_glyph_instance_t));
+            const QRhiCommandBuffer::VertexInput bindings[] = {
+                {m_vertex_buffer,         0U},
+                {m_image_instance_buffer, instance_offset},
+            };
+            command_buffer->setVertexInput(0, 2, bindings);
+            command_buffer->draw(static_cast<quint32>(k_atlas_quad_vertices.size()), 1U);
+        }
+    }
+
+    std::vector<Atlas_image_draw> image_draw_plan(
+        const std::vector<Terminal_render_image_quad>& quads,
+        qreal                                          opacity) const
+    {
+        std::vector<Atlas_image_draw> draws;
+        draws.reserve(quads.size());
+        for (const Terminal_render_image_quad& quad : quads) {
+            // A right-edge cut leaves a fractional source width, which the
+            // linear sampler takes as it is.
+            const qreal texture_width  = quad.slice->pixels.width();
+            const qreal texture_height = quad.slice->pixels.height();
+            Atlas_image_draw draw{quad.slice, {}};
+            store_rect(draw.instance.rect, quad.rect);
+            store_uv_rect(
+                draw.instance.uv_rect,
+                QRectF(
+                    quad.source_rect.x()      / texture_width,
+                    quad.source_rect.y()      / texture_height,
+                    quad.source_rect.width()  / texture_width,
+                    quad.source_rect.height() / texture_height));
+            store_color(draw.instance.color, {1.0f, 1.0f, 1.0f, static_cast<float>(opacity)});
+            draws.push_back(std::move(draw));
+        }
+        return draws;
+    }
+
+    bool ensure_image_pipelines(QRhi* rhi, QRhiRenderTarget* target)
+    {
+        if (m_image_pipeline != nullptr && m_stencil_image_pipeline != nullptr) {
+            return true;
+        }
+
+        // Loaded apart from ensure_shaders(), whose packages text needs: a
+        // missing image package costs images only.
+        if (!m_image_shader_checked) {
+            m_image_fragment_shader = load_shader(k_atlas_image_fragment_shader_path);
+            m_image_shader_checked  = true;
+        }
+        if (!m_image_fragment_shader.isValid() || !m_glyph_vertex_shader.isValid()) {
+            return false;
+        }
+
+        if (m_image_sampler == nullptr) {
+            QRhiSampler* sampler = rhi->newSampler(
+                QRhiSampler::Linear,
+                QRhiSampler::Linear,
+                QRhiSampler::None,
+                QRhiSampler::ClampToEdge,
+                QRhiSampler::ClampToEdge);
+            if (sampler == nullptr || !sampler->create()) {
+                delete_resource(sampler);
+                return false;
+            }
+            m_image_sampler = sampler;
+        }
+
+        // The pipelines need the binding layout only; each draw binds the
+        // bindings of its own texture.
+        if (m_image_layout_bindings == nullptr) {
+            QRhiShaderResourceBindings* layout = rhi->newShaderResourceBindings();
+            if (layout == nullptr) {
+                return false;
+            }
+            layout->setBindings({
+                QRhiShaderResourceBinding::uniformBuffer(
+                    0,
+                    QRhiShaderResourceBinding::VertexStage,
+                    m_uniform_buffer),
+                QRhiShaderResourceBinding::sampledTexture(
+                    1,
+                    QRhiShaderResourceBinding::FragmentStage,
+                    nullptr,
+                    nullptr),
+            });
+            if (!layout->create()) {
+                delete_resource(layout);
+                return false;
+            }
+            m_image_layout_bindings = layout;
+        }
+
+        QRhiRenderPassDescriptor* const render_pass_descriptor =
+            target->renderPassDescriptor();
+        QRhiGraphicsPipeline* pipeline =
+            create_image_pipeline(rhi, render_pass_descriptor, false);
+        QRhiGraphicsPipeline* stencil_pipeline =
+            create_image_pipeline(rhi, render_pass_descriptor, true);
+        if (pipeline == nullptr || stencil_pipeline == nullptr) {
+            delete_resource(pipeline);
+            delete_resource(stencil_pipeline);
+            return false;
+        }
+
+        m_image_pipeline         = pipeline;
+        m_stencil_image_pipeline = stencil_pipeline;
+        return true;
+    }
+
+    QRhiGraphicsPipeline* create_image_pipeline(
+        QRhi*                     rhi,
+        QRhiRenderPassDescriptor* render_pass_descriptor,
+        bool                      stencil_enabled)
+    {
+        QRhiGraphicsPipeline* pipeline = rhi->newGraphicsPipeline();
+        if (pipeline == nullptr) {
+            return nullptr;
+        }
+
+        QRhiGraphicsPipeline::Flags flags = QRhiGraphicsPipeline::UsesScissor;
+        if (stencil_enabled) {
+            flags |= QRhiGraphicsPipeline::UsesStencilRef;
+        }
+        pipeline->setFlags(flags);
+        pipeline->setTopology(QRhiGraphicsPipeline::Triangles);
+        pipeline->setCullMode(QRhiGraphicsPipeline::None);
+        pipeline->setTargetBlends({atlas_blend()});
+        pipeline->setDepthTest(false);
+        pipeline->setDepthWrite(false);
+        configure_stencil_state(pipeline, stencil_enabled);
+        pipeline->setSampleCount(m_render_target_samples);
+        pipeline->setShaderStages({
+            QRhiShaderStage(QRhiShaderStage::Vertex,   m_glyph_vertex_shader),
+            QRhiShaderStage(QRhiShaderStage::Fragment, m_image_fragment_shader),
+        });
+        pipeline->setVertexInputLayout(atlas_glyph_vertex_input_layout());
+        pipeline->setShaderResourceBindings(m_image_layout_bindings);
+        pipeline->setRenderPassDescriptor(render_pass_descriptor);
+        if (!pipeline->create()) {
+            delete pipeline;
+            return nullptr;
+        }
+
+        return pipeline;
+    }
+
+    std::optional<Atlas_image_texture> create_image_texture(
+        QRhi*       rhi,
+        QSize       pixel_size)
+    {
+        QRhiTexture* texture = rhi->newTexture(QRhiTexture::RGBA8, pixel_size);
+        if (texture == nullptr ||
+            s_fail_image_texture_create.load(std::memory_order_relaxed) ||
+            !texture->create())
+        {
+            delete_resource(texture);
+            return std::nullopt;
+        }
+
+        QRhiShaderResourceBindings* bindings = rhi->newShaderResourceBindings();
+        if (bindings == nullptr) {
+            delete_resource(texture);
+            return std::nullopt;
+        }
+        bindings->setBindings({
+            QRhiShaderResourceBinding::uniformBuffer(
+                0,
+                QRhiShaderResourceBinding::VertexStage,
+                m_uniform_buffer),
+            QRhiShaderResourceBinding::sampledTexture(
+                1,
+                QRhiShaderResourceBinding::FragmentStage,
+                texture,
+                m_image_sampler),
+        });
+        if (!bindings->create()) {
+            delete_resource(bindings);
+            delete_resource(texture);
+            return std::nullopt;
+        }
+
+        return Atlas_image_texture{texture, bindings};
+    }
+
+    // An upload into the texture can be recorded in the current frame, and
+    // D3D11 replays it through the native texture at endFrame() (cff11ee).
+    static void retire_image_texture(Atlas_image_texture& texture)
+    {
+        std::exchange(texture.bindings, nullptr)->deleteLater();
+        std::exchange(texture.texture, nullptr)->deleteLater();
+    }
+
+    bool upload_image_instances(
+        QRhi*                                      rhi,
+        const std::vector<atlas_glyph_instance_t>& instances,
+        QRhiResourceUpdateBatch*&                  updates)
+    {
+        const quint32 byte_count =
+            static_cast<quint32>(instances.size() * sizeof(atlas_glyph_instance_t));
+        if (m_image_instance_buffer == nullptr || m_image_instance_buffer_size < byte_count) {
+            QRhiBuffer* buffer =
+                create_dynamic_buffer(rhi, byte_count, QRhiBuffer::VertexBuffer);
+            if (buffer == nullptr) {
+                return false;
+            }
+            delete_resource(m_image_instance_buffer);
+            m_image_instance_buffer      = buffer;
+            m_image_instance_buffer_size = byte_count;
+            m_uploaded_image_instances.clear();
+        }
+
+        const bool unchanged =
+            m_uploaded_image_instances.size() == instances.size() &&
+            std::memcmp(
+                m_uploaded_image_instances.data(),
+                instances.data(),
+                byte_count) == 0;
+        if (unchanged) {
+            return true;
+        }
+
+        if (updates == nullptr) {
+            updates = rhi->nextResourceUpdateBatch();
+        }
+        updates->updateDynamicBuffer(m_image_instance_buffer, 0U, byte_count, instances.data());
+        m_uploaded_image_instances = instances;
+        return true;
+    }
+
+    // Every image GPU change happens here, in the commit branch of prepare()
+    // after its last prepare_atlas_instances(), outside any pass. A rejected
+    // prepare therefore leaves the committed image draws, their textures and
+    // their instances as they were. A failed image resource costs images
+    // only: the frame still commits its text.
+    void commit_image_pass(
+        QRhi*                     rhi,
+        QRhiCommandBuffer*        command_buffer,
+        QRhiRenderTarget*         target,
+        Qsg_atlas_render_summary& render_summary)
+    {
+        // Every committed draw samples a cached texture, so without a plan and
+        // a cached texture there is nothing to draw, create or evict.
+        if (m_image_draw_plan.empty() && m_image_textures.size() == 0U) {
+            Q_ASSERT(m_image_draw_bindings.empty());
+            return;
+        }
+
+        VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::commit_image_pass");
+
+        Qsg_atlas_image_summary&                 summary = render_summary.images;
+        std::vector<QRhiShaderResourceBindings*> draw_bindings;
+        std::vector<atlas_glyph_instance_t>      instances;
+        std::vector<std::uint64_t>               revisions;
+        QRhiResourceUpdateBatch*                 updates = nullptr;
+
+        const bool pipelines_ready =
+            !m_image_draw_plan.empty() && ensure_image_pipelines(rhi, target);
+        if (!m_image_draw_plan.empty() && !pipelines_ready) {
+            summary.resource_failures += static_cast<int>(m_image_draw_plan.size());
+        }
+        if (pipelines_ready) {
+            const int texture_size_max = rhi->resourceLimit(QRhi::TextureSizeMax);
+            for (const Atlas_image_draw& draw : m_image_draw_plan) {
+                // Capability-local: a slice no texture can hold is skipped.
+                const QImage& pixels = draw.slice->pixels;
+                if (pixels.width() > texture_size_max || pixels.height() > texture_size_max) {
+                    ++summary.oversized_skips;
+                    continue;
+                }
+
+                const Atlas_image_texture* texture = m_image_textures.find(draw.slice->revision);
+                if (texture == nullptr) {
+                    std::optional<Atlas_image_texture> created =
+                        create_image_texture(rhi, pixels.size());
+                    if (!created.has_value()) {
+                        ++summary.resource_failures;
+                        continue;
+                    }
+
+                    // Some backends upload a whole image as tightly packed
+                    // rows, which every slice producer keeps. The batch holds
+                    // its own reference to the pixels.
+                    Q_ASSERT(pixels.bytesPerLine() == pixels.width() * 4);
+                    if (updates == nullptr) {
+                        updates = rhi->nextResourceUpdateBatch();
+                    }
+                    updates->uploadTexture(created->texture, pixels);
+                    const std::uint64_t bytes =
+                        static_cast<std::uint64_t>(pixels.width()) *
+                        static_cast<std::uint64_t>(pixels.height()) *
+                        k_atlas_image_bytes_per_texel;
+                    m_image_textures.insert(draw.slice->revision, *created, bytes);
+                    texture = m_image_textures.find(draw.slice->revision);
+                    ++summary.texture_creations;
+                    summary.uploaded_bytes += bytes;
+                }
+
+                draw_bindings.push_back(texture->bindings);
+                instances.push_back(draw.instance);
+                revisions.push_back(draw.slice->revision);
+            }
+        }
+
+        if (!instances.empty() && !upload_image_instances(rhi, instances, updates)) {
+            summary.resource_failures += static_cast<int>(instances.size());
+            draw_bindings.clear();
+            revisions.clear();
+        }
+
+        for (Atlas_image_texture& evicted : m_image_textures.pin(revisions)) {
+            retire_image_texture(evicted);
+            ++summary.evictions;
+        }
+        if (updates != nullptr) {
+            command_buffer->resourceUpdate(updates);
+        }
+
+        m_image_draw_bindings = std::move(draw_bindings);
+        summary.draws = static_cast<int>(m_image_draw_bindings.size());
+        render_summary.draw_calls += summary.draws;
+    }
+
+    void record_image_cache_summary(Qsg_atlas_image_summary& summary) const
+    {
+        summary.cached_textures = static_cast<int>(m_image_textures.size());
+        summary.cached_bytes    = m_image_textures.bytes();
+        summary.pinned_bytes    = m_image_textures.pinned_bytes();
+        summary.pipeline_ready  =
+            m_image_pipeline != nullptr && m_stencil_image_pipeline != nullptr;
+    }
+
+    void release_image_resources()
+    {
+        for (Atlas_image_texture& texture : m_image_textures.take_all()) {
+            delete_resource(texture.bindings);
+            delete_resource(texture.texture);
+        }
+        m_image_draw_bindings.clear();
+        m_uploaded_image_instances.clear();
+        delete_resource(m_stencil_image_pipeline);
+        delete_resource(m_image_pipeline);
+        delete_resource(m_image_layout_bindings);
+        delete_resource(m_image_sampler);
+        delete_resource(m_image_instance_buffer);
+        m_image_instance_buffer_size = 0U;
+    }
+
     bool has_glyph_draw_passes() const
     {
         return m_text_pass.has_instances() || m_cursor_text_pass.has_instances();
@@ -6928,6 +7320,7 @@ private:
     quint32 total_instance_count() const
     {
         return
+            static_cast<quint32>(m_image_draw_bindings.size()) +
             m_background_pass.count +
             m_selection_pass.count +
             m_graphic_pass.count +
@@ -6963,6 +7356,8 @@ private:
     QShader                                  m_glyph_fragment_shader;
     QShader                                  m_glyph_alpha_fragment_shader;
     QShader                                  m_dual_source_probe_fragment_shader;
+    QShader                                  m_image_fragment_shader;
+    bool                                     m_image_shader_checked = false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     QShader                                  m_msdf_text_vertex_shader;
     QShader                                  m_msdf_text_fragment_shader;
@@ -7077,6 +7472,20 @@ private:
     bool                                     m_msdf_text_used_this_frame   = false;
     bool                                     m_msdf_text_missed_this_frame = false;
 #endif
+    // The attempt's image draws; commit_image_pass() turns them into the
+    // committed draw bindings that render() draws.
+    std::vector<Atlas_image_draw>            m_image_draw_plan;
+    std::vector<QRhiShaderResourceBindings*> m_image_draw_bindings;
+    std::vector<atlas_glyph_instance_t>      m_uploaded_image_instances;
+    Qsg_atlas_image_texture_cache<Atlas_image_texture>
+                                             m_image_textures{
+                                                 k_atlas_image_cache_unpinned_byte_limit};
+    QRhiSampler*                             m_image_sampler = nullptr;
+    QRhiShaderResourceBindings*              m_image_layout_bindings = nullptr;
+    QRhiGraphicsPipeline*                    m_image_pipeline = nullptr;
+    QRhiGraphicsPipeline*                    m_stencil_image_pipeline = nullptr;
+    QRhiBuffer*                              m_image_instance_buffer = nullptr;
+    quint32                                  m_image_instance_buffer_size = 0U;
     Qsg_atlas_warm_lazy_summary              m_warm_lazy;
     std::set<Glyph_atlas_cache_key>           m_failed_visible_lazy_glyph_raster_keys;
     bool                                     m_current_prepare_had_lazy_insert =
@@ -7133,6 +7542,11 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
 void qsg_atlas_fail_rect_buffer_create_for_testing(bool fail)
 {
     s_fail_rect_buffer_create.store(fail, std::memory_order_relaxed);
+}
+
+void qsg_atlas_fail_image_texture_create_for_testing(bool fail)
+{
+    s_fail_image_texture_create.store(fail, std::memory_order_relaxed);
 }
 
 void qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(

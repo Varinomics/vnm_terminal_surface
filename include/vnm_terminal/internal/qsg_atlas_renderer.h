@@ -16,12 +16,16 @@
 #include <QSize>
 #include <QSizeF>
 #include <QString>
+#include <QtGlobal>
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct QRhiDriverInfo;
@@ -327,6 +331,8 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
 
 void qsg_atlas_fail_rect_buffer_create_for_testing(bool fail);
 
+void qsg_atlas_fail_image_texture_create_for_testing(bool fail);
+
 void qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
     std::uint64_t sequence);
 
@@ -459,6 +465,134 @@ private:
     std::vector<unsigned char>  m_seeded_slots;
 };
 
+// The image pass of one prepare. The cache fields describe the image textures
+// kept after it, keyed by slice revision.
+struct Qsg_atlas_image_summary
+{
+    int           quads             = 0;
+    int           rejected          = 0;
+    int           draws             = 0;
+    int           texture_creations = 0;
+    std::uint64_t uploaded_bytes    = 0U;
+    int           evictions         = 0;
+    int           cached_textures   = 0;
+    std::uint64_t cached_bytes      = 0U;
+    std::uint64_t pinned_bytes      = 0U;
+    int           oversized_skips   = 0;
+    int           resource_failures = 0;
+    bool          pipeline_ready    = false;
+};
+
+// Image textures keyed by image slice revision. The textures the committed
+// draw list samples are pinned and never evicted; the others stay for reuse,
+// least recently used first out once their bytes pass the limit. A revision's
+// texels never change, so dropping any entry costs only a later upload.
+template <typename Texture>
+class Qsg_atlas_image_texture_cache final
+{
+public:
+    explicit Qsg_atlas_image_texture_cache(std::uint64_t unpinned_byte_limit)
+    :
+        m_unpinned_byte_limit(unpinned_byte_limit)
+    {}
+
+    const Texture* find(std::uint64_t revision) const
+    {
+        const auto found = m_entries.find(revision);
+        return found != m_entries.end() ? &found->second.texture : nullptr;
+    }
+
+    // The revision must not be cached yet.
+    void insert(std::uint64_t revision, Texture texture, std::uint64_t bytes)
+    {
+        [[maybe_unused]] const bool inserted =
+            m_entries.emplace(revision, Entry{std::move(texture), bytes, ++m_clock, false}).second;
+        Q_ASSERT(inserted);
+    }
+
+    // Pins exactly these revisions as the most recently used, and returns the
+    // unpinned textures evicted to bring the unpinned bytes within the limit.
+    std::vector<Texture> pin(const std::vector<std::uint64_t>& revisions)
+    {
+        for (auto& item : m_entries) {
+            item.second.pinned = false;
+        }
+        for (const std::uint64_t revision : revisions) {
+            const auto found = m_entries.find(revision);
+            if (found != m_entries.end()) {
+                found->second.pinned   = true;
+                found->second.last_use = ++m_clock;
+            }
+        }
+
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> unpinned_by_use;
+        std::uint64_t unpinned_bytes = 0U;
+        for (const auto& item : m_entries) {
+            if (!item.second.pinned) {
+                unpinned_by_use.emplace_back(item.second.last_use, item.first);
+                unpinned_bytes += item.second.bytes;
+            }
+        }
+        std::sort(unpinned_by_use.begin(), unpinned_by_use.end());
+
+        std::vector<Texture> evicted;
+        for (const auto& candidate : unpinned_by_use) {
+            if (unpinned_bytes <= m_unpinned_byte_limit) {
+                break;
+            }
+            const auto found = m_entries.find(candidate.second);
+            unpinned_bytes -= found->second.bytes;
+            evicted.push_back(std::move(found->second.texture));
+            m_entries.erase(found);
+        }
+        return evicted;
+    }
+
+    std::vector<Texture> take_all()
+    {
+        std::vector<Texture> textures;
+        textures.reserve(m_entries.size());
+        for (auto& item : m_entries) {
+            textures.push_back(std::move(item.second.texture));
+        }
+        m_entries.clear();
+        return textures;
+    }
+
+    std::size_t size() const { return m_entries.size(); }
+
+    std::uint64_t bytes() const
+    {
+        std::uint64_t total = 0U;
+        for (const auto& item : m_entries) {
+            total += item.second.bytes;
+        }
+        return total;
+    }
+
+    std::uint64_t pinned_bytes() const
+    {
+        std::uint64_t total = 0U;
+        for (const auto& item : m_entries) {
+            total += item.second.pinned ? item.second.bytes : 0U;
+        }
+        return total;
+    }
+
+private:
+    struct Entry
+    {
+        Texture       texture;
+        std::uint64_t bytes    = 0U;
+        std::uint64_t last_use = 0U;
+        bool          pinned   = false;
+    };
+
+    std::uint64_t                            m_unpinned_byte_limit = 0U;
+    std::uint64_t                            m_clock               = 0U;
+    std::unordered_map<std::uint64_t, Entry> m_entries;
+};
+
 struct Qsg_atlas_render_summary
 {
     Qsg_atlas_buffer_update_summary
@@ -467,6 +601,8 @@ struct Qsg_atlas_render_summary
                   glyph_buffer;
     Qsg_atlas_buffer_update_summary
                   msdf_text_buffer;
+    Qsg_atlas_image_summary
+                  images;
     int           shaped_text_runs                  = 0;
     int           shaped_glyph_records              = 0;
     int           shaped_missing_string_indexes     = 0;

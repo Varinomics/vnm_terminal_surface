@@ -3301,7 +3301,8 @@ bool test_invalid_row_images_are_dropped_alone()
     const term::Terminal_render_frame miscounted_frame = build(miscounted);
     ok &= check(miscounted_frame.image_quads.empty() &&
             miscounted_frame.stats.images_rejected == 2,
-        "an image field that does not match the grid rows draws no image");
+        "an image field that does not match the grid rows draws no image "
+        "(the count of two, one per image entry, is provisional)");
 
     return ok;
 }

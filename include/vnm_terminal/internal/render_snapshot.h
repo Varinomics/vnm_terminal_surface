@@ -429,6 +429,7 @@ enum class Terminal_render_image_status
 {
     OK,
     INVALID_ROW_COUNT,
+    INVALID_REVISION,
     INVALID_PIXELS,
     INVALID_CELL_PIXEL_SIZE,
     INVALID_PIXEL_SIZE,
@@ -1629,6 +1630,11 @@ inline Terminal_render_image_status validate_render_snapshot_row_image(
     const Terminal_image_slice* slice = images[static_cast<std::size_t>(row)].get();
     if (slice == nullptr) {
         return Terminal_render_image_status::OK;
+    }
+
+    // Revisions start at 1, and a renderer keys cached texels on them alone.
+    if (slice->revision == 0U) {
+        return Terminal_render_image_status::INVALID_REVISION;
     }
 
     if (slice->pixels.isNull() ||
