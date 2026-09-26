@@ -634,6 +634,7 @@ target_compile_definitions(vnm_terminal_diagnostics_text_layout PRIVATE
 )
 
 target_link_libraries(vnm_terminal_diagnostics_text_layout PRIVATE
+    vnm_msdf_text::lcd_contract
     Qt6::Core
     Qt6::Gui
 )
