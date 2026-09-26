@@ -124,6 +124,18 @@ bool supported_content_extent_is_valid(
                 frame.cursor.row);
 }
 
+const vnm_terminal::Terminal_canvas_images* supported_images(
+    const vnm_terminal::Terminal_canvas_frame& frame)
+{
+    if (!frame.images ||
+        frame.images->record_version != vnm_terminal::k_terminal_canvas_images_version ||
+        frame.images->status != vnm_terminal::Terminal_canvas_images_status::AVAILABLE)
+    {
+        return nullptr;
+    }
+    return &*frame.images;
+}
+
 std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
     const vnm_terminal::Terminal_canvas_frame& frame)
 {
@@ -196,6 +208,22 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
             continuation.style_id          = source_cell.style_index;
             continuation.text_category     = continuation.text.category();
             snapshot->cells.push_back(std::move(continuation));
+        }
+    }
+
+    if (const auto* images = supported_images(frame)) {
+        for (const auto& slice : images->rows) {
+            // Sender revisions can collide across sessions and processes. The
+            // receiver's immutable QImage identity keys the actual local texels.
+            term::set_render_snapshot_row_image(
+                *snapshot,
+                slice.row,
+                std::make_shared<const term::Terminal_image_slice>(term::Terminal_image_slice{
+                    slice.pixels,
+                    slice.first_column,
+                    {slice.cell_pixel_width, slice.cell_pixel_height},
+                    static_cast<std::uint64_t>(slice.pixels.cacheKey()),
+                }));
         }
     }
 
@@ -504,7 +532,18 @@ int VNM_TerminalCanvas::content_bottom_row_exclusive() const
 {
     const vnm_terminal::terminal_canvas_content_extent_t* const extent =
         supported_content_extent(m_private->frame.get());
-    return extent != nullptr ? extent->content_bottom_row_exclusive : 0;
+    if (extent == nullptr) {
+        return 0;
+    }
+    int bottom = extent->content_bottom_row_exclusive;
+    if (const auto* images = supported_images(*m_private->frame)) {
+        for (const auto& slice : images->rows) {
+            if (slice.first_column < m_private->frame->columns) {
+                bottom = std::max(bottom, slice.row + 1);
+            }
+        }
+    }
+    return bottom;
 }
 
 int VNM_TerminalCanvas::scrollback_rows() const
@@ -614,8 +653,13 @@ bool VNM_TerminalCanvas::set_canvas_frame(
         return false;
     }
 
-    const std::shared_ptr<const vnm_terminal::Terminal_canvas_frame> owned_frame =
-        std::make_shared<const vnm_terminal::Terminal_canvas_frame>(*frame);
+    auto owned_frame = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    if (owned_frame->images &&
+        !vnm_terminal::terminal_canvas_images_are_valid(*owned_frame->images, owned_frame->rows))
+    {
+        owned_frame->images->status = vnm_terminal::Terminal_canvas_images_status::INVALID;
+        owned_frame->images->rows.clear();
+    }
     const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
         materialize_snapshot(*owned_frame);
     if (term::validate_render_snapshot(*snapshot).status !=

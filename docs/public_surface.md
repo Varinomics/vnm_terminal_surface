@@ -625,9 +625,16 @@ installs `vnm_terminal/backend_output_capture.h`,
 subtree through
 `vnm_terminal_surface::vnm_terminal_surface`. Embedders that consume the
 installed package therefore cannot include internal headers and must rely on
-these public targets and headers. A canvas frame, exported or rendered, carries
-text only: sixel images the surface shows are not part of it. Renderer diagnostics are exposed through the
-public `qsg_atlas` serializer.
+these public targets and headers. Canvas frames carry text and an optional,
+independently versioned image record. Exported sixel row slices preserve their
+RGBA pixels, original cell scale, and placement; the canvas clips them to its
+grid and renders them through the surface's image renderer. Images share the
+enclosing publication's lifetime. Missing, unknown, invalid, or over-limit image
+records leave text available; unavailable status never represents a partial
+image as complete. Transport owners set their decoded-byte budgets. The existing
+content-extent record describes text and cursor state, while the canvas's
+presentation bottom also includes visible image rows. Renderer diagnostics are
+exposed through the public `qsg_atlas` serializer.
 Internal headers carry no source- or binary-stability guarantee and may change
 without notice.
 

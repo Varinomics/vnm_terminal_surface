@@ -80,6 +80,8 @@ public:
     bool content_extent_available() const;
     // Extent value accessors are meaningful only while availability is true;
     // otherwise they return neutral values.
+    // The presentation bottom also includes supported visible image rows;
+    // the frame's text/cursor extent record retains its own wire semantics.
     int content_bottom_row_exclusive() const;
     int scrollback_rows() const;
     int viewport_offset_from_tail() const;
@@ -93,7 +95,8 @@ public:
     QString render_error() const;
 
     // The item copies and validates the immutable frame on its owning thread.
-    // A rejected frame leaves the last accepted canvas installed.
+    // A rejected base frame leaves the last accepted canvas installed. Invalid
+    // image records become image-local INVALID status while text is installed.
     bool set_canvas_frame(
         std::shared_ptr<const vnm_terminal::Terminal_canvas_frame> frame);
     std::shared_ptr<const vnm_terminal::Terminal_canvas_frame>
