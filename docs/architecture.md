@@ -163,7 +163,10 @@ synchronized output state, and render snapshot production.
 A decoded sixel image is placed against the cell pixel size and cut into one
 immutable `Terminal_image_slice` (`render_snapshot.h`) per text row it covers;
 there is no image store. The row owns its slice, which moves and dies with the
-row and reaches retained history with it. A history row record carries its
+row and reaches retained history with it. Text written or erased over a row's
+image clears the image under those cells, ICH and DCH move image columns with
+the cells, and an image row always starts its logical line, so reflow keeps the
+image on the line's first row. A history row record carries its
 slice in a presence-flagged section, so image-free records keep their exact
 encoding, and a decode materializes the pixels only when a reader asks for
 them. Each slice records the cell size it was placed on and a model-lifetime

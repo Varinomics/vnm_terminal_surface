@@ -319,6 +319,18 @@ const QString& printable_ascii_cell_text(QChar character)
         character.unicode() - k_printable_ascii_first)];
 }
 
+// Undrawn image pixels are all zero, whatever the byte order.
+bool image_block_has_drawn_pixel(const QImage& pixels, int x_first, int x_end)
+{
+    for (int y = 0; y < pixels.height(); ++y) {
+        const auto* line = reinterpret_cast<const std::uint32_t*>(pixels.constScanLine(y));
+        if (std::any_of(line + x_first, line + x_end, [](std::uint32_t pixel) { return pixel != 0U; })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Draws a band over its row's earlier image, drawn pixels over earlier ones,
 // into one image over the union of their columns. An earlier image placed on
 // another cell is first resampled to this one, the size a renderer draws it
@@ -3832,6 +3844,14 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             ? state.rows[first].retained_line_provenance
             : cell_origins.front();
         Terminal_screen_row row = make_row(first_origin);
+        // An image stays on the first row of its logical line (S2), which is
+        // the only row of the line that can show one (D2). Its columns take
+        // no part in the reflow, so widening back loses nothing of it.
+        Q_ASSERT(std::none_of(
+            state.rows.begin() + static_cast<std::ptrdiff_t>(first) + 1,
+            state.rows.begin() + static_cast<std::ptrdiff_t>(last) + 1,
+            [](const Terminal_screen_row& source_row) { return source_row.image_slice != nullptr; }));
+        row.image_slice = std::move(state.rows[first].image_slice);
         int column = 0;
         bool cursor_pending_end_mapped = false;
         bool saved_pending_end_mapped = false;
@@ -4742,6 +4762,10 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                     screen_row,
                     m_config.grid_size.columns - 1,
                     text[text.size() - 1]);
+            clear_image_cells(
+                screen_row,
+                m_config.grid_size.columns - 1,
+                m_config.grid_size.columns);
             write_printable_ascii_cell_content(
                 screen_row,
                 m_config.grid_size.columns - 1,
@@ -4835,6 +4859,10 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
                     screen_row,
                     m_config.grid_size.columns - 1,
                     text[text.size() - 1]);
+            clear_image_cells(
+                screen_row,
+                m_config.grid_size.columns - 1,
+                m_config.grid_size.columns);
             const QString margin_text(text[text.size() - 1]);
             write_single_width_bmp_cell_content(
                 screen_row,
@@ -4905,6 +4933,7 @@ void Terminal_screen_model::write_printable_ascii_span_content(
     }
 
     mark_terminal_content_changed();
+    clear_image_cells(row, first_column, first_column + static_cast<int>(text.size()));
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
         m_profile_stats.printable_ascii_cells_written +=
@@ -4973,6 +5002,7 @@ void Terminal_screen_model::write_single_width_bmp_span_content(
     }
 
     mark_terminal_content_changed();
+    clear_image_cells(row, first_column, first_column + static_cast<int>(text.size()));
     const QString first_text(text[0]);
     for (qsizetype offset = 0; offset < text.size(); ++offset) {
         if (text[offset] == text[0]) {
@@ -5139,6 +5169,7 @@ void Terminal_screen_model::install_cell_span(
             display_width,
             natural_display_width);
     clear_cell_at(position);
+    clear_image_cells(screen_row, position.column, position.column + display_width);
 
     Cell& cell = screen_row.cells[position.column];
     cell.text              = std::move(text);
@@ -5311,6 +5342,9 @@ void Terminal_screen_model::erase_row_range(int row, int first_column, int last_
     if (last_column == m_config.grid_size.columns - 1) {
         screen_row.soft_wrap_columns = 0;
     }
+    // Before the unoccupied-tail trim below: an image usually covers cells
+    // with no text, and the erase clears its pixels there too.
+    clear_image_cells(screen_row, first_column, last_column + 1);
     const Cell replacement = erased_cell();
     bool       selection_content_changed = false;
 
@@ -5455,6 +5489,7 @@ void Terminal_screen_model::erase_visible_screen()
             const std::vector<Cell> before_cells = screen_row.cells;
             fill_row_with_erased_cells(screen_row.cells);
             screen_row.soft_wrap_columns = 0;
+            screen_row.image_slice.reset();
             advance_row_content_generation_if_changed(screen_row, before_cells);
         }
     }
@@ -5591,6 +5626,7 @@ void Terminal_screen_model::insert_cells(int count)
         row.begin() + m_cursor.column,
         row.begin() + m_config.grid_size.columns - count,
         row.end());
+    shift_image_columns(screen_row, m_cursor.column, count);
 
     const Cell replacement = erased_cell();
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
@@ -5617,6 +5653,7 @@ void Terminal_screen_model::delete_cells(int count)
         row.begin() + m_cursor.column + count,
         row.end(),
         row.begin() + m_cursor.column);
+    shift_image_columns(screen_row, m_cursor.column, -count);
 
     const Cell replacement = erased_cell();
     for (int column = m_config.grid_size.columns - count;
@@ -6861,8 +6898,19 @@ void Terminal_screen_model::line_feed()
 
 void Terminal_screen_model::wrap_line()
 {
-    active_grid_rows()[(std::size_t)m_cursor.row].soft_wrap_columns =
-        m_pending_wrap ? m_config.grid_size.columns : m_cursor.column;
+    // A row that shows an image starts its own logical line (D2), so text
+    // wrapping onto one wraps hard. Text wrapping off one stays soft. At the
+    // bottom margin the wrap scrolls onto a fresh row instead.
+    const int  next_row = m_cursor.row + 1;
+    const bool wraps_onto_image_row =
+        m_cursor.row != m_scroll_bottom         &&
+        next_row     <  m_config.grid_size.rows &&
+        active_grid_rows()[(std::size_t)next_row].image_slice != nullptr;
+    int soft_wrap_columns = m_pending_wrap ? m_config.grid_size.columns : m_cursor.column;
+    if (wraps_onto_image_row) {
+        soft_wrap_columns = 0;
+    }
+    active_grid_rows()[(std::size_t)m_cursor.row].soft_wrap_columns = soft_wrap_columns;
     carriage_return();
     advance_row();
 }
@@ -7054,6 +7102,13 @@ void Terminal_screen_model::place_image_band(
     // text and hyperlink and keeps its style, the way an erase leaves a cell;
     // a wide glyph with a covered cell is cleared whole.
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+
+    // A row that shows an image starts its own logical line (owner decision
+    // D2), so placing one hard-terminates the soft wraps into and out of its
+    // row, and reflow never has to split one image over several rows.
+    break_soft_wrap_before(row);
+    screen_row.soft_wrap_columns = 0;
+
     std::vector<Cell> before_cells;
     for (int index = 0; index < band_columns; ++index) {
         if (covered_columns[static_cast<std::size_t>(index)] == 0U) {
@@ -7118,6 +7173,139 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_sl
         cell_pixel_size,
         m_next_image_slice_revision++,
     });
+}
+
+// Text written or erased in a cell leaves no image under it (S1): the image
+// pixels of cells [first_column, end_column) go, measured in the cells the
+// image was placed on. A slice left with no drawn pixel is dropped.
+void Terminal_screen_model::clear_image_cells(
+    Terminal_screen_row& row,
+    int                  first_column,
+    int                  end_column)
+{
+    if (row.image_slice == nullptr) {
+        return;
+    }
+
+    const int                        slice_first_column = row.image_slice->first_column;
+    const terminal_cell_pixel_size_t slice_cell         = row.image_slice->cell_pixel_size;
+    const QImage&                    slice_pixels       = row.image_slice->pixels;
+    const int x_first = std::max(0, (first_column - slice_first_column) * slice_cell.width);
+    const int x_end   = std::min(
+        slice_pixels.width(),
+        (end_column - slice_first_column) * slice_cell.width);
+    if (x_first >= x_end || !image_block_has_drawn_pixel(slice_pixels, x_first, x_end)) {
+        return;
+    }
+
+    QImage pixels = slice_pixels.copy();
+    // QImage reports a failed allocation with a null image, not an exception.
+    if (pixels.isNull()) {
+        throw std::bad_alloc();
+    }
+    for (int y = 0; y < pixels.height(); ++y) {
+        auto* line = reinterpret_cast<std::uint32_t*>(pixels.scanLine(y));
+        std::fill(line + x_first, line + x_end, 0U);
+    }
+
+    if (image_block_has_drawn_pixel(pixels, 0, pixels.width())) {
+        row.image_slice = make_image_slice(std::move(pixels), slice_first_column, slice_cell);
+    }
+    else {
+        row.image_slice.reset();
+    }
+}
+
+// ICH and DCH move a row's cells from from_column on by `shift` columns, to
+// the right when positive, and the image moves with them (S1). Image columns
+// the shift pushes past the right margin, or that DCH deletes, are lost; so
+// are moving columns already past the margin, as no cell carries them in.
+void Terminal_screen_model::shift_image_columns(
+    Terminal_screen_row& row,
+    int                  from_column,
+    int                  shift)
+{
+    if (row.image_slice == nullptr) {
+        return;
+    }
+
+    const Terminal_image_slice& slice = *row.image_slice;
+    const int slice_end_column = slice.first_column + terminal_image_slice_column_span(slice);
+    if (slice_end_column <= from_column) {
+        return;
+    }
+
+    struct column_segment_t
+    {
+        int first  = 0;
+        int end    = 0;
+        int offset = 0;
+    };
+
+    // Columns left of from_column stay; columns from it on move, less those
+    // DCH deletes and those that would land at or past the right margin.
+    const int columns = m_config.grid_size.columns;
+    const column_segment_t segments[] = {
+        {slice.first_column, std::min(slice_end_column, from_column), 0},
+        {
+            std::max(slice.first_column, from_column + std::max(0, -shift)),
+            std::min({slice_end_column, columns, columns - shift}),
+            shift,
+        },
+    };
+
+    const int cell_width   = slice.cell_pixel_size.width;
+    const int pixel_width  = slice.pixels.width();
+    int       first_column = std::numeric_limits<int>::max();
+    int       end_x        = 0;
+    for (const column_segment_t& segment : segments) {
+        if (segment.first < segment.end) {
+            first_column = std::min(first_column, segment.first + segment.offset);
+        }
+    }
+    if (first_column == std::numeric_limits<int>::max()) {
+        row.image_slice.reset();
+        return;
+    }
+    for (const column_segment_t& segment : segments) {
+        if (segment.first < segment.end) {
+            const int source_end_x =
+                std::min(pixel_width, (segment.end - slice.first_column) * cell_width);
+            const int source_first_x = (segment.first - slice.first_column) * cell_width;
+            const int target_first_x = (segment.first + segment.offset - first_column) * cell_width;
+            end_x = std::max(end_x, target_first_x + source_end_x - source_first_x);
+        }
+    }
+
+    QImage pixels(end_x, slice.pixels.height(), QImage::Format_RGBA8888_Premultiplied);
+    // QImage reports a failed allocation with a null image, not an exception.
+    if (pixels.isNull()) {
+        throw std::bad_alloc();
+    }
+    pixels.fill(0U);
+    for (const column_segment_t& segment : segments) {
+        if (segment.first >= segment.end) {
+            continue;
+        }
+
+        const int source_first_x = (segment.first - slice.first_column) * cell_width;
+        const int source_end_x   = std::min(pixel_width, (segment.end - slice.first_column) * cell_width);
+        const int target_first_x = (segment.first + segment.offset - first_column) * cell_width;
+        for (int y = 0; y < pixels.height(); ++y) {
+            std::memcpy(
+                pixels.scanLine(y) + static_cast<std::size_t>(target_first_x) * sizeof(std::uint32_t),
+                slice.pixels.constScanLine(y) + static_cast<std::size_t>(source_first_x) * sizeof(std::uint32_t),
+                static_cast<std::size_t>(source_end_x - source_first_x) * sizeof(std::uint32_t));
+        }
+    }
+
+    const terminal_cell_pixel_size_t cell = slice.cell_pixel_size;
+    if (image_block_has_drawn_pixel(pixels, 0, pixels.width())) {
+        row.image_slice = make_image_slice(std::move(pixels), first_column, cell);
+    }
+    else {
+        row.image_slice.reset();
+    }
 }
 
 void Terminal_screen_model::backspace()

@@ -734,6 +734,317 @@ bool test_capacity_shrink_keeps_text_rows_around_an_oversized_image()
     return ok;
 }
 
+// One sixel row of `cells` ten-pixel blocks, each in its own color, so a
+// moved or cleared block shows in the pixels.
+QByteArray striped_cells(int cells)
+{
+    QByteArray data;
+    for (int cell = 0; cell < cells; ++cell) {
+        data += '#' + QByteArray::number(cell + 1) + ";2;" + QByteArray::number(cell * 10) +
+            ";" + QByteArray::number(100 - cell * 10) + ";50";
+    }
+    for (int cell = 0; cell < cells; ++cell) {
+        data += '#' + QByteArray::number(cell + 1) + "!10~";
+    }
+    return data;
+}
+
+// The decoder's raster with the pixels of cells [first_cell, end_cell)
+// cleared, cells counted from the image's first column.
+QImage raster_without_cells(const QImage& raster, int first_cell, int end_cell)
+{
+    QImage expected = raster.copy();
+    for (int y = 0; y < expected.height(); ++y) {
+        auto* line = reinterpret_cast<std::uint32_t*>(expected.scanLine(y));
+        std::fill(
+            line + first_cell * k_cell.width,
+            line + std::min(expected.width(), end_cell * k_cell.width),
+            0U);
+    }
+    return expected;
+}
+
+struct Cell_move
+{
+    int source_first_cell = 0;
+    int source_end_cell   = 0;
+    int target_first_cell = 0;
+};
+
+// The decoder's raster rebuilt from whole-cell blocks moved to new cells.
+QImage raster_with_moved_cells(const QImage& raster, int width, const std::vector<Cell_move>& moves)
+{
+    QImage expected(width, raster.height(), QImage::Format_RGBA8888_Premultiplied);
+    expected.fill(0U);
+    for (const Cell_move& move : moves) {
+        const std::size_t bytes =
+            static_cast<std::size_t>((move.source_end_cell - move.source_first_cell) * k_cell.width) * 4U;
+        for (int y = 0; y < expected.height(); ++y) {
+            std::memcpy(
+                expected.scanLine(y) + move.target_first_cell * k_cell.width * 4,
+                raster.constScanLine(y) + move.source_first_cell * k_cell.width * 4,
+                bytes);
+        }
+    }
+    return expected;
+}
+
+term::Terminal_retained_row_wrap_state history_wrap_state(
+    const term::Terminal_screen_model& model,
+    int                                row)
+{
+    const std::optional<term::terminal_retained_row_record_metadata_t> metadata =
+        model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+    return metadata.has_value()
+        ? metadata->wrap_state
+        : term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
+}
+
+bool test_text_writes_and_erases_clear_image_cells()
+{
+    bool ok = true;
+
+    const QByteArray data = striped_cells(10);
+    const term::Screen_sixel_image_mutation image = decoded_image("9;1", data);
+    ok &= check(image.raster.width() == 100 && image.raster.height() == 6,
+        "the striped reference image decodes to 100 x 6 pixels");
+
+    struct Edit_case
+    {
+        const char* name;
+        QByteArray  edit;
+        int         first_cell;
+        int         end_cell;
+    };
+
+    const std::vector<Edit_case> cases = {
+        {"printing clears the image under the printed cells",
+            cursor_to(0, 2) + "ab", 2, 4},
+        {"a wide glyph clears the image under both its cells",
+            cursor_to(0, 4) + "\xe7\x95\x8c", 4, 6},
+        {"EL 0 clears the image from the cursor on, over cells with no text",
+            cursor_to(0, 6) + "\x1b[K", 6, 10},
+        {"EL 1 clears the image up to the cursor",
+            cursor_to(0, 3) + "\x1b[1K", 0, 4},
+        {"ECH clears the image under the erased cells",
+            cursor_to(0, 4) + "\x1b[3X", 4, 7},
+        {"ED 0 clears the image from the cursor on",
+            cursor_to(0, 7) + "\x1b[J", 7, 10},
+        {"ED 1 clears the image up to the cursor",
+            cursor_to(0, 2) + "\x1b[1J", 0, 3},
+    };
+
+    for (const Edit_case& edit_case : cases) {
+        term::Terminal_screen_model model = make_model(4, 20);
+        model.ingest(sixel("9;1", data));
+        const std::uint64_t revision_before = slice_at(model, 0)->revision;
+        model.ingest(edit_case.edit);
+        const std::shared_ptr<const term::Terminal_image_slice> slice = slice_at(model, 0);
+        ok &= check(slice != nullptr &&
+                slice->first_column == 0 &&
+                slice->pixels == raster_without_cells(
+                    image.raster,
+                    edit_case.first_cell,
+                    edit_case.end_cell),
+            edit_case.name);
+        ok &= check(slice != nullptr && slice->revision > revision_before,
+            "an edited row image is a new slice with a new revision");
+    }
+
+    const std::vector<std::pair<const char*, QByteArray>> clearing_edits = {
+        {"EL 2 drops the row image", cursor_to(0, 5) + "\x1b[2K"},
+        {"ED 2 drops the screen's images", cursor_to(0, 5) + "\x1b[2J"},
+        {"printing over every image cell drops the row image",
+            cursor_to(0, 0) + "0123456789"},
+        {"edits that together clear every image cell drop the row image",
+            cursor_to(0, 4) + "\x1b[1K" + cursor_to(0, 5) + "\x1b[5X" + cursor_to(0, 4) + "x"},
+    };
+    for (const auto& [name, edit] : clearing_edits) {
+        term::Terminal_screen_model model = make_model(4, 20);
+        model.ingest(sixel("9;1", data));
+        model.ingest(edit);
+        ok &= check(slice_at(model, 0) == nullptr, name);
+    }
+
+    // ED 0 erases whole rows below the cursor, and their images with them.
+    term::Terminal_screen_model rows_below = make_model(4, 20);
+    rows_below.ingest(cursor_to(2, 0) + sixel("9;1", data) + cursor_to(0, 0) + "\x1b[J");
+    ok &= check(slice_at(rows_below, 2) == nullptr,
+        "ED 0 drops the images of the rows below the cursor");
+
+    return ok;
+}
+
+bool test_ich_and_dch_move_image_columns()
+{
+    bool ok = true;
+
+    const QByteArray data = striped_cells(10);
+    const term::Screen_sixel_image_mutation image = decoded_image("9;1", data);
+
+    // ICH 2 at column 3 of an 11-column row: cells 3 to 8 move to 5 to 10,
+    // and cell 9 is pushed past the right margin.
+    term::Terminal_screen_model inserted = make_model(3, 11);
+    inserted.ingest(sixel("9;1", data) + cursor_to(0, 3) + "\x1b[2@");
+    const std::shared_ptr<const term::Terminal_image_slice> inserted_slice = slice_at(inserted, 0);
+    ok &= check(inserted_slice != nullptr &&
+            inserted_slice->first_column == 0 &&
+            inserted_slice->pixels == raster_with_moved_cells(image.raster, 110, {{0, 3, 0}, {3, 9, 5}}),
+        "ICH moves the image cells with the text cells and loses those pushed past the margin");
+
+    // DCH 2 at column 3: cells 3 and 4 go, and cells 5 to 9 move to 3 to 7.
+    term::Terminal_screen_model deleted = make_model(3, 20);
+    deleted.ingest(sixel("9;1", data) + cursor_to(0, 3) + "\x1b[2P");
+    const std::shared_ptr<const term::Terminal_image_slice> deleted_slice = slice_at(deleted, 0);
+    ok &= check(deleted_slice != nullptr &&
+            deleted_slice->first_column == 0 &&
+            deleted_slice->pixels == raster_with_moved_cells(image.raster, 80, {{0, 3, 0}, {5, 10, 3}}),
+        "DCH deletes the image cells with the text cells and moves the rest left");
+
+    term::Terminal_screen_model shifted = make_model(3, 20);
+    shifted.ingest(sixel("9;1", data) + cursor_to(0, 0) + "\x1b[3@");
+    ok &= check(slice_at(shifted, 0) != nullptr &&
+            slice_at(shifted, 0)->first_column == 3 &&
+            slice_at(shifted, 0)->pixels == raster_without_cells(image.raster, 10, 10),
+        "ICH at the image's first cell moves the whole image right");
+
+    term::Terminal_screen_model removed = make_model(3, 20);
+    removed.ingest(sixel("9;1", data) + cursor_to(0, 0) + "\x1b[10P");
+    ok &= check(slice_at(removed, 0) == nullptr, "DCH over every image cell drops the row image");
+
+    term::Terminal_screen_model untouched = make_model(3, 20);
+    untouched.ingest(sixel("9;1", data));
+    const std::shared_ptr<const term::Terminal_image_slice> placed = slice_at(untouched, 0);
+    untouched.ingest(cursor_to(0, 12) + "\x1b[2@\x1b[2P");
+    ok &= check(slice_at(untouched, 0) == placed,
+        "ICH and DCH right of the image leave the row image as it was");
+
+    return ok;
+}
+
+bool test_image_rows_start_their_own_logical_lines()
+{
+    bool ok = true;
+
+    // Thirty characters on a ten-column screen: rows 0 and 1 wrap softly.
+    const QByteArray text("0123456789abcdefghijklmnopqrst");
+    const QByteArray push_into_history = cursor_to(3, 0) + "\n\n\n\n";
+
+    term::Terminal_screen_model control = make_model(4, 10);
+    control.ingest(text + push_into_history);
+    ok &= check(history_wrap_state(control, 0) == term::Terminal_retained_row_wrap_state::SOFT_WRAP &&
+            history_wrap_state(control, 1) == term::Terminal_retained_row_wrap_state::SOFT_WRAP,
+        "without an image the wrapped rows stay soft");
+
+    // D2: an image placed on row 1 hard-terminates the wrap into it and the
+    // wrap out of it.
+    term::Terminal_screen_model placed = make_model(4, 10);
+    placed.ingest(text + cursor_to(1, 9) + sixel("9;1", solid_rows(3, 1)) + push_into_history);
+    ok &= check(history_wrap_state(placed, 0) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "placing an image hard-terminates the soft wrap into its row");
+    ok &= check(history_wrap_state(placed, 1) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "placing an image hard-terminates the soft wrap out of its row");
+
+    // A row that shows an image starts a logical line, so text wrapping onto
+    // it later wraps hard as well.
+    term::Terminal_screen_model wrapped_onto = make_model(4, 10);
+    wrapped_onto.ingest(
+        cursor_to(1, 7) + sixel("9;1", solid_rows(3, 1)) + cursor_to(0, 0) + "0123456789abcde" +
+        push_into_history);
+    ok &= check(history_wrap_state(wrapped_onto, 0) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "text wrapping onto an image row wraps hard");
+    ok &= check(wrapped_onto.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 1) != nullptr,
+        "the wrapped text leaves the image cells it does not reach");
+
+    // Text wrapping off an image row stays soft (provisional: no reference
+    // decides it; only wraps onto an image row have to be hard).
+    term::Terminal_screen_model wrapped_off = make_model(4, 10);
+    wrapped_off.ingest(
+        cursor_to(1, 0) + sixel("9;1", solid_rows(3, 1)) + cursor_to(1, 5) + "vwxyz12" +
+        push_into_history);
+    ok &= check(history_wrap_state(wrapped_off, 1) == term::Terminal_retained_row_wrap_state::SOFT_WRAP,
+        "text wrapping off an image row wraps softly (provisional)");
+
+    return ok;
+}
+
+bool test_reflow_keeps_the_image_on_its_line_first_row()
+{
+    bool ok = true;
+
+    // S2: an image stays on the first row of its logical line through a
+    // reflow, and its columns never make continuation rows.
+    term::Terminal_screen_model model = make_model(4, 20);
+    model.ingest(sixel("9;1", striped_cells(10)) + cursor_to(0, 12) + "abcdefgh");
+    const std::shared_ptr<const term::Terminal_image_slice> placed = slice_at(model, 0);
+
+    model.resize(term::terminal_grid_size_t{4, 10});
+    ok &= check(slice_at(model, 0) == placed && slice_at(model, 1) == nullptr,
+        "narrowing keeps the image on the first row of its line");
+    ok &= check(model.row_text(1) == QStringLiteral("  abcdefgh"),
+        "narrowing wraps the row's text onto a continuation row");
+
+    model.resize(term::terminal_grid_size_t{4, 20});
+    ok &= check(slice_at(model, 0) == placed,
+        "widening back restores the image unchanged");
+    ok &= check(model.row_text(0) == QStringLiteral("            abcdefgh") &&
+            model.row_text(1).isEmpty(),
+        "widening back restores the row's text");
+
+    term::Terminal_screen_model image_only = make_model(4, 20);
+    image_only.ingest(sixel("9;1", solid_rows(150, 1)) + cursor_to(1, 0) + "next");
+    const std::shared_ptr<const term::Terminal_image_slice> wide = slice_at(image_only, 0);
+    image_only.resize(term::terminal_grid_size_t{4, 10});
+    ok &= check(slice_at(image_only, 0) == wide &&
+            image_only.row_text(1) == QStringLiteral("next"),
+        "an image wider than the narrowed row makes no continuation rows");
+
+    return ok;
+}
+
+bool test_recovered_history_rows_keep_their_images()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {4, 8};
+    config.scrollback_limit                         = 8;
+    config.cell_pixel_size                          = k_cell;
+    config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model model(config);
+
+    const auto rows_stream = [](std::initializer_list<const char*> rows, bool cursor_hidden) {
+        QByteArray stream = cursor_hidden ? QByteArray("\x1b[?25l") : QByteArray();
+        int row = 1;
+        for (const char* text : rows) {
+            stream += "\x1b[" + QByteArray::number(row++) + ";1H" + text + "\x1b[K";
+        }
+        if (cursor_hidden) {
+            stream += "\x1b[?25h";
+        }
+        return stream;
+    };
+
+    model.ingest(rows_stream({"aa", "bb", "cc", "dd"}, false));
+    model.ingest(cursor_to(0, 4) + sixel("9;1", solid_rows(20, 1)));
+    const std::shared_ptr<const term::Terminal_image_slice> placed = slice_at(model, 0);
+    ok &= check(placed != nullptr, "the recovery fixture places an image on row 0");
+
+    // The application repaints the screen shifted up by one row; recovery
+    // keeps the row that left the top as history.
+    model.ingest(rows_stream({"bb", "cc", "dd", "ee"}, true));
+    ok &= check(model.scrollback_size() == 1 && history_row_text(model, 0) == QStringLiteral("aa"),
+        "the repaint recovers the row that left the screen");
+    ok &= check(slices_equal(
+            model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0),
+            placed),
+        "a recovered history row keeps the image it showed before the repaint");
+    ok &= check(slice_at(model, 0) == nullptr,
+        "the repainted screen row loses the image to the repaint's erase");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -751,5 +1062,10 @@ int main()
     ok &= test_placement_marks_rows_dirty();
     ok &= test_oversized_image_rows_keep_their_text_in_history();
     ok &= test_capacity_shrink_keeps_text_rows_around_an_oversized_image();
+    ok &= test_text_writes_and_erases_clear_image_cells();
+    ok &= test_ich_and_dch_move_image_columns();
+    ok &= test_image_rows_start_their_own_logical_lines();
+    ok &= test_reflow_keeps_the_image_on_its_line_first_row();
+    ok &= test_recovered_history_rows_keep_their_images();
     return ok ? 0 : 1;
 }

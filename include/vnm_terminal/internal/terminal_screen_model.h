@@ -1413,6 +1413,16 @@ private:
         int                            first_column,
         terminal_cell_pixel_size_t     cell_pixel_size);
 
+    void clear_image_cells(
+        Terminal_screen_row&           row,
+        int                            first_column,
+        int                            end_column);
+
+    void shift_image_columns(
+        Terminal_screen_row&           row,
+        int                            from_column,
+        int                            shift);
+
     void backspace();
     void horizontal_tab();
     void mark_cursor_dirty();
