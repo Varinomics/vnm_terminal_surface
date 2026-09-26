@@ -34,11 +34,16 @@ public:
     bool try_charge(std::uint64_t units)
     {
         if (m_charged && units > m_remaining) {
+            m_refused = true;
             return false;
         }
         charge_after(units);
         return true;
     }
+
+    // Whether the budget has nothing left or refused a step: the caller
+    // returns at the next boundary rather than start more expensive work.
+    bool exhausted() const { return m_refused || (m_charged && m_remaining == 0U); }
 
     // Whether work of this size fits in what is left, without the first
     // charge's allowance.
@@ -53,6 +58,7 @@ public:
 private:
     std::uint64_t m_remaining;
     bool          m_charged = false;
+    bool          m_refused = false;
 };
 
 inline bool try_charge_sixel_work(Sixel_work_budget* budget, std::uint64_t units)

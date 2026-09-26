@@ -1704,6 +1704,55 @@ bool test_budgeted_placement_matches_an_unbudgeted_one()
     return ok;
 }
 
+// An image whose decoding spends the budget ends the ingest even when it is
+// placed nowhere, dropped below the bottom margin: the next image waits for a
+// later call, so one call never runs two image ends.
+bool test_spent_budget_ends_the_ingest_at_an_image_end()
+{
+    bool ok = true;
+
+    const QByteArray image("\x1bPq\"1;1;1448;1448\x1b\\");
+    const QByteArray bytes = QByteArray("\x1b[1;5r\x1b[10;1H") + image + image + image;
+    term::Terminal_screen_model model = make_model(20, 160);
+    term::Sixel_work_budget budget(2000000U);
+    const term::Terminal_screen_model_result result = model.ingest(bytes, nullptr, &budget);
+    ok &= check(result.sixel_work_pending &&
+            result.consumed_bytes == bytes.size() - 2 * image.size(),
+        "a dropped image that spends the budget ends the call at its end");
+
+    qsizetype offset = result.consumed_bytes;
+    for (int step = 0; offset < bytes.size() && step < 16; ++step) {
+        term::Sixel_work_budget next(2000000U);
+        offset += model.ingest(QByteArrayView(bytes).sliced(offset), nullptr, &next).consumed_bytes;
+    }
+    ok &= check(offset == bytes.size() && model.cursor_position().row == 9,
+        "later calls take the other images, and all of them are dropped");
+    return ok;
+}
+
+// Drawing a band over a row's earlier image composites the union of their
+// columns, which costs as much as that union however small the band is, so a
+// run of small images over a wide one spends the budget on the composites.
+bool test_composites_are_paid_for()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(4, 160);
+    model.ingest(sixel("9;1", solid_rows(1440, 3)));
+    ok &= check(slice_at(model, 0) != nullptr, "a wide image covers the top row");
+
+    QByteArray overlays;
+    for (int i = 0; i < 100; ++i) {
+        overlays += QByteArray("\x1b[1;") + QByteArray::number(1 + i) + 'H' +
+            sixel("9;1", "#2;2;0;100;0#2~");
+    }
+    term::Sixel_work_budget budget(200000U);
+    const term::Terminal_screen_model_result result = model.ingest(overlays, nullptr, &budget);
+    ok &= check(result.sixel_work_pending && result.consumed_bytes < overlays.size() / 10,
+        "the composites over the wide image spend the budget within a few overlays");
+    return ok;
+}
+
 int main()
 {
     bool ok = true;
@@ -1733,5 +1782,7 @@ int main()
     ok &= test_reported_geometry_decodes_within_the_cap();
     ok &= test_row_images_stay_within_the_decoded_size_cap();
     ok &= test_budgeted_placement_matches_an_unbudgeted_one();
+    ok &= test_spent_budget_ends_the_ingest_at_an_image_end();
+    ok &= test_composites_are_paid_for();
     return ok ? 0 : 1;
 }

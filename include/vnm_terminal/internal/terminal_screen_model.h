@@ -621,10 +621,13 @@ public:
     Terminal_screen_model& operator=(Terminal_screen_model&&) = default;
 
     // Applies bytes. With a budget, sixel decoding and placement stop where
-    // the budget cannot pay for their next step, and the result says how
-    // much was consumed and that work is pending. While a placement is
-    // pending, the only valid call is one with no bytes, which continues it;
-    // nothing else is parsed until it ends. Without a budget everything runs.
+    // the budget cannot pay for their next step, and an image end that spends
+    // the budget ends the call; the result says how much was consumed and
+    // that work is pending. While a placement is pending, the only valid call
+    // is one with no bytes, which continues it: nothing else is parsed, and
+    // no other mutation (resize, capacity, scrollback, color or cell pixel
+    // size) may run until it ends; the session completes pending work before
+    // any of those. Without a budget everything runs.
     Terminal_screen_model_result ingest(
         QByteArrayView bytes,
         const terminal_screen_model_resize_transition_sink_t*
@@ -1460,6 +1463,7 @@ private:
         const Screen_sixel_image_mutation& image,
         std::vector<Parser_action>&        generated_actions);
     std::uint64_t sixel_band_cost(const Sixel_placement& placement, int band) const;
+    std::uint64_t sixel_composite_cost(const Sixel_placement& placement, int row) const;
     std::uint64_t sixel_scroll_cost() const;
     // Runs placement steps while the budget pays for them; true once done.
     bool advance_sixel_placement(std::vector<Parser_action>& generated_actions);

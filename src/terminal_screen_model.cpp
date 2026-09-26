@@ -826,7 +826,15 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
                 publish_pending_changes(publication);
             }
         }
-        deferred = m_parser.sixel_work_deferred() || m_sixel_placement.has_value();
+        // A budget an image has spent ends the call here, at the image's end,
+        // whether or not the image was placed, so one call never runs two
+        // image ends or allocations.
+        deferred =
+            m_parser.sixel_work_deferred() ||
+            m_sixel_placement.has_value()  ||
+            (sixel_work_budget != nullptr &&
+                sixel_work_budget->exhausted() &&
+                parsed < bytes.size());
     }
     while (!deferred && parsed < bytes.size());
 
@@ -4674,6 +4682,7 @@ Terminal_screen_model_result Terminal_screen_model::resize(
     terminal_grid_size_t grid_size,
     const terminal_screen_model_resize_transition_sink_t* resize_transition_sink)
 {
+    Q_ASSERT(!m_sixel_placement.has_value());
     Terminal_screen_model_result result;
     m_scrollback_evicted_rows = 0;
     clear_backing_deltas();
@@ -4727,6 +4736,7 @@ Terminal_screen_model_result Terminal_screen_model::resize(
 
 Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int limit)
 {
+    Q_ASSERT(!m_sixel_placement.has_value());
     Terminal_screen_model_result result;
     m_scrollback_evicted_rows = 0;
     clear_backing_deltas();
@@ -4781,6 +4791,7 @@ Terminal_screen_model_result
 Terminal_screen_model::set_retained_history_capacity_bytes(
     std::size_t capacity_bytes)
 {
+    Q_ASSERT(!m_sixel_placement.has_value());
     if (capacity_bytes < k_terminal_min_retained_history_capacity_bytes ||
         capacity_bytes > k_terminal_max_retained_history_capacity_bytes)
     {
@@ -4898,6 +4909,7 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
 
 Terminal_screen_model_result Terminal_screen_model::set_color_state(Terminal_color_state state)
 {
+    Q_ASSERT(!m_sixel_placement.has_value());
     Terminal_screen_model_result result;
     clear_backing_deltas();
     clear_recovery_proposals();
@@ -4922,6 +4934,7 @@ void Terminal_screen_model::set_text_area_resize_policy(
 
 void Terminal_screen_model::set_cell_pixel_size(terminal_cell_pixel_size_t size)
 {
+    Q_ASSERT(!m_sixel_placement.has_value());
     if (!is_valid_cell_pixel_size(size)) {
         throw std::invalid_argument("invalid cell pixel size");
     }
@@ -7364,13 +7377,25 @@ void Terminal_screen_model::place_sixel_image(
     }
 
     // What the whole placement costs at most, from the steps it will take.
+    // The bands placed before the region scrolls land on rows that may hold
+    // an earlier image to composite with; the others land on scrolled-in rows.
     const bool resamples = placement.aspect < placement.decoded_aspect && !image.raster.isNull();
+    const std::int64_t unscrolled_rows = placement.display_mode
+        ? placed_bands
+        : std::min<std::int64_t>(placed_bands, m_scroll_bottom - placement.origin.row + 1);
+    std::uint64_t composite_cost = 0U;
+    for (std::int64_t band = 0; band < unscrolled_rows; ++band) {
+        composite_cost += sixel_composite_cost(
+            placement,
+            static_cast<int>(placement.origin.row + band));
+    }
     placement.total_cost =
         (resamples
             ? static_cast<std::uint64_t>(placement.width) *
                 static_cast<std::uint64_t>(placement.height)
             : 0U) +
         static_cast<std::uint64_t>(placed_bands) * sixel_band_cost(placement, 0) +
+        composite_cost +
         static_cast<std::uint64_t>(planned_scrolls) * sixel_scroll_cost();
     m_sixel_placement = std::move(placement);
 
@@ -7404,6 +7429,41 @@ std::uint64_t Terminal_screen_model::sixel_band_cost(
     return k_sixel_band_step_units +
         2U * static_cast<std::uint64_t>(std::max<std::int64_t>(0, band_width)) *
             static_cast<std::uint64_t>(std::max<std::int64_t>(0, band_height));
+}
+
+// Drawing a band over its row's earlier image composites the union of their
+// columns: the union is cleared, the earlier image copied, resampled first
+// when its cell differs, and the band drawn over it.
+std::uint64_t Terminal_screen_model::sixel_composite_cost(
+    const Sixel_placement& placement,
+    int                    row) const
+{
+    const std::shared_ptr<const Terminal_image_slice>& earlier =
+        active_grid_rows()[static_cast<std::size_t>(row)].image_slice;
+    if (earlier == nullptr) {
+        return 0U;
+    }
+
+    const std::int64_t band_width = std::min<std::int64_t>(
+        placement.width,
+        static_cast<std::int64_t>(m_config.grid_size.columns - placement.origin.column) *
+            placement.cell.width);
+    const std::int64_t band_columns =
+        (band_width + placement.cell.width - 1) / placement.cell.width;
+    const std::int64_t first_column =
+        std::min<std::int64_t>(earlier->first_column, placement.origin.column);
+    const std::int64_t end_column = std::max<std::int64_t>(
+        earlier->first_column + terminal_image_slice_column_span(*earlier),
+        placement.origin.column + band_columns);
+    const std::uint64_t union_pixels =
+        static_cast<std::uint64_t>(end_column - first_column) *
+        static_cast<std::uint64_t>(placement.cell.width) *
+        static_cast<std::uint64_t>(placement.cell.height);
+    const std::uint64_t resample_pixels = earlier->cell_pixel_size != placement.cell
+        ? static_cast<std::uint64_t>(earlier->pixels.width()) *
+            static_cast<std::uint64_t>(earlier->pixels.height()) + union_pixels
+        : 0U;
+    return 2U * union_pixels + resample_pixels;
 }
 
 // One region scroll: the rows move and are marked, and the row leaving the top
@@ -7462,7 +7522,10 @@ bool Terminal_screen_model::advance_sixel_placement(std::vector<Parser_action>& 
             break;
         }
         const std::uint64_t cost =
-            sixel_band_cost(placement, band) + (scrolls_first ? sixel_scroll_cost() : 0U);
+            sixel_band_cost(placement, band) +
+            (scrolls_first
+                ? sixel_scroll_cost()
+                : sixel_composite_cost(placement, static_cast<int>(row)));
         if (!try_charge_sixel_work(budget, cost)) {
             return false;
         }
