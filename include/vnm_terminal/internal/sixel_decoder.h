@@ -80,8 +80,10 @@ private:
     std::uint64_t m_rows_moved         = 0U;
 };
 
-// The sixel work one drain step may do, in Sixel_work_budget units: about a
-// millisecond on the reference host.
+// The sixel work one drain step may do, in Sixel_work_budget units: about two
+// million pixel writes or copies, chosen so a step is a small fraction of the
+// drain budget on typical hardware. The most a call does past it is one
+// indivisible step, whose unit bounds sixel_placement_tests asserts.
 constexpr std::uint64_t k_sixel_work_units_per_drain_step = 2000000U;
 
 inline bool try_charge_sixel_work(Sixel_work_budget* budget, std::uint64_t units)
