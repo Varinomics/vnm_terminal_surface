@@ -502,6 +502,10 @@ private:
         qsizetype                recorded = 0;
         bool                     entered  = false;
         bool                     admitted = false;
+        // Set once the operation has output to interpret (a callback's bytes,
+        // or a released tail) and kept until it retires, so it counts as open
+        // output through the disposal of its last replies.
+        bool                     owns_output = false;
         Runner_operation_phase   phase    = Runner_operation_phase::OWN_SOURCE;
         // Whether the released tail may arm the next text-area resize
         // request; an exit's may not.

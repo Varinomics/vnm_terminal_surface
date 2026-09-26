@@ -3053,6 +3053,12 @@ void Terminal_session::set_scrollback_limit(int limit)
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     m_config.scrollback_limit = std::max(0, limit);
     if (!m_screen_model.has_value()) {
@@ -3092,6 +3098,12 @@ void Terminal_session::set_retained_history_capacity_bytes(
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     m_config.retained_history_capacity_bytes = capacity_bytes;
     if (!m_screen_model.has_value()) {
@@ -3135,6 +3147,12 @@ void Terminal_session::set_color_state(Terminal_color_state state)
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     // Remember the requested color state so it survives a screen-model
     // (re)creation. At startup this runs before the model exists (the model is
@@ -3180,6 +3198,12 @@ void Terminal_session::set_cell_pixel_size(terminal_cell_pixel_size_t size)
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     // A fixed backend cell stays in force whatever the display reports: that
     // backend's pseudoconsole places images on its own cell, so the child has
@@ -3513,13 +3537,11 @@ void Terminal_session::set_sixel_work_step_units_for_testing(
 }
 
 // An open operation that owns backend output: a callback's bytes, or a tail a
-// release let go. Any other command is the head only while it takes effect.
+// release let go, until it retires. Any other command is the head only while
+// it takes effect.
 bool Terminal_session::output_operation_open() const
 {
-    return m_operation.has_value() &&
-        (m_operation->command.kind == Terminal_session_command_kind::BACKEND_OUTPUT ||
-            m_operation->phase == Runner_operation_phase::RELEASED_TAIL ||
-            m_operation->phase == Runner_operation_phase::EXIT_EFFECTS);
+    return m_operation.has_value() && m_operation->owns_output;
 }
 
 // The one completion rule: output up to an epoch is settled when every
@@ -4596,6 +4618,12 @@ Terminal_session_result Terminal_session::enqueue_and_process_synchronous_comman
         }
     }
 
+    // A synchronous command reached from inside another one's processing
+    // (a backend hook, a notification handler) captures its own result and
+    // then gives the outer command's capture back.
+    const std::uint64_t outer_capture_sequence = m_result_capture_sequence;
+    std::optional<Terminal_session_result> outer_captured_result =
+        std::move(m_captured_result);
     begin_result_capture(sequence);
     process_pending_commands(
         drain_policy,
@@ -4604,6 +4632,8 @@ Terminal_session_result Terminal_session::enqueue_and_process_synchronous_comman
             : Backend_callback_drain_deadline(std::nullopt));
     const Terminal_session_result result = result_after_processing(sequence, enqueue_result);
     end_result_capture();
+    m_result_capture_sequence = outer_capture_sequence;
+    m_captured_result         = std::move(outer_captured_result);
     return result;
 }
 
@@ -4915,7 +4945,8 @@ Terminal_session_result Terminal_session::admit_operation(Runner_operation& oper
     operation.phase = Runner_operation_phase::RETIRED;
     switch (command.kind) {
         case Terminal_session_command_kind::BACKEND_OUTPUT:
-            operation.phase = Runner_operation_phase::OWN_SOURCE;
+            operation.phase       = Runner_operation_phase::OWN_SOURCE;
+            operation.owns_output = true;
             return admit_backend_output(operation);
         case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
             return process_text_area_resize_arbitration_command(command);
@@ -6855,6 +6886,7 @@ void Terminal_session::release_text_area_resize_arbitration(
     // goes on to anything else of its own.
     m_operation->phase                      = Runner_operation_phase::RELEASED_TAIL;
     m_operation->released_tail_allows_rearm = allow_rearm;
+    m_operation->owns_output                = true;
 }
 
 Terminal_session_result Terminal_session::process_text_area_resize_arbitration_command(

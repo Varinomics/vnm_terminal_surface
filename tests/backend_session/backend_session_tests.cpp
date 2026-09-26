@@ -17014,6 +17014,135 @@ bool test_reentrant_input_takes_the_unsettled_outcome()
     return ok;
 }
 
+// A session as a host embeds it: no result, command or event traces, so a
+// synchronous result can come only from its own capture.
+Scripted_backend* make_untraced_session(
+    std::unique_ptr<term::Terminal_session>&   session,
+    term::Terminal_session_config              config)
+{
+    auto              backend     = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    session = std::make_unique<term::Terminal_session>(
+        std::move(backend),
+        recovery_disabled_primary_backing_session_config(config));
+    return backend_ptr;
+}
+
+// Arms one request in an untraced session and hands it to the host.
+std::uint64_t arm_untraced_request(term::Terminal_session& session, Scripted_backend& backend)
+{
+    (void)backend.emit_output(QByteArrayLiteral("\x1b[8;9;40t"));
+    session.process_backend_callback_events();
+    std::uint64_t request_id = 0U;
+    for (term::Terminal_session_delivery& delivery : session.take_pending_deliveries()) {
+        if (delivery.text_area_resize_arbitration_event.has_value() &&
+            delivery.text_area_resize_arbitration_event->request.has_value())
+        {
+            request_id = delivery.text_area_resize_arbitration_event->request->request_id;
+            (void)session.mark_text_area_resize_arbitration_presented(request_id);
+        }
+    }
+    return request_id;
+}
+
+// A settlement's operation owns its output until it retires, through the
+// disposal of the replies its last step generated: a write that re-enters from
+// that disposal takes the unsettled outcome and cannot disturb the settlement's
+// own result, which an untraced session gets only from its capture.
+bool test_final_settlement_step_keeps_its_ownership()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_untraced_session(session, config);
+    (void)session->start(launch_config_with_grid(10, 40));
+    session->process_backend_callback_events();
+    const std::uint64_t request_id = arm_untraced_request(*session, *backend);
+    ok &= check(request_id != 0U, "the untraced request reaches the host");
+    (void)backend->emit_output(QByteArrayLiteral("held\x1b[c"));
+    session->process_backend_callback_events();
+
+    std::optional<term::Terminal_session_result_code> nested_code;
+    backend->after_outputs_during_write = [&] {
+        if (!nested_code.has_value()) {
+            nested_code = session->write_user_bytes(QByteArrayLiteral("nested")).code;
+        }
+    };
+    const term::Terminal_session_result settled = session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{0, 0},
+    });
+    backend->after_outputs_during_write = {};
+    session->process_backend_callback_events();
+
+    ok &= check(nested_code == term::Terminal_session_result_code::INVALID_STATE,
+        "a write re-entering from the settlement's last reply is refused as unsettled");
+    ok &= check(settled.code == term::Terminal_session_result_code::INVALID_ARGUMENT,
+        "the unsupported-grid settlement returns its own result without traces");
+    ok &= check(backend->writes.size() == 1U &&
+            backend->writes.front().startsWith(QByteArrayLiteral("\x1b[?")),
+        "only the tail's reply is written");
+    return ok;
+}
+
+// The model setters settle older output before they change anything. Reached
+// from inside a drain, with a placement the drain left pending, they cannot
+// settle it and change nothing: no configuration, no model state, no backend
+// call.
+bool test_reentrant_setters_leave_a_pending_placement_alone()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_untraced_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    (void)session->start(launch_config_with_grid(80, 160));
+    session->process_backend_callback_events();
+    const std::uint64_t byte_budget_before = session->retained_history_diagnostics().byte_budget;
+    const std::size_t cell_calls_before = backend->cell_pixel_sizes.size();
+
+    // The query's reply is disposed of at the end of the step that decoded
+    // and ended the image, which leaves its placement pending.
+    bool placement_pending = false;
+    backend->after_outputs_during_write = [&] {
+        placement_pending = session->has_pending_backend_callback_events();
+        session->set_scrollback_limit(5);
+        session->set_retained_history_capacity_bytes(
+            term::k_terminal_min_retained_history_capacity_bytes);
+        session->set_color_state(term::Terminal_color_state{});
+        session->set_cell_pixel_size({12, 24});
+    };
+    (void)backend->emit_output(
+        QByteArrayLiteral("\x1b[c\x1bPq\"1;1;1448;1448\x1b\\after"));
+    (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    backend->after_outputs_during_write = {};
+    ok &= check(placement_pending, "the setters run while the image's placement is pending");
+    session->process_backend_callback_events();
+
+    ok &= check(backend->cell_pixel_sizes.size() == cell_calls_before,
+        "the re-entered cell size setter reaches neither the model nor the backend");
+    ok &= check(session->retained_history_diagnostics().byte_budget == byte_budget_before,
+        "the re-entered capacity setter leaves the retained history alone");
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    const std::shared_ptr<const term::Terminal_image_slice> image =
+        snapshot.has_value() ? term::render_snapshot_row_image(*snapshot, 0) : nullptr;
+    ok &= check(image != nullptr &&
+            image->cell_pixel_size == term::terminal_cell_pixel_size_t{10, 20} &&
+            snapshot_contains_text(*snapshot, QStringLiteral("after")),
+        "the placement completes on the cell it was planned for");
+
+    // Outside a drain the same setter takes effect.
+    session->set_cell_pixel_size({12, 24});
+    ok &= check(backend->cell_pixel_sizes.size() == cell_calls_before + 1U,
+        "a setter outside the drain still takes effect");
+    return ok;
+}
+
 bool test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot()
 {
     bool ok = true;
@@ -21941,6 +22070,8 @@ int main()
     ok &= test_withdrawal_reaches_an_open_operation();
     ok &= test_ingress_overflow_leaves_the_open_operation_to_finish();
     ok &= test_reentrant_input_takes_the_unsettled_outcome();
+    ok &= test_final_settlement_step_keeps_its_ownership();
+    ok &= test_reentrant_setters_leave_a_pending_placement_alone();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
     ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
     ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();
