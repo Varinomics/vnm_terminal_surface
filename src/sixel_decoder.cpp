@@ -248,7 +248,8 @@ qsizetype Sixel_decoder::decode(
             m_command != Command::NONE && is_parameter_byte(byte) ? 0U :
             data_byte   ? draw_cost(byte - k_sixel_data_first)    :
             byte == '-' ? band_expansion_cost()                   : 0U;
-        const std::uint64_t reserved_before = m_reserved_pixels;
+        const std::uint64_t reservations_before = m_reservations;
+        const std::uint64_t reserved_before     = m_reserved_pixels;
         decode_byte(byte);
         ++consumed;
         const std::uint64_t incurred = work + (m_reserved_pixels - reserved_before);
@@ -256,6 +257,7 @@ qsizetype Sixel_decoder::decode(
             if (incurred > 0U) {
                 budget->charge_after(incurred);
             }
+            budget->count_raster_allocations(m_reservations - reservations_before);
             if (budget->exhausted()) {
                 break;
             }
@@ -305,7 +307,8 @@ void Sixel_decoder::finish(std::vector<Parser_action>& actions, Sixel_work_budge
 {
     // A command still collecting parameters completes at the terminator, so
     // a trailing color definition applies. A repeat has nothing to repeat.
-    const std::uint64_t reserved_before = m_reserved_pixels;
+    const std::uint64_t reservations_before = m_reservations;
+    const std::uint64_t reserved_before     = m_reserved_pixels;
     finish_command();
 
     // The cap may have shrunk since the image last grew. The end is one step
@@ -313,6 +316,7 @@ void Sixel_decoder::finish(std::vector<Parser_action>& actions, Sixel_work_budge
     grow_extent_within_limit();
     if (budget != nullptr) {
         budget->charge_after(finish_cost() + (m_reserved_pixels - reserved_before));
+        budget->count_raster_allocations(m_reservations - reservations_before);
     }
     expand_band();
     emit_limit_diagnostic(actions);
@@ -590,6 +594,7 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
     if (grown.isNull()) {
         throw std::bad_alloc();
     }
+    ++m_reservations;
     m_reserved_pixels += static_cast<std::uint64_t>(grown_width * grown_height);
 
     m_raster        = std::move(grown);

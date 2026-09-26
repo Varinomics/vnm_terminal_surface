@@ -24,7 +24,9 @@ constexpr std::int64_t k_sixel_bytes_per_pixel      = 4;
 // budget, never before a byte, so its stops are the places a chunk could end.
 // Placement charges each of its steps before it runs and waits when the next
 // one does not fit. The first charge of a budget always fits, so every step
-// makes progress. No budget means no limit.
+// makes progress. No budget means no limit. The budget also keeps a ledger
+// of its step: the units charged past the budget, and the rasters allocated
+// and grid rows scrolled, which bound the step besides its units.
 class Sixel_work_budget final
 {
 public:
@@ -54,14 +56,33 @@ public:
     void charge_after(std::uint64_t units)
     {
         m_charged    = true;
+        m_overrun   += units - std::min(units, m_remaining);
         m_remaining -= std::min(units, m_remaining);
     }
 
+    // A raster is a decoder reservation or a resampled image, up to the
+    // decoded-size cap; the smaller buffers a band or a scroll makes are paid
+    // for in its units. The rows are those region scrolls at the bottom
+    // margin move, by placement or by line feeds.
+    void count_raster_allocations(std::uint64_t rasters) { m_raster_allocations += rasters; }
+    void count_rows_moved(std::uint64_t rows)            { m_rows_moved         += rows;    }
+
+    std::uint64_t overrun()            const { return m_overrun;            }
+    std::uint64_t raster_allocations() const { return m_raster_allocations; }
+    std::uint64_t rows_moved()         const { return m_rows_moved;         }
+
 private:
     std::uint64_t m_remaining;
-    bool          m_charged = false;
-    bool          m_refused = false;
+    bool          m_charged            = false;
+    bool          m_refused            = false;
+    std::uint64_t m_overrun            = 0U;
+    std::uint64_t m_raster_allocations = 0U;
+    std::uint64_t m_rows_moved         = 0U;
 };
+
+// The sixel work one drain step may do, in Sixel_work_budget units: about a
+// millisecond on the reference host.
+constexpr std::uint64_t k_sixel_work_units_per_drain_step = 2000000U;
 
 inline bool try_charge_sixel_work(Sixel_work_budget* budget, std::uint64_t units)
 {
@@ -169,8 +190,9 @@ private:
     std::uint32_t*             m_pixels              = nullptr;
     std::int64_t               m_stride_pixels       = 0;
 
-    // Every pixel raster reservations have allocated, so that the byte or the
-    // image end that causes one is charged for it.
+    // The rasters reservations have allocated and their pixels, so that the
+    // byte or the image end that causes one is charged for it.
+    std::uint64_t              m_reservations        = 0U;
     std::uint64_t              m_reserved_pixels     = 0U;
 
     std::size_t                m_limit_bytes;

@@ -34,9 +34,6 @@ namespace {
 constexpr std::size_t k_pending_notification_limit = 4096U;
 constexpr std::size_t k_selection_trace_span_limit = 4U;
 constexpr qsizetype   k_backend_output_drain_slice_bytes = 4096;
-// The sixel work one drain step may do, in Sixel_work_budget units (about one
-// pixel written or copied each): about a millisecond on the reference host.
-constexpr std::uint64_t k_sixel_work_units_per_drain_step = 2000000U;
 constexpr QByteArrayView k_focus_in_report("\x1b[I", 3);
 constexpr QByteArrayView k_focus_out_report("\x1b[O", 3);
 

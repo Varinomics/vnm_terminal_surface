@@ -166,13 +166,19 @@ goes a band or a scroll at a time, each paid for before it runs; the model
 reports what it consumed and that work is pending. Every end of a sixel
 string (the image completes, or a cancel, a recovery or an over-cap discard
 abandons it) is a place where the parser returns, so a spent budget is seen
-there whatever ended the string. A single byte's work, and an image end, which
-allocates, fills and expands the whole raster, cannot be divided, so a drain
-call can overrun its deadline by about that much (accepted allowance: about
-10 ms on the reference host for a cap-size image). A placement that has started holds publication like
-synchronized output until it ends, so no published snapshot shows part of an
-image; a forced release of a stale synchronized update ends only the
-application's hold, and never places or publishes part of an image.
+there whatever ended the string. A single byte's work, an image end, which
+allocates, fills and expands the whole raster, and a placement start's
+resample cannot be divided, so a step charges past its budget by less than one
+of them. The budget keeps a ledger of that overrun, of the rasters a step
+allocates and of the rows it scrolls, and `sixel_placement_tests` bounds them
+in units of P, the decoded-size cap in pixels: a byte that completes raster
+attributes and draws past them at most 2P and its draw, with two rasters, a
+graphics new line under P with none, an image end at most 2P with one, and a
+placement start at most P with one; none of them moves a row. A placement that
+has started holds publication like synchronized output until it ends, so no
+published snapshot shows part of an image; a forced release of a stale
+synchronized update ends only the application's hold, and never places or
+publishes part of an image.
 
 Backend output is interpreted by one ordered operation of the session's
 command runner at a time: the head of its queue, whose source is a callback's

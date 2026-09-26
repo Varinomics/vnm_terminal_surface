@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1769,38 +1771,184 @@ bool test_abandoned_rasters_take_one_allocation_per_call()
     };
     for (const auto& [name, image] : cases) {
         const QByteArray bytes = image + image + image + QByteArray("done");
-        // The byte that completes each raster's attributes allocates it.
-        std::vector<qsizetype> allocations;
-        for (qsizetype index = bytes.indexOf('"'); index >= 0; index = bytes.indexOf('"', index + 1)) {
-            allocations.push_back(bytes.indexOf('#', index));
-        }
 
         term::Terminal_screen_model model = make_model(20, 160);
-        qsizetype offset = 0;
-        int calls = 0;
-        int most_per_call = 0;
-        qsizetype first_stop = -1;
+        qsizetype     offset        = 0;
+        int           calls         = 0;
+        std::uint64_t allocations   = 0U;
+        std::uint64_t most_per_call = 0U;
+        qsizetype     first_stop    = -1;
         for (; offset < bytes.size() && calls < 32; ++calls) {
-            const qsizetype before = offset;
             term::Sixel_work_budget budget(1U);
             offset += model.ingest(QByteArrayView(bytes).sliced(offset), nullptr, &budget).consumed_bytes;
             if (first_stop < 0) {
                 first_stop = offset;
             }
-            most_per_call = std::max(most_per_call, static_cast<int>(std::count_if(
-                allocations.begin(),
-                allocations.end(),
-                [before, offset](qsizetype allocation) {
-                    return allocation >= before && allocation < offset;
-                })));
+            allocations  += budget.raster_allocations();
+            most_per_call = std::max(most_per_call, budget.raster_allocations());
         }
-        ok &= check(first_stop == allocations.front() + 1,
+        // The byte that completes the raster attributes allocates the raster.
+        ok &= check(first_stop == bytes.indexOf('#') + 1,
             std::string(name) + ": the first call stops right after the byte that allocated");
-        ok &= check(most_per_call == 1,
-            std::string(name) + ": no call allocates more than one raster");
+        ok &= check(allocations == 3U && most_per_call == 1U,
+            std::string(name) + ": each string allocates its raster, and no call more than one");
         ok &= check(offset == bytes.size() && calls >= 3 &&
                 model.visible_text().contains(QStringLiteral("done")),
             std::string(name) + ": later calls end each string and take the text after them");
+    }
+    return ok;
+}
+
+// One budgeted call's ledger, and the input offset after it.
+struct budgeted_call_t
+{
+    qsizetype     end;
+    bool          placement;
+    std::uint64_t overrun;
+    std::uint64_t raster_allocations;
+    std::uint64_t rows_moved;
+};
+
+// Feeds the bytes as a drain does: each call has a fresh budget, and a
+// waiting placement continues with no bytes.
+std::vector<budgeted_call_t> ingest_in_budgeted_calls(
+    term::Terminal_screen_model& model,
+    const QByteArray&            bytes,
+    std::uint64_t                units)
+{
+    std::vector<budgeted_call_t> calls;
+    qsizetype offset = 0;
+    while ((offset < bytes.size() || model.sixel_placement_pending()) && calls.size() < 10000U) {
+        const bool placement = model.sixel_placement_pending();
+        term::Sixel_work_budget budget(units);
+        offset += model.ingest(
+            placement ? QByteArrayView() : QByteArrayView(bytes).sliced(offset),
+            nullptr,
+            &budget).consumed_bytes;
+        calls.push_back({
+            offset,
+            placement,
+            budget.overrun(),
+            budget.raster_allocations(),
+            budget.rows_moved(),
+        });
+    }
+    return calls;
+}
+
+// Sixel work divides into steps except for a byte's work, an image end and a
+// placement start's resample, each of which runs whole, so a call charges
+// past its budget by less than one of them. Their bounds, in the budget's
+// units and in P, the decoded-size cap in pixels, read from the budget's
+// ledger at a budget of one unit, the step's charge when it starts with one
+// unit left, and at a drain step's budget Q:
+// - a byte that completes raster attributes and draws past them reserves two
+//   rasters: at most 2P and its draw;
+// - a graphics new line at the largest aspect ratio copies under P and
+//   allocates nothing;
+// - an image end that reserves its declared raster and fills it: 2P and one
+//   raster;
+// - a placement start that resamples: at most P and one raster, on a fresh
+//   budget, so past Q by at most P - Q.
+// None of them moves a row: each region scroll is a step of its own, so a call
+// at one unit moves at most one region.
+bool test_indivisible_steps_are_bounded_in_units()
+{
+    bool ok = true;
+
+    constexpr int       rows = 20;
+    const std::uint64_t cap  = term::terminal_history_ring_max_record_bytes(
+        term::k_terminal_default_retained_history_capacity_bytes) /
+        static_cast<std::uint64_t>(term::k_sixel_bytes_per_pixel);
+    const std::uint64_t q    = term::k_sixel_work_units_per_drain_step;
+
+    // The widest band the cap holds at the largest aspect ratio, and a raster
+    // of exactly the cap, which an aspect ratio of 67 makes a region of 20
+    // rows of 20 pixels (66 pixels a sixel pixel at most) resample.
+    const std::uint64_t tallest_sixel = 6U * 32767U;
+    const QByteArray    widest        = QByteArray::number(static_cast<qulonglong>(cap / tallest_sixel));
+    const QByteArray    cap_raster    =
+        "2048;" + QByteArray::number(static_cast<qulonglong>(cap / 2048U));
+
+    struct path_t
+    {
+        const char*   name;
+        QByteArray    bytes;
+        char          step_byte;   // The byte whose call runs the step: 0 for the ST.
+        bool          placement_start;
+        std::uint64_t least;       // The step's charge exceeds this.
+        std::uint64_t most;        // The step's charge is at most this.
+        std::uint64_t rasters;
+    };
+    const path_t paths[] = {
+        {"a byte reserving two rasters",
+            QByteArray("\x1bP0;1q\"32767;1;") + cap_raster + "~\x1b\\",
+            '~', false, cap, 2U * cap + 6U, 2U},
+        {"a graphics new line at the largest aspect ratio",
+            QByteArray("\x1b[20;1H\x1bP0;1q\"32767;1#1!") + widest + "~-\x1b\\",
+            '-', false, cap - tallest_sixel, cap, 0U},
+        {"an image end reserving and filling its declared raster",
+            QByteArray("\x1bP0;0q\"1;1;") + cap_raster + "\x1b\\",
+            0, false, 2U * cap - 1U, 2U * cap, 1U},
+        {"a placement start resampling the raster",
+            QByteArray("\x1bP0;0q\"67;1;") + cap_raster + "\x1b\\",
+            0, true, q, cap, 1U},
+    };
+
+    for (const path_t& path : paths) {
+        const std::string name(path.name);
+        const qsizetype   step_end = path.step_byte == 0
+            ? path.bytes.size()
+            : path.bytes.lastIndexOf(path.step_byte) + 1;
+        const auto step_call = [&](const std::vector<budgeted_call_t>& calls) {
+            return std::find_if(calls.begin(), calls.end(), [&](const budgeted_call_t& call) {
+                return path.placement_start ? call.placement : !call.placement && call.end == step_end;
+            });
+        };
+
+        term::Terminal_screen_model at_one_unit = make_model(rows, 160);
+        term::Terminal_screen_model at_q        = make_model(rows, 160);
+        const std::vector<budgeted_call_t> unit_calls = ingest_in_budgeted_calls(at_one_unit, path.bytes, 1U);
+        const std::vector<budgeted_call_t> q_calls    = ingest_in_budgeted_calls(at_q, path.bytes, q);
+        const auto unit_step = step_call(unit_calls);
+        const auto q_step    = step_call(q_calls);
+        if (!check(unit_step != unit_calls.end() && q_step != q_calls.end(),
+                name + ": a call runs the step at either budget"))
+        {
+            ok = false;
+            continue;
+        }
+
+        const std::uint64_t charge = unit_step->overrun + 1U;
+        ok &= check(charge > path.least && charge <= path.most,
+            name + ": the step charges within its bound");
+        ok &= check(unit_step->raster_allocations == path.rasters && unit_step->rows_moved == 0U,
+            name + ": the step allocates its rasters and moves no row");
+        ok &= check(q_step->overrun < charge && q_step->rows_moved == 0U &&
+                (!path.placement_start || q_step->overrun == charge - q),
+            name + ": its call at Q overruns by less than the step, and a placement start by the "
+                "step less Q");
+
+        std::uint64_t most_rows_at_q = 0U;
+        for (const budgeted_call_t& call : q_calls) {
+            ok &= check(call.overrun < 2U * cap + 6U && call.raster_allocations <= 2U,
+                name + ": no call at Q overruns by an indivisible step or allocates three rasters");
+            most_rows_at_q = std::max(most_rows_at_q, call.rows_moved);
+        }
+        for (const budgeted_call_t& call : unit_calls) {
+            ok &= check(call.rows_moved <= static_cast<std::uint64_t>(rows),
+                name + ": no call at one unit moves more than one region");
+        }
+
+        const auto in_q = [q](std::uint64_t units) {
+            return static_cast<double>(units) / static_cast<double>(q);
+        };
+        std::cout << std::fixed << std::setprecision(3) <<
+            "sixel step bound, " << name << ": " << charge << " units (" << in_q(charge) <<
+            " Q), " << unit_step->raster_allocations << " rasters, 0 rows; its call at Q: " <<
+            q_step->overrun << " units past Q (" << in_q(q_step->overrun) << " Q), " <<
+            q_step->raster_allocations << " rasters; most rows moved by a call at Q: " <<
+            most_rows_at_q << '\n';
     }
     return ok;
 }
@@ -1837,5 +1985,6 @@ int main()
     ok &= test_spent_budget_ends_the_ingest_at_an_image_end();
     ok &= test_composites_are_paid_for();
     ok &= test_abandoned_rasters_take_one_allocation_per_call();
+    ok &= test_indivisible_steps_are_bounded_in_units();
     return ok ? 0 : 1;
 }

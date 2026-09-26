@@ -7293,6 +7293,10 @@ void Terminal_screen_model::advance_row()
 // screen region that starts at the top row feeds history.
 void Terminal_screen_model::scroll_active_region_up()
 {
+    if (m_sixel_work_budget != nullptr) {
+        m_sixel_work_budget->count_rows_moved(
+            static_cast<std::uint64_t>(m_scroll_bottom - m_scroll_top + 1));
+    }
     scroll_up_region(
         m_scroll_top,
         m_scroll_bottom,
@@ -7513,6 +7517,9 @@ bool Terminal_screen_model::advance_sixel_placement(std::vector<Parser_action>& 
                 placement.raster,
                 placement.decoded_aspect,
                 placement.aspect);
+            if (budget != nullptr) {
+                budget->count_raster_allocations(1U);
+            }
         }
         placement.started = true;
     }
