@@ -159,19 +159,41 @@ A few bytes of sixel data can describe work as large as the cap, so a drain
 with a deadline gives each step a `Sixel_work_budget` (`sixel_decoder.h`),
 counted in pixels written or copied. Decoding stops before a draw or graphics
 new line the budget cannot pay for, and placement goes a band or a scroll at
-a time; the model reports what it consumed and that work is pending, the
-session keeps the rest of the output at the front of its queue, and the next
-step continues. An image end, which allocates, fills and expands the whole
-raster, is one step that always runs, and a budget it spends ends the step
-there, placed or not; it is the largest indivisible step, so a drain call can
-overrun its deadline by about that much (accepted allowance: about 10 ms on the
-reference host for a cap-size image, typically 2 to 6 ms). A placement that has
-started holds publication like synchronized output until it ends, so no
-published snapshot shows part of an image; a forced release of a stale
-synchronized update ends only the application's hold. A settled text-area
-resize tail, and the exit that follows one, replay through the same steps, a
-window at a time. Drains without a deadline, which include the synchronous
-calls that settle the input frontier, run sixel work to completion.
+a time; the model reports what it consumed and that work is pending. Every
+end of a sixel string (the image completes, or a cancel, a recovery or an
+over-cap discard abandons it) is a place where the parser returns, so a spent
+budget is seen there whatever ended the string. An image end, which
+allocates, fills and expands the whole raster, is one step that always runs,
+and a budget it spends ends the step there, placed or not; it is the largest
+indivisible step, so a drain call can overrun its deadline by about that much
+(accepted allowance: about 10 ms on the reference host for a cap-size image,
+typically 2 to 6 ms). A placement that has started holds publication like
+synchronized output until it ends, so no published snapshot shows part of an
+image; a forced release of a stale synchronized update ends only the
+application's hold, and never places or publishes part of an image.
+
+Backend output is interpreted by one ordered operation of the session's
+command runner at a time: the head of its queue, whose source is a callback's
+bytes, or the tail a text-area resize hold captured and a release let go (the
+host's settlement or its deadline, a hold overflow, the process exit), then
+whatever of its own the releasing command has. A budgeted drain takes that
+source a 4 KiB window at a time. The operation owns everything its bytes
+cause: model work it leaves pending, which only its own next step continues,
+and every reply it generates, which reaches its final disposition through the
+terminal-reply write policy (written, or refused with its error recorded) at
+the end of the step that generated it, in query order. Nothing behind the
+operation starts until it retires: its source consumed, its model work ended,
+its replies disposed of; a callback's epoch completes then, or when a hold
+captures its bytes, which certifies only that the hold owns them. Output up to
+a callback epoch is settled when every callback up to it has been processed
+and no operation is open. Input reads its modes, and a frame counts as caught
+up, only once its frontier is settled, so input never encodes with modes older
+than the output before it and a reply never follows newer input. A host's
+settlement runs its operation for one budgeted step and returns its own result
+at once; frames and drains take the rest, and the first frontier-draining input
+or host resize after it takes whatever is left synchronously. Drains without a
+deadline, which include those synchronous frontier drains, run operations to
+completion.
 
 The screen-model ingestion path runs the parser, applies actions to the model,
 collects dirty rows and viewport changes, and returns a

@@ -577,6 +577,14 @@ grid when the request was accepted and against the grid then current otherwise;
 `rows` and `columns` are that grid. A host that armed UI on the request tears it
 down on this signal rather than on its own answer.
 
+`respond_text_area_resize` returns its own result at once, whatever the held
+output costs. The held output then replays as ordered output of its own, a
+bounded step in the answer and the rest over the frames and drains that follow,
+and it is settled before anything after it takes effect: the replies it
+generates are written before any later input, and a key, paste or host resize
+that arrives while it is still replaying first applies what is left of it,
+synchronously, before it reads the modes that output set.
+
 Arbitration is an optional capability and adds no transcript event kind. A
 transcript captured with it enabled replays under a session without it as the
 sequence-point behavior, because the recorded backend byte stream is identical
