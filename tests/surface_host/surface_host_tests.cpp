@@ -13351,6 +13351,13 @@ bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
     pump_events(app);
     ok &= check(started, "heavy tail frame fixture starts");
 
+    // One sixel-work step per frame keeps this a multi-frame replay even on
+    // machines that can finish the whole tail within the default time budget.
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
     ok &= check(pump_until(app, [&observer] {
         return !observer.requests.empty();
@@ -13376,22 +13383,27 @@ bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
         80),
         "the heavy tail answer is accepted");
 
-    // Frames a few milliseconds apart, with events processed between them as
-    // a window's event loop would, and no further output or input.
     const auto tail_shown = [&fixture] {
         const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
         return snapshot != nullptr &&
             snapshot_contains_text(*snapshot, QStringLiteral("tail-text"));
     };
-    int frames = 0;
+
+    // Check the first frame before posted drains can also advance the tail.
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    ok &= check(!tail_shown(), "the heavy tail spans multiple frames");
+
+    // Continue with events between frames, as a window's event loop would,
+    // and no further output or input.
+    int frames = 1;
     while (!tail_shown() && frames < 400) {
         term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
         app.processEvents(QEventLoop::AllEvents, 0);
         QThread::msleep(5);
         ++frames;
     }
-    ok &= check(tail_shown() && frames > 1, "the frames replay the heavy tail to its end");
+    ok &= check(tail_shown(), "the frames replay the heavy tail to its end");
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface)
             .frame_progress_watchdog_firings == firings_before,
