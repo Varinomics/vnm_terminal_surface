@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -589,6 +590,40 @@ QRectF decoration_rect(
     }
 
     return rect;
+}
+
+// A slice's texels are device pixels of the cell it was placed on, so a texel
+// spans the current cell's logical size divided by that cell's pixel size. The
+// right edge is cut where the grid or the item ends, and the texels with it. A
+// slice is at most one cell high, so nothing is cut at the bottom.
+void append_image_quad(
+    Terminal_render_frame&                       frame,
+    int                                          row,
+    std::shared_ptr<const Terminal_image_slice>  slice,
+    terminal_cell_metrics_t                      metrics)
+{
+    const qreal texel_width  = metrics.width  / slice->cell_pixel_size.width;
+    const qreal texel_height = metrics.height / slice->cell_pixel_size.height;
+    const qreal right_limit  = std::min(
+        static_cast<qreal>(frame.grid_size.columns) * metrics.width,
+        frame.logical_size.width());
+
+    QRectF rect(
+        static_cast<qreal>(slice->first_column) * metrics.width,
+        static_cast<qreal>(row) * metrics.height,
+        slice->pixels.width()  * texel_width,
+        slice->pixels.height() * texel_height);
+    if (rect.left() >= right_limit) {
+        return;
+    }
+
+    QRectF source_rect(0.0, 0.0, slice->pixels.width(), slice->pixels.height());
+    if (rect.right() > right_limit) {
+        rect.setRight(right_limit);
+        source_rect.setWidth(rect.width() / texel_width);
+    }
+
+    frame.image_quads.push_back({row, rect, source_rect, std::move(slice)});
 }
 
 
@@ -1802,6 +1837,17 @@ void build_terminal_render_frame_descriptors(
         for (const Terminal_render_cell& cell : row_content) {
             append_frame_key_cell(descriptor.content_identity_key, cell);
         }
+        // Only a row with an image extends its key, so image-free keys stay as
+        // they are. The revision stands for the texels.
+        const std::shared_ptr<const Terminal_image_slice> image = row_content.image();
+        if (image != nullptr &&
+            validate_render_snapshot_row_image(snapshot, row) == Terminal_render_image_status::OK)
+        {
+            append_frame_key_uint64(descriptor.content_identity_key, image->revision);
+            append_frame_key_int(descriptor.content_identity_key, image->first_column);
+            append_frame_key_int(descriptor.content_identity_key, image->cell_pixel_size.width);
+            append_frame_key_int(descriptor.content_identity_key, image->cell_pixel_size.height);
+        }
         append_frame_key_bool(
             descriptor.hyperlink_underline_key,
             options.underline_hyperlinks);
@@ -2523,6 +2569,26 @@ Terminal_render_frame build_terminal_render_frame(
         }
     }
 
+    if (!snapshot->visible_row_images.empty()) {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::images");
+
+        for (int row = 0; row < rows.row_count(); ++row) {
+            std::shared_ptr<const Terminal_image_slice> image = rows.image_at(row);
+            if (image == nullptr) {
+                continue;
+            }
+
+            const Terminal_render_image_status status =
+                validate_render_snapshot_row_image(*snapshot, row);
+            if (status != Terminal_render_image_status::OK) {
+                ++frame.stats.images_rejected;
+                continue;
+            }
+
+            append_image_quad(frame, row, std::move(image), cell_metrics);
+        }
+    }
+
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::search_matches");
 
@@ -2667,6 +2733,7 @@ Terminal_render_frame build_terminal_render_frame(
     frame.stats.decoration_rects_emitted = static_cast<int>(frame.decorations.size());
     frame.stats.cursor_rects_emitted     = static_cast<int>(frame.cursors.size());
     frame.stats.overlay_rects_emitted        = static_cast<int>(frame.overlay_rects.size());
+    frame.stats.image_quads_emitted      = static_cast<int>(frame.image_quads.size());
     return frame;
 }
 

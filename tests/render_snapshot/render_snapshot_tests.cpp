@@ -5,6 +5,7 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QImage>
 #include <QSizeF>
 #include <QString>
 #include <QtGlobal>
@@ -3592,6 +3593,355 @@ bool test_validate_render_snapshot_rejects_out_of_order_cells()
     return ok;
 }
 
+// Row images. Oracles: A1 and I4 (a row's image is its slice, shared from a
+// live row and decoded from a history record with its stored revision); rule 3
+// (every snapshot producer carries the same slice for a row); the snapshot
+// contract (a row whose content changed is dirty, rows not covered are
+// unchanged); the capability rule (the image check never changes
+// validate_render_snapshot's verdict).
+
+constexpr term::terminal_cell_pixel_size_t k_image_cell{10, 20};
+
+term::Terminal_screen_model make_image_model(term::terminal_grid_size_t grid_size)
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size        = grid_size;
+    config.scrollback_limit = 16;
+    config.cell_pixel_size  = k_image_cell;
+    return term::Terminal_screen_model(config);
+}
+
+// A red sixel image at 1:1 aspect, `sixel_rows` rows of six pixels: up to
+// three rows fill one 20-pixel band, four to six rows two bands.
+QByteArray sixel_image(int width, int sixel_rows)
+{
+    QByteArray image = QByteArrayLiteral("\x1bP9;1q#1;2;100;0;0");
+    for (int row = 0; row < sixel_rows; ++row) {
+        image += "#1!" + QByteArray::number(width) + '~';
+        if (row + 1 < sixel_rows) {
+            image += '-';
+        }
+    }
+    return image + QByteArrayLiteral("\x1b\\");
+}
+
+std::shared_ptr<const term::Terminal_image_slice> primary_image(
+    const term::Terminal_screen_model& model,
+    int                                logical_row)
+{
+    return model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, logical_row);
+}
+
+bool images_equal(
+    const std::shared_ptr<const term::Terminal_image_slice>& left,
+    const std::shared_ptr<const term::Terminal_image_slice>& right)
+{
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+
+    return
+        left->revision        == right->revision        &&
+        left->first_column    == right->first_column    &&
+        left->cell_pixel_size == right->cell_pixel_size &&
+        left->pixels          == right->pixels;
+}
+
+bool test_model_snapshots_share_live_and_alternate_row_images()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_image_model({6, 12});
+    model.ingest(QByteArrayLiteral("hello\r\n\r\n") + sixel_image(24, 5));
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(1U);
+    ok &= check(snapshot.visible_row_images.size() == 6U,
+        "a snapshot showing an image carries one image entry per grid row");
+    for (int row = 0; row < 6; ++row) {
+        const std::shared_ptr<const term::Terminal_image_slice> expected =
+            primary_image(model, model.scrollback_size() + row);
+        ok &= check((expected != nullptr) == (row == 2 || row == 3) &&
+                term::render_snapshot_row_image(snapshot, row) == expected,
+            "each live row shares its own slice with the snapshot, uncopied");
+        ok &= check(term::validate_render_snapshot_row_image(snapshot, row) ==
+                term::Terminal_render_image_status::OK,
+            "a model row image passes the image check");
+    }
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "a model snapshot with images validates");
+
+    term::Terminal_screen_model plain = make_image_model({6, 12});
+    plain.ingest(QByteArrayLiteral("hello"));
+    ok &= check(plain.render_snapshot(1U).visible_row_images.empty(),
+        "a snapshot without images leaves the image field empty");
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h\x1b[2;1H") + sixel_image(12, 2));
+    const term::Terminal_render_snapshot alternate = model.render_snapshot(2U);
+    bool only_alternate_row = alternate.visible_row_images.size() == 6U;
+    for (int row = 0; only_alternate_row && row < 6; ++row) {
+        const std::shared_ptr<const term::Terminal_image_slice> expected =
+            model.image_slice_for_testing(term::Terminal_buffer_id::ALTERNATE, row);
+        only_alternate_row =
+            (expected != nullptr) == (row == 1) &&
+            term::render_snapshot_row_image(alternate, row) == expected;
+    }
+    ok &= check(alternate.viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
+            only_alternate_row,
+        "an alternate-screen snapshot carries the alternate rows' images only");
+
+    return ok;
+}
+
+bool test_scrolled_back_snapshots_decode_history_row_images()
+{
+    bool ok = true;
+
+    // Two bands on rows 0 and 1; three new lines move both into history.
+    term::Terminal_screen_model model = make_image_model({3, 12});
+    model.ingest(sixel_image(24, 5));
+    const std::shared_ptr<const term::Terminal_image_slice> live_top    = primary_image(model, 0);
+    const std::shared_ptr<const term::Terminal_image_slice> live_bottom = primary_image(model, 1);
+    model.ingest(QByteArrayLiteral("\r\n\r\n\r\n"));
+    ok &= check(live_top != nullptr && live_bottom != nullptr && model.scrollback_size() == 2,
+        "the history image fixture scrolls both image rows into history");
+
+    ok &= check(model.render_snapshot(request_for_model(model, 1U)).visible_row_images.empty(),
+        "a snapshot at the tail shows no history row and so no image");
+
+    const term::Terminal_render_snapshot scrolled =
+        model.render_snapshot(request_for_model(model, 2U, 2));
+    ok &= check(images_equal(term::render_snapshot_row_image(scrolled, 0), live_top)    &&
+            images_equal(term::render_snapshot_row_image(scrolled, 1), live_bottom) &&
+            term::render_snapshot_row_image(scrolled, 2) == nullptr,
+        "a scrolled-back snapshot shows each history row's image as its live row held it");
+    ok &= check(term::validate_render_snapshot_row_image(scrolled, 0) ==
+            term::Terminal_render_image_status::OK,
+        "a decoded history image passes the image check");
+
+    return ok;
+}
+
+bool test_an_image_only_change_dirties_only_its_row()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_image_model({6, 12});
+    model.ingest(QByteArrayLiteral("text\r\n\r\n\r\n"));
+    const term::Terminal_render_snapshot before = model.render_snapshot(1U);
+
+    // One band on the blank row 3; the cursor stays where it was.
+    model.ingest(sixel_image(24, 2));
+    const term::Terminal_render_snapshot after = model.render_snapshot(2U);
+    ok &= check(before.visible_row_images.empty() &&
+            term::render_snapshot_row_image(after, 3) != nullptr,
+        "the image-only fixture places one image on a blank row");
+    ok &= check(term::render_snapshot_row_is_dirty(after, 3) &&
+            after.visible_line_provenance[3] == before.visible_line_provenance[3],
+        "a row that gains only an image is dirty although its text identity is unchanged");
+
+    bool others_unchanged = true;
+    for (int row = 0; row < 6; ++row) {
+        if (row == 3) {
+            continue;
+        }
+        others_unchanged =
+            others_unchanged                                    &&
+            !term::render_snapshot_row_is_dirty(after, row)     &&
+            term::render_snapshot_row_image(after, row) == nullptr;
+    }
+    ok &= check(others_unchanged, "rows the image does not reach stay clean and imageless");
+
+    return ok;
+}
+
+bool test_full_projection_rows_carry_image_revisions()
+{
+    bool ok = true;
+
+    // History: "top" and two image rows; screen: an image on row 0, "end".
+    term::Terminal_screen_model model = make_image_model({3, 12});
+    model.ingest(
+        QByteArrayLiteral("top\r\n") + sixel_image(24, 5) +
+        QByteArrayLiteral("\r\n\r\n\r\nend\x1b[1;1H") + sixel_image(12, 1));
+    ok &= check(model.scrollback_size() == 3 &&
+            primary_image(model, 1) != nullptr &&
+            primary_image(model, 2) != nullptr &&
+            primary_image(model, 3) != nullptr,
+        "the projection fixture holds image rows in history and on the screen");
+
+    const term::Terminal_render_snapshot safe_basis =
+        model.render_snapshot(request_for_model(model, 50U));
+    const term::Terminal_public_projection projection =
+        term::Terminal_public_projection::capture_primary_full_rows_from_safe_model(
+            51U,
+            safe_basis,
+            {},
+            52U,
+            model);
+    ok &= check(!projection.rows_are_safe_basis_viewport_only() &&
+            projection.stored_row_count() == 6U,
+        "a full-row capture over image rows copies every public row");
+
+    bool revisions_match = true;
+    for (const term::Terminal_public_projection_row& row : projection.rows()) {
+        const std::shared_ptr<const term::Terminal_image_slice> expected =
+            primary_image(model, static_cast<int>(row.public_row));
+        revisions_match =
+            revisions_match &&
+            (row.image == nullptr) == (expected == nullptr) &&
+            (row.image == nullptr || row.image->revision == expected->revision);
+    }
+    ok &= check(revisions_match,
+        "each projection row carries its row's image with the model's revision");
+
+    // An image the model no longer shows means the basis is not the model's
+    // current content, so the capture falls back to the basis viewport.
+    term::Terminal_render_snapshot diverged = safe_basis;
+    const std::shared_ptr<const term::Terminal_image_slice> shown =
+        term::render_snapshot_row_image(safe_basis, 0);
+    diverged.visible_row_images[0] = std::make_shared<const term::Terminal_image_slice>(
+        term::Terminal_image_slice{
+            shown->pixels,
+            shown->first_column,
+            shown->cell_pixel_size,
+            shown->revision + 1000U,
+        });
+    const term::Terminal_public_projection diverged_projection =
+        term::Terminal_public_projection::capture_primary_full_rows_from_safe_model(
+            53U,
+            diverged,
+            {},
+            54U,
+            model);
+    ok &= check(diverged_projection.rows_are_safe_basis_viewport_only(),
+        "a basis whose row image differs from the model's does not pass as the model's content");
+
+    return ok;
+}
+
+bool test_geometry_derived_snapshots_keep_row_images()
+{
+    bool ok = true;
+
+    Recording_backend* backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+    session->set_cell_pixel_size(k_image_cell);
+    ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            backend != nullptr &&
+            backend->emit_output(QByteArrayLiteral("top\r\n") + sixel_image(24, 5)),
+        "the geometry image fixture publishes two image rows");
+    const std::shared_ptr<const term::Terminal_render_snapshot> base =
+        session->latest_render_snapshot_handle();
+    ok &= check(base != nullptr &&
+            term::render_snapshot_row_image(*base, 1) != nullptr &&
+            term::render_snapshot_row_image(*base, 2) != nullptr,
+        "the published snapshot carries both image rows");
+    if (base == nullptr) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")) &&
+            session->resize(QSizeF(120.0, 100.0), {4, 12}).code ==
+                term::Terminal_session_result_code::ACCEPTED,
+        "a grid change during synchronized output publishes a geometry-derived snapshot");
+    const std::shared_ptr<const term::Terminal_render_snapshot> taller =
+        session->latest_render_snapshot_handle();
+    ok &= check(taller != nullptr &&
+            taller->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
+            taller->visible_row_images.size() == 4U &&
+            term::render_snapshot_row_image(*taller, 1) == term::render_snapshot_row_image(*base, 1) &&
+            term::render_snapshot_row_image(*taller, 2) == term::render_snapshot_row_image(*base, 2) &&
+            term::render_snapshot_row_image(*taller, 3) == nullptr,
+        "a taller geometry-derived snapshot keeps each row's image with its cells");
+
+    ok &= check(session->resize(QSizeF(120.0, 40.0), {2, 12}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "a shorter grid during synchronized output is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> shorter =
+        session->latest_render_snapshot_handle();
+    ok &= check(shorter != nullptr &&
+            shorter->visible_row_images.size() == 2U &&
+            term::render_snapshot_row_image(*shorter, 1) == term::render_snapshot_row_image(*base, 1),
+        "a shorter geometry-derived snapshot keeps the images of the rows that remain");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "the geometry image fixture releases synchronized output");
+
+    return ok;
+}
+
+bool test_row_image_check_leaves_snapshot_validation_alone()
+{
+    bool ok = true;
+
+    term::Terminal_viewport_state viewport;
+    viewport.visible_rows = 2;
+    const term::Terminal_render_snapshot plain =
+        term::make_empty_render_snapshot({2, 8}, viewport, 40U);
+
+    const auto pixels = [](int width, int height, QImage::Format format) {
+        QImage image(width, height, format);
+        image.fill(0U);
+        return image;
+    };
+    const auto with_image = [&](QImage image, int first_column, term::terminal_cell_pixel_size_t cell) {
+        term::Terminal_render_snapshot snapshot = plain;
+        term::set_render_snapshot_row_image(
+            snapshot,
+            1,
+            std::make_shared<const term::Terminal_image_slice>(
+                term::Terminal_image_slice{std::move(image), first_column, cell, 5U}));
+        return snapshot;
+    };
+
+    constexpr QImage::Format k_premultiplied = QImage::Format_RGBA8888_Premultiplied;
+    using Status = term::Terminal_render_image_status;
+    struct Image_case
+    {
+        const char*                     name;
+        term::Terminal_render_snapshot  snapshot;
+        Status                          status;
+    };
+    const std::vector<Image_case> cases = {
+        {"a slice inside its cell and the column limit passes",
+            with_image(pixels(30, 20, k_premultiplied), 2,    {10, 20}), Status::OK},
+        {"a slice starting past a narrowed grid passes",
+            with_image(pixels(30, 20, k_premultiplied), 8,    {10, 20}), Status::OK},
+        {"a slice ending on the column limit passes",
+            with_image(pixels(30, 20, k_premultiplied), 4093, {10, 20}), Status::OK},
+        {"a null image fails",
+            with_image(QImage(),                         0,    {10, 20}), Status::INVALID_PIXELS},
+        {"straight alpha fails",
+            with_image(pixels(30, 20, QImage::Format_RGBA8888), 0, {10, 20}), Status::INVALID_PIXELS},
+        {"a slice without a cell pixel size fails",
+            with_image(pixels(30, 20, k_premultiplied), 0,    {0,  20}), Status::INVALID_CELL_PIXEL_SIZE},
+        {"a slice taller than its cell fails",
+            with_image(pixels(30, 21, k_premultiplied), 0,    {10, 20}), Status::INVALID_PIXEL_SIZE},
+        {"a negative first column fails",
+            with_image(pixels(30, 20, k_premultiplied), -1,   {10, 20}), Status::INVALID_COLUMN_SPAN},
+        {"a slice reaching past the column limit fails",
+            with_image(pixels(31, 20, k_premultiplied), 4093, {10, 20}), Status::INVALID_COLUMN_SPAN},
+    };
+    for (const Image_case& image_case : cases) {
+        ok &= check(term::validate_render_snapshot_row_image(image_case.snapshot, 1) == image_case.status &&
+                term::validate_render_snapshot_row_image(image_case.snapshot, 0) == Status::OK,
+            image_case.name);
+        ok &= check(term::validate_render_snapshot(image_case.snapshot).status ==
+                term::Terminal_render_snapshot_status::OK,
+            "an image never changes the snapshot's own validation");
+    }
+
+    term::Terminal_render_snapshot miscounted = cases.front().snapshot;
+    miscounted.visible_row_images.push_back(nullptr);
+    ok &= check(term::validate_render_snapshot_row_image(miscounted, 0) == Status::INVALID_ROW_COUNT &&
+            term::validate_render_snapshot_row_image(miscounted, 1) == Status::INVALID_ROW_COUNT &&
+            term::validate_render_snapshot(miscounted).status ==
+                term::Terminal_render_snapshot_status::OK,
+        "an image field whose size is neither zero nor the row count fails the image check only");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -3637,5 +3987,11 @@ int main()
     ok &= test_validate_render_snapshot_accepts_huge_sparse_empty_snapshot();
     ok &= test_real_model_snapshot_cells_are_row_major_column_ascending();
     ok &= test_validate_render_snapshot_rejects_out_of_order_cells();
+    ok &= test_model_snapshots_share_live_and_alternate_row_images();
+    ok &= test_scrolled_back_snapshots_decode_history_row_images();
+    ok &= test_an_image_only_change_dirties_only_its_row();
+    ok &= test_full_projection_rows_carry_image_revisions();
+    ok &= test_geometry_derived_snapshots_keep_row_images();
+    ok &= test_row_image_check_leaves_snapshot_validation_alone();
     return ok ? 0 : 1;
 }

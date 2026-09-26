@@ -825,6 +825,9 @@ private:
                                                 owned_style_table;
         std::optional<std::map<Terminal_hyperlink_id, QByteArray>>
                                                 owned_hyperlink_identity_keys;
+        // Null when the row shows no image.
+        std::shared_ptr<const Terminal_image_slice>
+                                                image_slice;
 
         const std::vector<Cell>& cells() const
         {
@@ -1687,9 +1690,6 @@ private:
     // DECSDM (?80) only decides where later sixel images go, so it stays
     // outside the render snapshot mode state as well.
     bool                            m_sixel_display_mode = false;
-    // Every new image slice takes the next revision, so a revision identifies
-    // slice content for the lifetime of the model.
-    std::uint64_t                   m_next_image_slice_revision = 1U;
     int                             m_active_alternate_mode = 0;
     Terminal_hyperlink_id           m_current_hyperlink_id = k_no_terminal_hyperlink_id;
     Terminal_hyperlink_id           m_next_hyperlink_id = 1U;

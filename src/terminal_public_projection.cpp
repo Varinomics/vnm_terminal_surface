@@ -73,12 +73,25 @@ bool render_cells_match(
         left.style_id          == right.style_id;
 }
 
+// A revision identifies a slice's content, so equal revisions are equal images.
+bool projection_row_images_match(
+    const Terminal_public_projection_row& left,
+    const Terminal_public_projection_row& right)
+{
+    if (left.image == nullptr || right.image == nullptr) {
+        return left.image == right.image;
+    }
+
+    return left.image->revision == right.image->revision;
+}
+
 bool projection_row_cells_match(
     const Terminal_public_projection_row& left,
     const Terminal_public_projection_row& right)
 {
-    if (left.public_row != right.public_row ||
-        !(left.provenance == right.provenance) ||
+    if (left.public_row != right.public_row       ||
+        !(left.provenance == right.provenance)    ||
+        !projection_row_images_match(left, right) ||
         left.cells.size() != right.cells.size())
     {
         return false;
@@ -168,6 +181,7 @@ Terminal_public_projection_row copied_projection_row(
         copied_cell.position.row         = 0;
         row.cells.push_back(std::move(copied_cell));
     }
+    row.image = snapshot_row_content.image();
 
     return row;
 }

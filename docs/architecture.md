@@ -166,9 +166,9 @@ there is no image store. The row owns its slice, which moves and dies with the
 row and reaches retained history with it. A history row record carries its
 slice in a presence-flagged section, so image-free records keep their exact
 encoding, and a decode materializes the pixels only when a reader asks for
-them. Each slice records the cell size it was placed on and a model-lifetime
-revision, so a renderer can scale it and key a cache on row identity and
-revision.
+them. Each slice records the cell size it was placed on and a revision unique
+in the process, so a renderer can scale it and key a cache on the revision
+alone, also across a session replacement.
 
 Terminal cell widths come from generated Unicode 16.0.0 tables in
 `unicode_width_tables`. Ambiguous East Asian Width characters are narrow,
@@ -227,7 +227,8 @@ cache choices do not create alternate renderer APIs.
 The model creates `Terminal_render_snapshot` objects defined in
 `include/vnm_terminal/internal/render_snapshot.h`. A snapshot owns grid size,
 viewport, color metadata, style table, cells, dirty row ranges, hyperlink
-metadata, cursor, IME preedit, selection spans, metadata, and terminal modes.
+metadata, cursor, IME preedit, selection spans, metadata, and terminal modes,
+and shares the image slices of the visible rows that show one.
 Snapshot cell vector entries are positioned and ordered: the cell vector is
 row-major with strictly ascending columns within each row. This ordering is the
 architecture contract, not an incidental production detail. Row-content views
@@ -247,7 +248,10 @@ render node builds the `Terminal_render_frame` in `QSGRenderNode::prepare()`
 using the frame-building path in `src/qsg_terminal_renderer.cpp`, prepares atlas
 pages and instance buffers, then submits QRhi draws in `render()`. The frame
 owns per-frame vectors of rects, arcs, text runs, cursor primitives,
-decorations, overlays, and dirty row ranges.
+decorations, overlays, image quads, and dirty row ranges. An image quad places
+one row's slice in logical pixels, scaled from the cell the slice was placed on
+to the current cell and cut where the grid ends; the snapshot contract
+describes how a bad image is dropped alone.
 
 `Terminal_render_frame::text_runs` is the canonical renderer input for terminal
 text. `Terminal_render_frame::cursor_text_runs` carries cursor inverse-text

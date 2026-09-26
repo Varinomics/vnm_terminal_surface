@@ -7,11 +7,15 @@
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 
+#include <QColor>
 #include <QGuiApplication>
+#include <QImage>
 #include <QString>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace term = vnm_terminal::internal;
 
@@ -589,6 +593,71 @@ bool test_text_bounds_fail_closed_without_truncation()
     return ok;
 }
 
+bool canvas_cells_equal(
+    const std::vector<vnm_terminal::Terminal_canvas_cell>& left,
+    const std::vector<vnm_terminal::Terminal_canvas_cell>& right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        if (left[index].row           != right[index].row           ||
+            left[index].column        != right[index].column        ||
+            left[index].display_width != right[index].display_width ||
+            left[index].style_index   != right[index].style_index   ||
+            left[index].text          != right[index].text)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// S10: a canvas frame is text only, so a snapshot's row images are left out
+// and its text exports exactly as it would without them.
+bool test_row_images_export_as_text()
+{
+    bool                ok = true;
+    VNM_TerminalSurface surface;
+
+    auto plain = make_snapshot(2, 6);
+    plain->cells.push_back(make_cell(0, 0, QStringLiteral("a")));
+    plain->cells.push_back(make_cell(1, 4, QStringLiteral("b")));
+    auto with_image = std::make_shared<term::Terminal_render_snapshot>(*plain);
+    QImage pixels(30, 20, QImage::Format_RGBA8888_Premultiplied);
+    pixels.fill(QColor(200, 40, 40));
+    term::set_render_snapshot_row_image(
+        *with_image,
+        1,
+        std::make_shared<const term::Terminal_image_slice>(
+            term::Terminal_image_slice{std::move(pixels), 1, {10, 20}, 3U}));
+
+    const vnm_terminal::Terminal_canvas_export_result plain_result =
+        export_snapshot(surface, std::move(plain));
+    const vnm_terminal::Terminal_canvas_export_result image_result =
+        export_snapshot(surface, std::move(with_image));
+    ok &= check(
+        plain_result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
+        image_result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
+        plain_result.frame != nullptr &&
+        image_result.frame != nullptr,
+        "a snapshot showing an image exports");
+    if (plain_result.frame == nullptr || image_result.frame == nullptr) {
+        return false;
+    }
+
+    ok &= check(
+        canvas_cells_equal(image_result.frame->cells, plain_result.frame->cells) &&
+        image_result.frame->content_extent.has_value() &&
+        plain_result.frame->content_extent.has_value() &&
+        image_result.frame->content_extent->content_bottom_row_exclusive ==
+            plain_result.frame->content_extent->content_bottom_row_exclusive,
+        "a row image leaves the exported text and its extent as they are without it");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -604,5 +673,6 @@ int main(int argc, char** argv)
     ok &= test_content_extent_uses_semantic_cells_cursor_and_viewport();
     ok &= test_exact_bounds_and_one_over_fail_closed();
     ok &= test_text_bounds_fail_closed_without_truncation();
+    ok &= test_row_images_export_as_text();
     return ok ? 0 : 1;
 }

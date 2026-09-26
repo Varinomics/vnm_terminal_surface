@@ -14,6 +14,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QIODevice>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QKeyEvent>
@@ -10400,6 +10401,94 @@ bool test_public_projection_publishes_natural_full_row_scroll()
     return ok;
 }
 
+// Oracles: rule 3 (the public-projection producer carries a row's image as the
+// live producer does) and A1 and I4 (a history row's image decodes with the
+// revision its live row held).
+bool test_public_projection_scroll_carries_row_images()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 20;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 16};
+    ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            backend->emit_output(
+                QByteArrayLiteral("row-0\r\n\x1bP9;1q#1;2;100;0;0#1!12~\x1b\\")),
+        "image projection fixture publishes an image on row 1");
+    const std::shared_ptr<const term::Terminal_render_snapshot> placed =
+        session->latest_render_snapshot_handle();
+    const std::shared_ptr<const term::Terminal_image_slice> live_image =
+        placed != nullptr ? term::render_snapshot_row_image(*placed, 1) : nullptr;
+    ok &= check(live_image != nullptr, "the published snapshot carries the row image");
+    if (live_image == nullptr) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nrow-2\r\nrow-3\r\nrow-4")),
+        "image projection fixture scrolls the image row into history");
+    const std::optional<term::Terminal_render_snapshot> safe_content =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(safe_content.has_value() &&
+            safe_content->viewport.scrollback_rows == 2 &&
+            safe_content->visible_row_images.empty(),
+        "the image row is in history and off the screen");
+    if (!safe_content.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "image projection fixture enters synchronized output");
+    const std::optional<term::Terminal_public_projection> projection =
+        session->public_projection_for_testing();
+    const term::Terminal_public_projection_row* image_row = nullptr;
+    if (projection.has_value()) {
+        for (const term::Terminal_public_projection_row& row : projection->rows()) {
+            if (row.public_row == 1) {
+                image_row = &row;
+            }
+        }
+    }
+    ok &= check(projection.has_value() &&
+            !projection->rows_are_safe_basis_viewport_only() &&
+            image_row != nullptr &&
+            image_row->image != nullptr &&
+            image_row->image->revision == live_image->revision &&
+            image_row->image->pixels == live_image->pixels,
+        "the hold's full-row capture decodes the history image row with its live revision");
+
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines_from_published_state(2, safe_content->viewport);
+    const std::optional<term::Terminal_render_snapshot> public_scroll =
+        session->latest_render_snapshot();
+    const std::shared_ptr<const term::Terminal_image_slice> projected_image =
+        public_scroll.has_value() ? term::render_snapshot_row_image(*public_scroll, 1) : nullptr;
+    ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+            public_scroll.has_value() &&
+            public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            public_scroll->viewport.offset_from_tail == 2 &&
+            projected_image != nullptr &&
+            projected_image->revision == live_image->revision &&
+            term::render_snapshot_row_image(*public_scroll, 0) == nullptr &&
+            term::render_snapshot_row_image(*public_scroll, 2) == nullptr &&
+            term::validate_render_snapshot(*public_scroll).status ==
+                term::Terminal_render_snapshot_status::OK &&
+            term::validate_render_snapshot_row_image(*public_scroll, 1) ==
+                term::Terminal_render_image_status::OK,
+        "a scroll during the hold shows the history image row from the projection");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "image projection fixture releases synchronized output");
+    return ok;
+}
+
 bool test_public_projection_natural_wrapped_capture_fragment_ordinals()
 {
     bool ok = true;
@@ -20493,6 +20582,7 @@ int main()
     ok &= test_public_projection_geometry_invalidation_composes_with_prior_invalidation();
     ok &= test_public_projection_rebases_hidden_safe_cursor();
     ok &= test_public_projection_publishes_natural_full_row_scroll();
+    ok &= test_public_projection_scroll_carries_row_images();
     ok &= test_public_projection_natural_wrapped_capture_fragment_ordinals();
     ok &= test_public_projection_wrapped_fragment_release_reconciles_fragment_index();
     ok &= test_public_projection_viewport_only_fragment_release_avoids_false_exact();

@@ -147,6 +147,41 @@ match (`INVALID_SEARCH_MATCH_SPAN`). Producers use
 not available. Selection paint takes precedence over search paint where spans
 overlap.
 
+## Row Images
+
+`visible_row_images` carries the sixel image each visible row shows, as the
+row's immutable `Terminal_image_slice`. It is presence-tagged: empty unless a
+visible row shows an image, then one entry per grid row, null for a row
+without one, so a snapshot without images has exactly the fields it would
+have without the capability. Producers set entries only through
+`set_render_snapshot_row_image`, and consumers read them through the row
+content view (`image()`, `image_at()`).
+
+Slices are shared, never copied or mutated: the live-content producer hands
+out the live row's own slice, and a history row's slice is decoded from its
+record with the revision stored there. Revisions are unique in the process,
+so a revision identifies a slice's pixels across snapshots, sessions, and
+decodes. The public-projection producer copies each row's slice pointer into
+its projection rows and back into scroll snapshots; a full-row capture
+compares rows by revision. A geometry-derived snapshot keeps the images of the
+rows that remain, like their cells.
+
+A row whose image changes is a dirty row, so the dirty-range guarantee covers
+images: a row not covered by a dirty range shows the same slice. An image
+change alone does not advance the row's `content_generation`.
+
+Images are an optional capability, so `validate_render_snapshot` ignores them
+and a bad image never rejects the text of its snapshot. A consumer checks a
+row's image with `validate_render_snapshot_row_image`, which returns its own
+`Terminal_render_image_status`: the field size must be zero or the row count
+(`INVALID_ROW_COUNT`), the pixels non-null RGBA8888 premultiplied
+(`INVALID_PIXELS`), the placing cell size positive
+(`INVALID_CELL_PIXEL_SIZE`), the height at most one cell
+(`INVALID_PIXEL_SIZE`), and the columns inside `[0, 4096]`
+(`INVALID_COLUMN_SPAN`). A slice may start or end past a grid that narrowed
+after it was placed; the renderer clips it. The frame builder drops only the
+image of a row that fails and counts it (`images_rejected`).
+
 ## Styles, Hyperlinks, Cursor
 
 - `styles` is non-empty and `styles[0]` equals the default style; every
@@ -162,7 +197,8 @@ overlap.
 path: `src/terminal_session.cpp` rejects an invalid assembled snapshot
 (publication returns no snapshot rather than publishing a bad one), and
 `Terminal_public_projection::capture_from_safe_model` records the basis
-snapshot's validation status. The test suites (`tests/render_snapshot`,
+snapshot's validation status. The frame builder runs `validate_render_snapshot_row_image` on every row
+that shows an image. The test suites (`tests/render_snapshot`,
 `tests/backend_session`, `tests/behavior_smoke`, `tests/screen_sgr`,
 `tests/terminal_modes`, conformance and randomized-parser suites) validate
 snapshots produced by the real producers, including dedicated
