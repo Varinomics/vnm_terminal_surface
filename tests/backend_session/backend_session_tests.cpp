@@ -186,6 +186,7 @@ public:
 
     term::Terminal_backend_result write(QByteArray bytes) override
     {
+        write_attempts.push_back(bytes);
         if (!running || fail_write) {
             return
                 term::backend_reject(
@@ -375,6 +376,8 @@ public:
     std::optional<term::Terminal_backend_exit>
                                exit_during_start;
     std::vector<QByteArray>    writes;
+    // Every write the session attempted, the refused ones included, in order.
+    std::vector<QByteArray>    write_attempts;
     std::vector<bool>          output_pause_requests;
     std::vector<term::Terminal_backend_resize_request>
                                resize_requests;
@@ -2961,6 +2964,9 @@ bool test_text_area_resize_arbitration_near_limit_replay_is_linear()
         }
     }
 
+    // Each settlement runs one step of its operation, which reaches the next
+    // adjacent request; the last one leaves the rest of its tail to drains.
+    session->process_backend_callback_events();
     const term::terminal_text_area_resize_arbitration_work_counters_t counters =
         session->text_area_resize_arbitration_work_counters();
     ok &= check(counters.scanned_bytes == static_cast<std::uint64_t>(k_stream_size),
@@ -14397,8 +14403,8 @@ bool test_parser_notifications_reach_session_notifications()
             title_index = std::min(title_index, i);
         }
     }
-    ok &= check(backend_error_index < title_index,
-        "parser terminal reply handling preserves action order before later title notification");
+    ok &= check(title_index < backend_error_index,
+        "a reply the write queue refuses is disposed of at its step's end, after the step's actions");
     ok &= check(backend_error_index < ordered_notifications.size() &&
         title_index < ordered_notifications.size(),
         "parser terminal reply ordering test observes both compared notifications");
@@ -15744,32 +15750,52 @@ bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
     return ok;
 }
 
-bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
+// A near-cap image: a background-filled 1448 x 1448 raster, 73 rows of 20
+// pixels, whose decoding and placement take several drain steps.
+QByteArray budget_filling_sixel_image()
+{
+    return QByteArrayLiteral("\x1bPq\"1;1;1448;1448#1~\x1b\\");
+}
+
+// Rows [first, first + count) of a snapshot either all carry an image or none
+// do: a published snapshot never shows part of an image.
+bool snapshot_image_rows_whole(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   first,
+    int                                   count)
+{
+    int with_image = 0;
+    for (int row = first; row < first + count && row < snapshot.grid_size.rows; ++row) {
+        with_image += term::render_snapshot_row_image(snapshot, row) != nullptr ? 1 : 0;
+    }
+    return with_image == 0 || with_image == count;
+}
+
+bool test_budgeted_backend_callback_drain_resumes_sixel_work()
 {
     bool ok = true;
 
     // A sixel image described in a few bytes can expand into one as large as
-    // the decoded-size cap, so a budgeted drain ends its slice where an image
-    // completes and meets its deadline before decoding the next one. The
-    // images and the text around them end up as one unbudgeted drain leaves
-    // them, a query between them is answered the same, and images inside a
-    // synchronized update stay unpublished until it ends.
-    const QByteArray image    = QByteArrayLiteral("\x1bPq\"1;1;40;40#1~\x1b\\");
-    const QByteArray before   = QByteArrayLiteral("before ");
-    const QByteArray query    = QByteArrayLiteral("\x1b[c");
-    const QByteArray sync_on  = QByteArrayLiteral("\x1b[?2026h");
-    const QByteArray sync_off = QByteArrayLiteral("\x1b[?2026l");
-    const QByteArray after    = QByteArrayLiteral(" after");
+    // the decoded-size cap. A budgeted drain step pays for its sixel work and
+    // leaves the rest to the next step, which continues where it stopped.
+    // Whatever the steps, the screen, the replies and their order end as one
+    // unbudgeted drain leaves them, the output is recorded once, and no
+    // published snapshot shows part of an image, inside or outside a
+    // synchronized update.
+    const QByteArray image  = budget_filling_sixel_image();
     const QByteArray output =
-        before + image + query + sync_on + image + image + sync_off + after;
+        QByteArrayLiteral("before \x1b[2;1H") + image + QByteArrayLiteral("\x1b[c") +
+        QByteArrayLiteral("\x1b[?2026h\x1b[80;1H") + image + QByteArrayLiteral("\x1b[?2026l") +
+        QByteArrayLiteral(" after");
 
     struct drain_result_t
     {
-        std::vector<QByteArray>                      chunks;
-        std::vector<QByteArray>                      writes;
-        std::vector<term::terminal_grid_position_t>  published_cursors;
+        std::vector<QByteArray>                       chunks;
+        std::vector<QByteArray>                       writes;
         std::optional<term::Terminal_render_snapshot> snapshot;
-        int                                          calls = 0;
+        int                                           calls       = 0;
+        bool                                          whole_images = true;
+        bool                                          held_image_hidden = true;
     };
     const auto drain = [&](bool budgeted, const std::string& label) {
         term::Terminal_session_config config;
@@ -15777,34 +15803,33 @@ bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
         std::unique_ptr<term::Terminal_session> session;
         Scripted_backend* backend = make_session(session, config);
         session->set_cell_pixel_size({10, 20});
-        ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{160, 160};
+        ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
             label + ": session starts");
         ok &= check(backend->emit_output(output), label + ": output queues");
 
-        // The published cursor is recorded after each drain that takes output;
-        // a later drain may only send the reply.
         drain_result_t result;
-        while (session->has_pending_backend_callback_events() && result.calls < 16) {
+        while (session->has_pending_backend_callback_events() && result.calls < 1000) {
             ++result.calls;
-            const std::size_t chunks_before = session->output_chunks().size();
             if (budgeted) {
                 session->process_backend_callback_events_for(
                     std::chrono::steady_clock::duration::zero());
-                ok &= check(session->output_chunks().size() <= chunks_before + 1U,
-                    label + ": an owner drain takes at most one slice");
             }
             else {
                 session->process_backend_callback_events();
             }
-            if (session->output_chunks().size() == chunks_before) {
-                continue;
-            }
             const std::optional<term::Terminal_render_snapshot> published =
                 session->latest_render_snapshot();
-            result.published_cursors.push_back(published.has_value()
-                ? published->cursor.position
-                : term::terminal_grid_position_t{});
+            if (published.has_value()) {
+                result.whole_images = result.whole_images &&
+                    snapshot_image_rows_whole(*published, 1, 73) &&
+                    snapshot_image_rows_whole(*published, 79, 73);
+                result.held_image_hidden = result.held_image_hidden &&
+                    (!session->render_publication_blocked() ||
+                        term::render_snapshot_row_image(*published, 79) == nullptr);
+            }
         }
         result.chunks   = session->output_chunks();
         result.writes   = backend->writes;
@@ -15815,18 +15840,17 @@ bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
     const drain_result_t budgeted   = drain(true,  "budgeted sixel drain");
     const drain_result_t unbudgeted = drain(false, "unbudgeted sixel drain");
 
-    ok &= check(budgeted.chunks == std::vector<QByteArray>{
-            before + image, query + sync_on + image, image, sync_off + after},
-        "budgeted sixel drain ends a slice after each image");
+    ok &= check(budgeted.calls > 4,
+        "budgeted sixel drain spreads the images over several steps");
+    ok &= check(budgeted.chunks == std::vector<QByteArray>{output} &&
+            unbudgeted.chunks == std::vector<QByteArray>{output},
+        "budgeted sixel drain records the output once");
     ok &= check(!budgeted.writes.empty() && budgeted.writes == unbudgeted.writes,
         "budgeted sixel drain answers the query between images as one drain does");
-    ok &= check(budgeted.published_cursors.size() == 4U &&
-            budgeted.published_cursors[1] == budgeted.published_cursors[0] &&
-            budgeted.published_cursors[2] == budgeted.published_cursors[0] &&
-            budgeted.published_cursors[3] != budgeted.published_cursors[0],
-        "budgeted sixel drain publishes nothing inside the synchronized update");
-    ok &= check(unbudgeted.chunks == std::vector<QByteArray>{output},
-        "unbudgeted sixel drain takes the output whole");
+    ok &= check(budgeted.whole_images,
+        "budgeted sixel drain never publishes part of an image");
+    ok &= check(budgeted.held_image_hidden,
+        "budgeted sixel drain publishes nothing of the image inside the synchronized update");
     ok &= check(budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value(),
         "both sixel drains publish a snapshot");
     if (budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value()) {
@@ -15845,10 +15869,1277 @@ bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
         }
         ok &= check(same_rows,
             "budgeted sixel drain leaves the text and images one drain does");
-        ok &= check(snapshot_contains_text(left, QStringLiteral("after")),
-            "budgeted sixel drain reaches the text after the images");
+        ok &= check(snapshot_contains_text(left, QStringLiteral("after")) &&
+                term::render_snapshot_row_image(left, 1) != nullptr &&
+                term::render_snapshot_row_image(left, 79) != nullptr,
+            "budgeted sixel drain reaches both images and the text after them");
     }
 
+    return ok;
+}
+
+// A host answer releases a held tail. Its sixel work beyond one drain step's
+// budget replays in the drains that follow, ahead of later input and output.
+bool test_settled_tail_replays_heavy_sixel_work_across_drains()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "settled heavy tail session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 1U && requests.front().request.has_value(),
+        "the resize request reaches the host");
+    if (requests.empty() || !requests.front().request.has_value()) {
+        return false;
+    }
+
+    ok &= check(backend->emit_output(
+            budget_filling_sixel_image() + QByteArrayLiteral("\r\ntail-text")),
+        "the tail is held");
+    session->process_backend_callback_events();
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+            requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            term::terminal_grid_size_t{90, 160},
+        }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the host answer is accepted");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the tail's image is still being replayed after the answer");
+
+    int  calls        = 0;
+    bool whole_images = true;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        const std::optional<term::Terminal_render_snapshot> published =
+            session->latest_render_snapshot();
+        if (published.has_value()) {
+            whole_images = whole_images && snapshot_image_rows_whole(*published, 0, 73);
+        }
+    }
+    ok &= check(calls > 1 && !session->has_pending_backend_callback_events(),
+        "the drains after the answer finish the tail");
+    ok &= check(whole_images, "no published snapshot shows part of the tail's image");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            snapshot->grid_size.rows == 90 &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("tail-text")),
+        "the replayed tail shows the image and the text after it");
+    return ok;
+}
+
+// A callback longer than a drain window, whose first window pauses in sixel
+// work and ends with an escape the next window completes, stays one logical
+// command: it records one final result, and its callback epoch settles once
+// every byte is applied, so input written after it is accepted.
+bool test_paused_window_stays_inside_its_command()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{160, 160};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "paused window session starts");
+
+    QByteArray output = budget_filling_sixel_image();
+    output += QByteArray(4095 - output.size(), 'x');
+    output += QByteArrayLiteral("\x1b[31mZ");
+    output += QByteArray(100, 'y');
+    ok &= check(backend->emit_output(output), "the long callback queues");
+    const std::uint64_t callback_epoch = session->backend_callback_enqueue_epoch();
+
+    int calls = 0;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    ok &= check(calls > 3, "the first window pauses in sixel work");
+    ok &= check(session->backend_callback_processed_epoch() >= callback_epoch,
+        "the callback epoch settles once all its bytes are applied");
+    ok &= check(session->output_chunks() ==
+            std::vector<QByteArray>{output.first(4096), output.sliced(4096)},
+        "each window is recorded once");
+    ok &= check(session->write_user_bytes(QByteArrayLiteral("k")).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "input after the callback is accepted");
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    // The text after the image covers its first 26 rows.
+    ok &= check(snapshot.has_value() &&
+            term::render_snapshot_row_image(*snapshot, 60) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("Zyyy")),
+        "the image and the text after it are applied");
+    return ok;
+}
+
+// Settling a request whose tail answers a query before a heavy image stays
+// asynchronous: the settle call does not replay the image, and the reply
+// follows the tail in order once the drains have replayed it.
+bool test_settle_with_a_reply_before_a_heavy_image_stays_asynchronous()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "reply-before-image settle session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    if (!check(requests.size() == 1U && requests.front().request.has_value(),
+            "the resize request reaches the host"))
+    {
+        return false;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[c") + budget_filling_sixel_image() +
+            QByteArrayLiteral("tail-text")),
+        "the tail is held");
+    session->process_backend_callback_events();
+    const std::size_t writes_before = backend->writes.size();
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+            requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            term::terminal_grid_size_t{90, 160},
+        }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the host answer is accepted");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the settle call leaves the heavy image to the drains");
+
+    int calls = 0;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("tail-text")),
+        "the drains replay the image and the text after it");
+    ok &= check(backend->writes.size() == writes_before + 1U &&
+            backend->writes.back().startsWith(QByteArrayLiteral("\x1b[?")),
+        "the query is answered once");
+    return ok;
+}
+
+// A process that exits while its output is held for a resize answer keeps
+// the tail's order: the tail replays first, arbitration off, across budgeted
+// drains, and the exit follows it.
+bool test_exit_waits_behind_a_heavy_held_tail()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "held-tail exit session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    ok &= check(arbitration_requests(*session).size() == 1U, "the resize request reaches the host");
+
+    ok &= check(backend->emit_output(budget_filling_sixel_image() +
+            QByteArrayLiteral("tail-text\x1b[8;50;100t")),
+        "the tail is held");
+    backend->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+
+    int  calls              = 0;
+    bool exit_before_tail   = false;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        const std::optional<term::Terminal_render_snapshot> published =
+            session->latest_render_snapshot();
+        exit_before_tail = exit_before_tail ||
+            (session->exit_status().has_value() &&
+                (!published.has_value() ||
+                    !snapshot_contains_text(*published, QStringLiteral("tail-text"))));
+    }
+    ok &= check(calls > 3, "the held tail replays across several drains");
+    ok &= check(!exit_before_tail && session->exit_status().has_value(),
+        "the exit follows the replayed tail");
+    ok &= check(arbitration_requests(*session).size() == 1U,
+        "the replayed tail asks the host nothing more");
+    return ok;
+}
+
+// A forced release of a stale synchronized update ends the application's
+// hold but not the hold of an image being placed: the release neither
+// finishes the placement nor publishes part of it, and the drains finish it.
+bool test_forced_release_keeps_a_placement_budgeted()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{160, 160};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "forced release session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("start")), "the first output queues");
+    session->process_backend_callback_events();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h") +
+            QByteArrayLiteral("\x1bPq\"1;1;1448;1448\x1b\\done")),
+        "the held image queues");
+
+    // One step allocates and fills the declared raster, the next starts
+    // placing its 73 bands.
+    session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the image is still being placed");
+
+    ok &= check(session->force_release_synchronized_output_without_backend_drain().code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "the stale update is released");
+    const std::optional<term::Terminal_render_snapshot> released =
+        session->latest_render_snapshot();
+    ok &= check(session->has_pending_backend_callback_events() &&
+            session->render_publication_blocked(),
+        "the release does not finish the placement");
+    ok &= check(released.has_value() && snapshot_image_rows_whole(*released, 0, 73) &&
+            term::render_snapshot_row_image(*released, 0) == nullptr,
+        "the release publishes nothing of the partly placed image");
+
+    int calls = 0;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    ok &= check(calls > 1 && snapshot.has_value() &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("done")) &&
+            !session->render_publication_blocked(),
+        "the drains finish the image and publish it whole");
+    return ok;
+}
+
+// ----- Released-output completion ordering (R4 T1) -----
+//
+// Released output is one ordered operation of the command runner that owns
+// what it causes. The harness below drives one output stream through drains
+// of one step each under a chosen sixel work budget, delivers it as callbacks
+// with random cuts or as a held CSI 8 t tail released every way a hold ends,
+// and injects a key, a mouse report, a model setter or the backend exit at a
+// step boundary. Each run is checked against contracts stated on its own, and
+// against the unbudgeted run with the same injection at the same place.
+
+// A tall image: 20 sixel bands, 8 x 120 pixels, six rows of a 10 x 20 cell.
+// A budget of one unit decodes a band a step and places a row a step.
+QByteArray ordered_trace_image()
+{
+    QByteArray image = QByteArrayLiteral("\x1bPq\"1;1;8;120#1;2;100;0;0");
+    for (int band = 0; band < 20; ++band) {
+        image += band + 1 < 20 ? QByteArrayLiteral("#1!8~-") : QByteArrayLiteral("#1!8~");
+    }
+    return image + QByteArrayLiteral("\x1b\\");
+}
+
+// Text, a DA1 and a CSI 16 t query, the image at column 31 of row 1, the SGR
+// mouse and bracketed paste modes, a CSI 6 n query, text back at column 1,
+// then lines that scroll the image partly into history. No text is printed
+// over the image, so only scrolling moves or cuts it.
+QByteArray ordered_trace_output()
+{
+    QByteArray output = QByteArrayLiteral("hello\x1b[c\x1b[16t\r\n\x1b[31G") + ordered_trace_image() +
+        QByteArrayLiteral("\r\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[6n world");
+    for (int line = 0; line < 8; ++line) {
+        output += QByteArrayLiteral("\r\nline");
+    }
+    return output;
+}
+
+std::vector<QByteArray> ordered_trace_cuts(const QByteArray& output, std::uint64_t seed)
+{
+    std::vector<QByteArray> cuts;
+    std::uint64_t state = seed;
+    qsizetype offset = 0;
+    while (offset < output.size()) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        const qsizetype size = std::min<qsizetype>(
+            output.size() - offset,
+            1 + static_cast<qsizetype>((state >> 33U) % 24U));
+        cuts.push_back(output.sliced(offset, size));
+        offset += size;
+    }
+    return cuts;
+}
+
+int ordered_trace_query_count(const QByteArray& bytes)
+{
+    return static_cast<int>(bytes.count(QByteArrayLiteral("\x1b[c")) +
+        bytes.count(QByteArrayLiteral("\x1b[16t")) +
+        bytes.count(QByteArrayLiteral("\x1b[6n")));
+}
+
+// A reply's kind by its shape: 0 DA1, 1 cell size, 2 cursor position; -1 input.
+int ordered_trace_reply_kind(const QByteArray& write)
+{
+    if (write.startsWith(QByteArrayLiteral("\x1b[?")) && write.endsWith('c')) {
+        return 0;
+    }
+    if (write.startsWith(QByteArrayLiteral("\x1b[6;")) && write.endsWith('t')) {
+        return 1;
+    }
+    if (write.startsWith(QByteArrayLiteral("\x1b[")) && write.endsWith('R')) {
+        return 2;
+    }
+    return -1;
+}
+
+enum class Ordered_trace_release
+{
+    CALLBACKS,
+    ACCEPTED_TAIL,
+    REJECTED_TAIL,
+    TIMED_OUT_TAIL,
+    OVERFLOWED_TAIL,
+    EXITED_TAIL,
+    SYNC_RECOVERY,
+};
+
+enum class Ordered_trace_budget
+{
+    UNIT,
+    SMALL,
+    RANDOM,
+    DEFAULT_QUANTUM,
+    UNBUDGETED,
+};
+
+enum class Ordered_trace_injection
+{
+    NONE,
+    KEY,
+    MOUSE,
+    SETTER,
+    BACKEND_EXIT,
+    STALE_RECOVERY,
+};
+
+struct Ordered_trace_plan
+{
+    Ordered_trace_release   release   = Ordered_trace_release::CALLBACKS;
+    Ordered_trace_budget    budget    = Ordered_trace_budget::UNBUDGETED;
+    Ordered_trace_injection injection = Ordered_trace_injection::NONE;
+    int                     boundary  = -1;
+};
+
+struct Ordered_trace
+{
+    std::vector<QByteArray>                           write_attempts;
+    std::optional<std::size_t>                        input_write;
+    QByteArray                                        applied_before_injection;
+    bool                                              exit_before_injection = false;
+    std::vector<QString>                              arbitration;
+    std::vector<int>                                  notifications;
+    std::optional<term::Terminal_session_result_code> settle_code;
+    std::vector<QByteArray>                           live_rows;
+    std::vector<QByteArray>                           history_rows;
+    term::terminal_grid_position_t                    cursor;
+    term::terminal_grid_size_t                        grid;
+    bool                                              partial_image     = false;
+    bool                                              exit_seen_early   = false;
+    bool                                              setter_unsettled  = false;
+    bool                                              recovery_finished = false;
+    int                                               boundaries        = 0;
+};
+
+// A row as the screen shows it: its text, and its image's position, geometry,
+// producing cell and pixels (never its process-unique revision).
+QByteArray ordered_trace_row(const term::Terminal_render_snapshot& snapshot, int row)
+{
+    QByteArray record = snapshot_row_text(snapshot, row).toUtf8();
+    const std::shared_ptr<const term::Terminal_image_slice> image =
+        term::render_snapshot_row_image(snapshot, row);
+    if (image != nullptr) {
+        record += '|' + QByteArray::number(image->first_column) + ':' +
+            QByteArray::number(image->cell_pixel_size.width) + 'x' +
+            QByteArray::number(image->cell_pixel_size.height) + ':' +
+            QByteArray::number(image->pixels.width()) + 'x' +
+            QByteArray::number(image->pixels.height()) + ':';
+        for (int y = 0; y < image->pixels.height(); ++y) {
+            record.append(
+                reinterpret_cast<const char*>(image->pixels.constScanLine(y)),
+                image->pixels.width() * 4);
+        }
+    }
+    return record;
+}
+
+// A published snapshot shows a partial image when its image rows are not one
+// run, or when a run below the top row is shorter than the image: the image
+// is placed at row 1, and only scrolling, never placement, moves it up.
+bool ordered_trace_shows_partial_image(const term::Terminal_render_snapshot& snapshot)
+{
+    int first = -1;
+    int count = 0;
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        if (term::render_snapshot_row_image(snapshot, row) == nullptr) {
+            continue;
+        }
+        if (first < 0) {
+            first = row;
+        }
+        else
+        if (row != first + count) {
+            return true;
+        }
+        ++count;
+    }
+    return first > 0 && count != 6;
+}
+
+Ordered_trace run_ordered_trace(const Ordered_trace_plan& plan)
+{
+    Ordered_trace trace;
+    const bool held = plan.release != Ordered_trace_release::CALLBACKS &&
+        plan.release != Ordered_trace_release::SYNC_RECOVERY;
+    constexpr std::size_t k_overflow_hold_limit = 128U;
+    term::Terminal_session_config config = held
+        ? text_area_resize_arbitration_config(
+            plan.release == Ordered_trace_release::OVERFLOWED_TAIL
+                ? k_overflow_hold_limit
+                : term::k_terminal_default_text_area_resize_hold_limit_bytes)
+        : term::Terminal_session_config{};
+    config.backend_event_notifier = [] {};
+    // The smallest ring: thousands of runs, each with a small image.
+    config.retained_history_capacity_bytes = term::k_terminal_min_retained_history_capacity_bytes;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    (void)session->start(launch_config_with_grid(10, 40));
+    session->process_backend_callback_events();
+    std::uint64_t random_state = 0x6a09e667f3bcc909ULL;
+    switch (plan.budget) {
+        case Ordered_trace_budget::UNIT:
+            session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+            break;
+        case Ordered_trace_budget::SMALL:
+            session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{300U}; });
+            break;
+        case Ordered_trace_budget::RANDOM:
+            session->set_sixel_work_step_units_for_testing([&random_state] {
+                random_state = random_state * 6364136223846793005ULL + 1442695040888963407ULL;
+                return std::uint64_t{1U} + (random_state >> 33U) % 6000U;
+            });
+            break;
+        case Ordered_trace_budget::DEFAULT_QUANTUM:
+        case Ordered_trace_budget::UNBUDGETED:
+            break;
+    }
+
+    QByteArray output = ordered_trace_output();
+    if (plan.release == Ordered_trace_release::SYNC_RECOVERY) {
+        output = QByteArrayLiteral("\x1b[?2026h") + output + QByteArrayLiteral("\x1b[?2026l");
+    }
+    const QByteArray request = QByteArrayLiteral("\x1b[8;9;40t");
+    std::vector<QByteArray> callbacks;
+    if (held) {
+        callbacks.push_back(request);
+    }
+    for (QByteArray& cut : ordered_trace_cuts(output, 0x243f6a8885a308d3ULL)) {
+        callbacks.push_back(std::move(cut));
+    }
+    const int release_boundary = static_cast<int>(callbacks.size());
+    const bool host_release =
+        plan.release == Ordered_trace_release::ACCEPTED_TAIL ||
+        plan.release == Ordered_trace_release::REJECTED_TAIL ||
+        plan.release == Ordered_trace_release::TIMED_OUT_TAIL;
+
+    QByteArray delivered;
+    bool released = false;
+    bool exit_emitted = false;
+    // The process exits when the backend reports it; the scripted backend
+    // keeps taking writes until the session applies the exit, so a reply's
+    // disposition does not depend on when a drain reaches its query.
+    const auto emit_exit = [&] {
+        backend->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+        backend->running = true;
+        exit_emitted     = true;
+    };
+    const int last_event = std::max(release_boundary, plan.boundary);
+    for (int boundary = 0; ; ++boundary) {
+        if (boundary < static_cast<int>(callbacks.size()) && !exit_emitted) {
+            (void)backend->emit_output_ignoring_pause(callbacks[static_cast<std::size_t>(boundary)]);
+            delivered += callbacks[static_cast<std::size_t>(boundary)];
+        }
+        if (held && boundary == release_boundary) {
+            if (host_release) {
+                const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+                    arbitration_requests(*session);
+                const std::uint64_t request_id =
+                    !requests.empty() && requests.back().request.has_value()
+                        ? requests.back().request->request_id
+                        : 0U;
+                const auto outcome = plan.release == Ordered_trace_release::ACCEPTED_TAIL
+                    ? term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED
+                    : plan.release == Ordered_trace_release::REJECTED_TAIL
+                        ? term::Terminal_text_area_resize_arbitration_outcome::REJECTED
+                        : term::Terminal_text_area_resize_arbitration_outcome::TIMED_OUT;
+                trace.settle_code = session->settle_text_area_resize_arbitration({
+                    request_id,
+                    outcome,
+                    term::terminal_grid_size_t{9, 40},
+                }).code;
+                released = true;
+            }
+            else
+            if (plan.release == Ordered_trace_release::EXITED_TAIL && !exit_emitted) {
+                emit_exit();
+                released = true;
+            }
+        }
+        if (plan.release == Ordered_trace_release::OVERFLOWED_TAIL &&
+            delivered.size() - request.size() > static_cast<qsizetype>(k_overflow_hold_limit))
+        {
+            released = true;
+        }
+
+        if (boundary == plan.boundary) {
+            // Output whose effects come before the injection: everything
+            // delivered, except bytes a hold still owns.
+            trace.applied_before_injection =
+                held && !released && !exit_emitted ? QByteArray{} : delivered;
+            trace.exit_before_injection = exit_emitted;
+            const std::size_t writes_before = backend->write_attempts.size();
+            const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+            switch (plan.injection) {
+                case Ordered_trace_injection::KEY: {
+                    const QKeyEvent key(QEvent::KeyPress, Qt::Key_K, Qt::NoModifier, QStringLiteral("k"));
+                    (void)session->write_key_event(key);
+                    break;
+                }
+                case Ordered_trace_injection::MOUSE: {
+                    // As the surface does: the fast path declines while older
+                    // output is unsettled, so the report waits for a drain
+                    // that settles it.
+                    term::Terminal_mouse_event event;
+                    event.kind   = term::Terminal_mouse_event_kind::PRESS;
+                    event.button = term::Terminal_mouse_button::LEFT;
+                    event.row    = 2;
+                    event.column = 3;
+                    if (!session->try_write_mouse_event_without_backend_drain_if_callbacks_empty(
+                            event).has_value())
+                    {
+                        (void)session->process_backend_callback_events_until_epoch(epoch);
+                        (void)session->try_write_mouse_event_without_backend_drain_if_callbacks_empty(
+                            event);
+                    }
+                    break;
+                }
+                case Ordered_trace_injection::SETTER:
+                    // The setter drains its frontier before it touches the
+                    // model, so no operation of older output is left open.
+                    session->set_scrollback_limit(1000);
+                    trace.setter_unsettled = session->has_pending_backend_callback_events();
+                    break;
+                case Ordered_trace_injection::BACKEND_EXIT:
+                    if (!exit_emitted) {
+                        emit_exit();
+                    }
+                    break;
+                case Ordered_trace_injection::STALE_RECOVERY: {
+                    const bool pending = session->has_pending_backend_callback_events();
+                    (void)session->force_release_synchronized_output_without_backend_drain();
+                    trace.recovery_finished =
+                        trace.recovery_finished ||
+                        (pending && !session->has_pending_backend_callback_events());
+                    break;
+                }
+                case Ordered_trace_injection::NONE:
+                    break;
+            }
+            for (std::size_t index = writes_before; index < backend->write_attempts.size(); ++index) {
+                if (ordered_trace_reply_kind(backend->write_attempts[index]) < 0) {
+                    trace.input_write = index;
+                }
+            }
+        }
+
+        if (boundary >= last_event && !session->has_pending_backend_callback_events()) {
+            trace.boundaries = boundary;
+            break;
+        }
+
+        const bool exited_before = session->exit_status().has_value();
+        if (plan.budget == Ordered_trace_budget::UNBUDGETED) {
+            session->process_backend_callback_events();
+        }
+        else {
+            (void)session->process_backend_callback_events_for(
+                std::chrono::steady_clock::duration::zero());
+        }
+        const std::shared_ptr<const term::Terminal_render_snapshot> published =
+            session->latest_render_snapshot_handle();
+        trace.partial_image = trace.partial_image ||
+            (published != nullptr && ordered_trace_shows_partial_image(*published));
+        // The host takes a request as soon as a drain delivers it.
+        if (held) {
+            (void)arbitration_requests(*session);
+        }
+        // The exit is applied only after every effect of the output before it.
+        if (!exited_before && session->exit_status().has_value()) {
+            trace.exit_seen_early = session->has_pending_backend_callback_events();
+        }
+        if (boundary > 4096) {
+            trace.boundaries = boundary;
+            break;
+        }
+    }
+
+    trace.write_attempts = backend->write_attempts;
+    // Requests, and the host's answers to them. A settlement the session makes
+    // itself (an exit, a hold overflow) is announced only for a request the
+    // host has been handed, which depends on where drains let the host in, not
+    // on the order of the output; its effects are compared through the screen.
+    for (const term::Terminal_text_area_resize_arbitration_event& event :
+        session->text_area_resize_arbitration_events())
+    {
+        if (event.settlement.has_value() &&
+            (event.settlement->outcome ==
+                    term::Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED ||
+                event.settlement->outcome ==
+                    term::Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED))
+        {
+            continue;
+        }
+        QString entry = event.kind == term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED
+            ? QStringLiteral("requested")
+            : QStringLiteral("settled");
+        if (event.request.has_value()) {
+            entry += QStringLiteral(" %1x%2")
+                .arg(event.request->requested_grid_size.rows)
+                .arg(event.request->requested_grid_size.columns);
+        }
+        if (event.settlement.has_value()) {
+            entry += QStringLiteral(" %1 %2x%3")
+                .arg(static_cast<int>(event.settlement->outcome))
+                .arg(event.settlement->effective_grid_size.rows)
+                .arg(event.settlement->effective_grid_size.columns);
+        }
+        trace.arbitration.push_back(entry);
+    }
+    for (const term::Terminal_session_notification& notification : session->notifications()) {
+        switch (notification.kind) {
+            case term::Terminal_session_notification_kind::SNAPSHOT_READY:
+            case term::Terminal_session_notification_kind::OUTPUT_ACTIVITY:
+            case term::Terminal_session_notification_kind::OUTPUT_BACKPRESSURE_CHANGED:
+                break;
+            default:
+                trace.notifications.push_back(static_cast<int>(notification.kind));
+                break;
+        }
+    }
+    trace.grid = session->grid_size();
+    if (const std::optional<term::Terminal_render_snapshot> snapshot =
+            session->latest_render_snapshot())
+    {
+        trace.cursor = snapshot->cursor.position;
+        for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+            trace.live_rows.push_back(ordered_trace_row(*snapshot, row));
+        }
+    }
+    // History, as the viewport shows it scrolled to the top.
+    (void)session->scroll_viewport_lines(1000);
+    if (const std::optional<term::Terminal_render_snapshot> snapshot =
+            session->latest_render_snapshot())
+    {
+        for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+            trace.history_rows.push_back(ordered_trace_row(*snapshot, row));
+        }
+    }
+    return trace;
+}
+
+const char* ordered_trace_release_name(Ordered_trace_release release)
+{
+    switch (release) {
+        case Ordered_trace_release::CALLBACKS:     return "callbacks";
+        case Ordered_trace_release::ACCEPTED_TAIL:        return "accepted tail";
+        case Ordered_trace_release::REJECTED_TAIL:        return "rejected tail";
+        case Ordered_trace_release::TIMED_OUT_TAIL:       return "timed-out tail";
+        case Ordered_trace_release::OVERFLOWED_TAIL:      return "overflowed tail";
+        case Ordered_trace_release::EXITED_TAIL:          return "exit-released tail";
+        case Ordered_trace_release::SYNC_RECOVERY: return "synchronized update";
+    }
+    return "?";
+}
+
+const char* ordered_trace_budget_name(Ordered_trace_budget budget)
+{
+    switch (budget) {
+        case Ordered_trace_budget::UNIT:   return "unit budget";
+        case Ordered_trace_budget::SMALL:  return "small budget";
+        case Ordered_trace_budget::RANDOM: return "random budget";
+        case Ordered_trace_budget::DEFAULT_QUANTUM:      return "default budget";
+        case Ordered_trace_budget::UNBUDGETED:   return "no budget";
+    }
+    return "?";
+}
+
+const char* ordered_trace_injection_name(Ordered_trace_injection injection)
+{
+    switch (injection) {
+        case Ordered_trace_injection::NONE:     return "nothing";
+        case Ordered_trace_injection::KEY:      return "a key";
+        case Ordered_trace_injection::MOUSE:    return "a mouse press";
+        case Ordered_trace_injection::SETTER:   return "a model setter";
+        case Ordered_trace_injection::BACKEND_EXIT:     return "the exit";
+        case Ordered_trace_injection::STALE_RECOVERY: return "a stale recovery";
+    }
+    return "?";
+}
+
+// The contracts one run must keep on its own.
+bool check_ordered_trace_contracts(
+    const Ordered_trace&      trace,
+    const Ordered_trace_plan& plan,
+    const std::string&        label)
+{
+    bool ok = true;
+
+    // Replies follow query order, each once.
+    int next_kind = 0;
+    bool in_order = true;
+    for (const QByteArray& write : trace.write_attempts) {
+        const int kind = ordered_trace_reply_kind(write);
+        if (kind < 0) {
+            continue;
+        }
+        in_order = in_order && kind == next_kind;
+        next_kind = kind + 1;
+    }
+    ok &= check(in_order, label + ": replies follow query order, each once");
+
+    // Every reply to a query whose output came before the input reaches its
+    // disposition before the input is written.
+    if (trace.input_write.has_value()) {
+        int replies_before = 0;
+        for (std::size_t index = 0U; index < *trace.input_write; ++index) {
+            replies_before += ordered_trace_reply_kind(trace.write_attempts[index]) >= 0 ? 1 : 0;
+        }
+        ok &= check(replies_before >= ordered_trace_query_count(trace.applied_before_injection),
+            label + ": the replies to earlier queries precede the input");
+    }
+
+    // A mouse press encodes with the modes of all output before it: SGR once
+    // ?1000h ?1006h came before it, nothing without mouse reporting or once
+    // the process has exited.
+    if (plan.injection == Ordered_trace_injection::MOUSE) {
+        const bool reporting =
+            !trace.exit_before_injection &&
+            trace.applied_before_injection.contains(QByteArrayLiteral("\x1b[?1000h")) &&
+            trace.applied_before_injection.contains(QByteArrayLiteral("\x1b[?1006h"));
+        ok &= check(reporting
+                ? trace.input_write.has_value() &&
+                    trace.write_attempts[*trace.input_write].startsWith(QByteArrayLiteral("\x1b[<0;"))
+                : !trace.input_write.has_value(),
+            label + ": the press encodes with the modes of the output before it");
+    }
+
+    ok &= check(!trace.exit_seen_early,
+        label + ": the exit follows every effect of the output before it");
+    ok &= check(!trace.setter_unsettled,
+        label + ": the model setter settles the older operation before it");
+    ok &= check(!trace.recovery_finished,
+        label + ": a stale recovery never finishes a placement");
+    ok &= check(!trace.partial_image, label + ": no published snapshot shows part of the image");
+    return ok;
+}
+
+// The same run as the unbudgeted one with the injection at the same place.
+bool check_ordered_trace_matches(
+    const Ordered_trace& trace,
+    const Ordered_trace& reference,
+    const std::string&   label)
+{
+    bool ok = true;
+    ok &= check(trace.write_attempts == reference.write_attempts,
+        label + ": the backend write log, replies and input, matches the unbudgeted run");
+    ok &= check(trace.arbitration == reference.arbitration,
+        label + ": the arbitration events match the unbudgeted run");
+    ok &= check(trace.notifications == reference.notifications,
+        label + ": the notifications match the unbudgeted run");
+    ok &= check(trace.settle_code == reference.settle_code,
+        label + ": the settlement's result matches the unbudgeted run");
+    ok &= check(trace.grid.rows == reference.grid.rows &&
+            trace.grid.columns == reference.grid.columns &&
+            trace.cursor == reference.cursor &&
+            trace.live_rows == reference.live_rows,
+        label + ": the final screen, cursor and row images match the unbudgeted run");
+    ok &= check(trace.history_rows == reference.history_rows,
+        label + ": the history rows and their images match the unbudgeted run");
+    return ok;
+}
+
+bool test_released_output_keeps_the_unbudgeted_order()
+{
+    bool ok = true;
+    const std::vector<Ordered_trace_release> releases = {
+        Ordered_trace_release::CALLBACKS,
+        Ordered_trace_release::ACCEPTED_TAIL,
+        Ordered_trace_release::REJECTED_TAIL,
+        Ordered_trace_release::TIMED_OUT_TAIL,
+        Ordered_trace_release::OVERFLOWED_TAIL,
+        Ordered_trace_release::EXITED_TAIL,
+        Ordered_trace_release::SYNC_RECOVERY,
+    };
+    const std::vector<Ordered_trace_budget> budgets = {
+        Ordered_trace_budget::UNIT,
+        Ordered_trace_budget::SMALL,
+        Ordered_trace_budget::RANDOM,
+        Ordered_trace_budget::DEFAULT_QUANTUM,
+    };
+    int runs = 0;
+    for (const Ordered_trace_release release : releases) {
+        std::vector<Ordered_trace_injection> injections = {
+            Ordered_trace_injection::KEY,
+            Ordered_trace_injection::MOUSE,
+            Ordered_trace_injection::SETTER,
+        };
+        if (release != Ordered_trace_release::EXITED_TAIL) {
+            injections.push_back(Ordered_trace_injection::BACKEND_EXIT);
+        }
+        if (release == Ordered_trace_release::SYNC_RECOVERY) {
+            injections.push_back(Ordered_trace_injection::STALE_RECOVERY);
+        }
+
+        const Ordered_trace plain = run_ordered_trace({release, Ordered_trace_budget::UNBUDGETED});
+        ok &= check_ordered_trace_contracts(
+            plain,
+            {release, Ordered_trace_budget::UNBUDGETED},
+            std::string(ordered_trace_release_name(release)) + ", no budget");
+        std::map<std::pair<int, int>, Ordered_trace> references;
+        for (const Ordered_trace_budget budget : budgets) {
+            const Ordered_trace uninjected = run_ordered_trace({release, budget});
+            const std::string base = std::string(ordered_trace_release_name(release)) + ", " +
+                ordered_trace_budget_name(budget);
+            ok &= check_ordered_trace_contracts(uninjected, {release, budget}, base);
+            ok &= check_ordered_trace_matches(uninjected, plain, base);
+            for (const Ordered_trace_injection injection : injections) {
+                for (int boundary = 0; boundary <= uninjected.boundaries; ++boundary) {
+                    const Ordered_trace_plan plan{release, budget, injection, boundary};
+                    const std::pair<int, int> key{static_cast<int>(injection), boundary};
+                    if (!references.contains(key)) {
+                        references.emplace(
+                            key,
+                            run_ordered_trace({release, Ordered_trace_budget::UNBUDGETED, injection, boundary}));
+                    }
+                    const Ordered_trace trace = run_ordered_trace(plan);
+                    ++runs;
+                    const std::string label = base + ", " +
+                        ordered_trace_injection_name(injection) + " at step boundary " +
+                        std::to_string(boundary);
+                    ok &= check_ordered_trace_contracts(trace, plan, label);
+                    ok &= check_ordered_trace_contracts(
+                        references.at(key),
+                        {release, Ordered_trace_budget::UNBUDGETED, injection, boundary},
+                        label + " (unbudgeted)");
+                    ok &= check_ordered_trace_matches(trace, references.at(key), label);
+                    if (!ok) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    ok &= check(runs > 1000, "the ordered trace covers every step boundary of every run");
+    return ok;
+}
+
+// Replies the backend refuses still reach their disposition at their
+// operation's step boundary, in query order and before later input; the
+// operation retires and its callback epoch settles.
+bool test_refused_replies_keep_their_place()
+{
+    bool ok = true;
+    for (const bool budgeted : {true, false}) {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        session->set_cell_pixel_size({10, 20});
+        (void)session->start(launch_config_with_grid(10, 40));
+        session->process_backend_callback_events();
+        if (budgeted) {
+            session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+        }
+        backend->fail_write = true;
+        ok &= check(backend->emit_output(ordered_trace_output()), "the refused-reply output queues");
+        const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+        if (budgeted) {
+            for (int step = 0; step < 6; ++step) {
+                (void)session->process_backend_callback_events_for(
+                    std::chrono::steady_clock::duration::zero());
+            }
+        }
+        const QKeyEvent key(QEvent::KeyPress, Qt::Key_K, Qt::NoModifier, QStringLiteral("k"));
+        (void)session->write_key_event(key);
+        ok &= check(backend->write_attempts.size() == 4U &&
+                ordered_trace_reply_kind(backend->write_attempts[0]) == 0 &&
+                ordered_trace_reply_kind(backend->write_attempts[1]) == 1 &&
+                ordered_trace_reply_kind(backend->write_attempts[2]) == 2 &&
+                backend->write_attempts[3] == expected_encoded_key_event_bytes(key) &&
+                backend->writes.empty(),
+            "refused replies are attempted in query order, all before the later key");
+        ok &= check(notification_count(
+                *session, term::Terminal_session_notification_kind::BACKEND_ERROR) == 4U,
+            "every refused write records its error");
+        ok &= check(session->backend_callbacks_settled(epoch) &&
+                !session->has_pending_backend_callback_events(),
+            "the operation retires and its callback settles");
+    }
+    return ok;
+}
+
+// A settlement's own validation is decided at admission, whatever its tail
+// costs: a stale request is refused, and an unsupported grid declines the
+// request, releases its tail and answers INVALID_ARGUMENT synchronously for
+// every tail size and budget.
+bool test_settlement_results_do_not_depend_on_the_tail()
+{
+    bool ok = true;
+    for (const QByteArray& tail : {QByteArrayLiteral("tail"), ordered_trace_output()}) {
+        for (const bool budgeted : {true, false}) {
+            term::Terminal_session_config config = text_area_resize_arbitration_config();
+            config.backend_event_notifier = [] {};
+            std::unique_ptr<term::Terminal_session> session;
+            Scripted_backend* backend = make_session(session, config);
+            session->set_cell_pixel_size({10, 20});
+            (void)session->start(launch_config_with_grid(10, 40));
+            if (budgeted) {
+                session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+            }
+            (void)backend->emit_output(QByteArrayLiteral("\x1b[8;9;40t"));
+            session->process_backend_callback_events();
+            (void)backend->emit_output(tail);
+            session->process_backend_callback_events();
+            const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+                arbitration_requests(*session);
+            if (!check(requests.size() == 1U && requests.front().request.has_value(),
+                    "the settlement-result request reaches the host"))
+            {
+                return false;
+            }
+            const std::uint64_t id = requests.front().request->request_id;
+            ok &= check(session->settle_text_area_resize_arbitration({
+                    id + 7U,
+                    term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+                    term::terminal_grid_size_t{9, 40},
+                }).code == term::Terminal_session_result_code::INVALID_STATE,
+                "a stale request id is refused synchronously");
+            ok &= check(session->settle_text_area_resize_arbitration({
+                    id,
+                    term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+                    term::terminal_grid_size_t{0, 0},
+                }).code == term::Terminal_session_result_code::INVALID_ARGUMENT,
+                "an unsupported grid answers INVALID_ARGUMENT synchronously at every tail size");
+            session->process_backend_callback_events();
+            const std::optional<term::Terminal_render_snapshot> snapshot =
+                session->latest_render_snapshot();
+            ok &= check(session->grid_size().rows == 10 && snapshot.has_value() &&
+                    snapshot_contains_text(*snapshot, tail.size() > 4 ? QStringLiteral("line") : QStringLiteral("tail")),
+                "the declined request's tail replays on the unchanged grid");
+        }
+    }
+    return ok;
+}
+
+// Withdrawing the host's capability or resize policy takes effect before any
+// drain, even while an operation with a later CSI 8 t is open: that request
+// never arms, and under a DISABLED policy it is not honored either.
+bool test_withdrawal_reaches_an_open_operation()
+{
+    bool ok = true;
+    for (const bool disable_policy : {true, false}) {
+        term::Terminal_session_config config = text_area_resize_arbitration_config();
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        session->set_cell_pixel_size({10, 20});
+        (void)session->start(launch_config_with_grid(10, 40));
+        session->process_backend_callback_events();
+        session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+        (void)backend->emit_output(
+            ordered_trace_image() + QByteArrayLiteral("\x1b[8;7;40tafter"));
+        (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        ok &= check(session->has_pending_backend_callback_events(),
+            "the operation with the later request is open");
+        if (disable_policy) {
+            session->set_text_area_resize_policy(term::Terminal_text_area_resize_policy::DISABLED);
+        }
+        else {
+            session->set_text_area_resize_arbitration(std::nullopt);
+        }
+        session->process_backend_callback_events();
+        ok &= check(arbitration_requests(*session).empty(),
+            "no request arms after the withdrawal");
+        ok &= check(disable_policy
+                ? session->grid_size().rows == 10
+                : session->grid_size().rows == 7,
+            disable_policy
+                ? "a DISABLED policy does not honor the request"
+                : "without the capability the request commits at its sequence point");
+    }
+    return ok;
+}
+
+// Callback ingress overflowing while an operation is open stops the backend
+// at once, outside the head; the open operation is older than the stop, so
+// later drains still complete it, its later replies are disposed of as
+// refused by the stopped backend, and the exit follows it.
+bool test_ingress_overflow_leaves_the_open_operation_to_finish()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    config.output_queue_limits.high_water_bytes = 2048U;
+    config.output_queue_limits.hard_limit_bytes = 4096U;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    (void)session->start(launch_config_with_grid(10, 40));
+    session->process_backend_callback_events();
+    session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+    (void)backend->emit_output(ordered_trace_output());
+    for (int step = 0; step < 4; ++step) {
+        (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    ok &= check(session->has_pending_backend_callback_events() &&
+            backend->write_attempts.size() == 2U,
+        "the overflow fixture's operation is open after its first replies");
+    (void)backend->emit_output_ignoring_pause(QByteArray(8192, 'x'));
+    int calls = 0;
+    bool exit_before_output = false;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        const std::optional<term::Terminal_render_snapshot> snapshot =
+            session->latest_render_snapshot();
+        exit_before_output = exit_before_output ||
+            (session->exit_status().has_value() &&
+                (!snapshot.has_value() || !snapshot_contains_text(*snapshot, QStringLiteral("world"))));
+    }
+    ok &= check(!session->has_pending_backend_callback_events(),
+        "the open operation completes after the overflow");
+    ok &= check(backend->write_attempts.size() == 2U && backend->writes.size() == 2U,
+        "the reply generated after the stop is not written");
+    bool refused = false;
+    for (const term::Terminal_session_notification& notification : session->notifications()) {
+        refused = refused ||
+            (notification.kind == term::Terminal_session_notification_kind::BACKEND_ERROR &&
+                notification.message == QStringLiteral("session write requires a running backend"));
+    }
+    ok &= check(refused, "the reply after the stop is refused with its error recorded");
+    ok &= check(session->exit_status().has_value() && !exit_before_output,
+        "the exit follows the open operation");
+    return ok;
+}
+
+// An input reached from inside a drain cannot advance the open operation and
+// takes the unsettled outcome; the operation completes and later input is
+// accepted.
+bool test_reentrant_input_takes_the_unsettled_outcome()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    (void)session->start(launch_config_with_grid(10, 40));
+    session->process_backend_callback_events();
+    session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+    std::optional<term::Terminal_session_result_code> reentrant_code;
+    backend->after_outputs_during_write = [&] {
+        if (!reentrant_code.has_value()) {
+            const QKeyEvent key(QEvent::KeyPress, Qt::Key_R, Qt::NoModifier, QStringLiteral("r"));
+            reentrant_code = session->write_key_event(key).result.code;
+        }
+    };
+    (void)backend->emit_output(ordered_trace_output());
+    (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    ok &= check(reentrant_code == term::Terminal_session_result_code::INVALID_STATE,
+        "a key reached from inside the drain is refused as unsettled");
+    backend->after_outputs_during_write = {};
+    session->process_backend_callback_events();
+    const QKeyEvent key(QEvent::KeyPress, Qt::Key_K, Qt::NoModifier, QStringLiteral("k"));
+    const QKeyEvent refused(QEvent::KeyPress, Qt::Key_R, Qt::NoModifier, QStringLiteral("r"));
+    ok &= check(session->write_key_event(key).result.code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            backend->writes.back() == expected_encoded_key_event_bytes(key) &&
+            std::count(
+                backend->writes.begin(),
+                backend->writes.end(),
+                expected_encoded_key_event_bytes(refused)) == 0,
+        "the operation completes and the later key is written, the refused one never");
+    return ok;
+}
+
+// A session as a host embeds it: no result, command or event traces, so a
+// synchronous result can come only from its own capture.
+Scripted_backend* make_untraced_session(
+    std::unique_ptr<term::Terminal_session>&   session,
+    term::Terminal_session_config              config)
+{
+    auto              backend     = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    session = std::make_unique<term::Terminal_session>(
+        std::move(backend),
+        recovery_disabled_primary_backing_session_config(config));
+    return backend_ptr;
+}
+
+// Arms one request in an untraced session and hands it to the host.
+std::uint64_t arm_untraced_request(term::Terminal_session& session, Scripted_backend& backend)
+{
+    (void)backend.emit_output(QByteArrayLiteral("\x1b[8;9;40t"));
+    session.process_backend_callback_events();
+    std::uint64_t request_id = 0U;
+    for (term::Terminal_session_delivery& delivery : session.take_pending_deliveries()) {
+        if (delivery.text_area_resize_arbitration_event.has_value() &&
+            delivery.text_area_resize_arbitration_event->request.has_value())
+        {
+            request_id = delivery.text_area_resize_arbitration_event->request->request_id;
+            (void)session.mark_text_area_resize_arbitration_presented(request_id);
+        }
+    }
+    return request_id;
+}
+
+// A settlement's operation owns its output until it retires, through the
+// disposal of the replies its last step generated: a write that re-enters from
+// that disposal takes the unsettled outcome and cannot disturb the settlement's
+// own result, which an untraced session gets only from its capture.
+bool test_final_settlement_step_keeps_its_ownership()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_untraced_session(session, config);
+    (void)session->start(launch_config_with_grid(10, 40));
+    session->process_backend_callback_events();
+    const std::uint64_t request_id = arm_untraced_request(*session, *backend);
+    ok &= check(request_id != 0U, "the untraced request reaches the host");
+    (void)backend->emit_output(QByteArrayLiteral("held\x1b[c"));
+    session->process_backend_callback_events();
+
+    std::optional<term::Terminal_session_result_code> nested_code;
+    backend->after_outputs_during_write = [&] {
+        if (!nested_code.has_value()) {
+            nested_code = session->write_user_bytes(QByteArrayLiteral("nested")).code;
+        }
+    };
+    const term::Terminal_session_result settled = session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{0, 0},
+    });
+    backend->after_outputs_during_write = {};
+    session->process_backend_callback_events();
+
+    ok &= check(nested_code == term::Terminal_session_result_code::INVALID_STATE,
+        "a write re-entering from the settlement's last reply is refused as unsettled");
+    ok &= check(settled.code == term::Terminal_session_result_code::INVALID_ARGUMENT,
+        "the unsupported-grid settlement returns its own result without traces");
+    ok &= check(backend->writes.size() == 1U &&
+            backend->writes.front().startsWith(QByteArrayLiteral("\x1b[?")),
+        "only the tail's reply is written");
+    return ok;
+}
+
+// The model setters settle older output before they change anything. Reached
+// from inside a drain, with a placement the drain left pending, they cannot
+// settle it and change nothing: no configuration, no model state, no backend
+// call.
+bool test_reentrant_setters_leave_a_pending_placement_alone()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_untraced_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    (void)session->start(launch_config_with_grid(80, 160));
+    session->process_backend_callback_events();
+    const std::uint64_t byte_budget_before = session->retained_history_diagnostics().byte_budget;
+    const std::size_t cell_calls_before = backend->cell_pixel_sizes.size();
+
+    // The query's reply is disposed of at the end of the step that decoded
+    // and ended the image, which leaves its placement pending.
+    bool placement_pending = false;
+    backend->after_outputs_during_write = [&] {
+        placement_pending = session->has_pending_backend_callback_events();
+        session->set_scrollback_limit(5);
+        session->set_retained_history_capacity_bytes(
+            term::k_terminal_min_retained_history_capacity_bytes);
+        session->set_color_state(term::Terminal_color_state{});
+        session->set_cell_pixel_size({12, 24});
+    };
+    (void)backend->emit_output(
+        QByteArrayLiteral("\x1b[c\x1bPq\"1;1;1448;1448\x1b\\after"));
+    (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    backend->after_outputs_during_write = {};
+    ok &= check(placement_pending, "the setters run while the image's placement is pending");
+    session->process_backend_callback_events();
+
+    ok &= check(backend->cell_pixel_sizes.size() == cell_calls_before,
+        "the re-entered cell size setter reaches neither the model nor the backend");
+    ok &= check(session->retained_history_diagnostics().byte_budget == byte_budget_before,
+        "the re-entered capacity setter leaves the retained history alone");
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    const std::shared_ptr<const term::Terminal_image_slice> image =
+        snapshot.has_value() ? term::render_snapshot_row_image(*snapshot, 0) : nullptr;
+    ok &= check(image != nullptr &&
+            image->cell_pixel_size == term::terminal_cell_pixel_size_t{10, 20} &&
+            snapshot_contains_text(*snapshot, QStringLiteral("after")),
+        "the placement completes on the cell it was planned for");
+
+    // Outside a drain the same setter takes effect.
+    session->set_cell_pixel_size({12, 24});
+    ok &= check(backend->cell_pixel_sizes.size() == cell_calls_before + 1U,
+        "a setter outside the drain still takes effect");
     return ok;
 }
 
@@ -20767,7 +22058,20 @@ int main()
     ok &= test_worker_thread_callback_is_delivered();
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
-    ok &= test_budgeted_backend_callback_drain_yields_after_each_sixel_image();
+    ok &= test_budgeted_backend_callback_drain_resumes_sixel_work();
+    ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
+    ok &= test_paused_window_stays_inside_its_command();
+    ok &= test_settle_with_a_reply_before_a_heavy_image_stays_asynchronous();
+    ok &= test_exit_waits_behind_a_heavy_held_tail();
+    ok &= test_forced_release_keeps_a_placement_budgeted();
+    ok &= test_released_output_keeps_the_unbudgeted_order();
+    ok &= test_refused_replies_keep_their_place();
+    ok &= test_settlement_results_do_not_depend_on_the_tail();
+    ok &= test_withdrawal_reaches_an_open_operation();
+    ok &= test_ingress_overflow_leaves_the_open_operation_to_finish();
+    ok &= test_reentrant_input_takes_the_unsettled_outcome();
+    ok &= test_final_settlement_step_keeps_its_ownership();
+    ok &= test_reentrant_setters_leave_a_pending_placement_alone();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
     ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
     ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();

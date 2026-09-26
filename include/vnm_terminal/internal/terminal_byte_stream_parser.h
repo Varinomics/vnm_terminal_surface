@@ -28,20 +28,22 @@ Terminal_csi_byte_kind terminal_csi_byte_kind(unsigned char byte);
 class Terminal_byte_stream_parser
 {
 public:
-    // Parses bytes from offset on and stops right after a sixel image
-    // completes, so its caller applies each image before the next is decoded
-    // and at most one decoded raster is alive at a time, however many images
-    // one chunk describes. offset advances past what was parsed; the caller
-    // calls again until it reaches bytes.size().
-    std::vector<Parser_action> ingest(QByteArrayView bytes, qsizetype& offset);
+    // Parses bytes from offset on and stops right after every sixel string
+    // ends, whatever ends it (the image completes, or a cancel, a recovery or
+    // an over-cap discard abandons it), so its caller applies each image
+    // before the next is decoded, at most one decoded raster is alive at a
+    // time however many images one chunk describes, and a spent budget is
+    // seen at every such boundary. It also stops where the budget cannot pay
+    // for the next sixel step (sixel_work_deferred). offset advances past what
+    // was parsed; the caller calls again until it reaches bytes.size(),
+    // handing deferred bytes over again in a later step.
+    std::vector<Parser_action> ingest(
+        QByteArrayView       bytes,
+        qsizetype&           offset,
+        Sixel_work_budget*   budget = nullptr);
 
-    // Where a caller that yields after each sixel image should end the next
-    // chunk it hands over: just past the first byte of bytes that could
-    // complete an image, or bytes.size() when none can. The bound is
-    // conservative, so a chunk may end early but never holds two image ends.
-    // It reads the parser's state without changing it and scans each byte of
-    // bytes at most once, up to the bound.
-    qsizetype sixel_image_boundary(QByteArrayView bytes) const;
+    // Whether the last ingest stopped because its budget ran out.
+    bool sixel_work_deferred() const { return m_sixel_work_deferred; }
 
     // The decoded size a sixel image may reach; its owner keeps it equal to
     // the retained history's largest record.
@@ -94,6 +96,11 @@ private:
         qsizetype                      payload_begin,
         Parser_string_terminator&      terminator);
 
+    void continue_sixel_string(
+        QByteArrayView                 bytes,
+        qsizetype&                     offset,
+        std::vector<Parser_action>&    actions);
+
     bool append_string_payload(
         Parser_sequence_family         family,
         QByteArrayView                 payload,
@@ -142,6 +149,10 @@ private:
     Terminal_utf8_scan_state   m_string_utf8_scan_state;
     bool                       m_dcs_header_pending            = false;
     Sixel_decoder              m_sixel_decoder;
+    Sixel_work_budget*         m_sixel_work_budget             = nullptr;
+    bool                       m_sixel_work_deferred           = false;
+    // A sixel string ended since the parse loop last looked.
+    bool                       m_sixel_string_ended            = false;
     bool                       m_discarding_csi                = false;
     bool                       m_discarding_escape             = false;
     std::uint64_t              m_next_host_request_id          = 1U;

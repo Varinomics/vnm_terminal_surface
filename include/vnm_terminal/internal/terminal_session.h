@@ -243,6 +243,23 @@ public:
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;
     bool render_publication_blocked() const;
+    // The application's synchronized-output hold, which a stale-hold recovery
+    // may end; a sixel placement in progress also blocks publication, but
+    // ends on its own.
+    bool synchronized_output_hold_active() const;
+    // Whether output up to a callback epoch is settled: every backend callback
+    // up to the epoch has been processed and no runner operation is open. An
+    // open operation (a callback's output, or output a hold captured and a
+    // release let go) owns what it has not yet applied, its replies included,
+    // so input reads its modes and a frame counts as caught up only once this
+    // holds for its frontier.
+    bool backend_callbacks_settled(std::uint64_t epoch) const;
+    // Counts runner steps. A drain that advanced it made progress, whether or
+    // not a callback epoch completed.
+    std::uint64_t backend_output_step_count() const;
+    // Test only: the sixel work budget of each budgeted drain step, asked for
+    // once per step; empty restores the production default.
+    void set_sixel_work_step_units_for_testing(std::function<std::uint64_t()> units);
     Terminal_synchronized_output_scroll_policy effective_synchronized_output_scroll_policy() const;
     bool has_pending_backend_callback_events() const;
     std::size_t pending_backend_callback_event_count() const;
@@ -442,10 +459,13 @@ private:
     Terminal_session_result enqueue_command(
         Terminal_session_command   command);
 
+    // With single_step, the pass runs the command's operation for one budgeted
+    // step and leaves what remains of it to later drains.
     Terminal_session_result enqueue_and_process_synchronous_command(
         Terminal_session_command           command,
         Backend_callback_drain_policy      drain_policy =
-            Backend_callback_drain_policy::DRAIN_CALLBACKS);
+            Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        bool                               single_step = false);
     Terminal_session_result settle_text_area_resize_arbitration_locked(
         terminal_text_area_resize_arbitration_settlement_t settlement);
 
@@ -457,8 +477,71 @@ private:
         std::optional<std::uint64_t>       target_backend_callback_epoch =
             std::nullopt);
 
-    Terminal_session_result process_command(
-        Terminal_session_command   command);
+    // What the head operation still has to do, in order.
+    enum class Runner_operation_phase
+    {
+        // A backend output callback's own bytes.
+        OWN_SOURCE,
+        // The bytes a hold captured and this operation's release let go.
+        RELEASED_TAIL,
+        // A backend exit's effects, which follow its released tail.
+        EXIT_EFFECTS,
+        RETIRED,
+    };
+
+    // The head of the command runner: a command admitted and not yet retired.
+    // It owns what is left of its source (its own bytes, then or first a
+    // released tail) and everything that source causes, replies included;
+    // nothing behind it starts until it retires.
+    struct Runner_operation
+    {
+        Terminal_session_command command;
+        Queue_category           category = Queue_category::NONE;
+        // Own bytes consumed, and own bytes recorded as they entered.
+        qsizetype                position = 0;
+        qsizetype                recorded = 0;
+        bool                     entered  = false;
+        bool                     admitted = false;
+        // Set once the operation has output to interpret (a callback's bytes,
+        // or a released tail) and kept until it retires, so it counts as open
+        // output through the disposal of its last replies.
+        bool                     owns_output = false;
+        Runner_operation_phase   phase    = Runner_operation_phase::OWN_SOURCE;
+        // Whether the released tail may arm the next text-area resize
+        // request; an exit's may not.
+        bool                     released_tail_allows_rearm = true;
+    };
+
+    // A reply its operation generated. It takes a write-queue slot from its
+    // generation to its disposition, as a queued write does; one the queue
+    // could not take is disposed of as a queue rejection.
+    struct Operation_reply
+    {
+        Terminal_session_command command;
+        bool                     queue_rejected = false;
+    };
+
+    bool output_operation_open() const;
+    bool backend_output_settled(std::uint64_t epoch) const;
+    void admit_front_command();
+    void run_operation_step(bool windowed);
+    Terminal_session_result admit_operation(Runner_operation& operation);
+    Terminal_session_result admit_backend_output(Runner_operation& operation);
+    bool step_backend_output_source(
+        Runner_operation&          operation,
+        bool                       windowed);
+    void step_released_tail(
+        Runner_operation&          operation,
+        bool                       windowed);
+    void finish_released_tail(Runner_operation& operation);
+    void consume_operation_source(
+        Runner_operation&          operation,
+        qsizetype                  byte_count);
+    void record_backend_output_entry(
+        Runner_operation&          operation,
+        qsizetype                  end);
+    void dispose_operation_replies();
+    void retire_operation();
 
     Terminal_session_result process_start_command(
         const Terminal_session_command&        command);
@@ -505,10 +588,10 @@ private:
     Terminal_session_result force_release_synchronized_output_locked(
         std::uint64_t                          sequence);
 
-    Terminal_session_result process_backend_output_command(
+    Terminal_session_result process_backend_exit_command(
         const Terminal_session_command&        command);
 
-    Terminal_session_result process_backend_exit_command(
+    void apply_backend_exit(
         const Terminal_session_command&        command);
 
     Terminal_session_result process_backend_error_command(
@@ -675,7 +758,9 @@ private:
     bool scanned_text_area_resize_request(
         unsigned char             final_byte,
         terminal_grid_size_t&     requested_grid_size) const;
-    void flush_text_area_resize_candidate(
+    // Returns how many candidate bytes the model left; see
+    // ingest_backend_output_bytes.
+    qsizetype flush_text_area_resize_candidate(
         std::uint64_t              sequence,
         bool                       decline_request,
         bool                       may_complete_backend_output_callback = false);
@@ -693,13 +778,10 @@ private:
     void prepare_text_area_resize_tail(std::size_t hold_limit_bytes);
     void append_text_area_resize_tail(QByteArrayView bytes);
     void clear_text_area_resize_tail_epoch();
-    void replay_text_area_resize_tail(
-        std::uint64_t              sequence,
-        bool                       allow_arbitration);
 
-    bool hold_text_area_resize_arbitration_output(
-        const Terminal_session_command&                command);
-
+    // Ends the hold inside the head operation: applies the captured request as
+    // the outcome decides, and makes the captured tail the operation's next
+    // source, which its later steps replay.
     void release_text_area_resize_arbitration(
         Terminal_text_area_resize_arbitration_outcome  outcome,
         terminal_grid_size_t                           effective_grid_size,
@@ -709,25 +791,34 @@ private:
     Terminal_session_result process_text_area_resize_arbitration_command(
         const Terminal_session_command&                command);
 
-    void ingest_backend_output_bytes(
+    // The output ingest layers each return how many of their bytes the model
+    // left for a later step, always their last ones; m_backend_output_stopped
+    // says whether it stopped, which a pending placement can do with nothing
+    // left over. available_bytes counts these bytes and the rest of their
+    // source after them, which a text-area resize request's hold would take.
+    qsizetype ingest_backend_output_bytes(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
-        bool                       allow_arbitration = true);
+        std::size_t                available_bytes);
 
     // Walks one scanner-approved run, splitting it at the
     // synchronized-output boundaries it contains. The caller states whether this
     // run may complete the in-flight backend output callback; a run that is only
     // a prefix of the command's bytes may not.
-    void ingest_backend_output_run(
+    qsizetype ingest_backend_output_run(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
         Terminal_utf8_scan_state   utf8_seed,
         bool                       may_complete_backend_output_callback);
 
-    void ingest_backend_output_segment(
+    qsizetype ingest_backend_output_segment(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
         bool                       completes_backend_output_callback = false);
+
+    // Continues the sixel placement the head operation's last step left
+    // waiting; true once none waits.
+    bool advance_pending_sixel_placement(std::uint64_t sequence);
 
     void defer_backend_content_snapshot(
         std::uint64_t                          sequence,
@@ -1084,9 +1175,20 @@ private:
     std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_ready_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_processing_backend_callback_epoch = 0U;
-    std::uint64_t                                          m_processing_command_callback_epoch = 0U;
     std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
-    std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
+    // The sixel work budget of the drain step in progress; none when the
+    // drain has no deadline.
+    Sixel_work_budget*                                     m_sixel_work_budget = nullptr;
+    std::function<std::uint64_t()>                         m_sixel_work_step_units_for_testing;
+    // Whether the model stopped in the output being ingested, and how many of
+    // its bytes it left; see ingest_backend_output_bytes.
+    bool                                                   m_backend_output_stopped = false;
+    qsizetype                                              m_unconsumed_backend_output_bytes = 0;
+    // The runner's head operation, the replies its current step generated,
+    // and the steps taken so far.
+    std::optional<Runner_operation>                        m_operation;
+    std::vector<Operation_reply>                           m_operation_replies;
+    std::uint64_t                                          m_operation_step_count = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
     std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;

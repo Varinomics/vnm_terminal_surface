@@ -872,110 +872,6 @@ bool test_sixel_cap_trips_inside_a_scaled_band()
     return ok;
 }
 
-bool test_sixel_image_boundary()
-{
-    bool ok = true;
-
-    // A caller that yields after each image ends its chunk at the boundary:
-    // never past the terminator of the first image in the chunk, and early at
-    // worst.
-    const QByteArray image = sixel_dcs({}, "~");
-    term::Terminal_byte_stream_parser idle;
-    ok &= check(idle.sixel_image_boundary("plain text") == 10, "text has no boundary");
-    ok &= check(idle.sixel_image_boundary("A" + image + "B" + image) == 1 + image.size(),
-        "the boundary follows the first image's terminator");
-    const QByteArray title("\x1b]2;title\x1b\\");
-    ok &= check(idle.sixel_image_boundary(title + image) == title.size() + image.size(),
-        "a terminator before any DCS is no boundary");
-    ok &= check(idle.sixel_image_boundary(QByteArray("\x90q~\x9crest", 8)) == 4,
-        "the C1 forms bound an image too");
-    ok &= check(idle.sixel_image_boundary(QByteArray("x\\y")) == 3,
-        "a backslash outside any DCS is no boundary");
-    const QByteArray other_dcs("\x1bP$qm\x1b\\");
-    ok &= check(idle.sixel_image_boundary(other_dcs + "x") == other_dcs.size() + 1 &&
-            idle.sixel_image_boundary(other_dcs + image + "x") ==
-                other_dcs.size() + image.size(),
-        "a DCS that is not sixel is no boundary");
-
-    // A header the parser already buffers decides the DCS just the same.
-    term::Terminal_byte_stream_parser sixel_header;
-    ingest_all(sixel_header, QByteArray("\x1bP0;1"));
-    ok &= check(sixel_header.sixel_image_boundary(QByteArray("q~\x1b\\tail")) == 4,
-        "a buffered header that ends in q starts an image");
-    term::Terminal_byte_stream_parser other_header;
-    ingest_all(other_header, QByteArray("\x1bP0;1"));
-    ok &= check(other_header.sixel_image_boundary(QByteArray("z\x1b\\") + image + "x") ==
-            3 + image.size(),
-        "a buffered header that ends otherwise is no image");
-    term::Terminal_byte_stream_parser other_payload;
-    ingest_all(other_payload, QByteArray("\x1bPzz"));
-    ok &= check(other_payload.sixel_image_boundary(QByteArray("\x1b\\tail")) == 6,
-        "the end of a DCS in progress that is not sixel is no boundary");
-
-    // Mid-image, the next terminator ends it, including one whose ESC the
-    // caller or the parser still holds.
-    term::Terminal_byte_stream_parser mid_image;
-    ingest_all(mid_image, QByteArray("\x1bPq~~"));
-    ok &= check(mid_image.sixel_image_boundary(QByteArray("~\x1b\\tail")) == 3,
-        "mid-image the terminator is the boundary");
-    ok &= check(mid_image.sixel_image_boundary(QByteArray("\\tail")) == 1,
-        "mid-image a leading backslash may complete the terminator");
-
-    // A caller cuts each window of bytes it receives at successive
-    // boundaries. For every split of a stream into two windows, including
-    // one inside each terminator, which leaves its ESC pending in the parser,
-    // the cuts leave at most one image per chunk, ending it, and exactly the
-    // actions of parsing the same windows uncut. The stream has images ended
-    // by both ST forms, a cancelled image, one a CSI abandons, an OSC ended by
-    // ST and a query.
-    const QByteArray image_8bit_st("\x1bPq#1;2;100;0;0~~\x9c");
-    const QByteArray stream =
-        "A" + image + image_8bit_st + QByteArray("\x1b]2;t\x1b\\") +
-        QByteArray("\x1bPq~\x18") + QByteArray("\x1bPq~\x1b[1m") + image + "\x1b[cB";
-    const auto parse_windows = [](const QByteArray& bytes, qsizetype split, bool cut, bool& bounded) {
-        term::Terminal_byte_stream_parser parser;
-        std::vector<term::Parser_action> actions;
-        for (const QByteArrayView window : {
-            QByteArrayView(bytes).first(split), QByteArrayView(bytes).sliced(split)})
-        {
-            for (qsizetype offset = 0; offset < window.size();) {
-                const QByteArrayView rest  = window.sliced(offset);
-                const qsizetype      chunk = cut ? parser.sixel_image_boundary(rest) : rest.size();
-                const std::vector<term::Parser_action> chunk_actions =
-                    ingest_all(parser, rest.first(chunk));
-                const std::size_t chunk_images = images_in(chunk_actions).size();
-                bounded = bounded && chunk_images <= 1U &&
-                    (chunk_images == 0U || images_in({chunk_actions.back()}).size() == 1U);
-                actions.insert(actions.end(), chunk_actions.begin(), chunk_actions.end());
-                offset += chunk;
-            }
-        }
-        return actions;
-    };
-
-    bool bounded       = true;
-    bool same_as_uncut = true;
-    for (qsizetype split = 0; split <= stream.size(); ++split) {
-        bool unused = true;
-        const std::vector<term::Parser_action> uncut = parse_windows(stream, split, false, unused);
-        const std::vector<term::Parser_action> cut   = parse_windows(stream, split, true,  bounded);
-        same_as_uncut = same_as_uncut && images_in(uncut).size() == 3U && same_actions(cut, uncut);
-    }
-    ok &= check(bounded, "a bounded chunk holds at most one image, as its last action");
-    ok &= check(same_as_uncut, "cutting at boundaries keeps every action exactly");
-
-    // The split inside the first terminator leaves its ESC pending, and the
-    // backslash that completes it is the next window's first boundary.
-    const qsizetype pending_escape_split = 1 + image.size() - 1;
-    term::Terminal_byte_stream_parser pending_escape;
-    ingest_all(pending_escape, QByteArrayView(stream).first(pending_escape_split));
-    ok &= check(
-        stream.at(pending_escape_split) == '\\' &&
-            pending_escape.sixel_image_boundary(QByteArrayView(stream).sliced(pending_escape_split)) == 1,
-        "a pending ESC and a leading backslash end the image");
-    return ok;
-}
-
 bool test_sixel_header_limit_is_chunk_independent()
 {
     bool ok = true;
@@ -1165,6 +1061,256 @@ bool test_parser_stops_after_each_image_across_chunks()
     return ok;
 }
 
+// With a sixel work budget the parser stops after the byte whose work spends
+// it, a draw, a graphics new line, a raster reservation or an image end, and
+// the bytes after it are handed over in the next step. However small the
+// budget, parsing a stream step by step gives exactly the actions and images
+// of parsing it whole.
+bool test_sixel_budget_steps_match_a_whole_parse()
+{
+    bool ok = true;
+
+    const QByteArray overdraw =
+        QByteArray("\x1bP0;1q\"1;1#1;2;100;0;0#2;2;0;100;0") +
+        QByteArray("#1!300~$#2!300~-").repeated(6) + QByteArray("\x1b\\");
+    const std::vector<std::pair<std::string, QByteArray>> streams = {
+        {"images between text",
+            "A" + sixel_dcs({}, "#1~~-~") + "B" + sixel_dcs("2;1", "#1!20~$!40~-!10~") + "C"},
+        {"a background raster", sixel_dcs("0;0", "\"1;1;64;48#0;2;0;0;100#1!64~")},
+        {"overdraw at 2:1", overdraw},
+        {"8-bit controls", QByteArray("\x90q#1!9~-~\x9c", 10) + QByteArray("x")},
+        {"a cancelled and a recovered image",
+            QByteArray("\x1bPq!50~\x18") + QByteArray("\x1bPq!50~\x1b[0m") + sixel_dcs({}, "~~")},
+        {"a query after an image", sixel_dcs({}, "!100~-!100~") + QByteArray("\x1b[c")},
+    };
+
+    for (const auto& [name, stream] : streams) {
+        const std::vector<term::Parser_action> whole = parse(stream);
+        for (const std::uint64_t units : {1ULL, 7ULL, 600ULL}) {
+            const std::string label = name + " in steps of " + std::to_string(units) + " units";
+            term::Terminal_byte_stream_parser parser;
+            std::vector<term::Parser_action> stepped;
+            bool      deferred = false;
+            qsizetype offset   = 0;
+            for (int step = 0; offset < stream.size() && step < 100000; ++step) {
+                term::Sixel_work_budget budget(units);
+                const std::vector<term::Parser_action> actions =
+                    parser.ingest(stream, offset, &budget);
+                deferred = deferred || parser.sixel_work_deferred();
+                stepped.insert(stepped.end(), actions.begin(), actions.end());
+            }
+            ok &= check(offset == stream.size(), label + ": the whole stream is parsed");
+            ok &= check(deferred || units == 600U, label + ": a small budget defers work");
+            ok &= check(same_actions(stepped, whole), label + ": exactly the same actions");
+        }
+    }
+
+    // For every split of a stream into two windows, including one inside each
+    // terminator, which leaves its ESC pending in the parser, parsing each
+    // window in steps of one unit gives exactly the actions of parsing the
+    // windows whole. The stream has images ended by both ST forms, a
+    // cancelled image, one a CSI abandons, an OSC ended by ST and a query.
+    const QByteArray image = sixel_dcs({}, "~~-~");
+    const QByteArray image_8bit_st("\x1bPq#1;2;100;0;0~~\x9c");
+    const QByteArray mixed =
+        "A" + image + image_8bit_st + QByteArray("\x1b]2;t\x1b\\") +
+        QByteArray("\x1bPq~~\x18") + QByteArray("\x1bPq~~\x1b[1m") + image + "\x1b[cB";
+    const auto parse_windows = [](
+        const QByteArray&            bytes,
+        qsizetype                    split,
+        std::optional<std::uint64_t> units)
+    {
+        term::Terminal_byte_stream_parser parser;
+        std::vector<term::Parser_action> actions;
+        for (const QByteArrayView window : {
+            QByteArrayView(bytes).first(split), QByteArrayView(bytes).sliced(split)})
+        {
+            qsizetype offset = 0;
+            for (int step = 0; offset < window.size() && step < 10000; ++step) {
+                std::optional<term::Sixel_work_budget> budget;
+                if (units.has_value()) {
+                    budget.emplace(*units);
+                }
+                const std::vector<term::Parser_action> step_actions = parser.ingest(
+                    window,
+                    offset,
+                    budget.has_value() ? &*budget : nullptr);
+                actions.insert(actions.end(), step_actions.begin(), step_actions.end());
+            }
+        }
+        return actions;
+    };
+    bool same_as_whole = true;
+    for (qsizetype split = 0; split <= mixed.size(); ++split) {
+        const std::vector<term::Parser_action> whole   = parse_windows(mixed, split, std::nullopt);
+        const std::vector<term::Parser_action> stepped = parse_windows(mixed, split, 1U);
+        same_as_whole = same_as_whole && images_in(whole).size() == 3U &&
+            same_actions(stepped, whole);
+    }
+    ok &= check(same_as_whole, "budget steps keep every action exactly for every split");
+    return ok;
+}
+
+// A raster reservation is charged to the byte that causes it. Raster
+// attributes that alternate between two shapes each replace a near-cap
+// transparent raster, which no draw or graphics new line pays for; the byte
+// that completes them is charged for its allocation, and decoding stops after
+// it once that spends the budget. So a call makes at most one such allocation
+// past its budget, at a unit budget and at a drain step's budget, and the
+// steps parse exactly as a whole parse does.
+bool test_sixel_raster_reservations_are_budgeted()
+{
+    bool ok = true;
+
+    const QByteArray alternation("\"1;1;32000;64#0\"1;1;64;32000#0");
+    const QByteArray cancelled = QByteArray("\x1bP0;1q") + alternation.repeated(8) + QByteArray("\x18");
+    // Where each raster attribute command completes: at the byte after its
+    // parameters.
+    std::vector<qsizetype> completions;
+    for (qsizetype index = cancelled.indexOf('"'); index >= 0; index = cancelled.indexOf('"', index + 1)) {
+        completions.push_back(cancelled.indexOf('#', index));
+    }
+
+    for (const std::uint64_t units : {1ULL, 2000000ULL}) {
+        const std::string label = "alternating rasters at " + std::to_string(units) + " units";
+        term::Terminal_byte_stream_parser parser;
+        qsizetype offset = 0;
+        int most_per_call = 0;
+        int calls = 0;
+        for (; offset < cancelled.size() && calls < 1000; ++calls) {
+            const qsizetype before = offset;
+            term::Sixel_work_budget budget(units);
+            (void)parser.ingest(cancelled, offset, &budget);
+            const int completed = static_cast<int>(std::count_if(
+                completions.begin(),
+                completions.end(),
+                [before, offset](qsizetype completion) {
+                    return completion >= before && completion < offset;
+                }));
+            most_per_call = std::max(most_per_call, completed);
+        }
+        ok &= check(offset == cancelled.size(), label + ": the whole string is parsed");
+        ok &= check(most_per_call == 1 && calls >= static_cast<int>(completions.size()),
+            label + ": each call completes at most one reserving raster command");
+    }
+
+    // Cut into two windows around every completion, and stepped at a unit
+    // budget, the string parses exactly as whole.
+    const QByteArray ended = QByteArray("\x1bP0;1q") + alternation.repeated(3) +
+        QByteArray("#1;2;100;0;0#1~~\x1b\\") + QByteArray("B");
+    std::vector<qsizetype> splits;
+    for (qsizetype index = ended.indexOf('"'); index >= 0; index = ended.indexOf('"', index + 1)) {
+        const qsizetype completion = ended.indexOf('#', index);
+        splits.insert(splits.end(), {completion - 1, completion, completion + 1});
+    }
+    const std::vector<term::Parser_action> whole = parse(ended);
+    bool same_as_whole = images_in(whole).size() == 1U;
+    for (const qsizetype split : splits) {
+        term::Terminal_byte_stream_parser parser;
+        std::vector<term::Parser_action> stepped;
+        for (const QByteArrayView window : {
+                QByteArrayView(ended).first(split), QByteArrayView(ended).sliced(split)})
+        {
+            qsizetype offset = 0;
+            for (int step = 0; offset < window.size() && step < 1000; ++step) {
+                term::Sixel_work_budget budget(1U);
+                const std::vector<term::Parser_action> actions = parser.ingest(window, offset, &budget);
+                stepped.insert(stepped.end(), actions.begin(), actions.end());
+            }
+        }
+        same_as_whole = same_as_whole && same_actions(stepped, whole);
+    }
+    ok &= check(same_as_whole,
+        "unit steps cut around every raster completion keep every action exactly");
+    return ok;
+}
+
+// The two inputs that once stalled or misread a suspended string, at unit
+// budgets: an ignored ESC after raster attributes whose completion spends the
+// budget (it was retried at no progress, forever, inside one call; the test's
+// TIMEOUT bounds that), and a UTF-8 lead byte completing them whose
+// continuation is ST's C1 byte (it was read as ST). Both strings end at CAN
+// without an image, whole and cut right after the ESC or between the two
+// UTF-8 bytes, and every call makes progress.
+bool test_suspension_takes_every_byte_once()
+{
+    bool ok = true;
+
+    const QByteArray prefix("\x1bP0;1q\"1;1;1;1#0\"1;1;2;2");
+    const std::vector<std::pair<std::string, QByteArray>> cases = {
+        {"an ignored ESC", QByteArray("\x1bX\x18", 3)},
+        {"a UTF-8 lead byte", QByteArray("\xc2\x9c\x18", 3)},
+    };
+    for (const auto& [name, tail] : cases) {
+        const QByteArray stream = prefix + tail + QByteArray("after");
+        const std::vector<term::Parser_action> whole = parse(stream);
+        for (const std::optional<qsizetype> split :
+            {std::optional<qsizetype>{}, std::optional<qsizetype>{prefix.size() + 1}})
+        {
+            const std::string label = name + (split.has_value() ? ", cut inside it" : ", whole");
+            term::Terminal_byte_stream_parser parser;
+            std::vector<term::Parser_action> stepped;
+            bool progress = true;
+            qsizetype parsed = 0;
+            const std::vector<QByteArrayView> windows = split.has_value()
+                ? std::vector<QByteArrayView>{
+                    QByteArrayView(stream).first(*split), QByteArrayView(stream).sliced(*split)}
+                : std::vector<QByteArrayView>{QByteArrayView(stream)};
+            for (const QByteArrayView window : windows) {
+                qsizetype offset = 0;
+                for (int calls = 0; offset < window.size() && calls < 1000; ++calls) {
+                    const qsizetype before = offset;
+                    term::Sixel_work_budget budget(1U);
+                    const std::vector<term::Parser_action> actions =
+                        parser.ingest(window, offset, &budget);
+                    progress = progress && (offset > before || !actions.empty());
+                    stepped.insert(stepped.end(), actions.begin(), actions.end());
+                }
+                parsed += offset;
+            }
+            ok &= check(parsed == stream.size() && progress,
+                label + ": every call takes a byte, and the whole stream is taken");
+            ok &= check(images_in(stepped).empty() && same_actions(stepped, whole),
+                label + ": the string ends at CAN without an image, as parsed whole");
+        }
+    }
+    return ok;
+}
+
+// An image end is one step that always runs, whatever is left of the budget:
+// it fills and expands the raster, charges that afterwards, and the draws of
+// the next image wait for a later step.
+bool test_sixel_image_end_is_one_step()
+{
+    bool ok = true;
+
+    // The declared 64 x 64 raster and the draw cost 4104 units, and the end's
+    // 64 x 64 background fill 4096 more.
+    const QByteArray stream("\x1bPq\"1;1;64;64#1!8~\x1b\\\x1bPq!3~\x1b\\");
+    term::Terminal_byte_stream_parser parser;
+    term::Sixel_work_budget budget(5000U);
+    qsizetype offset = 0;
+    std::vector<term::Parser_action> actions = parser.ingest(stream, offset, &budget);
+    ok &= check(images_in(actions).size() == 1U && !parser.sixel_work_deferred(),
+        "the first image ends past what is left of the budget");
+
+    const std::vector<term::Parser_action> next = parser.ingest(stream, offset, &budget);
+    ok &= check(images_in(next).empty() && parser.sixel_work_deferred() &&
+            offset < stream.size(),
+        "with the budget spent, the next image's data waits for a later step");
+
+    term::Sixel_work_budget fresh(5000U);
+    const std::vector<term::Parser_action> rest = parser.ingest(stream, offset, &fresh);
+    actions.insert(actions.end(), next.begin(), next.end());
+    actions.insert(actions.end(), rest.begin(), rest.end());
+    const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+    const std::vector<term::Screen_sixel_image_mutation> whole  = images_in(parse(stream));
+    ok &= check(offset == stream.size() && images.size() == 2U && whole.size() == 2U &&
+            images[0].raster == whole[0].raster && images[1].raster == whole[1].raster,
+        "a later step finishes the next image as a whole parse does");
+    return ok;
+}
+
 bool test_model_supplies_the_cap()
 {
     bool ok = true;
@@ -1227,7 +1373,10 @@ int main()
     ok &= test_sixel_header_limit_is_chunk_independent();
     ok &= test_parser_stops_after_each_image();
     ok &= test_parser_stops_after_each_image_across_chunks();
-    ok &= test_sixel_image_boundary();
+    ok &= test_sixel_budget_steps_match_a_whole_parse();
+    ok &= test_sixel_image_end_is_one_step();
+    ok &= test_sixel_raster_reservations_are_budgeted();
+    ok &= test_suspension_takes_every_byte_once();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }

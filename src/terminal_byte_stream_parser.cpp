@@ -304,20 +304,6 @@ bool dcs_header_continues(unsigned char byte)
     return byte < 0x20U && byte != 0x1bU && byte != 0x18U && byte != 0x1aU;
 }
 
-// A completed sixel image is the last action its string produces.
-bool ends_with_sixel_image(const std::vector<Parser_action>& actions)
-{
-    if (actions.empty() ||
-        parser_action_kind(actions.back()) != Parser_action_kind::SCREEN_MUTATION)
-    {
-        return false;
-    }
-
-    return
-        screen_mutation_kind(std::get<Screen_mutation>(actions.back().payload)) ==
-        Screen_mutation_kind::SIXEL_IMAGE;
-}
-
 Parser_action make_string_recovery_diagnostic(Parser_sequence_family family)
 {
     return
@@ -949,51 +935,18 @@ bool parse_sgr_parameter_groups(
     return finish_group();
 }
 
-qsizetype Terminal_byte_stream_parser::sixel_image_boundary(QByteArrayView bytes) const
-{
-    // Only a string terminator ends an image, and only one that ends a sixel
-    // DCS: the image in progress, or a DCS whose header, here or already
-    // buffered, ends in 'q'. The caller may hold the bytes just before these
-    // as well as the parser, so a leading 'P' or backslash counts as following
-    // an ESC. Once in an image the scan leaves it only at a terminator, and
-    // any such byte counts as one: these only end chunks early.
-    enum class Scan_state { OUTSIDE_IMAGE, DCS_HEADER, IMAGE };
-    Scan_state state = Scan_state::OUTSIDE_IMAGE;
-    if (m_string_family == Parser_sequence_family::DCS) {
-        state = m_sixel_decoder.active() ? Scan_state::IMAGE
-              : m_dcs_header_pending     ? Scan_state::DCS_HEADER
-              :                            Scan_state::OUTSIDE_IMAGE;
-    }
-
-    for (qsizetype i = 0; i < bytes.size(); ++i) {
-        const unsigned char byte         = byte_at(bytes, i);
-        const bool          after_escape = i == 0 || byte_at(bytes, i - 1) == 0x1bU;
-        if (state == Scan_state::IMAGE) {
-            if (byte == 0x9cU || (byte == '\\' && after_escape)) {
-                return i + 1;
-            }
-        }
-        else
-        if (byte == 0x90U || (byte == 'P' && after_escape)) {
-            state = Scan_state::DCS_HEADER;
-        }
-        else
-        if (state == Scan_state::DCS_HEADER && !dcs_header_continues(byte)) {
-            state = byte == 'q' ? Scan_state::IMAGE : Scan_state::OUTSIDE_IMAGE;
-        }
-    }
-
-    return bytes.size();
-}
-
 std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
-    QByteArrayView bytes,
-    qsizetype&     offset)
+    QByteArrayView       bytes,
+    qsizetype&           offset,
+    Sixel_work_budget*   budget)
 {
+    m_sixel_work_budget   = budget;
+    m_sixel_work_deferred = false;
     const QByteArrayView unparsed = bytes.sliced(offset);
     std::vector<Parser_action> actions;
     if (m_pending_prefix.isEmpty()) {
         offset += ingest_buffer(unparsed, actions);
+        m_sixel_work_budget = nullptr;
         return actions;
     }
 
@@ -1002,11 +955,17 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
     const qsizetype prefix_size = prefixed.size();
     prefixed.append(unparsed.data(), unparsed.size());
     const qsizetype parsed = ingest_buffer(prefixed, actions);
+    m_sixel_work_budget = nullptr;
 
-    // An image ends at a string terminator, and a pending prefix holds a
-    // sequence its own bytes could not complete, so a stop at an image always
-    // falls past the prefix.
-    Q_ASSERT(parsed >= prefix_size);
+    // A pending prefix holds a sequence its own bytes could not complete, so
+    // an image, which ends at its string terminator, and a budget stop, which
+    // comes before a draw or graphics new line, both fall past it. Only a
+    // recovery can end a sixel string at a held ESC, and the ESC then starts
+    // the sequence the next call parses: it is held again.
+    if (parsed < prefix_size) {
+        m_pending_prefix = prefixed.first(prefix_size).sliced(parsed);
+        return actions;
+    }
     offset += parsed - prefix_size;
     return actions;
 }
@@ -1032,6 +991,13 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         print_text_printable_ascii_only = true;
     };
 
+    // A sixel string that ends, however it ends, is a place to return: the
+    // caller applies an image before the next is decoded and sees a spent
+    // budget there, since an abandoned image's raster was paid for too.
+    const auto sixel_boundary_reached = [&]() {
+        return std::exchange(m_sixel_string_ended, false) || m_sixel_work_deferred;
+    };
+
     qsizetype offset = 0;
     while (offset < bytes.size()) {
         if (m_discarding_csi) {
@@ -1049,7 +1015,7 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         if (is_string_family(m_string_family)) {
             flush_print_text();
             continue_string(bytes, offset, actions);
-            if (ends_with_sixel_image(actions)) {
+            if (sixel_boundary_reached()) {
                 break;
             }
             continue;
@@ -1076,7 +1042,7 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         if (try_start_string(bytes, offset, actions)          == String_state_result::CONSUMED ||
             try_consume_escape_or_csi(bytes, offset, actions) == String_state_result::CONSUMED)
         {
-            if (ends_with_sixel_image(actions)) {
+            if (sixel_boundary_reached()) {
                 break;
             }
             continue;
@@ -1303,6 +1269,10 @@ void Terminal_byte_stream_parser::continue_string(
     if (m_dcs_header_pending) {
         classify_dcs_header(bytes, offset, actions);
     }
+    if (m_sixel_decoder.active()) {
+        continue_sixel_string(bytes, offset, actions);
+        return;
+    }
 
     Parser_string_terminator terminator = Parser_string_terminator::END_OF_INPUT;
     const qsizetype terminator_offset =
@@ -1336,6 +1306,101 @@ void Terminal_byte_stream_parser::continue_string(
     }
     else {
         offset = terminator_offset + 1;
+    }
+}
+
+// Sixel data streams to the decoder, which stops before a byte that could end
+// the string, or after the byte that spends the budget, and advances the
+// string's UTF-8 scan state over exactly the bytes it takes: no byte is
+// scanned twice, and a stop leaves the rest unscanned. A spent budget ends the
+// call before any byte after it is looked at, so every stop is a place a chunk
+// could end. The terminators and their handling are find_string_terminator's.
+void Terminal_byte_stream_parser::continue_sixel_string(
+    QByteArrayView                 bytes,
+    qsizetype&                     offset,
+    std::vector<Parser_action>&    actions)
+{
+    const auto budget_spent = [this]() {
+        return m_sixel_work_budget != nullptr && m_sixel_work_budget->exhausted();
+    };
+
+    // An ESC taken as data and the byte after it, which decided that, are
+    // one transition: no stop comes between them.
+    bool deciding_byte = false;
+    while (offset < bytes.size()) {
+        if (!deciding_byte && budget_spent()) {
+            m_sixel_work_deferred = true;
+            return;
+        }
+
+        const qsizetype taken = m_sixel_decoder.decode(
+            bytes.sliced(offset),
+            actions,
+            m_sixel_work_budget,
+            &m_string_utf8_scan_state);
+        offset += taken;
+        if (offset == bytes.size()) {
+            return;
+        }
+        if (taken > 0 && budget_spent()) {
+            m_sixel_work_deferred = true;
+            return;
+        }
+        deciding_byte = false;
+
+        // The decoder stopped before a byte that could end the string.
+        Parser_string_terminator terminator = Parser_string_terminator::END_OF_INPUT;
+        const unsigned char byte = byte_at(bytes, offset);
+        if (byte == 0x9cU) {
+            terminator = Parser_string_terminator::ST_8BIT;
+        }
+        else
+        if (byte == 0x9bU) {
+            terminator = Parser_string_terminator::RECOVERY;
+        }
+        else
+        if (byte == 0x18U || byte == 0x1aU) {
+            terminator = Parser_string_terminator::CANCEL;
+        }
+        else {
+            Q_ASSERT(byte == 0x1bU);
+            // What an ESC at the end starts is the next chunk's to say.
+            if (offset + 1 == bytes.size()) {
+                m_pending_prefix = QByteArray(bytes.data() + offset, 1);
+                offset = bytes.size();
+                return;
+            }
+            const unsigned char next = byte_at(bytes, offset + 1);
+            if (next == '\\') {
+                terminator = Parser_string_terminator::ST_7BIT;
+            }
+            else
+            if (next == '[') {
+                terminator = Parser_string_terminator::RECOVERY;
+            }
+            else {
+                // Any other ESC is data, which the decoder ignores; it still
+                // ends a command collecting parameters. The byte after it is
+                // taken in the same transition.
+                offset += m_sixel_decoder.decode(
+                    bytes.sliced(offset, 1),
+                    actions,
+                    m_sixel_work_budget);
+                deciding_byte = true;
+                continue;
+            }
+        }
+
+        reset_utf8_scan_state(m_string_utf8_scan_state);
+        finish_string(m_string_family, terminator, actions);
+        if (terminator == Parser_string_terminator::ST_7BIT) {
+            offset += 2;
+        }
+        else
+        if (terminator != Parser_string_terminator::RECOVERY) {
+            offset += 1;
+        }
+        return;
     }
 }
 
@@ -1459,14 +1524,11 @@ bool Terminal_byte_stream_parser::append_string_payload(
     QByteArrayView                 payload,
     std::vector<Parser_action>&    actions)
 {
+    // Sixel data streams to the decoder instead (continue_sixel_string) and
+    // is never buffered, so the DCS payload limit does not apply to it; the
+    // decoded-size cap does.
+    Q_ASSERT(!m_sixel_decoder.active());
     if (payload.empty() || m_string_over_limit) {
-        return true;
-    }
-
-    // Sixel data streams into the decoder and is never buffered, so the DCS
-    // payload limit does not apply to it; the decoded-size cap does.
-    if (m_sixel_decoder.active()) {
-        m_sixel_decoder.decode(payload, actions);
         return true;
     }
 
@@ -1535,13 +1597,15 @@ void Terminal_byte_stream_parser::finish_sixel(
     Parser_string_terminator       terminator,
     std::vector<Parser_action>&    actions)
 {
+    m_sixel_string_ended = true;
+
     // Only the string terminator completes an image. A recovery boundary or
     // CAN/SUB abandons it: nothing is placed, and the next image starts from
     // a fresh decoder.
     if (terminator == Parser_string_terminator::ST_7BIT ||
         terminator == Parser_string_terminator::ST_8BIT)
     {
-        m_sixel_decoder.finish(actions);
+        m_sixel_decoder.finish(actions, m_sixel_work_budget);
         return;
     }
 

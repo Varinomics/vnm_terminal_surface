@@ -131,10 +131,35 @@ bool backend_callback_drain_deadline_reached(
     return deadline.has_value() && std::chrono::steady_clock::now() >= *deadline;
 }
 
+// A sixel placement that has started and not ended holds publication the
+// way synchronized output does, so a partly placed image is never shown.
 bool model_allows_render_snapshot(const Terminal_screen_model& model)
 {
-    return !model.mode_state().synchronized_output;
+    return !model.mode_state().synchronized_output && !model.sixel_placement_started();
 }
+
+// Lends a drain step's sixel work budget to the session for the step, and
+// takes it back however the step ends.
+class Sixel_work_budget_scope final
+{
+public:
+    Sixel_work_budget_scope(Sixel_work_budget*& slot, Sixel_work_budget* budget)
+    :
+        m_slot(slot),
+        m_previous(slot)
+    {
+        m_slot = budget;
+    }
+
+    ~Sixel_work_budget_scope() { m_slot = m_previous; }
+
+    Sixel_work_budget_scope(const Sixel_work_budget_scope&)            = delete;
+    Sixel_work_budget_scope& operator=(const Sixel_work_budget_scope&) = delete;
+
+private:
+    Sixel_work_budget*& m_slot;
+    Sixel_work_budget*  m_previous;
+};
 
 bool render_snapshot_can_advance_latest_content_snapshot(
     const Terminal_render_snapshot& snapshot)
@@ -2150,8 +2175,9 @@ Terminal_session::try_write_user_bytes_without_backend_drain_if_callbacks_empty(
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if ((!m_input_frontier_epoch.has_value() ||
-            m_last_processed_backend_callback_epoch < *m_input_frontier_epoch) &&
-        (!m_pending_commands.empty() ||
+            !backend_output_settled(*m_input_frontier_epoch)) &&
+        (output_operation_open() ||
+            !m_pending_commands.empty() ||
             m_callback_lifetime->has_pending_or_active_callbacks()))
     {
         return std::nullopt;
@@ -2252,8 +2278,9 @@ Terminal_session::try_write_mouse_event_without_backend_drain_if_callbacks_empty
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if ((!m_input_frontier_epoch.has_value() ||
-            m_last_processed_backend_callback_epoch < *m_input_frontier_epoch) &&
-        (!m_pending_commands.empty() ||
+            !backend_output_settled(*m_input_frontier_epoch)) &&
+        (output_operation_open() ||
+            !m_pending_commands.empty() ||
             m_callback_lifetime->has_pending_or_active_callbacks()))
     {
         return std::nullopt;
@@ -2386,7 +2413,7 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     };
 
     if (m_input_frontier_epoch.has_value() &&
-        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+        !backend_output_settled(*m_input_frontier_epoch))
     {
         return refuse_before_encoding(
             Terminal_session_result_code::INVALID_STATE,
@@ -2634,7 +2661,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines(int line
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
     if (m_input_frontier_epoch.has_value() &&
-        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+        !backend_output_settled(*m_input_frontier_epoch))
     {
         return {};
     }
@@ -2752,7 +2779,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_line
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
     if (m_input_frontier_epoch.has_value() &&
-        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+        !backend_output_settled(*m_input_frontier_epoch))
     {
         return {};
     }
@@ -2809,7 +2836,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_o
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
     if (m_input_frontier_epoch.has_value() &&
-        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+        !backend_output_settled(*m_input_frontier_epoch))
     {
         return {};
     }
@@ -3023,6 +3050,12 @@ void Terminal_session::set_scrollback_limit(int limit)
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     m_config.scrollback_limit = std::max(0, limit);
     if (!m_screen_model.has_value()) {
@@ -3062,6 +3095,12 @@ void Terminal_session::set_retained_history_capacity_bytes(
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     m_config.retained_history_capacity_bytes = capacity_bytes;
     if (!m_screen_model.has_value()) {
@@ -3105,6 +3144,12 @@ void Terminal_session::set_color_state(Terminal_color_state state)
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     // Remember the requested color state so it survives a screen-model
     // (re)creation. At startup this runs before the model exists (the model is
@@ -3150,6 +3195,12 @@ void Terminal_session::set_cell_pixel_size(terminal_cell_pixel_size_t size)
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
+    // Older output settles before the model changes: reached from inside a
+    // drain that cannot settle it (an operation may hold a placement), the
+    // setter changes nothing, configuration included.
+    if (!backend_output_settled(*m_input_frontier_epoch)) {
+        return;
+    }
 
     // A fixed backend cell stays in force whatever the display reports: that
     // backend's pseudoconsole places images on its own cell, so the child has
@@ -3344,10 +3395,14 @@ Terminal_session_result Terminal_session::settle_text_area_resize_arbitration_lo
         Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION;
     command.text_area_resize_arbitration = settlement;
 
+    // The settlement's result is decided at admission. Its operation then
+    // runs one budgeted step here, and later drains, or the next frontier
+    // drain, take the rest of the released tail.
     process_backend_callback_events_to_current_epoch();
     return enqueue_and_process_synchronous_command(
         std::move(command),
-        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED,
+        true);
 }
 
 void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
@@ -3449,11 +3504,58 @@ bool Terminal_session::render_publication_blocked() const
     return m_screen_model.has_value() && !model_allows_render_snapshot(*m_screen_model);
 }
 
+bool Terminal_session::synchronized_output_hold_active() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_screen_model.has_value() && m_screen_model->mode_state().synchronized_output;
+}
+
+bool Terminal_session::backend_callbacks_settled(std::uint64_t epoch) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return backend_output_settled(epoch);
+}
+
+std::uint64_t Terminal_session::backend_output_step_count() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_operation_step_count;
+}
+
+void Terminal_session::set_sixel_work_step_units_for_testing(
+    std::function<std::uint64_t()> units)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    m_sixel_work_step_units_for_testing = std::move(units);
+}
+
+// An open operation that owns backend output: a callback's bytes, or a tail a
+// release let go, until it retires. Any other command is the head only while
+// it takes effect.
+bool Terminal_session::output_operation_open() const
+{
+    return m_operation.has_value() && m_operation->owns_output;
+}
+
+// The one completion rule: output up to an epoch is settled when every
+// callback up to it has been processed and no operation owning output is
+// open. An open operation always started before whatever asks, so it is
+// older work.
+bool Terminal_session::backend_output_settled(std::uint64_t epoch) const
+{
+    return !output_operation_open() && m_last_processed_backend_callback_epoch >= epoch;
+}
+
 bool Terminal_session::has_pending_backend_callback_events() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    return !m_pending_commands.empty() ||
+    return output_operation_open() ||
+        !m_pending_commands.empty() ||
         m_callback_lifetime->has_pending_or_active_callbacks();
 }
 
@@ -3461,7 +3563,8 @@ std::size_t Terminal_session::pending_backend_callback_event_count() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    std::size_t count = 0U;
+    std::size_t count =
+        output_operation_open() && m_operation->command.backend_callback_epoch != 0U ? 1U : 0U;
     for (const Terminal_session_command& command : m_pending_commands) {
         if (command.backend_callback_epoch != 0U) {
             ++count;
@@ -4469,11 +4572,12 @@ std::optional<Terminal_backend_exit> Terminal_session::exit_status() const
 
 Terminal_session_result Terminal_session::enqueue_and_process_synchronous_command(
     Terminal_session_command           command,
-    Backend_callback_drain_policy      drain_policy)
+    Backend_callback_drain_policy      drain_policy,
+    bool                               single_step)
 {
     if (drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED &&
         m_input_frontier_epoch.has_value() &&
-        m_last_processed_backend_callback_epoch < *m_input_frontier_epoch)
+        !backend_output_settled(*m_input_frontier_epoch))
     {
         return make_rejected_result(
             command.sequence,
@@ -4511,10 +4615,22 @@ Terminal_session_result Terminal_session::enqueue_and_process_synchronous_comman
         }
     }
 
+    // A synchronous command reached from inside another one's processing
+    // (a backend hook, a notification handler) captures its own result and
+    // then gives the outer command's capture back.
+    const std::uint64_t outer_capture_sequence = m_result_capture_sequence;
+    std::optional<Terminal_session_result> outer_captured_result =
+        std::move(m_captured_result);
     begin_result_capture(sequence);
-    process_pending_commands(drain_policy);
+    process_pending_commands(
+        drain_policy,
+        single_step
+            ? Backend_callback_drain_deadline(std::chrono::steady_clock::now())
+            : Backend_callback_drain_deadline(std::nullopt));
     const Terminal_session_result result = result_after_processing(sequence, enqueue_result);
     end_result_capture();
+    m_result_capture_sequence = outer_capture_sequence;
+    m_captured_result         = std::move(outer_captured_result);
     return result;
 }
 
@@ -4599,108 +4715,8 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         m_backend_content_snapshot_deferral_active;
     m_backend_content_snapshot_deferral_active = deadline.has_value();
 
-    Backend_callback_drain_stop stop = Backend_callback_drain_stop::COMPLETE;
-    for (;;) {
-        if (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS) {
-            drain_backend_callback_commands(target_backend_callback_epoch);
-        }
-        if (m_pending_commands.empty()) {
-            break;
-        }
-        const std::optional<std::uint64_t> input_frontier =
-            drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED
-                ? m_input_frontier_epoch
-                : target_backend_callback_epoch;
-        if (input_frontier.has_value() &&
-            m_pending_commands.front().backend_callback_epoch > *input_frontier)
-        {
-            break;
-        }
-
-        Terminal_session_command command = std::move(m_pending_commands.front());
-        m_pending_commands.pop_front();
-        const std::uint64_t command_backend_callback_epoch =
-            command.backend_callback_epoch;
-
-        const bool continuing_budgeted_output =
-            command.kind     == Terminal_session_command_kind::BACKEND_OUTPUT &&
-            command.sequence == m_budgeted_backend_output_sequence;
-        if (!continuing_budgeted_output) {
-            record_processed_command(command);
-        }
-
-        // A deadline-bound drain takes backend output in bounded slices and
-        // also ends a slice where a sixel image may complete, so the deadline
-        // is checked between images: a description of a few bytes can expand
-        // into an image as large as the decoded-size cap. Each slice scans
-        // only its own bytes for that boundary.
-        qsizetype slice_bytes = command.bytes.size();
-        if (deadline.has_value()                                          &&
-            command.kind == Terminal_session_command_kind::BACKEND_OUTPUT &&
-            m_screen_model.has_value()                                    &&
-            !should_ignore_backend_output_after_stop(command.sequence))
-        {
-            const QByteArrayView window = QByteArrayView(command.bytes).first(
-                std::min(command.bytes.size(), k_backend_output_drain_slice_bytes));
-            slice_bytes = m_screen_model->sixel_image_boundary(window);
-        }
-        const bool slice_backend_output = slice_bytes < command.bytes.size();
-        if (slice_backend_output) {
-            // A sliced BACKEND_OUTPUT remains one logical queued command. Bytes
-            // are released per slice, but command-count/backpressure accounting
-            // stays held until the final continuation completes.
-            Q_ASSERT(m_result_capture_sequence == 0U);
-            Terminal_session_command remainder = command;
-            // Copy only the consumed prefix, then release command's reference
-            // to the backing store before removing it from the remainder.
-            // A uniquely owned Qt 6 QByteArray can drop a prefix without
-            // copying the tail. An external trace reference detaches once.
-            command.bytes = QByteArray(remainder.bytes.constData(), slice_bytes);
-            remainder.bytes.remove(0, slice_bytes);
-            m_pending_commands.push_front(std::move(remainder));
-            m_budgeted_backend_output_sequence = command.sequence;
-        }
-        else
-        if (continuing_budgeted_output) {
-            m_budgeted_backend_output_sequence = 0U;
-        }
-
-        const Queue_category category      = queue_category_for(command.kind);
-        const std::size_t    byte_count    = static_cast<std::size_t>(command.bytes.size());
-        const std::size_t    command_count = slice_backend_output ? 0U : 1U;
-        const bool completes_backend_callback =
-            command_backend_callback_epoch != 0U && !slice_backend_output;
-        const Terminal_session_command_kind command_kind = command.kind;
-        m_last_processed_sequence = command.sequence;
-
-        if (command.kind != Terminal_session_command_kind::BACKEND_OUTPUT ||
-            should_ignore_backend_output_after_stop(command.sequence))
-        {
-            flush_deferred_backend_content_snapshot();
-        }
-
-        m_backend_error_queued_during_command = false;
-        m_processing_backend_callback_epoch =
-            completes_backend_callback ? command_backend_callback_epoch : 0U;
-        m_processing_command_callback_epoch = command_backend_callback_epoch;
-        Terminal_session_result result = process_command(std::move(command));
-        m_processing_command_callback_epoch = 0U;
-        m_processing_backend_callback_epoch = 0U;
-        if (!slice_backend_output) {
-            record_result(std::move(result));
-        }
-        remove_from_queue_state(category, byte_count, command_count);
-        if (category == Queue_category::OUTPUT) {
-            set_output_backpressure_active(
-                output_backpressure_required(),
-                m_last_processed_sequence);
-        }
-        if (completes_backend_callback &&
-            command_kind != Terminal_session_command_kind::BACKEND_OUTPUT)
-        {
-            advance_processed_backend_callback_epoch(command_backend_callback_epoch);
-        }
-
+    // Whether the drain stops after a step, and how; none to go on.
+    const auto stop_after_step = [&]() -> std::optional<Backend_callback_drain_stop> {
         bool synchronized_output_active = false;
         if (m_screen_model.has_value()) {
             synchronized_output_active =
@@ -4708,26 +4724,27 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         }
 
         if (target_backend_callback_epoch.has_value() &&
-            m_last_processed_backend_callback_epoch >= *target_backend_callback_epoch)
+            backend_output_settled(*target_backend_callback_epoch))
         {
-            break;
+            return Backend_callback_drain_stop::COMPLETE;
         }
 
         if (!backend_callback_drain_deadline_reached(deadline)) {
-            continue;
+            return std::nullopt;
         }
         const bool drain_work_remaining =
+            m_operation.has_value()     ||
             !m_pending_commands.empty() ||
             (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS &&
                 m_callback_lifetime->has_pending_or_active_callbacks());
         if (!drain_work_remaining) {
-            continue;
+            return std::nullopt;
         }
 
-        // The primary budget expired at a command/slice boundary with work
-        // remaining. A synchronized-output release that remains the latest
-        // live-content publication is an explicit whole-frame boundary. An
-        // active hold is HELD only while the installed publication is unchanged.
+        // The primary budget expired at a step boundary with work remaining.
+        // A synchronized-output release that remains the latest live-content
+        // publication is an explicit whole-frame boundary. An active hold is
+        // HELD only while the installed publication is unchanged.
         const bool deferred_content_publication_pending =
             m_deferred_backend_content_snapshot.has_value();
         const bool release_is_latest_publication =
@@ -4737,21 +4754,66 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
                     *m_drain_synchronized_release_publication_generation) &&
             !deferred_content_publication_pending;
         if (release_is_latest_publication) {
-            stop = Backend_callback_drain_stop::SYNCHRONIZED_OUTPUT_RELEASED;
-            break;
+            return Backend_callback_drain_stop::SYNCHRONIZED_OUTPUT_RELEASED;
         }
         if (synchronized_output_active) {
             const bool hold_publication_unchanged =
                 !m_drain_latest_live_content_publication_generation.has_value() &&
                 !m_drain_synchronized_release_publication_generation.has_value() &&
                 !deferred_content_publication_pending;
-            stop = hold_publication_unchanged
+            return hold_publication_unchanged
                 ? Backend_callback_drain_stop::HELD
                 : Backend_callback_drain_stop::UNSETTLED;
+        }
+        return Backend_callback_drain_stop::UNSETTLED;
+    };
+
+    Backend_callback_drain_stop stop = Backend_callback_drain_stop::COMPLETE;
+    for (;;) {
+        if (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS) {
+            drain_backend_callback_commands(target_backend_callback_epoch);
+        }
+
+        // Only the head advances. An open operation is older than anything
+        // queued behind it, so it continues whatever the frontier; a command
+        // is admitted only once no operation is open.
+        if (!m_operation.has_value()) {
+            if (m_pending_commands.empty()) {
+                break;
+            }
+            const std::optional<std::uint64_t> input_frontier =
+                drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED
+                    ? m_input_frontier_epoch
+                    : target_backend_callback_epoch;
+            if (input_frontier.has_value() &&
+                m_pending_commands.front().backend_callback_epoch > *input_frontier)
+            {
+                break;
+            }
+            admit_front_command();
+        }
+
+        // With a deadline each step may spend one budget of sixel work and
+        // takes its source a window at a time; the deadline is checked after
+        // every step.
+        {
+            std::optional<Sixel_work_budget> step_budget;
+            if (deadline.has_value()) {
+                step_budget.emplace(
+                    m_sixel_work_step_units_for_testing
+                        ? m_sixel_work_step_units_for_testing()
+                        : k_sixel_work_units_per_drain_step);
+            }
+            const Sixel_work_budget_scope budget_scope(
+                m_sixel_work_budget,
+                step_budget.has_value() ? &*step_budget : nullptr);
+            run_operation_step(deadline.has_value());
+        }
+
+        if (const std::optional<Backend_callback_drain_stop> step_stop = stop_after_step()) {
+            stop = *step_stop;
             break;
         }
-        stop = Backend_callback_drain_stop::UNSETTLED;
-        break;
     }
     flush_deferred_backend_content_snapshot();
     m_backend_content_snapshot_deferral_active =
@@ -4762,13 +4824,14 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
     // overwritten.
     if (stop == Backend_callback_drain_stop::COMPLETE     &&
         target_backend_callback_epoch.has_value()         &&
-        m_last_processed_backend_callback_epoch < *target_backend_callback_epoch)
+        !backend_output_settled(*target_backend_callback_epoch))
     {
         stop = Backend_callback_drain_stop::UNSETTLED;
     }
     if (stop == Backend_callback_drain_stop::COMPLETE &&
-        drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS &&
-        m_callback_lifetime->has_pending_or_active_callbacks())
+        (m_operation.has_value() ||
+            (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS &&
+                m_callback_lifetime->has_pending_or_active_callbacks())))
     {
         stop = Backend_callback_drain_stop::UNSETTLED;
     }
@@ -4777,9 +4840,115 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
     return stop;
 }
 
-Terminal_session_result Terminal_session::process_command(Terminal_session_command command)
+// Pops the front command as the runner's head operation. Its trace records
+// it once, however many steps it takes.
+void Terminal_session::admit_front_command()
 {
+    Q_ASSERT(!m_operation.has_value());
+
+    Runner_operation operation;
+    operation.command  = std::move(m_pending_commands.front());
+    operation.category = queue_category_for(operation.command.kind);
+    m_pending_commands.pop_front();
+    record_processed_command(operation.command);
+    m_last_processed_sequence = operation.command.sequence;
+
+    if (operation.command.kind != Terminal_session_command_kind::BACKEND_OUTPUT ||
+        should_ignore_backend_output_after_stop(operation.command.sequence))
+    {
+        flush_deferred_backend_content_snapshot();
+    }
+    m_operation = std::move(operation);
+}
+
+// One step of the head operation: its admission when it has not been admitted,
+// the model work its last step left pending, then at most one window of its
+// source. Window boundaries are never completion boundaries. The replies the
+// step generated reach their final disposition before it yields or retires.
+void Terminal_session::run_operation_step(bool windowed)
+{
+    Q_ASSERT(m_operation.has_value());
+    Runner_operation& operation = *m_operation;
+    ++m_operation_step_count;
+    m_backend_output_stopped          = false;
+    m_unconsumed_backend_output_bytes = 0;
+
+    if (!operation.admitted) {
+        operation.admitted                    = true;
+        m_backend_error_queued_during_command = false;
+        record_result(admit_operation(operation));
+    }
+
+    bool window_taken = false;
+    while (operation.phase != Runner_operation_phase::RETIRED && !m_backend_output_stopped) {
+        if (m_screen_model.has_value() &&
+            m_screen_model->sixel_placement_pending() &&
+            !advance_pending_sixel_placement(operation.command.sequence))
+        {
+            break;
+        }
+
+        if (operation.phase == Runner_operation_phase::OWN_SOURCE) {
+            if (window_taken) {
+                break;
+            }
+            window_taken = step_backend_output_source(operation, windowed);
+            continue;
+        }
+
+        if (operation.phase == Runner_operation_phase::RELEASED_TAIL) {
+            if (m_text_area_resize_arbitration.has_value() ||
+                text_area_resize_tail_size() == 0U)
+            {
+                finish_released_tail(operation);
+                continue;
+            }
+            if (window_taken) {
+                break;
+            }
+            window_taken = true;
+            step_released_tail(operation, windowed);
+            continue;
+        }
+
+        // The exit follows every effect of its released tail, the tail's
+        // replies included.
+        dispose_operation_replies();
+        apply_backend_exit(operation.command);
+        operation.phase = Runner_operation_phase::RETIRED;
+    }
+    m_backend_output_stopped          = false;
+    m_unconsumed_backend_output_bytes = 0;
+
+    if (operation.category == Queue_category::OUTPUT) {
+        set_output_backpressure_active(
+            output_backpressure_required(),
+            m_last_processed_sequence);
+    }
+    dispose_operation_replies();
+    if (operation.phase == Runner_operation_phase::RETIRED) {
+        retire_operation();
+    }
+}
+
+// The command's own validation and result, decided at admission and never by
+// how long its operation takes; and what the operation then has to do.
+Terminal_session_result Terminal_session::admit_operation(Runner_operation& operation)
+{
+    Terminal_session_command& command = operation.command;
+    // Only output and a release move the operation off RETIRED: output onto
+    // its own bytes, a settlement's or an exit's release onto the released
+    // tail. Every other command takes effect here.
+    operation.phase = Runner_operation_phase::RETIRED;
     switch (command.kind) {
+        case Terminal_session_command_kind::BACKEND_OUTPUT:
+            operation.phase       = Runner_operation_phase::OWN_SOURCE;
+            operation.owns_output = true;
+            return admit_backend_output(operation);
+        case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
+            return process_text_area_resize_arbitration_command(command);
+        case Terminal_session_command_kind::BACKEND_EXIT:
+            return process_backend_exit_command(command);
         case Terminal_session_command_kind::START:
             return process_start_command(command);
         case Terminal_session_command_kind::USER_WRITE:
@@ -4788,26 +4957,119 @@ Terminal_session_result Terminal_session::process_command(Terminal_session_comma
         case Terminal_session_command_kind::TERMINAL_REPLY:
             return process_write_command(command);
         case Terminal_session_command_kind::RESIZE:
-            return process_resize_command(std::move(command));
+            return process_resize_command(command);
         case Terminal_session_command_kind::INTERRUPT:
             return process_interrupt_command(command);
         case Terminal_session_command_kind::TERMINATE:
             return process_terminate_command(command);
         case Terminal_session_command_kind::FORCE_RELEASE_SYNCHRONIZED_OUTPUT:
             return process_force_release_synchronized_output_command(command);
-        case Terminal_session_command_kind::BACKEND_OUTPUT:
-            return process_backend_output_command(command);
-        case Terminal_session_command_kind::BACKEND_EXIT:
-            return process_backend_exit_command(command);
         case Terminal_session_command_kind::BACKEND_ERROR:
             return process_backend_error_command(command);
         case Terminal_session_command_kind::BACKEND_RESIZE_COMPLETE:
             return process_backend_resize_completion_command(command);
-        case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
-            return process_text_area_resize_arbitration_command(command);
     }
 
     return make_accepted_result(command.sequence);
+}
+
+void Terminal_session::consume_operation_source(
+    Runner_operation& operation,
+    qsizetype         byte_count)
+{
+    Q_ASSERT(byte_count >= 0 && operation.position + byte_count <= operation.command.bytes.size());
+    operation.position += byte_count;
+    remove_from_queue_state(operation.category, static_cast<std::size_t>(byte_count), 0U);
+}
+
+// Each byte is recorded once, as it first enters the ingest: an operation's
+// own bytes a window at a time. A step resuming inside a window records
+// nothing, and a released tail was recorded when its hold captured it.
+void Terminal_session::record_backend_output_entry(
+    Runner_operation& operation,
+    qsizetype         end)
+{
+    if (operation.entered && end <= operation.recorded) {
+        return;
+    }
+
+    const Terminal_session_command& command = operation.command;
+    const QByteArrayView entering =
+        QByteArrayView(command.bytes).sliced(operation.recorded, end - operation.recorded);
+    if (m_config.trace_output_chunk_limit != 0U) {
+        record_output_chunk(
+            entering.size() == command.bytes.size() ? command.bytes : entering.toByteArray());
+    }
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    if (m_config.transcript_recorder != nullptr) {
+        (void)m_config.transcript_recorder->record_backend_output(
+            command.sequence,
+            entering);
+    }
+#endif
+    operation.entered  = true;
+    operation.recorded = end;
+}
+
+// Every reply the step generated goes through the terminal-reply write policy
+// in the order its query was parsed and reaches its final disposition here:
+// written, or rejected (queue limit, stopped backend, backend rejection) with
+// its error recorded; no retry. Nothing behind the operation has taken effect
+// yet.
+void Terminal_session::dispose_operation_replies()
+{
+    std::vector<Operation_reply> replies = std::move(m_operation_replies);
+    m_operation_replies.clear();
+    for (const Operation_reply& reply : replies) {
+        const Terminal_session_command& command = reply.command;
+        if (reply.queue_rejected) {
+            Terminal_backend_error error = make_backend_error(
+                Terminal_backend_error_code::WRITE_FAILED,
+                QStringLiteral("session command queue hard limit reached"));
+            record_backend_error(command.sequence, error);
+            record_result(make_rejected_result(
+                command.sequence,
+                Terminal_session_result_code::QUEUE_HARD_LIMIT_REACHED,
+                std::move(error)));
+            continue;
+        }
+
+        record_processed_command(command);
+        const Terminal_session_result result = process_write_command(command);
+        remove_from_queue_state(
+            Queue_category::WRITE,
+            static_cast<std::size_t>(command.bytes.size()),
+            1U);
+        record_result(result);
+    }
+}
+
+// The operation retires: its source is consumed, the model holds no work of
+// its, and its replies are disposed of. Its command count and its callback
+// epoch follow the retirement; an output callback's epoch completed when its
+// last bytes were applied, or when a hold captured them.
+void Terminal_session::retire_operation()
+{
+    Q_ASSERT(m_operation.has_value());
+    Q_ASSERT(m_screen_model.has_value() ? !m_screen_model->sixel_placement_pending() : true);
+    const Runner_operation operation = std::move(*m_operation);
+    m_operation.reset();
+
+    remove_from_queue_state(
+        operation.category,
+        static_cast<std::size_t>(operation.command.bytes.size() - operation.position),
+        1U);
+    if (operation.category == Queue_category::OUTPUT) {
+        set_output_backpressure_active(
+            output_backpressure_required(),
+            m_last_processed_sequence);
+    }
+    if (operation.command.backend_callback_epoch != 0U &&
+        operation.command.kind != Terminal_session_command_kind::BACKEND_OUTPUT)
+    {
+        advance_processed_backend_callback_epoch(operation.command.backend_callback_epoch);
+    }
+    flush_ready_processed_backend_callback_epoch();
 }
 
 Terminal_session_result Terminal_session::process_start_command(
@@ -5582,7 +5844,11 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
     apply_trailing_changes(model_result, trailing_changes);
     accumulate_synchronized_selection_continuity(model_result);
 
-    if (render_result_warrants_snapshot || m_visual_bell_active) {
+    // A sixel placement in progress keeps holding publication past the
+    // forced release; its own end releases what both held.
+    if ((render_result_warrants_snapshot || m_visual_bell_active) &&
+        model_allows_render_snapshot(*m_screen_model))
+    {
         Terminal_screen_model_result selection_basis_result =
             model_result_with_deferred_synchronized_row_origins(model_result);
         selection_basis_result = compose_synchronized_selection_release(
@@ -5624,13 +5890,17 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
     return make_accepted_result(sequence);
 }
 
-Terminal_session_result Terminal_session::process_backend_output_command(
-    const Terminal_session_command& command)
+Terminal_session_result Terminal_session::admit_backend_output(Runner_operation& operation)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::process_backend_output_command");
+    VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::admit_backend_output");
 
+    const Terminal_session_command& command = operation.command;
     if (should_ignore_backend_output_after_stop(command.sequence)) {
+        m_processing_backend_callback_epoch = command.backend_callback_epoch;
         complete_processing_backend_callback_side_effects();
+        m_processing_backend_callback_epoch = 0U;
+        consume_operation_source(operation, command.bytes.size());
+        operation.phase = Runner_operation_phase::RETIRED;
         return make_rejected_result(
             command.sequence,
             Terminal_session_result_code::INVALID_STATE,
@@ -5639,38 +5909,190 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                 QStringLiteral("backend output ignored after terminal stop request")));
     }
 
-    record_output_chunk(command.bytes);
-#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
-    if (m_config.transcript_recorder != nullptr) {
-        (void)m_config.transcript_recorder->record_backend_output(
-            command.sequence,
-            command.bytes);
-    }
-#endif
     if (!m_screen_model.has_value()) {
+        record_backend_output_entry(operation, command.bytes.size());
         Terminal_backend_error error = make_backend_error(
             Terminal_backend_error_code::READ_FAILED,
             QStringLiteral("backend output requires an initialized screen model"));
         record_backend_error(command.sequence, error);
+        m_processing_backend_callback_epoch = command.backend_callback_epoch;
         complete_processing_backend_callback_side_effects();
+        m_processing_backend_callback_epoch = 0U;
+        consume_operation_source(operation, command.bytes.size());
+        operation.phase = Runner_operation_phase::RETIRED;
         return make_rejected_result(
             command.sequence,
             Terminal_session_result_code::INVALID_STATE,
             std::move(error));
     }
 
-    if (!command.bytes.isEmpty()) {
+    return make_accepted_result(command.sequence);
+}
+
+// Takes the operation's own bytes one window at a time: into a hold that owns
+// them, or through the ingest layers. A deadline-bound drain takes windows of
+// the fixed drain slice; a drain without one takes the rest of the source.
+// Returns whether a window of model input was taken.
+bool Terminal_session::step_backend_output_source(
+    Runner_operation& operation,
+    bool              windowed)
+{
+    const Terminal_session_command& command = operation.command;
+    const qsizetype      size  = command.bytes.size();
+    const std::uint64_t  epoch = command.backend_callback_epoch;
+
+    // A hold owns every byte it captures. One that cannot take the rest of
+    // this source is released first, inside this operation, before any byte
+    // of the rest is admitted; its tail may arm the next request, which then
+    // faces the rest in turn.
+    if (m_text_area_resize_arbitration.has_value()) {
+        const QByteArrayView rest = QByteArrayView(command.bytes).sliced(operation.position);
+        const std::size_t held = text_area_resize_tail_size();
+        if (static_cast<std::size_t>(rest.size()) <=
+            m_text_area_resize_arbitration->hold_limit_bytes - held)
+        {
+            record_backend_output_entry(operation, size);
+            if (!rest.isEmpty()) {
+                record_output_activity(command.sequence);
+            }
+            append_text_area_resize_tail(rest);
+            observe_text_area_resize_arbitration_storage();
+            consume_operation_source(operation, rest.size());
+            // Capture completes the callback's epoch: it certifies that the
+            // hold owns the bytes, not that they took effect. Withholding it
+            // would stall frame capture for the whole host round trip and
+            // would suppress the output that arrived before the request.
+            m_processing_backend_callback_epoch = epoch;
+            complete_processing_backend_output_side_effects();
+            m_processing_backend_callback_epoch = 0U;
+            operation.phase = Runner_operation_phase::RETIRED;
+            return true;
+        }
+
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED,
+            {},
+            command.sequence);
+        return false;
+    }
+
+    const qsizetype window_end = windowed
+        ? std::min(
+            size,
+            (operation.position / k_backend_output_drain_slice_bytes + 1) *
+                k_backend_output_drain_slice_bytes)
+        : size;
+    const qsizetype recorded_before = operation.recorded;
+    record_backend_output_entry(operation, window_end);
+    if (window_end > recorded_before) {
         record_output_activity(command.sequence);
     }
 
-    if (m_text_area_resize_arbitration.has_value() &&
-        hold_text_area_resize_arbitration_output(command))
-    {
-        return make_accepted_result(command.sequence);
+    // Only the window that reaches the end of the source may complete the
+    // callback, and only once the model has applied all of it.
+    m_processing_backend_callback_epoch = window_end == size ? epoch : 0U;
+    const qsizetype left = ingest_backend_output_bytes(
+        command.sequence,
+        QByteArrayView(command.bytes).sliced(
+            operation.position,
+            window_end - operation.position),
+        static_cast<std::size_t>(size - operation.position));
+    m_processing_backend_callback_epoch = 0U;
+    consume_operation_source(operation, window_end - operation.position - left);
+    if (!m_backend_output_stopped && operation.position == size) {
+        operation.phase = Runner_operation_phase::RETIRED;
+    }
+    return true;
+}
+
+// Replays one window of the released tail, arbitration as the operation
+// allows it. The ring keeps what the model left for the next step.
+void Terminal_session::step_released_tail(
+    Runner_operation& operation,
+    bool              windowed)
+{
+    const std::size_t available_bytes = text_area_resize_tail_size();
+    const QByteArrayView tail_front = text_area_resize_tail_front();
+    const QByteArrayView front = windowed
+        ? tail_front.first(std::min(tail_front.size(), k_backend_output_drain_slice_bytes))
+        : tail_front;
+    std::size_t consumed_bytes = 0U;
+    const bool armed = scan_backend_output_span(
+        operation.command.sequence,
+        front,
+        operation.released_tail_allows_rearm,
+        available_bytes,
+        true,
+        consumed_bytes);
+    if (armed) {
+        // An owned-tail arm advances its absolute read cursor before
+        // changing ring epochs, so applying consumed_bytes again would
+        // replay past the newly latched tail.
+        Q_ASSERT(consumed_bytes > 0U);
+        observe_text_area_resize_arbitration_storage();
+        return;
+    }
+    Q_ASSERT(consumed_bytes > 0U || m_backend_output_stopped);
+    consume_text_area_resize_tail(consumed_bytes);
+}
+
+// The released tail is done when nothing of it is left or when it armed the
+// next request, which owns the rest. What the operation does next depends on
+// what released the hold.
+void Terminal_session::finish_released_tail(Runner_operation& operation)
+{
+    if (!m_text_area_resize_arbitration.has_value()) {
+        // An exit's tail cannot arm, so a candidate it leaves stashed will
+        // never be completed; it is applied as it stands.
+        if (!operation.released_tail_allows_rearm &&
+            m_text_area_resize_scanner.candidate_size > 0U)
+        {
+            flush_text_area_resize_candidate(operation.command.sequence, false, false);
+            Q_ASSERT(!m_backend_output_stopped);
+            reset_text_area_resize_scanner();
+        }
+
+        if (text_area_resize_tail_size() == 0U) {
+            const bool capability_known =
+                m_config.text_area_resize_arbitration.has_value() &&
+                m_config.text_area_resize_arbitration->version ==
+                    k_terminal_text_area_resize_arbitration_capability_version;
+            const std::size_t configured_hold_limit = capability_known
+                ? m_config.text_area_resize_arbitration->hold_limit_bytes
+                : 0U;
+            if (m_text_area_resize_tail.capacity_limit != configured_hold_limit) {
+                clear_text_area_resize_tail_epoch();
+            }
+        }
     }
 
-    ingest_backend_output_bytes(command.sequence, QByteArrayView(command.bytes));
-    return make_accepted_result(command.sequence);
+    switch (operation.command.kind) {
+        case Terminal_session_command_kind::BACKEND_OUTPUT:
+            operation.phase = Runner_operation_phase::OWN_SOURCE;
+            break;
+        case Terminal_session_command_kind::BACKEND_EXIT:
+            operation.phase = Runner_operation_phase::EXIT_EFFECTS;
+            break;
+        default:
+            operation.phase = Runner_operation_phase::RETIRED;
+            break;
+    }
+}
+
+bool Terminal_session::advance_pending_sixel_placement(std::uint64_t sequence)
+{
+    if (!m_screen_model->sixel_placement_pending()) {
+        return true;
+    }
+
+    // Until it starts, the screen is as the output before the image left it,
+    // so a content snapshot the drain deferred is published first; once it
+    // starts, publication is held until it ends.
+    if (!m_screen_model->sixel_placement_started()) {
+        flush_deferred_backend_content_snapshot();
+    }
+    (void)ingest_backend_output_segment(sequence, QByteArrayView{}, false);
+    return !m_screen_model->sixel_placement_pending();
 }
 
 bool Terminal_session::text_area_resize_arbitration_armable() const
@@ -5982,13 +6404,13 @@ bool Terminal_session::scanned_text_area_resize_request(
     return is_terminal_screen_model_grid_size_supported(requested_grid_size);
 }
 
-void Terminal_session::flush_text_area_resize_candidate(
+qsizetype Terminal_session::flush_text_area_resize_candidate(
     std::uint64_t sequence,
     bool          decline_request,
     bool          may_complete_backend_output_callback)
 {
     if (m_text_area_resize_scanner.candidate_size == 0U) {
-        return;
+        return 0;
     }
 
     const QByteArrayView candidate(
@@ -5996,26 +6418,28 @@ void Terminal_session::flush_text_area_resize_candidate(
         static_cast<qsizetype>(m_text_area_resize_scanner.candidate_size));
     Terminal_utf8_scan_state utf8_seed;
     reset_utf8_scan_state(utf8_seed);
+    qsizetype left = 0;
     if (decline_request) {
         Arbitrated_text_area_resize_replay_scope arbitrated(
             m_replaying_arbitrated_text_area_resize);
         Text_area_resize_policy_scope declined(
             *m_screen_model,
             m_config.text_area_resize_policy);
-        ingest_backend_output_run(
+        left = ingest_backend_output_run(
             sequence,
             candidate,
             utf8_seed,
             may_complete_backend_output_callback);
     }
     else {
-        ingest_backend_output_run(
+        left = ingest_backend_output_run(
             sequence,
             candidate,
             utf8_seed,
             may_complete_backend_output_callback);
     }
     m_text_area_resize_scanner.candidate_size = 0U;
+    return left;
 }
 
 bool Terminal_session::scan_backend_output_span(
@@ -6037,19 +6461,36 @@ bool Terminal_session::scan_backend_output_span(
 
     qsizetype plain_begin = 0;
     Terminal_utf8_scan_state plain_seed = m_text_area_resize_scanner.utf8_state;
+    // A plain span goes to the model; where the model stops in it, the scan
+    // stops too, with its state as it was after the bytes the model took,
+    // and plain_begin marks the stop. Returns false then.
     const auto flush_plain = [this, sequence, bytes, &plain_begin, &plain_seed](
         qsizetype end,
         bool      may_complete_backend_output_callback = false)
     {
         if (end > plain_begin) {
-            ingest_backend_output_run(
+            const qsizetype left = ingest_backend_output_run(
                 sequence,
                 bytes.sliced(plain_begin, end - plain_begin),
                 plain_seed,
                 may_complete_backend_output_callback);
+            if (m_backend_output_stopped) {
+                const qsizetype stop = end - left;
+                Terminal_utf8_scan_state utf8_state = plain_seed;
+                for (qsizetype offset = plain_begin; offset < stop; ++offset) {
+                    (void)utf8_scan_consumes_byte(
+                        static_cast<unsigned char>(bytes[offset]),
+                        utf8_state);
+                }
+                m_text_area_resize_scanner.state      = Text_area_resize_scan_state::PLAIN;
+                m_text_area_resize_scanner.utf8_state = utf8_state;
+                plain_begin = stop;
+                return false;
+            }
         }
         plain_begin = end;
         plain_seed  = m_text_area_resize_scanner.utf8_state;
+        return true;
     };
 
     const auto ingest_passthrough_byte = [this, sequence](
@@ -6082,6 +6523,16 @@ bool Terminal_session::scan_backend_output_span(
         }
     };
 
+    // A candidate the model stops in ends the scan as a plain span does. The
+    // model stops in one only after its ESC, inside sixel data or once an
+    // image has ended, so what it left are the input bytes from end - left
+    // on, where end follows the candidate's last byte.
+    const auto stop_in_candidate = [this, &consumed_bytes](qsizetype end, qsizetype left) {
+        Q_ASSERT(left <= end);
+        reset_text_area_resize_scanner();
+        consumed_bytes = static_cast<std::size_t>(end - left);
+    };
+
     qsizetype offset = 0;
     qsizetype scanned_through = 0;
     while (offset < bytes.size()) {
@@ -6099,7 +6550,10 @@ bool Terminal_session::scan_backend_output_span(
             }
 
             if (byte == 0x1bU || byte == 0x9bU) {
-                flush_plain(offset);
+                if (!flush_plain(offset)) {
+                    consumed_bytes = static_cast<std::size_t>(plain_begin);
+                    return false;
+                }
                 begin_text_area_resize_candidate(byte);
                 ++offset;
                 plain_begin = offset;
@@ -6113,7 +6567,11 @@ bool Terminal_session::scan_backend_output_span(
 
         if (byte == 0x1bU || byte == 0x9bU) {
             if (scanner.candidate_size > 0U) {
-                flush_text_area_resize_candidate(sequence, false);
+                const qsizetype left = flush_text_area_resize_candidate(sequence, false);
+                if (m_backend_output_stopped) {
+                    stop_in_candidate(offset, left);
+                    return false;
+                }
             }
             begin_text_area_resize_candidate(byte);
             ++offset;
@@ -6177,7 +6635,11 @@ bool Terminal_session::scan_backend_output_span(
 
         if (!append_text_area_resize_candidate_byte(byte)) {
             const Text_area_resize_scan_state previous_state = scanner.state;
-            flush_text_area_resize_candidate(sequence, capability_known);
+            const qsizetype left = flush_text_area_resize_candidate(sequence, capability_known);
+            if (m_backend_output_stopped) {
+                stop_in_candidate(offset, left);
+                return false;
+            }
             scanner.state = previous_state == Text_area_resize_scan_state::ESCAPE
                 ? Text_area_resize_scan_state::PASSTHROUGH_ESCAPE
                 : previous_state == Text_area_resize_scan_state::INTERMEDIATES
@@ -6198,7 +6660,11 @@ bool Terminal_session::scan_backend_output_span(
                 scanner.state = Text_area_resize_scan_state::PARAMETERS;
             }
             else {
-                flush_text_area_resize_candidate(sequence, false);
+                const qsizetype left = flush_text_area_resize_candidate(sequence, false);
+                if (m_backend_output_stopped) {
+                    stop_in_candidate(offset + 1, left);
+                    return false;
+                }
                 reset_text_area_resize_scanner();
                 plain_begin = offset + 1;
                 plain_seed  = scanner.utf8_state;
@@ -6262,16 +6728,24 @@ bool Terminal_session::scan_backend_output_span(
                     return true;
                 }
 
-                flush_text_area_resize_candidate(
+                const qsizetype left = flush_text_area_resize_candidate(
                     sequence,
                     true,
                     !tail_already_owned && offset + 1 == bytes.size());
+                if (m_backend_output_stopped) {
+                    stop_in_candidate(offset + 1, left);
+                    return false;
+                }
             }
             else {
-                flush_text_area_resize_candidate(
+                const qsizetype left = flush_text_area_resize_candidate(
                     sequence,
                     false,
                     !tail_already_owned && offset + 1 == bytes.size());
+                if (m_backend_output_stopped) {
+                    stop_in_candidate(offset + 1, left);
+                    return false;
+                }
             }
             reset_text_area_resize_scanner();
             ++offset;
@@ -6280,18 +6754,25 @@ bool Terminal_session::scan_backend_output_span(
             continue;
         }
 
-        flush_text_area_resize_candidate(
+        const qsizetype left = flush_text_area_resize_candidate(
             sequence,
             false,
             !tail_already_owned && offset + 1 == bytes.size());
+        if (m_backend_output_stopped) {
+            stop_in_candidate(offset + 1, left);
+            return false;
+        }
         reset_text_area_resize_scanner();
         ++offset;
         plain_begin = offset;
         plain_seed  = m_text_area_resize_scanner.utf8_state;
     }
 
-    if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN) {
-        flush_plain(bytes.size(), !tail_already_owned);
+    if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN &&
+        !flush_plain(bytes.size(), !tail_already_owned))
+    {
+        consumed_bytes = static_cast<std::size_t>(plain_begin);
+        return false;
     }
     else
     if (m_text_area_resize_scanner.candidate_size > 0U &&
@@ -6299,7 +6780,14 @@ bool Terminal_session::scan_backend_output_span(
     {
         const Text_area_resize_scan_state previous_state =
             m_text_area_resize_scanner.state;
-        flush_text_area_resize_candidate(sequence, false, !tail_already_owned);
+        const qsizetype left = flush_text_area_resize_candidate(
+            sequence,
+            false,
+            !tail_already_owned);
+        if (m_backend_output_stopped) {
+            stop_in_candidate(bytes.size(), left);
+            return false;
+        }
         m_text_area_resize_scanner.state =
             previous_state == Text_area_resize_scan_state::ESCAPE
                 ? Text_area_resize_scan_state::PASSTHROUGH_ESCAPE
@@ -6313,38 +6801,6 @@ bool Terminal_session::scan_backend_output_span(
     return false;
 }
 
-bool Terminal_session::hold_text_area_resize_arbitration_output(
-    const Terminal_session_command& command)
-{
-    while (m_text_area_resize_arbitration.has_value()) {
-        const std::size_t append_size =
-            static_cast<std::size_t>(command.bytes.size());
-        const std::size_t held = text_area_resize_tail_size();
-        if (append_size <=
-            m_text_area_resize_arbitration->hold_limit_bytes - held)
-        {
-            append_text_area_resize_tail(QByteArrayView(command.bytes));
-            observe_text_area_resize_arbitration_storage();
-            // A hold owns every byte it captured, so this callback is fully
-            // accounted even though the bytes are not on screen yet. Withholding
-            // the epoch would stall frame capture for the whole host round trip
-            // and would suppress the output that arrived before the request.
-            complete_processing_backend_output_side_effects();
-            return true;
-        }
-
-        // Settle before admitting even the first byte of the overflowing
-        // callback. Replayed tail may arm the next request, so keep this
-        // iterative.
-        release_text_area_resize_arbitration(
-            Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED,
-            {},
-            command.sequence);
-    }
-
-    return false;
-}
-
 void Terminal_session::release_text_area_resize_arbitration(
     Terminal_text_area_resize_arbitration_outcome  outcome,
     terminal_grid_size_t                           effective_grid_size,
@@ -6352,6 +6808,12 @@ void Terminal_session::release_text_area_resize_arbitration(
     bool                                           allow_rearm)
 {
     Q_ASSERT(m_text_area_resize_arbitration.has_value());
+    // A release happens inside the operation of the command that makes it (a
+    // settlement, an overflowing callback, an exit), and never while the
+    // model has work pending: none is pending when a hold arms, and a hold
+    // takes bytes without applying them.
+    Q_ASSERT(m_operation.has_value());
+    Q_ASSERT(!m_screen_model->sixel_placement_pending());
 
     Text_area_resize_arbitration_hold hold =
         std::move(*m_text_area_resize_arbitration);
@@ -6416,14 +6878,12 @@ void Terminal_session::release_text_area_resize_arbitration(
         }
     }
 
-    replay_text_area_resize_tail(settlement_sequence, allow_rearm);
-    if (!allow_rearm &&
-        !m_text_area_resize_arbitration.has_value() &&
-        m_text_area_resize_scanner.candidate_size > 0U)
-    {
-        flush_text_area_resize_candidate(settlement_sequence, false, false);
-        reset_text_area_resize_scanner();
-    }
+    // The captured tail becomes the operation's next source: its steps
+    // replay it, a window at a time in a budgeted drain, before the operation
+    // goes on to anything else of its own.
+    m_operation->phase                      = Runner_operation_phase::RELEASED_TAIL;
+    m_operation->released_tail_allows_rearm = allow_rearm;
+    m_operation->owns_output                = true;
 }
 
 Terminal_session_result Terminal_session::process_text_area_resize_arbitration_command(
@@ -6440,6 +6900,7 @@ Terminal_session_result Terminal_session::process_text_area_resize_arbitration_c
 
     const terminal_text_area_resize_arbitration_settlement_t& settlement =
         *command.text_area_resize_arbitration;
+
     // A cancellation queued ahead of this settlement (a backend exit, a host
     // resize) legitimately ends the request first, so the id is checked again
     // here and not only at the public entry point.
@@ -6480,11 +6941,12 @@ Terminal_session_result Terminal_session::process_text_area_resize_arbitration_c
     return make_accepted_result(command.sequence);
 }
 
-void Terminal_session::ingest_backend_output_bytes(
+qsizetype Terminal_session::ingest_backend_output_bytes(
     std::uint64_t  sequence,
     QByteArrayView bytes,
-    bool           allow_arbitration)
+    std::size_t    available_bytes)
 {
+    Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
     const bool capability_known =
         m_config.text_area_resize_arbitration.has_value() &&
         m_config.text_area_resize_arbitration->version ==
@@ -6500,6 +6962,33 @@ void Terminal_session::ingest_backend_output_bytes(
         bool candidate_embedded_c0 = false;
         bool parameters_empty       = true;
         bool private_parameters     = false;
+
+        // Where the model stopped, the scan state is the one after the bytes
+        // it took. It stops only inside sixel data, where a scan that is
+        // not plain would turn plain with a fresh decoding state at the next
+        // byte anyway.
+        const auto keep_scan_state_through = [&](qsizetype consumed) {
+            Terminal_utf8_scan_state state = utf8_seed;
+            Text_area_resize_scan_state kind = Text_area_resize_scan_state::PLAIN;
+            for (qsizetype offset = 0; offset < consumed; ++offset) {
+                const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
+                if (kind == Text_area_resize_scan_state::PLAIN &&
+                    utf8_scan_consumes_byte(byte, state))
+                {
+                    continue;
+                }
+                if (byte == 0x1bU || byte == 0x9bU) {
+                    kind = Text_area_resize_scan_state::ESCAPE;
+                    reset_utf8_scan_state(state);
+                    continue;
+                }
+                kind = Text_area_resize_scan_state::PLAIN;
+            }
+            if (kind != Text_area_resize_scan_state::PLAIN) {
+                reset_utf8_scan_state(state);
+            }
+            m_text_area_resize_scanner.utf8_state = state;
+        };
 
         for (qsizetype offset = 0; offset < bytes.size(); ++offset) {
             const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
@@ -6576,11 +7065,15 @@ void Terminal_session::ingest_backend_output_bytes(
                 k_terminal_text_area_resize_arbitration_request_limit_bytes)
         {
             if (candidate_start > 0) {
-                ingest_backend_output_run(
+                const qsizetype left = ingest_backend_output_run(
                     sequence,
                     bytes.sliced(0, candidate_start),
                     utf8_seed,
                     false);
+                if (m_backend_output_stopped) {
+                    keep_scan_state_through(candidate_start - left);
+                    return left + (bytes.size() - candidate_start);
+                }
             }
             reset_text_area_resize_scanner();
             std::memcpy(
@@ -6592,25 +7085,32 @@ void Terminal_session::ingest_backend_output_bytes(
             m_text_area_resize_scanner.state = scan_state;
             m_text_area_resize_scanner.parameters_valid = false;
             record_incomplete_processing_backend_output_side_effects();
-            return;
+            return 0;
         }
 
-        ingest_backend_output_run(sequence, bytes, utf8_seed, true);
+        const qsizetype left = ingest_backend_output_run(sequence, bytes, utf8_seed, true);
+        if (m_backend_output_stopped) {
+            keep_scan_state_through(bytes.size() - left);
+            return left;
+        }
         m_text_area_resize_scanner.utf8_state = scan_utf8_state;
         if (bytes.empty()) {
             complete_processing_backend_output_side_effects();
         }
-        return;
+        return 0;
     }
 
     std::size_t consumed_bytes = 0U;
     const bool armed = scan_backend_output_span(
         sequence,
         bytes,
-        allow_arbitration,
-        static_cast<std::size_t>(bytes.size()),
+        true,
+        available_bytes,
         false,
         consumed_bytes);
+    if (m_backend_output_stopped) {
+        return bytes.size() - static_cast<qsizetype>(consumed_bytes);
+    }
     Q_ASSERT(consumed_bytes == static_cast<std::size_t>(bytes.size()));
     if (armed || bytes.empty()) {
         complete_processing_backend_output_side_effects();
@@ -6619,54 +7119,10 @@ void Terminal_session::ingest_backend_output_bytes(
     if (m_text_area_resize_scanner.candidate_size > 0U) {
         record_incomplete_processing_backend_output_side_effects();
     }
+    return 0;
 }
 
-void Terminal_session::replay_text_area_resize_tail(
-    std::uint64_t sequence,
-    bool          allow_arbitration)
-{
-    while (!m_text_area_resize_arbitration.has_value() &&
-        text_area_resize_tail_size() > 0U)
-    {
-        const std::size_t available_bytes = text_area_resize_tail_size();
-        const QByteArrayView front = text_area_resize_tail_front();
-        std::size_t consumed_bytes = 0U;
-        const bool armed = scan_backend_output_span(
-            sequence,
-            front,
-            allow_arbitration,
-            available_bytes,
-            true,
-            consumed_bytes);
-        if (armed) {
-            // An owned-tail arm advances its absolute read cursor before
-            // changing ring epochs, so applying consumed_bytes again would
-            // replay past the newly latched tail.
-            Q_ASSERT(consumed_bytes > 0U);
-            observe_text_area_resize_arbitration_storage();
-            return;
-        }
-        Q_ASSERT(consumed_bytes > 0U);
-        consume_text_area_resize_tail(consumed_bytes);
-    }
-
-    if (!m_text_area_resize_arbitration.has_value() &&
-        text_area_resize_tail_size() == 0U)
-    {
-        const bool capability_known =
-            m_config.text_area_resize_arbitration.has_value() &&
-            m_config.text_area_resize_arbitration->version ==
-                k_terminal_text_area_resize_arbitration_capability_version;
-        const std::size_t configured_hold_limit = capability_known
-            ? m_config.text_area_resize_arbitration->hold_limit_bytes
-            : 0U;
-        if (m_text_area_resize_tail.capacity_limit != configured_hold_limit) {
-            clear_text_area_resize_tail_epoch();
-        }
-    }
-}
-
-void Terminal_session::ingest_backend_output_run(
+qsizetype Terminal_session::ingest_backend_output_run(
     std::uint64_t              sequence,
     QByteArrayView             bytes,
     Terminal_utf8_scan_state   utf8_seed,
@@ -6675,6 +7131,13 @@ void Terminal_session::ingest_backend_output_run(
     QByteArray               combined_output;
     QByteArrayView           remaining(bytes);
     Terminal_utf8_scan_state remaining_utf8_scan_state = utf8_seed;
+    // When the model stops in a segment, the run stops too. What it left is
+    // the end of that segment and everything after it in remaining, which
+    // are the run's last bytes: a rewritten synchronized-output sequence
+    // holds no sixel data, so the model never stops in one.
+    const auto stopped_after = [&](qsizetype segment_size, qsizetype left) {
+        return left + (remaining.size() - segment_size);
+    };
     while (!remaining.empty()) {
         if (immediate_public_projection_policy_enabled() &&
             m_screen_model->mode_state().synchronized_output)
@@ -6684,9 +7147,12 @@ void Terminal_session::ingest_backend_output_run(
                 remaining_utf8_scan_state);
             if (sync_reset.start >= 0) {
                 if (sync_reset.start > 0) {
-                    ingest_backend_output_segment(
+                    const qsizetype left = ingest_backend_output_segment(
                         sequence,
                         remaining.sliced(0, sync_reset.start));
+                    if (m_backend_output_stopped) {
+                        return stopped_after(sync_reset.start, left);
+                    }
                     remaining = remaining.sliced(sync_reset.start);
                     reset_utf8_scan_state(remaining_utf8_scan_state);
                     continue;
@@ -6696,6 +7162,7 @@ void Terminal_session::ingest_backend_output_run(
                 const QByteArray prefix = sync_sequence_prefix(remaining, sync_reset, 'l');
                 if (!prefix.isEmpty()) {
                     ingest_backend_output_segment(sequence, QByteArrayView(prefix));
+                    Q_ASSERT(!m_backend_output_stopped);
                     combined_output =
                         sync_sequence_from_sync_parameter_and_tail(remaining, sync_reset, 'l');
                     remaining = QByteArrayView(combined_output);
@@ -6711,6 +7178,7 @@ void Terminal_session::ingest_backend_output_run(
                     QByteArrayView(release),
                     may_complete_backend_output_callback &&
                         combined_output.isEmpty());
+                Q_ASSERT(!m_backend_output_stopped);
                 remaining = QByteArrayView(combined_output);
                 reset_utf8_scan_state(remaining_utf8_scan_state);
                 continue;
@@ -6721,17 +7189,20 @@ void Terminal_session::ingest_backend_output_run(
             remaining,
             remaining_utf8_scan_state);
         if (sync_set.start < 0) {
-            ingest_backend_output_segment(
+            const qsizetype left = ingest_backend_output_segment(
                 sequence,
                 remaining,
                 may_complete_backend_output_callback);
-            break;
+            return m_backend_output_stopped ? left : 0;
         }
 
         if (sync_set.start > 0) {
-            ingest_backend_output_segment(
+            const qsizetype left = ingest_backend_output_segment(
                 sequence,
                 remaining.sliced(0, sync_set.start));
+            if (m_backend_output_stopped) {
+                return stopped_after(sync_set.start, left);
+            }
             remaining = remaining.sliced(sync_set.start);
             reset_utf8_scan_state(remaining_utf8_scan_state);
             continue;
@@ -6749,6 +7220,7 @@ void Terminal_session::ingest_backend_output_run(
         const QByteArray prefix = sync_sequence_prefix(remaining, sync_set, 'h');
         if (!prefix.isEmpty()) {
             ingest_backend_output_segment(sequence, QByteArrayView(prefix));
+            Q_ASSERT(!m_backend_output_stopped);
             combined_output =
                 immediate_entry_boundary
                     ? sync_sequence_from_sync_parameter_and_tail(remaining, sync_set, 'h')
@@ -6767,6 +7239,7 @@ void Terminal_session::ingest_backend_output_run(
                 QByteArrayView(entry),
                 may_complete_backend_output_callback &&
                     combined_output.isEmpty());
+            Q_ASSERT(!m_backend_output_stopped);
             (void)capture_public_projection_from_latest_content_basis();
             remaining = QByteArrayView(combined_output);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -6777,6 +7250,7 @@ void Terminal_session::ingest_backend_output_run(
             ingest_backend_output_segment(
                 sequence,
                 remaining.sliced(0, sync_set.end));
+            Q_ASSERT(!m_backend_output_stopped);
             remaining = remaining.sliced(sync_set.end);
             reset_utf8_scan_state(remaining_utf8_scan_state);
             continue;
@@ -6786,8 +7260,10 @@ void Terminal_session::ingest_backend_output_run(
             sequence,
             remaining,
             may_complete_backend_output_callback);
+        Q_ASSERT(!m_backend_output_stopped);
         break;
     }
+    return 0;
 }
 
 Terminal_session_result Terminal_session::process_backend_exit_command(
@@ -6812,17 +7288,27 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
     }
 
     // Nothing can answer a new request once the process is gone. Release the
-    // one transaction that could already have reached the host, then interpret
-    // its tail with arbitration disabled so exit cannot manufacture historical
-    // request/settlement pairs for requests no host ever saw.
+    // one transaction that could already have reached the host; the exit's
+    // operation then interprets its tail with arbitration disabled, so exit
+    // cannot manufacture historical request/settlement pairs for requests no
+    // host ever saw, and applies the exit after it.
     if (m_text_area_resize_arbitration.has_value()) {
         release_text_area_resize_arbitration(
             Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED,
             {},
             command.sequence,
             false);
+        return make_accepted_result(command.sequence);
     }
 
+    apply_backend_exit(command);
+    return make_accepted_result(command.sequence);
+}
+
+// The process state, the capture writer, the transcript's exit record and
+// PROCESS_EXITED: the last effects of the exit's operation.
+void Terminal_session::apply_backend_exit(const Terminal_session_command& command)
+{
     cancel_pending_backend_resizes();
     m_exit_status    = *command.exit;
     m_process_state  = command.exit->reason == Terminal_exit_reason::FAILED_TO_START
@@ -6862,8 +7348,6 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
         std::nullopt,
         false,
     });
-
-    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_backend_error_command(
@@ -7071,9 +7555,7 @@ Backend_callback_drain_stop Terminal_session::process_backend_callback_events_un
         target_epoch = std::min(target_epoch, *m_input_frontier_epoch);
     }
 
-    if (target_epoch == 0U ||
-        m_last_processed_backend_callback_epoch >= target_epoch)
-    {
+    if (backend_output_settled(target_epoch)) {
         return target_epoch < requested_epoch
             ? Backend_callback_drain_stop::UNSETTLED
             : Backend_callback_drain_stop::COMPLETE;
@@ -7213,7 +7695,7 @@ std::optional<Terminal_session_result>
 Terminal_session::reject_unsettled_input_frontier()
 {
     if (!m_input_frontier_epoch.has_value() ||
-        m_last_processed_backend_callback_epoch >= *m_input_frontier_epoch)
+        backend_output_settled(*m_input_frontier_epoch))
     {
         return std::nullopt;
     }
@@ -7425,6 +7907,15 @@ void Terminal_session::flush_ready_processed_backend_callback_epoch()
 bool Terminal_session::pending_backend_callback_blocks_processed_callback_epoch(
     std::uint64_t epoch) const
 {
+    // A later callback settled outside the runner (an overflow, output ignored
+    // after a stop) waits for the open operation; the operation's own epoch
+    // completes when its last bytes are applied.
+    if (m_operation.has_value() &&
+        m_operation->command.backend_callback_epoch != 0U &&
+        m_operation->command.backend_callback_epoch < epoch)
+    {
+        return true;
+    }
     for (const Terminal_session_command& command : m_pending_commands) {
         if (command.backend_callback_epoch != 0U &&
             command.backend_callback_epoch <= epoch)
@@ -7559,15 +8050,16 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_visual_bell_active                = false;
 }
 
-void Terminal_session::ingest_backend_output_segment(
+qsizetype Terminal_session::ingest_backend_output_segment(
     std::uint64_t  sequence,
     QByteArrayView bytes,
     bool           completes_backend_output_callback)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::ingest_backend_output_segment");
 
-    if (bytes.empty()) {
-        return;
+    // No bytes continue a waiting placement, and nothing else.
+    if (bytes.empty() && !m_screen_model->sixel_placement_pending()) {
+        return 0;
     }
 
     const bool render_snapshot_was_blocked =
@@ -7595,7 +8087,14 @@ void Terminal_session::ingest_backend_output_segment(
     Terminal_screen_model_result ingest_result;
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::model_ingest");
-        ingest_result = m_screen_model->ingest(bytes, &resize_transition_sink);
+        ingest_result = m_screen_model->ingest(
+            bytes,
+            &resize_transition_sink,
+            m_sixel_work_budget);
+    }
+    const qsizetype unconsumed_bytes = bytes.size() - ingest_result.consumed_bytes;
+    if (ingest_result.sixel_work_pending) {
+        m_backend_output_stopped = true;
     }
     m_search_retained_reset_pending =
         m_search_retained_reset_pending ||
@@ -7629,7 +8128,7 @@ void Terminal_session::ingest_backend_output_segment(
         model_result_warrants_render_snapshot(ingest_result);
     const bool render_terminal_content_changed = ingest_result.terminal_content_changed;
     apply_trailing_changes(ingest_result, trailing_changes);
-    if (completes_backend_output_callback) {
+    if (completes_backend_output_callback && !ingest_result.sixel_work_pending) {
         complete_processing_backend_output_side_effects();
     }
 
@@ -7719,6 +8218,7 @@ void Terminal_session::ingest_backend_output_segment(
     if (had_public_projection_hold && render_snapshot_available) {
         reset_public_projection_lifecycle();
     }
+    return unconsumed_bytes;
 }
 
 void Terminal_session::defer_backend_content_snapshot(
@@ -7747,7 +8247,12 @@ void Terminal_session::defer_backend_content_snapshot(
 
 void Terminal_session::flush_deferred_backend_content_snapshot()
 {
-    if (!m_deferred_backend_content_snapshot.has_value()) {
+    // A snapshot is built from the live model, which a started sixel
+    // placement holds. The placement starts only after a flush, so this only
+    // keeps a late deferral for the release to publish.
+    if (!m_deferred_backend_content_snapshot.has_value() ||
+        (m_screen_model.has_value() && !model_allows_render_snapshot(*m_screen_model)))
+    {
         return;
     }
 
@@ -7929,22 +8434,22 @@ void Terminal_session::handle_parser_actions(
             }
             case Parser_action_kind::TERMINAL_REPLY:
                 {
-                    const Terminal_reply& reply          = std::get<Terminal_reply>(action.payload);
-                    const std::uint64_t   reply_sequence = next_sequence();
-                    Terminal_session_command reply_command =
-                        make_terminal_reply_command(reply_sequence, reply);
-                    // The output callback is not settled until its protocol
-                    // replies have passed through the normal write queue. Keep
-                    // that provenance even when output is consumed in slices.
-                    reply_command.backend_callback_epoch = m_processing_command_callback_epoch;
-                    const Terminal_session_result enqueue_result = enqueue_command(
-                        std::move(reply_command));
-                    record_result(enqueue_result);
-                    if (enqueue_result.code != Terminal_session_result_code::ACCEPTED &&
-                        enqueue_result.error.has_value())
-                    {
-                        record_backend_error(reply_sequence, *enqueue_result.error);
+                    // A reply belongs to the operation that parsed its query and
+                    // reaches its final disposition at that operation's next
+                    // step boundary, before anything behind the operation.
+                    Q_ASSERT(m_operation.has_value());
+                    const Terminal_reply& reply = std::get<Terminal_reply>(action.payload);
+                    Operation_reply pending;
+                    pending.command = make_terminal_reply_command(next_sequence(), reply);
+                    const std::size_t byte_count =
+                        static_cast<std::size_t>(pending.command.bytes.size());
+                    pending.queue_rejected =
+                        would_accept_command(Queue_category::WRITE, byte_count, 1U).code ==
+                            Terminal_queue_result_code::HARD_LIMIT_REACHED;
+                    if (!pending.queue_rejected) {
+                        add_to_queue_state(Queue_category::WRITE, byte_count);
                     }
+                    m_operation_replies.push_back(std::move(pending));
                     break;
             }
             case Parser_action_kind::HOST_REQUEST:

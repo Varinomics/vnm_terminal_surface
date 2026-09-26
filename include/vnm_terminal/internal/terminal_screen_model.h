@@ -375,6 +375,11 @@ struct Terminal_screen_model_result
     bool                       alternate_scroll_mode_changed = false;
     int                        scrollback_rows               = 0;
     int                        evicted_scrollback_rows       = 0;
+    // How much of an ingest's bytes it parsed, and whether sixel work its
+    // budget could not pay for waits: the caller hands the rest over again
+    // in a later step, or, while a placement waits, calls with no bytes.
+    qsizetype                  consumed_bytes                = 0;
+    bool                       sixel_work_pending            = false;
 };
 
 struct terminal_screen_model_resize_transition_t
@@ -615,15 +620,27 @@ public:
     Terminal_screen_model(Terminal_screen_model&&)            = default;
     Terminal_screen_model& operator=(Terminal_screen_model&&) = default;
 
+    // Applies bytes. With a budget, sixel decoding stops after the byte whose
+    // work spends the budget, where a chunk could have ended, and placement
+    // before a step the budget cannot pay for; the result says how much was
+    // consumed and that work is pending. While a placement is pending, the only valid call
+    // is one with no bytes, which continues it: nothing else is parsed, and
+    // no other mutation (resize, capacity, scrollback, color or cell pixel
+    // size) may run until it ends; the session completes pending work before
+    // any of those. Without a budget everything runs.
     Terminal_screen_model_result ingest(
         QByteArrayView bytes,
         const terminal_screen_model_resize_transition_sink_t*
-            resize_transition_sink = nullptr);
-    // Where a caller that yields after each sixel image should end the next
-    // chunk it ingests; see Terminal_byte_stream_parser::sixel_image_boundary.
-    qsizetype sixel_image_boundary(QByteArrayView bytes) const
+            resize_transition_sink = nullptr,
+        Sixel_work_budget* sixel_work_budget = nullptr);
+
+    // A placement waits either unstarted, with the screen as it was, or
+    // started, partly placed: then nothing may be published until it ends,
+    // which the model's changes hold like synchronized output.
+    bool sixel_placement_pending() const { return m_sixel_placement.has_value(); }
+    bool sixel_placement_started() const
     {
-        return m_parser.sixel_image_boundary(bytes);
+        return m_sixel_placement.has_value() && m_sixel_placement->started;
     }
     Terminal_screen_model_result resize(
         terminal_grid_size_t grid_size,
@@ -1417,9 +1434,39 @@ private:
 
     std::size_t sixel_raster_limit_bytes() const;
 
+    // An image being placed a step at a time: the aspect-ratio clamp, then
+    // each band with the scroll it needs, then the trailing scrolls, then the
+    // cursor. Each step is paid for before it runs.
+    struct Sixel_placement
+    {
+        QImage                     raster;
+        terminal_cell_pixel_size_t cell;
+        terminal_grid_position_t   origin;
+        int                        decoded_aspect          = 1;
+        int                        aspect                  = 1;
+        int                        width                   = 0;
+        int                        height                  = 0;
+        bool                       display_mode            = false;
+        bool                       started                 = false;
+        bool                       bands_done              = false;
+        int                        band_count              = 0;
+        int                        next_band               = 0;
+        std::int64_t               final_cursor_y          = 0;
+        std::int64_t               scroll_count            = 0;
+        std::int64_t               scrolls                 = 0;
+        std::int64_t               trailing_scrolls_left   = 0;
+        std::size_t                refused_composite_bytes = 0U;
+        std::uint64_t              total_cost              = 0U;
+    };
+
     void place_sixel_image(
         const Screen_sixel_image_mutation& image,
         std::vector<Parser_action>&        generated_actions);
+    std::uint64_t sixel_band_cost(const Sixel_placement& placement, int band) const;
+    std::uint64_t sixel_composite_cost(const Sixel_placement& placement, int row) const;
+    std::uint64_t sixel_scroll_cost() const;
+    // Runs placement steps while the budget pays for them; true once done.
+    bool advance_sixel_placement(std::vector<Parser_action>& generated_actions);
 
     // Returns the size of a composite refused over the decoded-size cap, zero
     // when none was.
@@ -1725,6 +1772,12 @@ private:
     // DECSDM (?80) only decides where later sixel images go, so it stays
     // outside the render snapshot mode state as well.
     bool                            m_sixel_display_mode = false;
+    std::optional<Sixel_placement>  m_sixel_placement;
+    // A started placement has collected its changes across calls, to be
+    // released when it ends.
+    bool                            m_sixel_placement_held = false;
+    // The budget of the ingest in progress.
+    Sixel_work_budget*              m_sixel_work_budget = nullptr;
     int                             m_active_alternate_mode = 0;
     Terminal_hyperlink_id           m_current_hyperlink_id = k_no_terminal_hyperlink_id;
     Terminal_hyperlink_id           m_next_hyperlink_id = 1U;

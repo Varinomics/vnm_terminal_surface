@@ -710,7 +710,7 @@ bool protocol_callbacks_before_input_frontier_pending(
 {
     const std::optional<std::uint64_t> frontier = session.input_frontier_epoch();
     return frontier.has_value()
-        ? session.backend_callback_processed_epoch() < *frontier
+        ? !session.backend_callbacks_settled(*frontier)
         : session.has_pending_backend_callback_events();
 }
 
@@ -4663,8 +4663,11 @@ bool VNM_TerminalSurface::respond_text_area_resize(
             term::terminal_grid_size_t{effective_rows, effective_columns},
         });
     // The session drains pending work across that call, which can advance the
-    // model and publish a snapshot, so republish before returning.
+    // model and publish a snapshot, so republish before returning. A released
+    // tail with more sixel work than one drain step allows is left for the
+    // drains that follow.
     sync_from_session();
+    m_private->request_backend_callback_frame_update_or_queue_posted_drain(*this);
     if (!is_accepted(result.code)) {
         report_result_failure(result);
         return false;
@@ -4694,6 +4697,7 @@ void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
         {},
     });
     sync_from_session();
+    m_private->request_backend_callback_frame_update_or_queue_posted_drain(*this);
 }
 
 QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const
@@ -8304,8 +8308,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     }
 
     const std::uint64_t session_generation = m_private->session_generation;
-    const std::uint64_t callback_processed_epoch_before =
-        session->backend_callback_processed_epoch();
+    const std::uint64_t output_steps_before = session->backend_output_step_count();
     const auto session_processing_started = std::chrono::steady_clock::now();
     if (target_backend_callback_epoch.has_value()) {
         result.stop =
@@ -8370,9 +8373,11 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         }
         else
         if (m_private->backend_callback_frame_progress_deadline.has_value() &&
-            session->backend_callback_processed_epoch() >
-                callback_processed_epoch_before)
+            session->backend_output_step_count() > output_steps_before)
         {
+            // A step of the head operation is progress, whether or not it
+            // completed a callback epoch: the watchdog trips only on a
+            // stalled head.
             m_private->restart_backend_callback_frame_progress_watchdog();
         }
     }
@@ -8719,8 +8724,10 @@ void VNM_TerminalSurface::sync_synchronized_output_recovery_timer()
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
+    // Only the application's synchronized-output hold can go stale; a sixel
+    // placement that holds publication ends on its own as drains continue it.
     if (m_private->session == nullptr ||
-        !m_private->session->render_publication_blocked())
+        !m_private->session->synchronized_output_hold_active())
     {
         m_private->synchronized_output_recovery_timer.stop();
         return;
@@ -8765,7 +8772,7 @@ void VNM_TerminalSurface::handle_synchronized_output_recovery_timeout(
             Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     };
 
-    if (!session->render_publication_blocked()) {
+    if (!session->synchronized_output_hold_active()) {
         queue_remaining_callbacks();
         return;
     }
@@ -9007,13 +9014,16 @@ void VNM_TerminalSurface::updatePolish()
         return;
     }
 
-    if (target_epoch > session->backend_callback_processed_epoch()) {
+    // Output up to the frame's frontier is caught up only once it is
+    // settled, with or without newer callbacks: an open operation (such as a
+    // released text-area resize tail) is catch-up work too.
+    if (!session->backend_callbacks_settled(target_epoch)) {
         (void)drain_backend_callback_events_until_epoch(
             target_epoch,
             m_private->backend_callback_frame_catchup_budget());
     }
     if (m_private->active_session_matches(session, session_generation) &&
-        session->backend_callback_processed_epoch() >= target_epoch)
+        session->backend_callbacks_settled(target_epoch))
     {
         refresh_grid_metrics_if_device_pixel_ratio_changed();
     }

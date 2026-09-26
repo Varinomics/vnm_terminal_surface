@@ -218,47 +218,106 @@ void Sixel_decoder::begin(QByteArrayView header_parameters)
     m_active            = true;
 }
 
-void Sixel_decoder::decode(QByteArrayView data, std::vector<Parser_action>& actions)
+qsizetype Sixel_decoder::decode(
+    QByteArrayView               data,
+    std::vector<Parser_action>&  actions,
+    Sixel_work_budget*           budget,
+    Terminal_utf8_scan_state*    string_scan)
 {
-    for (const char character : data) {
-        const unsigned char byte = static_cast<unsigned char>(character);
+    qsizetype consumed = 0;
+    while (consumed < data.size()) {
+        const unsigned char byte = static_cast<unsigned char>(data[consumed]);
 
-        int repeat = 1;
-        if (m_command != Command::NONE) {
-            if (is_parameter_byte(byte)) {
-                collect_parameter_byte(byte);
-                continue;
+        // Inside a UTF-8 sequence a C1 byte is data, as the parser's
+        // terminator scan reads it. A byte that could end the string is the
+        // parser's to decide, so decoding stops before it.
+        if (string_scan != nullptr &&
+            !utf8_scan_consumes_byte(byte, *string_scan) &&
+            (byte == 0x1bU || byte == 0x18U || byte == 0x1aU ||
+                byte == 0x9bU || byte == 0x9cU))
+        {
+            break;
+        }
+
+        // A byte's work is charged once it is done, whatever it costs: its
+        // draw or graphics new line, and the raster it reserves, whether by
+        // completing raster attributes or by drawing past the capacity.
+        // Decoding stops after the byte that spends the budget.
+        const bool data_byte = byte >= k_sixel_data_first && byte <= k_sixel_data_last;
+        const std::uint64_t work =
+            m_command != Command::NONE && is_parameter_byte(byte) ? 0U :
+            data_byte   ? draw_cost(byte - k_sixel_data_first)    :
+            byte == '-' ? band_expansion_cost()                   : 0U;
+        const std::uint64_t reservations_before = m_reservations;
+        const std::uint64_t reserved_before     = m_reserved_pixels;
+        decode_byte(byte);
+        ++consumed;
+        const std::uint64_t incurred = work + (m_reserved_pixels - reserved_before);
+        if (budget != nullptr) {
+            if (incurred > 0U) {
+                budget->charge_after(incurred);
             }
-            repeat = finish_command();
-        }
-
-        if (byte >= k_sixel_data_first && byte <= k_sixel_data_last) {
-            draw_sixel(byte - k_sixel_data_first, repeat);
-            continue;
-        }
-
-        // Anything else, controls included, is not sixel data and is ignored.
-        switch (byte) {
-            case '!': start_command(Command::REPEAT);            break;
-            case '#': start_command(Command::COLOR);             break;
-            case '"': start_command(Command::RASTER_ATTRIBUTES); break;
-            case '$': m_x = 0;                                   break;
-            case '-': next_line();                               break;
-            default:                                             break;
+            budget->count_raster_allocations(m_reservations - reservations_before);
+            if (budget->exhausted()) {
+                break;
+            }
         }
     }
 
     emit_limit_diagnostic(actions);
+    return consumed;
 }
 
-void Sixel_decoder::finish(std::vector<Parser_action>& actions)
+void Sixel_decoder::decode_byte(unsigned char byte)
+{
+    if (m_command != Command::NONE && is_parameter_byte(byte)) {
+        collect_parameter_byte(byte);
+        return;
+    }
+
+    int repeat = 1;
+    if (m_command != Command::NONE) {
+        repeat = finish_command();
+    }
+
+    if (byte >= k_sixel_data_first && byte <= k_sixel_data_last) {
+        draw_sixel(byte - k_sixel_data_first, repeat);
+        return;
+    }
+
+    // Anything else, controls included, is not sixel data and is ignored.
+    switch (byte) {
+        case '!': start_command(Command::REPEAT);            break;
+        case '#': start_command(Command::COLOR);             break;
+        case '"': start_command(Command::RASTER_ATTRIBUTES); break;
+        case '$': m_x = 0;                                   break;
+        case '-': next_line();                               break;
+        default:                                             break;
+    }
+}
+
+std::uint64_t Sixel_decoder::finish_cost() const
+{
+    const bool fills = m_background_fill && !m_limit_exceeded;
+    return band_expansion_cost() +
+        (fills ? static_cast<std::uint64_t>(m_extent_width * m_extent_height) : 0U);
+}
+
+void Sixel_decoder::finish(std::vector<Parser_action>& actions, Sixel_work_budget* budget)
 {
     // A command still collecting parameters completes at the terminator, so
     // a trailing color definition applies. A repeat has nothing to repeat.
+    const std::uint64_t reservations_before = m_reservations;
+    const std::uint64_t reserved_before     = m_reserved_pixels;
     finish_command();
 
-    // The cap may have shrunk since the image last grew.
+    // The cap may have shrunk since the image last grew. The end is one step
+    // that always runs, so what it allocates is charged afterwards.
     grow_extent_within_limit();
+    if (budget != nullptr) {
+        budget->charge_after(finish_cost() + (m_reserved_pixels - reserved_before));
+        budget->count_raster_allocations(m_reservations - reservations_before);
+    }
     expand_band();
     emit_limit_diagnostic(actions);
 
@@ -397,6 +456,27 @@ void Sixel_decoder::apply_raster_attributes()
     }
 }
 
+// A draw writes each set bit's first row once per repeat; aspect rows follow
+// in the band expansion. An empty sixel only moves the cursor.
+std::uint64_t Sixel_decoder::draw_cost(int bits) const
+{
+    const int repeat = m_command == Command::REPEAT ? std::max(m_parameters[0], 1) : 1;
+    return bits == 0
+        ? 1U
+        : static_cast<std::uint64_t>(repeat) *
+            static_cast<std::uint64_t>(std::popcount(static_cast<unsigned int>(bits)));
+}
+
+std::uint64_t Sixel_decoder::band_expansion_cost() const
+{
+    if (m_pixel_aspect_ratio <= 1) {
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(m_band_width) *
+        static_cast<std::uint64_t>(std::popcount(static_cast<unsigned int>(m_band_drawn_bits))) *
+        static_cast<std::uint64_t>(m_pixel_aspect_ratio - 1);
+}
+
 void Sixel_decoder::draw_sixel(int bits, int repeat)
 {
     m_raster_locked = true;
@@ -460,6 +540,8 @@ void Sixel_decoder::next_line()
     m_y             = advanced(m_y, k_sixel_row_pixels * m_pixel_aspect_ratio);
 }
 
+// Allocates and counts; the byte or the image end that causes a reservation
+// is charged for it.
 void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
 {
     const std::int64_t capacity_width  = m_raster.width();
@@ -512,6 +594,8 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
     if (grown.isNull()) {
         throw std::bad_alloc();
     }
+    ++m_reservations;
+    m_reserved_pixels += static_cast<std::uint64_t>(grown_width * grown_height);
 
     m_raster        = std::move(grown);
     m_pixels        = reinterpret_cast<std::uint32_t*>(m_raster.bits());

@@ -309,6 +309,9 @@ add_test(
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_sixel_decoder>"
 )
+# A suspension that retries a byte at no progress loops inside one parser
+# call, where no iteration limit reaches it.
+set_tests_properties(vnm_terminal_sixel_decoder PROPERTIES TIMEOUT 60)
 
 add_executable(vnm_terminal_sixel_placement
     sixel_placement/sixel_placement_tests.cpp

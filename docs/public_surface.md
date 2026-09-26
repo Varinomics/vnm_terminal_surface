@@ -66,9 +66,11 @@ Writable Qt properties:
   `DEFER_UNTIL_CONTENT_PUBLICATION`; public scroll APIs and app chrome remain
   visually deferred until content is published. `IMMEDIATE_PUBLIC_PROJECTION`
   is opt-in and scrolls a copied public projection without exposing hidden live
-  rows. Policy changes during an active hold are latched: the current hold keeps
-  its entry policy, a diagnostic is recorded, and the next hold uses the new
-  policy.
+  rows; copying that projection at each hold entry is a synchronous cost that
+  grows with retained history, image rows included (see
+  `synchronized_output.md`). Policy changes during an active hold are latched:
+  the current hold keeps its entry policy, a diagnostic is recorded, and the
+  next hold uses the new policy.
 - `textAreaResizePolicy` is `APPLICATION_CONTROLLED` (the default) or
   `DISABLED`, and controls whether XTWINOPS `CSI 8 ; rows ; columns t` may move
   the text area. Hosts set `DISABLED` whenever the window manager owns their
@@ -366,6 +368,15 @@ replayed publications are counted but remain nonfatal. A transcript without
 snapshot diagnostics fails the strict gate. Final-only snapshot replay is not a
 supported mode.
 
+Known limitation (accepted): a drain with a deadline spreads sixel work over
+steps within one recorded `backend.output` event (an image's decoding, its
+placement, the output after it), publishing coherent snapshots between the
+steps. Replay takes each event whole, so it reproduces the final semantic run
+but not those intermediate checkpoints: strict replay reports them as divergent
+snapshot events and exits with failure (3), while causal structure and the
+final state still match. Transcripts of output without sixel images, or drained
+without a deadline, are unaffected.
+
 The summary reports recorded/replayed causal-group counts, causal-driver and
 causal-protocol divergences, semantic run and scheduling-surplus counts,
 fixed-digest object checks,
@@ -565,6 +576,14 @@ as `REJECTED` instead, and `respond_text_area_resize` returns false with a
 grid when the request was accepted and against the grid then current otherwise;
 `rows` and `columns` are that grid. A host that armed UI on the request tears it
 down on this signal rather than on its own answer.
+
+`respond_text_area_resize` returns its own result at once, whatever the held
+output costs. The held output then replays as ordered output of its own, a
+bounded step in the answer and the rest over the frames and drains that follow,
+and it is settled before anything after it takes effect: the replies it
+generates are written before any later input, and a key, paste or host resize
+that arrives while it is still replaying first applies what is left of it,
+synchronously, before it reads the modes that output set.
 
 Arbitration is an optional capability and adds no transcript event kind. A
 transcript captured with it enabled replays under a session without it as the

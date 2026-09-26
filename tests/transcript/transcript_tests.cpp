@@ -4114,6 +4114,342 @@ bool test_replay_tool_applies_recorded_cell_pixel_size(const QString& replay_too
     return ok;
 }
 
+// A drain with a deadline takes a near-cap sixel image over several steps. The
+// transcript still records each output byte once, before its effects, so the
+// replay finds the recorded causal structure and the final state. The
+// snapshots published between the steps are not replayed, since the replay
+// takes each output event whole: strict replay reports them as divergent and
+// fails, which is the accepted, documented limitation (public_surface.md).
+// Output a text-area resize hold captures is recorded once, when it arrives,
+// and never again when a release lets it go; the replies to its queries are
+// recorded as host writes in query order after it; and a process exit that
+// releases the hold is recorded after every effect of the released tail.
+// Both for a host's answer and for the exit, with the release drained in
+// unit sixel steps.
+bool test_released_tail_is_recorded_once_and_in_order()
+{
+    bool ok = true;
+
+    QByteArray image = QByteArrayLiteral("\x1bPq\"1;1;8;120#1;2;100;0;0");
+    for (int band = 0; band < 20; ++band) {
+        image += band + 1 < 20 ? QByteArrayLiteral("#1!8~-") : QByteArrayLiteral("#1!8~");
+    }
+    image += QByteArrayLiteral("\x1b\\");
+    const std::vector<QByteArray> held = {
+        QByteArrayLiteral("held\x1b[c"),
+        image,
+        QByteArrayLiteral("\x1b[6n tail"),
+    };
+
+    for (const bool release_by_exit : {false, true}) {
+        const std::string label = release_by_exit ? "exit release" : "host answer";
+        QTemporaryDir temp_dir;
+        if (!check(temp_dir.isValid(), label + ": transcript directory is valid")) {
+            return false;
+        }
+        const QString path = temp_dir.filePath(QStringLiteral("released-tail.ndjson"));
+        QString error;
+        std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+            term::Terminal_transcript_recorder::create(path, true, &error);
+        if (!check(recorder != nullptr, label + ": transcript recorder opens")) {
+            std::cerr << error.toStdString() << '\n';
+            return false;
+        }
+
+        QByteArray emitted;
+        {
+            auto backend = std::make_unique<Scripted_backend>();
+            Scripted_backend* backend_ptr = backend.get();
+            term::Terminal_session_config config;
+            config.transcript_recorder    = recorder;
+            config.backend_event_notifier = [] {};
+            config.text_area_resize_arbitration.emplace();
+            term::Terminal_session session(std::move(backend), config);
+            session.set_cell_pixel_size({10, 20});
+            term::Terminal_launch_config launch_config = valid_launch_config();
+            launch_config.initial_grid_size = term::terminal_grid_size_t{10, 40};
+            ok &= check(session.start(launch_config).code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+                label + ": session starts");
+            session.process_backend_callback_events();
+
+            const QByteArray request = QByteArrayLiteral("\x1b[8;9;40t");
+            backend_ptr->emit_output(request);
+            emitted += request;
+            session.process_backend_callback_events();
+            std::uint64_t request_id = 0U;
+            for (term::Terminal_session_delivery& delivery : session.take_pending_deliveries()) {
+                if (delivery.text_area_resize_arbitration_event.has_value() &&
+                    delivery.text_area_resize_arbitration_event->request.has_value())
+                {
+                    request_id = delivery.text_area_resize_arbitration_event->request->request_id;
+                    (void)session.mark_text_area_resize_arbitration_presented(request_id);
+                }
+            }
+            ok &= check(request_id != 0U, label + ": the request reaches the host");
+            for (const QByteArray& output : held) {
+                backend_ptr->emit_output(output);
+                emitted += output;
+                session.process_backend_callback_events();
+            }
+
+            session.set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+            if (release_by_exit) {
+                backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+            }
+            else {
+                (void)session.settle_text_area_resize_arbitration({
+                    request_id,
+                    term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+                    term::terminal_grid_size_t{9, 40},
+                });
+            }
+            for (int calls = 0; session.has_pending_backend_callback_events() && calls < 1000; ++calls) {
+                (void)session.process_backend_callback_events_for(
+                    std::chrono::steady_clock::duration::zero());
+            }
+            if (!release_by_exit) {
+                backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+                session.process_backend_callback_events();
+            }
+        }
+        recorder.reset();
+
+        const std::optional<std::vector<term::Terminal_transcript_event>> events =
+            term::read_terminal_transcript(path, &error);
+        if (!check(events.has_value(), label + ": transcript parses")) {
+            std::cerr << error.toStdString() << '\n';
+            return false;
+        }
+
+        QByteArray recorded;
+        std::vector<QByteArray> replies;
+        std::size_t last_reply_index = 0U;
+        std::size_t last_output_index = 0U;
+        std::optional<std::size_t> exit_index;
+        for (std::size_t index = 0U; index < events->size(); ++index) {
+            const term::Terminal_transcript_event& event = (*events)[index];
+            if (event.kind == QStringLiteral("backend.output")) {
+                recorded += event_bytes(event);
+                last_output_index = index;
+            }
+            else
+            if (event.kind == QStringLiteral("host.write") &&
+                event.object.value(QStringLiteral("source")).toString() ==
+                    QStringLiteral("terminal_reply"))
+            {
+                replies.push_back(event_bytes(event));
+                last_reply_index = index;
+            }
+            else
+            if (event.kind == QStringLiteral("session.process_exit")) {
+                exit_index = index;
+            }
+        }
+        ok &= check(recorded == emitted,
+            label + ": every held byte is recorded once, as it arrived, and not again at its release");
+        ok &= check(replies.size() == 2U &&
+                replies[0].startsWith(QByteArrayLiteral("\x1b[?")) && replies[0].endsWith('c') &&
+                replies[1].endsWith('R') &&
+                last_reply_index > last_output_index,
+            label + ": the released tail's replies are recorded in query order after its bytes");
+        ok &= check(exit_index.has_value() && *exit_index > last_reply_index &&
+                *exit_index > last_output_index,
+            label + ": the exit is recorded after every effect of the released tail");
+    }
+    return ok;
+}
+
+// A drain taken in single sixel steps records the same causal order as an
+// unbudgeted one: each output byte once, before its effects; each reply after
+// its query's output and before later input; the exit last. Only the
+// snapshots published between the steps differ.
+bool test_budgeted_drain_records_the_unbudgeted_causal_order()
+{
+    bool ok = true;
+
+    QByteArray image = QByteArrayLiteral("\x1bPq\"1;1;8;120#1;2;100;0;0");
+    for (int band = 0; band < 20; ++band) {
+        image += band + 1 < 20 ? QByteArrayLiteral("#1!8~-") : QByteArrayLiteral("#1!8~");
+    }
+    image += QByteArrayLiteral("\x1b\\");
+    const std::vector<QByteArray> outputs = {
+        QByteArrayLiteral("hello\x1b[c\x1b[16t\r\n\x1b[31G"),
+        image,
+        QByteArrayLiteral("\r\x1b[?1000h\x1b[?1006h\x1b[6n world\r\nline"),
+    };
+
+    const auto record = [&](bool budgeted, std::vector<QString>& causal) -> bool {
+        QTemporaryDir temp_dir;
+        if (!temp_dir.isValid()) {
+            return false;
+        }
+        const QString path = temp_dir.filePath(QStringLiteral("causal-order.ndjson"));
+        QString error;
+        std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+            term::Terminal_transcript_recorder::create(path, true, &error);
+        if (recorder == nullptr) {
+            std::cerr << error.toStdString() << '\n';
+            return false;
+        }
+        {
+            auto backend = std::make_unique<Scripted_backend>();
+            Scripted_backend* backend_ptr = backend.get();
+            term::Terminal_session_config config;
+            config.transcript_recorder    = recorder;
+            config.backend_event_notifier = [] {};
+            term::Terminal_session session(std::move(backend), config);
+            session.set_cell_pixel_size({10, 20});
+            term::Terminal_launch_config launch_config = valid_launch_config();
+            launch_config.initial_grid_size = term::terminal_grid_size_t{10, 40};
+            if (session.start(launch_config).code != term::Terminal_session_result_code::ACCEPTED) {
+                return false;
+            }
+            session.process_backend_callback_events();
+            if (budgeted) {
+                session.set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+            }
+            for (const QByteArray& output : outputs) {
+                backend_ptr->emit_output(output);
+            }
+            // The input arrives while the budgeted drains are mid-image.
+            for (int calls = 0; budgeted && calls < 8; ++calls) {
+                (void)session.process_backend_callback_events_for(
+                    std::chrono::steady_clock::duration::zero());
+            }
+            (void)session.write_user_bytes(QByteArrayLiteral("k"));
+            backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+            session.process_backend_callback_events();
+        }
+        recorder.reset();
+
+        const std::optional<std::vector<term::Terminal_transcript_event>> events =
+            term::read_terminal_transcript(path, &error);
+        if (!events.has_value()) {
+            std::cerr << error.toStdString() << '\n';
+            return false;
+        }
+        for (const term::Terminal_transcript_event& event : *events) {
+            if (event.kind == QStringLiteral("snapshot") ||
+                event.kind.startsWith(QStringLiteral("transcript.")))
+            {
+                continue;
+            }
+            causal.push_back(
+                event.kind + QLatin1Char('|') +
+                QString::number(event.object.value(QStringLiteral("session_sequence")).toInteger()) +
+                QLatin1Char('|') + event.object.value(QStringLiteral("source")).toString() +
+                QLatin1Char('|') + event.object.value(QStringLiteral("bytes_base64")).toString());
+        }
+        return true;
+    };
+
+    std::vector<QString> budgeted;
+    std::vector<QString> unbudgeted;
+    ok &= check(record(true, budgeted) && record(false, unbudgeted),
+        "both causal-order transcripts are recorded");
+    int replies = 0;
+    std::size_t input_index = budgeted.size();
+    for (std::size_t index = 0U; index < budgeted.size(); ++index) {
+        if (budgeted[index].startsWith(QStringLiteral("host.write|")) &&
+            budgeted[index].contains(QStringLiteral("|terminal_reply|")))
+        {
+            ok &= check(index < input_index, "every reply is recorded before the later input");
+            ++replies;
+        }
+        if (budgeted[index].startsWith(QStringLiteral("host.write|")) &&
+            budgeted[index].contains(QStringLiteral("|user|")))
+        {
+            input_index = index;
+        }
+    }
+    ok &= check(replies == 3 && input_index < budgeted.size() &&
+            !budgeted.empty() && budgeted.back().startsWith(QStringLiteral("session.process_exit|")),
+        "the budgeted transcript records three replies, then the input, then the exit");
+    ok &= check(budgeted == unbudgeted,
+        "the budgeted drain records the same causal order as the unbudgeted one");
+    return ok;
+}
+
+bool test_replay_tool_reads_output_drained_in_sixel_steps(const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "sixel step replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "sixel step replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("sixel-steps.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "sixel step replay recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config config;
+    config.transcript_recorder    = recorder;
+    config.backend_event_notifier = [] {};
+    term::Terminal_session session(std::move(backend), config);
+    session.set_cell_pixel_size({10, 20});
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{80, 160};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "sixel step replay captured session starts");
+    session.process_backend_callback_events();
+    backend_ptr->emit_output(QByteArrayLiteral(
+        "before\x1b[2;1H\x1bPq\"1;1;1448;1448\x1b\\after"));
+    int calls = 0;
+    while (session.has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session.process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    ok &= check(calls > 2, "the image takes several drain steps");
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "sixel step transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+    ok &= check(event_count(*events, QStringLiteral("backend.output")) == 1,
+        "the output is recorded once however many steps take it");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished && replay.exit_status == QProcess::NormalExit &&
+            replay.stdout_text.contains("causal_driver_divergences=0") &&
+            replay.stdout_text.contains("causal_protocol_divergences=0"),
+        "a replay of output drained in sixel steps finds the recorded causal structure");
+    ok &= check(
+        replay.stdout_text.contains(
+            "recorded_snapshot_runs=2 replayed_snapshot_runs=1 matching_snapshot_runs=1 "
+            "divergent_snapshot_runs=1") &&
+            replay.stdout_text.contains("text=\"after"),
+        "the final snapshot run matches the recording");
+    ok &= check(
+        replay.stdout_text.contains(
+            "recorded_snapshot_events=3 replayed_snapshot_events=1 matching_snapshot_events=1 "
+            "divergent_snapshot_events=2") &&
+            replay.exit_code == 3,
+        "strict replay reports exactly the two snapshots published between the steps");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
 bool test_replay_tool_compares_recovered_row_provenance_source(
     const QString& replay_tool_path)
 {
@@ -5684,6 +6020,9 @@ int main(int argc, char** argv)
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
     ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
     ok &= test_replay_tool_applies_recorded_cell_pixel_size(replay_tool_path);
+    ok &= test_replay_tool_reads_output_drained_in_sixel_steps(replay_tool_path);
+    ok &= test_budgeted_drain_records_the_unbudgeted_causal_order();
+    ok &= test_released_tail_is_recorded_once_and_in_order();
     ok &= test_replay_tool_compares_recovered_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_defaults_missing_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
