@@ -110,15 +110,18 @@ void coalesce_backend_content_model_result(
         update.backing_deltas.end());
 }
 
-bool model_result_clears_primary_history(
+// Clearing primary history and rewriting it both leave no retained handle
+// held from before resolving, so retained search state starts over.
+bool model_result_resets_primary_history(
     const Terminal_screen_model_result& result)
 {
     return std::any_of(
         result.backing_deltas.begin(),
         result.backing_deltas.end(),
         [](const terminal_backing_delta_t& delta) {
-            return delta.kind ==
-                Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED;
+            return
+                delta.kind == Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED ||
+                delta.kind == Terminal_backing_delta_kind::PRIMARY_HISTORY_REWRITTEN;
         });
 }
 
@@ -3069,6 +3072,11 @@ void Terminal_session::set_retained_history_capacity_bytes(
         capture_live_primary_detached_viewport_anchor();
     const Terminal_screen_model_result model_result =
         m_screen_model->set_retained_history_capacity_bytes(capacity_bytes);
+    // Search may not see this result if no content snapshot follows it, as
+    // while the alternate screen is active.
+    m_search_retained_reset_pending =
+        m_search_retained_reset_pending ||
+        model_result_resets_primary_history(model_result);
     const Terminal_viewport_state previous_viewport  = m_viewport_controller.state();
     const terminal_grid_size_t    previous_grid_size = m_grid_size;
     m_render_snapshot_model_result = model_result;
@@ -7581,7 +7589,7 @@ void Terminal_session::ingest_backend_output_segment(
     }
     m_search_retained_reset_pending =
         m_search_retained_reset_pending ||
-        model_result_clears_primary_history(ingest_result);
+        model_result_resets_primary_history(ingest_result);
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::store_ingest_result");
@@ -9480,7 +9488,7 @@ void Terminal_session::update_search_source_from_published_model(
 
     const bool retained_spine_reset =
         m_search_retained_reset_pending ||
-        model_result_clears_primary_history(model_result) ||
+        model_result_resets_primary_history(model_result) ||
         !m_queued_search_retained_range.has_value() ||
         retained_range.end_ordinal < m_queued_search_retained_range->end_ordinal ||
         retained_range.first_ordinal > m_queued_search_retained_range->end_ordinal;

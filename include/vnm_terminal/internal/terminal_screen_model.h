@@ -267,6 +267,9 @@ enum class Terminal_backing_delta_kind
     PRIMARY_HISTORY_EVICTED,
     PRIMARY_HISTORY_CLEARED,
     PRIMARY_HISTORY_DISCARDED,
+    // Every retained row was re-encoded: handles held from before no longer
+    // resolve, and rows may have lost their images.
+    PRIMARY_HISTORY_REWRITTEN,
     ACTIVE_GRID_RESIZED,
     COLUMN_REFLOWED,
     MODE_TRANSITIONED,
@@ -1416,13 +1419,13 @@ private:
         int                            first_column,
         terminal_cell_pixel_size_t     cell_pixel_size);
 
-    void clear_image_cells(
-        Terminal_screen_row&           row,
+    std::shared_ptr<const Terminal_image_slice> image_slice_without_cells(
+        const Terminal_screen_row&     row,
         int                            first_column,
         int                            end_column);
 
-    void shift_image_columns(
-        Terminal_screen_row&           row,
+    std::shared_ptr<const Terminal_image_slice> image_slice_shifted(
+        const Terminal_screen_row&     row,
         int                            from_column,
         int                            shift);
 

@@ -4575,6 +4575,19 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
             0,
             evicted_rows,
             0);
+    }
+    // A rebuild changes every kept row's handle, and the images it dropped
+    // change what those rows show, whether or not it evicted any row.
+    if (resize.retained_handles_replaced) {
+        record_primary_history_delta(
+            Terminal_backing_delta_kind::PRIMARY_HISTORY_REWRITTEN,
+            scrollback_rows_before,
+            scrollback_size(),
+            0,
+            0,
+            0);
+    }
+    if (evicted_rows > 0 || resize.retained_handles_replaced) {
         mark_terminal_content_changed();
         if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
             mark_viewport_changed();
@@ -4749,6 +4762,12 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
             mark_cursor_dirty();
             Terminal_screen_row& screen_row =
                 active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
+            // The touched cells run from the cursor to the margin: clear their
+            // image before any cell changes.
+            screen_row.image_slice = image_slice_without_cells(
+                screen_row,
+                m_cursor.column,
+                m_config.grid_size.columns);
             bool selection_content_changed = false;
             if (available_columns > 1) {
                 selection_content_changed =
@@ -4770,10 +4789,6 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                     screen_row,
                     m_config.grid_size.columns - 1,
                     text[text.size() - 1]);
-            clear_image_cells(
-                screen_row,
-                m_config.grid_size.columns - 1,
-                m_config.grid_size.columns);
             write_printable_ascii_cell_content(
                 screen_row,
                 m_config.grid_size.columns - 1,
@@ -4846,6 +4861,12 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
             mark_cursor_dirty();
             Terminal_screen_row& screen_row =
                 active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
+            // The touched cells run from the cursor to the margin: clear their
+            // image before any cell changes.
+            screen_row.image_slice = image_slice_without_cells(
+                screen_row,
+                m_cursor.column,
+                m_config.grid_size.columns);
             bool selection_content_changed = false;
             if (available_columns > 1) {
                 selection_content_changed =
@@ -4867,10 +4888,6 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
                     screen_row,
                     m_config.grid_size.columns - 1,
                     text[text.size() - 1]);
-            clear_image_cells(
-                screen_row,
-                m_config.grid_size.columns - 1,
-                m_config.grid_size.columns);
             const QString margin_text(text[text.size() - 1]);
             write_single_width_bmp_cell_content(
                 screen_row,
@@ -4941,7 +4958,10 @@ void Terminal_screen_model::write_printable_ascii_span_content(
     }
 
     mark_terminal_content_changed();
-    clear_image_cells(row, first_column, first_column + static_cast<int>(text.size()));
+    row.image_slice = image_slice_without_cells(
+        row,
+        first_column,
+        first_column + static_cast<int>(text.size()));
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
         m_profile_stats.printable_ascii_cells_written +=
@@ -5010,7 +5030,10 @@ void Terminal_screen_model::write_single_width_bmp_span_content(
     }
 
     mark_terminal_content_changed();
-    clear_image_cells(row, first_column, first_column + static_cast<int>(text.size()));
+    row.image_slice = image_slice_without_cells(
+        row,
+        first_column,
+        first_column + static_cast<int>(text.size()));
     const QString first_text(text[0]);
     for (qsizetype offset = 0; offset < text.size(); ++offset) {
         if (text[offset] == text[0]) {
@@ -5176,8 +5199,11 @@ void Terminal_screen_model::install_cell_span(
             QStringView(text),
             display_width,
             natural_display_width);
+    // Computed before any cell changes, so a failed allocation leaves the row
+    // whole.
+    std::shared_ptr<const Terminal_image_slice> image =
+        image_slice_without_cells(screen_row, position.column, position.column + display_width);
     clear_cell_at(position);
-    clear_image_cells(screen_row, position.column, position.column + display_width);
 
     Cell& cell = screen_row.cells[position.column];
     cell.text              = std::move(text);
@@ -5203,6 +5229,7 @@ void Terminal_screen_model::install_cell_span(
         continuation.hyperlink_id      = cell.hyperlink_id;
     }
 
+    screen_row.image_slice = std::move(image);
     advance_row_content_generation_with_change_flag(screen_row, selection_content_changed);
     mark_dirty(position.row);
 }
@@ -5347,12 +5374,13 @@ void Terminal_screen_model::erase_row_range(int row, int first_column, int last_
     }
 
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+    // Before any cell changes, and before the unoccupied-tail trim below: an
+    // image usually covers cells with no text, and the erase clears its pixels
+    // there too.
+    screen_row.image_slice = image_slice_without_cells(screen_row, first_column, last_column + 1);
     if (last_column == m_config.grid_size.columns - 1) {
         screen_row.soft_wrap_columns = 0;
     }
-    // Before the unoccupied-tail trim below: an image usually covers cells
-    // with no text, and the erase clears its pixels there too.
-    clear_image_cells(screen_row, first_column, last_column + 1);
     const Cell replacement = erased_cell();
     bool       selection_content_changed = false;
 
@@ -5626,6 +5654,10 @@ void Terminal_screen_model::insert_cells(int count)
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
     std::vector<Cell>& row = screen_row.cells;
     const std::vector<Cell> before_cells = row;
+    // Computed before any cell changes, so a failed allocation leaves the row
+    // whole.
+    std::shared_ptr<const Terminal_image_slice> image =
+        image_slice_shifted(screen_row, m_cursor.column, count);
 
     clear_wide_continuation_boundary(row, m_cursor.column);
     clear_wide_continuation_boundary(row, m_config.grid_size.columns - count);
@@ -5634,12 +5666,12 @@ void Terminal_screen_model::insert_cells(int count)
         row.begin() + m_cursor.column,
         row.begin() + m_config.grid_size.columns - count,
         row.end());
-    shift_image_columns(screen_row, m_cursor.column, count);
 
     const Cell replacement = erased_cell();
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
         row[static_cast<std::size_t>(column)] = replacement;
     }
+    screen_row.image_slice = std::move(image);
 
     finalize_row_cell_mutation(screen_row, before_cells);
 }
@@ -5651,6 +5683,10 @@ void Terminal_screen_model::delete_cells(int count)
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
     std::vector<Cell>& row = screen_row.cells;
     const std::vector<Cell> before_cells = row;
+    // Computed before any cell changes, so a failed allocation leaves the row
+    // whole.
+    std::shared_ptr<const Terminal_image_slice> image =
+        image_slice_shifted(screen_row, m_cursor.column, -count);
 
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
         erase_cell_at({m_cursor.row, column});
@@ -5661,7 +5697,6 @@ void Terminal_screen_model::delete_cells(int count)
         row.begin() + m_cursor.column + count,
         row.end(),
         row.begin() + m_cursor.column);
-    shift_image_columns(screen_row, m_cursor.column, -count);
 
     const Cell replacement = erased_cell();
     for (int column = m_config.grid_size.columns - count;
@@ -5670,6 +5705,7 @@ void Terminal_screen_model::delete_cells(int count)
     {
         row[static_cast<std::size_t>(column)] = replacement;
     }
+    screen_row.image_slice = std::move(image);
 
     finalize_row_cell_mutation(screen_row, before_cells);
 }
@@ -7194,16 +7230,18 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_sl
     });
 }
 
-// Text written or erased in a cell leaves no image under it (S1): the image
-// pixels of cells [first_column, end_column) go, measured in the cells the
-// image was placed on. A slice left with no drawn pixel is dropped.
-void Terminal_screen_model::clear_image_cells(
-    Terminal_screen_row& row,
-    int                  first_column,
-    int                  end_column)
+// Text written or erased in a cell leaves no image under it (S1): the row's
+// image without the pixels of cells [first_column, end_column), measured in
+// the cells the image was placed on, or null when no drawn pixel is left. The
+// row itself is left alone, so a caller computes this before changing cells
+// and a failed allocation leaves the row whole.
+std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_without_cells(
+    const Terminal_screen_row& row,
+    int                        first_column,
+    int                        end_column)
 {
     if (row.image_slice == nullptr) {
-        return;
+        return nullptr;
     }
 
     const int                        slice_first_column = row.image_slice->first_column;
@@ -7214,7 +7252,7 @@ void Terminal_screen_model::clear_image_cells(
         slice_pixels.width(),
         (end_column - slice_first_column) * slice_cell.width);
     if (x_first >= x_end || !image_block_has_drawn_pixel(slice_pixels, x_first, x_end)) {
-        return;
+        return row.image_slice;
     }
 
     QImage pixels = slice_pixels.copy();
@@ -7227,31 +7265,30 @@ void Terminal_screen_model::clear_image_cells(
         std::fill(line + x_first, line + x_end, 0U);
     }
 
-    if (image_block_has_drawn_pixel(pixels, 0, pixels.width())) {
-        row.image_slice = make_image_slice(std::move(pixels), slice_first_column, slice_cell);
-    }
-    else {
-        row.image_slice.reset();
-    }
+    return image_block_has_drawn_pixel(pixels, 0, pixels.width())
+        ? make_image_slice(std::move(pixels), slice_first_column, slice_cell)
+        : nullptr;
 }
 
 // ICH and DCH move a row's cells from from_column on by `shift` columns, to
 // the right when positive, and the image moves with them (S1). Image columns
 // the shift pushes past the right margin, or that DCH deletes, are lost; so
 // are moving columns already past the margin, as no cell carries them in.
-void Terminal_screen_model::shift_image_columns(
-    Terminal_screen_row& row,
-    int                  from_column,
-    int                  shift)
+// Like image_slice_without_cells, this computes the row's new image, null when
+// none is left, and leaves the row alone.
+std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_shifted(
+    const Terminal_screen_row& row,
+    int                        from_column,
+    int                        shift)
 {
     if (row.image_slice == nullptr) {
-        return;
+        return nullptr;
     }
 
     const Terminal_image_slice& slice = *row.image_slice;
     const int slice_end_column = slice.first_column + terminal_image_slice_column_span(slice);
     if (slice_end_column <= from_column) {
-        return;
+        return row.image_slice;
     }
 
     struct column_segment_t
@@ -7283,8 +7320,7 @@ void Terminal_screen_model::shift_image_columns(
         }
     }
     if (first_column == std::numeric_limits<int>::max()) {
-        row.image_slice.reset();
-        return;
+        return nullptr;
     }
     for (const column_segment_t& segment : segments) {
         if (segment.first < segment.end) {
@@ -7318,13 +7354,9 @@ void Terminal_screen_model::shift_image_columns(
         }
     }
 
-    const terminal_cell_pixel_size_t cell = slice.cell_pixel_size;
-    if (image_block_has_drawn_pixel(pixels, 0, pixels.width())) {
-        row.image_slice = make_image_slice(std::move(pixels), first_column, cell);
-    }
-    else {
-        row.image_slice.reset();
-    }
+    return image_block_has_drawn_pixel(pixels, 0, pixels.width())
+        ? make_image_slice(std::move(pixels), first_column, slice.cell_pixel_size)
+        : nullptr;
 }
 
 void Terminal_screen_model::backspace()

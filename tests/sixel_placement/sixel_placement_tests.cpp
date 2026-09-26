@@ -802,6 +802,63 @@ bool test_capacity_shrink_rebuilds_a_nearly_full_ring()
     return ok;
 }
 
+term::Terminal_render_snapshot scrolled_back_snapshot(
+    const term::Terminal_screen_model& model,
+    int                                offset_from_tail)
+{
+    term::Terminal_render_snapshot_request request;
+    request.sequence                  = 1U;
+    request.viewport.active_buffer    = model.active_buffer_id();
+    request.viewport.visible_rows     = model.grid_size().rows;
+    request.viewport.scrollback_rows  = model.scrollback_size();
+    request.viewport.offset_from_tail = offset_from_tail;
+    request.viewport.follow_tail      = false;
+    return model.render_snapshot(request);
+}
+
+bool test_capacity_shrink_signals_a_history_rewrite()
+{
+    bool ok = true;
+
+    // Every row fits the smaller ring, but one image no longer fits a record:
+    // the rebuild evicts nothing, yet it changes what a history row shows and
+    // replaces every retained handle.
+    const term::terminal_cell_pixel_size_t cell{16, 32};
+    term::Terminal_screen_model model = make_model(5, 90, cell, 100);
+    model.ingest(cursor_to(0, 88) + "IM" + cursor_to(0, 0) + sixel("1;0", "\"1;1;1400;32") +
+        cursor_to(4, 0) + "\r\n");
+    ok &= check(model.scrollback_size() == 1 &&
+            term::render_snapshot_row_image(scrolled_back_snapshot(model, 1), 0) != nullptr,
+        "a viewport scrolled back over the image row shows its image");
+
+    const term::Terminal_screen_model_result result =
+        model.set_retained_history_capacity_bytes(1024U * 1024U);
+    const bool rewritten = std::any_of(
+        result.backing_deltas.begin(),
+        result.backing_deltas.end(),
+        [](const term::terminal_backing_delta_t& delta) {
+            return delta.kind == term::Terminal_backing_delta_kind::PRIMARY_HISTORY_REWRITTEN;
+        });
+    const bool evicted = std::any_of(
+        result.backing_deltas.begin(),
+        result.backing_deltas.end(),
+        [](const term::terminal_backing_delta_t& delta) {
+            return delta.kind == term::Terminal_backing_delta_kind::PRIMARY_HISTORY_EVICTED;
+        });
+    ok &= check(model.scrollback_size() == 1 && rewritten && !evicted,
+        "a rebuild that evicts nothing still reports that history was rewritten");
+    ok &= check(result.terminal_content_changed && result.viewport_changed,
+        "a rebuild that evicts nothing marks content and viewport changed");
+
+    const term::Terminal_render_snapshot after = scrolled_back_snapshot(model, 1);
+    ok &= check(term::render_snapshot_row_image(after, 0) == nullptr,
+        "a viewport scrolled back over the row no longer shows the dropped image");
+    ok &= check(history_row_text(model, 0) == QStringLiteral("IM"),
+        "the rewritten row keeps its text");
+
+    return ok;
+}
+
 // One sixel row of `cells` ten-pixel blocks, each in its own color, so a
 // moved or cleared block shows in the pixels.
 QByteArray striped_cells(int cells)
@@ -1131,6 +1188,7 @@ int main()
     ok &= test_oversized_image_rows_keep_their_text_in_history();
     ok &= test_capacity_shrink_keeps_text_rows_around_an_oversized_image();
     ok &= test_capacity_shrink_rebuilds_a_nearly_full_ring();
+    ok &= test_capacity_shrink_signals_a_history_rewrite();
     ok &= test_text_writes_and_erases_clear_image_cells();
     ok &= test_ich_and_dch_move_image_columns();
     ok &= test_image_rows_start_their_own_logical_lines();
