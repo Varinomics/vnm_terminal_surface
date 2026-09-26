@@ -7393,9 +7393,9 @@ std::size_t Terminal_screen_model::place_image_band(
         return 0U;
     }
 
-    // Everything that can fail is prepared first: the row's new image, then
-    // the copy of its cells a text change needs. Only then do the row's text,
-    // wraps and image change, together.
+    // Everything that can fail is prepared first: the row's new image, the
+    // copy of its cells a text change needs, and the room to mark the row
+    // dirty. Only then do the row's text, wraps and image change, together.
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
 
     // S4 draws the band over an earlier image on the row, unless their
@@ -7465,6 +7465,7 @@ std::size_t Terminal_screen_model::place_image_band(
     if (clear_covered_text(false)) {
         before_cells = screen_row.cells;
     }
+    reserve_dirty_row_mark();
 
     // A row that shows an image starts its own logical line (owner decision
     // D2), so placing one hard-terminates the soft wraps into and out of its
@@ -7683,20 +7684,7 @@ void Terminal_screen_model::mark_dirty(int row)
     }
 
     const std::size_t row_index = static_cast<std::size_t>(row);
-    if (m_dirty_row_flags.size() !=
-        static_cast<std::size_t>(m_config.grid_size.rows))
-    {
-        std::vector<unsigned char> resized_flags(
-            static_cast<std::size_t>(m_config.grid_size.rows),
-            0U);
-        for (const int dirty_row : m_dirty_rows) {
-            const std::size_t dirty_row_index = static_cast<std::size_t>(dirty_row);
-            if (dirty_row_index < resized_flags.size()) {
-                resized_flags[dirty_row_index] = 1U;
-            }
-        }
-        m_dirty_row_flags = std::move(resized_flags);
-    }
+    size_dirty_row_flags();
 
     if (row == m_last_dirty_row || m_dirty_row_flags[row_index] != 0U) {
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -7725,6 +7713,36 @@ void Terminal_screen_model::mark_dirty_rows(int first, int last)
 {
     for (int row = first; row <= last; ++row) {
         mark_dirty(row);
+    }
+}
+
+void Terminal_screen_model::size_dirty_row_flags()
+{
+    if (m_dirty_row_flags.size() !=
+        static_cast<std::size_t>(m_config.grid_size.rows))
+    {
+        std::vector<unsigned char> resized_flags(
+            static_cast<std::size_t>(m_config.grid_size.rows),
+            0U);
+        for (const int dirty_row : m_dirty_rows) {
+            const std::size_t dirty_row_index = static_cast<std::size_t>(dirty_row);
+            if (dirty_row_index < resized_flags.size()) {
+                resized_flags[dirty_row_index] = 1U;
+            }
+        }
+        m_dirty_row_flags = std::move(resized_flags);
+    }
+}
+
+// Allocates what the next mark_dirty of a grid row can need, so a change that
+// must not fail halfway can reserve it first and mark its row afterwards.
+void Terminal_screen_model::reserve_dirty_row_mark()
+{
+    size_dirty_row_flags();
+    // A mark appends at most one row; growing as push_back would keeps the
+    // reserve amortized.
+    if (m_dirty_rows.size() == m_dirty_rows.capacity()) {
+        m_dirty_rows.reserve(std::max<std::size_t>(8U, 2U * m_dirty_rows.size()));
     }
 }
 

@@ -1444,6 +1444,8 @@ private:
     void mark_cursor_dirty();
     void mark_dirty(int row);
     void mark_dirty_rows(int first, int last);
+    void size_dirty_row_flags();
+    void reserve_dirty_row_mark();
     void mark_terminal_content_changed();
     void mark_active_buffer_changed();
     void mark_grid_reflow_changed();
