@@ -94,9 +94,12 @@ private:
         qsizetype                      payload_begin,
         Parser_string_terminator&      terminator);
 
-    // Returns how much of payload was taken: all of it, except that the
-    // sixel decoder stops where its budget runs out.
-    qsizetype append_string_payload(
+    void continue_sixel_string(
+        QByteArrayView                 bytes,
+        qsizetype&                     offset,
+        std::vector<Parser_action>&    actions);
+
+    bool append_string_payload(
         Parser_sequence_family         family,
         QByteArrayView                 payload,
         std::vector<Parser_action>&    actions);

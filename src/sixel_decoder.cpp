@@ -242,12 +242,25 @@ void Sixel_decoder::begin(QByteArrayView header_parameters)
 qsizetype Sixel_decoder::decode(
     QByteArrayView               data,
     std::vector<Parser_action>&  actions,
-    Sixel_work_budget*           budget)
+    Sixel_work_budget*           budget,
+    Terminal_utf8_scan_state*    string_scan)
 {
     qsizetype consumed = 0;
     Budget_scope budget_scope(m_budget, budget);
     for (; consumed < data.size(); ++consumed) {
         const unsigned char byte = static_cast<unsigned char>(data[consumed]);
+
+        // Inside a UTF-8 sequence a C1 byte is data, as the parser's
+        // terminator scan reads it. A draw byte a budget refuses below is
+        // ASCII, which leaves the scan state as it would find it again.
+        if (string_scan != nullptr &&
+            !utf8_scan_consumes_byte(byte, *string_scan) &&
+            (byte == 0x1bU || byte == 0x18U || byte == 0x1aU ||
+                byte == 0x9bU || byte == 0x9cU))
+        {
+            break;
+        }
+
         if (m_command != Command::NONE && is_parameter_byte(byte)) {
             collect_parameter_byte(byte);
             continue;

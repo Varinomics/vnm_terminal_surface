@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/parser_action.h"
+#include "vnm_terminal/internal/utf8_scan.h"
 #include <QByteArrayView>
 #include <QImage>
 #include <algorithm>
@@ -98,11 +99,15 @@ public:
 
     // Decodes data until it ends or the budget cannot pay for the next draw
     // or graphics new line, and returns how many bytes it took; the caller
-    // hands over the rest later.
+    // hands over the rest later. With the string's UTF-8 scan state it also
+    // stops before a byte that could end the string (ESC, CAN, SUB, ST or
+    // CSI outside a UTF-8 sequence), and advances that state over exactly
+    // the bytes it looks at, so the caller scans no byte twice.
     qsizetype decode(
         QByteArrayView               data,
         std::vector<Parser_action>&  actions,
-        Sixel_work_budget*           budget = nullptr);
+        Sixel_work_budget*           budget      = nullptr,
+        Terminal_utf8_scan_state*    string_scan = nullptr);
 
     // Ends the image at its string terminator. The end is one step that
     // always runs: its fill and band expansion are charged to the budget

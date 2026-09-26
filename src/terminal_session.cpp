@@ -6873,8 +6873,13 @@ bool Terminal_session::replay_text_area_resize_tail(
     while (!m_text_area_resize_arbitration.has_value() &&
         text_area_resize_tail_size() > 0U)
     {
+        // A drain window at a time, so a step that stops early leaves at
+        // most a window scanned ahead; the scan still sees how much of the
+        // tail follows.
         const std::size_t available_bytes = text_area_resize_tail_size();
-        const QByteArrayView front = text_area_resize_tail_front();
+        const QByteArrayView tail_front = text_area_resize_tail_front();
+        const QByteArrayView front = tail_front.first(
+            std::min(tail_front.size(), k_backend_output_drain_slice_bytes));
         std::size_t consumed_bytes = 0U;
         const bool armed = scan_backend_output_span(
             sequence,
