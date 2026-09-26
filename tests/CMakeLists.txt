@@ -1,3 +1,6 @@
+include("${PROJECT_SOURCE_DIR}/cmake/vnm_cmake_dependency.cmake")
+vnm_write_toolchain_context("${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake")
+
 set(vnm_terminal_qsg_atlas_report_timeout_seconds 240)
 
 if(WIN32)
@@ -2482,9 +2485,7 @@ add_test(
     NAME vnm_terminal_surface_rejects_distribution_transcript_build
     COMMAND
         "${CMAKE_COMMAND}"
-        "-Dgenerator=${CMAKE_GENERATOR}"
-        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
-        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
+        "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dsource_dir=${PROJECT_SOURCE_DIR}"
         "-Dbinary_dir=${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surface_distribution_guard"
         "-Dexpected_regex=VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires"
@@ -2546,10 +2547,7 @@ add_test(
     NAME vnm_terminal_surface_package_consumer_builds
     COMMAND
         "${CMAKE_COMMAND}"
-        "-Dgenerator=${CMAKE_GENERATOR}"
-        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
-        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
-        "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
+        "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
         "-Dpackage_version=${PROJECT_VERSION}"
         "-Dabbreviated_package_version=${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}"
@@ -2582,10 +2580,7 @@ add_test(
     NAME vnm_terminal_surface_renderer_only_package_consumer_builds
     COMMAND
         "${CMAKE_COMMAND}"
-        "-Dgenerator=${CMAKE_GENERATOR}"
-        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
-        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
-        "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
+        "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dsource_dir=${PROJECT_SOURCE_DIR}"
         "-Dproducer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_producer"
         "-Dinstall_dir=${CMAKE_BINARY_DIR}/package_smoke/renderer_only_install"
@@ -2608,10 +2603,7 @@ add_test(
     NAME vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch
     COMMAND
         "${CMAKE_COMMAND}"
-        "-Dgenerator=${CMAKE_GENERATOR}"
-        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
-        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
-        "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
+        "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
         "-Dinstall_config=$<CONFIG>"
         "-Dinstall_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_private_qt_minor/install"

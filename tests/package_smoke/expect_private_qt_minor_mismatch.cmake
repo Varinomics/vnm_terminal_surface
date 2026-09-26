@@ -1,3 +1,4 @@
+include("${VNM_TOOLCHAIN_CONTEXT}")
 foreach(required_var IN ITEMS
     package_binary_dir
     install_dir
@@ -14,7 +15,7 @@ endforeach()
 
 set(build_args
     --build "${package_binary_dir}"
-    --target vnm_terminal_surface)
+    --target vnm_terminal_surface --parallel 1)
 
 set(install_args
     --install "${package_binary_dir}"
@@ -108,21 +109,7 @@ endif()
 file(WRITE "${package_config_path}" "${mismatched_package_config_text}")
 
 set(configure_args)
-if(DEFINED generator AND NOT "${generator}" STREQUAL "")
-    list(APPEND configure_args -G "${generator}")
-endif()
-
-if(DEFINED generator_platform AND NOT "${generator_platform}" STREQUAL "")
-    list(APPEND configure_args -A "${generator_platform}")
-endif()
-
-if(DEFINED generator_toolset AND NOT "${generator_toolset}" STREQUAL "")
-    list(APPEND configure_args -T "${generator_toolset}")
-endif()
-
-if(DEFINED make_program AND NOT "${make_program}" STREQUAL "")
-    list(APPEND configure_args "-DCMAKE_MAKE_PROGRAM=${make_program}")
-endif()
+vnm_append_toolchain_args(configure_args)
 
 if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
     list(APPEND configure_args "-DQt6_DIR=${qt6_dir}")

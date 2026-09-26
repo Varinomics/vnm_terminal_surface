@@ -1,3 +1,4 @@
+include("${VNM_TOOLCHAIN_CONTEXT}")
 foreach(required_var IN ITEMS
     package_binary_dir
     package_version
@@ -98,25 +99,10 @@ if(NOT EXISTS "${installed_font_metrics_header}")
 endif()
 
 set(configure_args)
-if(DEFINED generator AND NOT "${generator}" STREQUAL "")
-    list(APPEND configure_args -G "${generator}")
-endif()
-
-if(DEFINED generator_platform AND NOT "${generator_platform}" STREQUAL "")
-    list(APPEND configure_args -A "${generator_platform}")
-endif()
-
-if(DEFINED generator_toolset AND NOT "${generator_toolset}" STREQUAL "")
-    list(APPEND configure_args -T "${generator_toolset}")
-endif()
-
-if(DEFINED make_program AND NOT "${make_program}" STREQUAL "")
-    list(APPEND configure_args "-DCMAKE_MAKE_PROGRAM=${make_program}")
-endif()
+vnm_append_toolchain_args(configure_args)
 
 set(single_config_generator ON)
-if(DEFINED generator AND
-    "${generator}" MATCHES "Visual Studio|Xcode|Multi-Config")
+if(VNM_NESTED_CONFIGURATION_TYPES)
     set(single_config_generator OFF)
 endif()
 

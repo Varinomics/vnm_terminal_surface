@@ -1,15 +1,6 @@
+include("${VNM_TOOLCHAIN_CONTEXT}")
 set(configure_args)
-if(NOT "${generator}" STREQUAL "")
-    list(APPEND configure_args -G "${generator}")
-endif()
-
-if(NOT "${generator_platform}" STREQUAL "")
-    list(APPEND configure_args -A "${generator_platform}")
-endif()
-
-if(NOT "${generator_toolset}" STREQUAL "")
-    list(APPEND configure_args -T "${generator_toolset}")
-endif()
+vnm_append_toolchain_args(configure_args)
 
 execute_process(
     COMMAND
