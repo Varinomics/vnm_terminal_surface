@@ -8743,8 +8743,10 @@ void VNM_TerminalSurface::sync_synchronized_output_recovery_timer()
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
+    // Only the application's synchronized-output hold can go stale; a sixel
+    // placement that holds publication ends on its own as drains continue it.
     if (m_private->session == nullptr ||
-        !m_private->session->render_publication_blocked())
+        !m_private->session->synchronized_output_hold_active())
     {
         m_private->synchronized_output_recovery_timer.stop();
         return;
@@ -8789,7 +8791,7 @@ void VNM_TerminalSurface::handle_synchronized_output_recovery_timeout(
             Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     };
 
-    if (!session->render_publication_blocked()) {
+    if (!session->synchronized_output_hold_active()) {
         queue_remaining_callbacks();
         return;
     }
@@ -9031,7 +9033,11 @@ void VNM_TerminalSurface::updatePolish()
         return;
     }
 
-    if (target_epoch > session->backend_callback_processed_epoch()) {
+    // A settled tail still replaying had its callbacks processed when they
+    // were held, so it is catch-up work whatever the callback epochs say.
+    if (target_epoch > session->backend_callback_processed_epoch() ||
+        session->backend_output_replay_pending())
+    {
         (void)drain_backend_callback_events_until_epoch(
             target_epoch,
             m_private->backend_callback_frame_catchup_budget());

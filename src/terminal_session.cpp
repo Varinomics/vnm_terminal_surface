@@ -2177,12 +2177,10 @@ Terminal_session::try_write_user_bytes_without_backend_drain_if_callbacks_empty(
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    // A released tail still replaying is output older than any input.
-    if (m_text_area_resize_tail_replay.has_value() ||
-        ((!m_input_frontier_epoch.has_value() ||
+    if ((!m_input_frontier_epoch.has_value() ||
             m_last_processed_backend_callback_epoch < *m_input_frontier_epoch) &&
         (!m_pending_commands.empty() ||
-            m_callback_lifetime->has_pending_or_active_callbacks())))
+            m_callback_lifetime->has_pending_or_active_callbacks()))
     {
         return std::nullopt;
     }
@@ -2281,12 +2279,10 @@ Terminal_session::try_write_mouse_event_without_backend_drain_if_callbacks_empty
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    // A released tail still replaying is output older than any input.
-    if (m_text_area_resize_tail_replay.has_value() ||
-        ((!m_input_frontier_epoch.has_value() ||
+    if ((!m_input_frontier_epoch.has_value() ||
             m_last_processed_backend_callback_epoch < *m_input_frontier_epoch) &&
         (!m_pending_commands.empty() ||
-            m_callback_lifetime->has_pending_or_active_callbacks())))
+            m_callback_lifetime->has_pending_or_active_callbacks()))
     {
         return std::nullopt;
     }
@@ -3481,6 +3477,20 @@ bool Terminal_session::render_publication_blocked() const
     return m_screen_model.has_value() && !model_allows_render_snapshot(*m_screen_model);
 }
 
+bool Terminal_session::synchronized_output_hold_active() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_screen_model.has_value() && m_screen_model->mode_state().synchronized_output;
+}
+
+bool Terminal_session::backend_output_replay_pending() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_text_area_resize_tail_replay.has_value();
+}
+
 bool Terminal_session::has_pending_backend_callback_events() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -4631,6 +4641,7 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
     const bool previous_backend_content_snapshot_deferral =
         m_backend_content_snapshot_deferral_active;
     m_backend_content_snapshot_deferral_active = deadline.has_value();
+    bool replay_pending_at_entry = m_text_area_resize_tail_replay.has_value();
 
     // Whether the drain stops after a step, and how; none to go on.
     const auto stop_after_step = [&]() -> std::optional<Backend_callback_drain_stop> {
@@ -4703,16 +4714,19 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             step_budget.has_value() ? &*step_budget : nullptr);
 
         // A released text-area resize tail replays ahead of every later
-        // command. A synchronous command that left one behind hands it to the
-        // next drain, unless commands wait behind it.
+        // command. A synchronous command that started one, a settlement,
+        // hands it to the drains, with whatever it queued behind it; one
+        // pending before the pass began is output older than the pass's
+        // input, which runs to completion first.
         if (m_text_area_resize_tail_replay.has_value()) {
             if (!deadline.has_value() &&
                 drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED &&
-                m_pending_commands.empty())
+                !replay_pending_at_entry)
             {
                 break;
             }
-            (void)continue_text_area_resize_tail_replay();
+            replay_pending_at_entry =
+                !continue_text_area_resize_tail_replay() && replay_pending_at_entry;
             if (const std::optional<Backend_callback_drain_stop> step_stop = stop_after_step()) {
                 stop = *step_stop;
                 break;
@@ -4741,7 +4755,7 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         const bool continuing_budgeted_output =
             command.kind     == Terminal_session_command_kind::BACKEND_OUTPUT &&
             command.sequence == m_budgeted_backend_output_sequence;
-        if (!continuing_budgeted_output) {
+        if (!continuing_budgeted_output && !command.resumed) {
             record_processed_command(command);
         }
 
@@ -4768,6 +4782,14 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
                 remainder.bytes.constData(), k_backend_output_drain_slice_bytes);
             remainder.bytes.remove(0, k_backend_output_drain_slice_bytes);
             m_pending_commands.push_front(std::move(remainder));
+        }
+
+        // A piece of backend output is its callback's last only when nothing
+        // of the callback waits behind it, whether a slice or the rest of a
+        // window the model paused in. Only the last piece completes the
+        // callback, records its result and releases its accounting.
+        const bool piece_not_last = slice_backend_output || command.output_remainder_follows;
+        if (piece_not_last) {
             m_budgeted_backend_output_sequence = command.sequence;
         }
         else
@@ -4778,7 +4800,7 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         const Queue_category category      = queue_category_for(command.kind);
         const std::size_t    byte_count    = static_cast<std::size_t>(command.bytes.size());
         const bool completes_backend_callback =
-            command_backend_callback_epoch != 0U && !slice_backend_output;
+            command_backend_callback_epoch != 0U && !piece_not_last;
         const Terminal_session_command_kind command_kind = command.kind;
         m_last_processed_sequence = command.sequence;
 
@@ -4789,18 +4811,26 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         }
 
         // Output the model stops in stays at the front of the queue, as one
-        // logical command, until the model has taken all of it.
+        // logical command, until the model has taken all of it. An exit that
+        // must follow a tail still replaying waits there too.
         Terminal_session_command continuation;
         if (command_kind == Terminal_session_command_kind::BACKEND_OUTPUT) {
-            continuation.sequence               = command.sequence;
-            continuation.interaction_trace_id   = command.interaction_trace_id;
-            continuation.backend_callback_epoch = command.backend_callback_epoch;
-            continuation.kind                   = command.kind;
-            continuation.bytes                  = command.bytes;
-            continuation.output_recorded        = true;
+            continuation.sequence                 = command.sequence;
+            continuation.interaction_trace_id     = command.interaction_trace_id;
+            continuation.backend_callback_epoch   = command.backend_callback_epoch;
+            continuation.kind                     = command.kind;
+            continuation.bytes                    = command.bytes;
+            continuation.output_recorded          = true;
+            continuation.output_remainder_follows = piece_not_last;
+        }
+        else
+        if (command_kind == Terminal_session_command_kind::BACKEND_EXIT) {
+            continuation         = command;
+            continuation.resumed = true;
         }
         m_backend_output_stopped          = false;
         m_unconsumed_backend_output_bytes = 0;
+        m_command_waits_for_tail_replay   = false;
 
         m_backend_error_queued_during_command = false;
         m_processing_backend_callback_epoch =
@@ -4822,8 +4852,13 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             m_pending_commands.push_front(std::move(continuation));
             m_budgeted_backend_output_sequence = m_last_processed_sequence;
         }
+        const bool command_waits = std::exchange(m_command_waits_for_tail_replay, false);
+        if (command_waits) {
+            Q_ASSERT(command_kind == Terminal_session_command_kind::BACKEND_EXIT);
+            m_pending_commands.push_front(std::move(continuation));
+        }
 
-        const bool command_continues = slice_backend_output || output_continues;
+        const bool command_continues = piece_not_last || output_continues || command_waits;
         if (!command_continues) {
             record_result(std::move(result));
         }
@@ -4837,6 +4872,7 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
                 m_last_processed_sequence);
         }
         if (completes_backend_callback &&
+            !command_waits &&
             command_kind != Terminal_session_command_kind::BACKEND_OUTPUT)
         {
             advance_processed_backend_callback_epoch(command_backend_callback_epoch);
@@ -5677,7 +5713,11 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
     apply_trailing_changes(model_result, trailing_changes);
     accumulate_synchronized_selection_continuity(model_result);
 
-    if (render_result_warrants_snapshot || m_visual_bell_active) {
+    // A sixel placement in progress keeps holding publication past the
+    // forced release; its own end releases what both held.
+    if ((render_result_warrants_snapshot || m_visual_bell_active) &&
+        model_allows_render_snapshot(*m_screen_model))
+    {
         Terminal_screen_model_result selection_basis_result =
             model_result_with_deferred_synchronized_row_origins(model_result);
         selection_basis_result = compose_synchronized_selection_release(
@@ -7116,14 +7156,19 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
     // one transaction that could already have reached the host, then interpret
     // its tail with arbitration disabled so exit cannot manufacture historical
     // request/settlement pairs for requests no host ever saw.
-    // The released tail replays whole here, since the exit follows it.
     if (m_text_area_resize_arbitration.has_value()) {
-        const Sixel_work_budget_scope unbudgeted(m_sixel_work_budget, nullptr);
         release_text_area_resize_arbitration(
             Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED,
             {},
             command.sequence,
             false);
+    }
+
+    // The released tail replays across drain steps, arbitration off, and the
+    // exit follows it: it waits at the front of the queue until then.
+    if (m_text_area_resize_tail_replay.has_value()) {
+        m_command_waits_for_tail_replay = true;
+        return make_accepted_result(command.sequence);
     }
 
     cancel_pending_backend_resizes();

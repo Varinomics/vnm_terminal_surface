@@ -13307,6 +13307,64 @@ bool test_text_area_resize_arbitration_does_not_spin_the_backend_drain(QGuiAppli
     return ok;
 }
 
+// A settled tail whose sixel work outlasts one drain step is replayed by the
+// frames of a visible surface that receives nothing more: its callbacks were
+// all processed when they were held, so no newer callback epoch asks for the
+// catch-up.
+bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_text_area_resize_arbitration_enabled(true);
+    pump_events(app);
+
+    Text_area_resize_arbitration_observer observer(fixture.surface);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "heavy tail frame fixture starts");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    ok &= check(pump_until(app, [&observer] {
+        return !observer.requests.empty();
+    }),
+        "the heavy tail request reaches the host");
+    if (observer.requests.empty()) {
+        return false;
+    }
+    backend_ptr->emit_output(
+        QByteArrayLiteral("\x1bPq\"1;1;1448;1448\x1b\\tail-text"));
+    pump_events(app);
+
+    ok &= check(fixture.surface.respond_text_area_resize(
+        observer.requests.front().request_id,
+        VNM_TerminalSurface::Text_area_resize_arbitration_decision::ACCEPT,
+        24,
+        80),
+        "the heavy tail answer is accepted");
+
+    // Frames alone, with no events processed in between.
+    const auto tail_shown = [&fixture] {
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return snapshot != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("tail-text"));
+    };
+    int frames = 0;
+    while (!tail_shown() && frames < 200) {
+        term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+        ++frames;
+    }
+    ok &= check(tail_shown(), "the frames replay the heavy tail to its end");
+    return ok;
+}
+
 bool test_respond_text_area_resize_reports_a_missing_request(QGuiApplication& app)
 {
     bool ok = true;
@@ -20416,6 +20474,7 @@ int main(int argc, char** argv)
     ok &= test_rejected_text_area_resize_arbitration_leaves_the_item_grid(app);
     ok &= test_text_area_resize_arbitration_times_out(app);
     ok &= test_text_area_resize_arbitration_does_not_spin_the_backend_drain(app);
+    ok &= test_visible_frames_replay_a_settled_heavy_tail(app);
     ok &= test_respond_text_area_resize_reports_a_missing_request(app);
     ok &= test_text_area_resize_arbitration_clears_when_the_process_is_torn_down(app);
     ok &= test_text_area_resize_arbitration_exit_before_delivery_suppresses_stale_request(app);

@@ -15789,6 +15789,7 @@ bool test_budgeted_backend_callback_drain_resumes_sixel_work()
         std::optional<term::Terminal_render_snapshot> snapshot;
         int                                           calls       = 0;
         bool                                          whole_images = true;
+        bool                                          held_image_hidden = true;
     };
     const auto drain = [&](bool budgeted, const std::string& label) {
         term::Terminal_session_config config;
@@ -15819,6 +15820,9 @@ bool test_budgeted_backend_callback_drain_resumes_sixel_work()
                 result.whole_images = result.whole_images &&
                     snapshot_image_rows_whole(*published, 1, 73) &&
                     snapshot_image_rows_whole(*published, 79, 73);
+                result.held_image_hidden = result.held_image_hidden &&
+                    (!session->render_publication_blocked() ||
+                        term::render_snapshot_row_image(*published, 79) == nullptr);
             }
         }
         result.chunks   = session->output_chunks();
@@ -15839,6 +15843,8 @@ bool test_budgeted_backend_callback_drain_resumes_sixel_work()
         "budgeted sixel drain answers the query between images as one drain does");
     ok &= check(budgeted.whole_images,
         "budgeted sixel drain never publishes part of an image");
+    ok &= check(budgeted.held_image_hidden,
+        "budgeted sixel drain publishes nothing of the image inside the synchronized update");
     ok &= check(budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value(),
         "both sixel drains publish a snapshot");
     if (budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value()) {
@@ -15905,9 +15911,6 @@ bool test_settled_tail_replays_heavy_sixel_work_across_drains()
         "the host answer is accepted");
     ok &= check(session->has_pending_backend_callback_events(),
         "the tail's image is still being replayed after the answer");
-    ok &= check(!session->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
-            QByteArrayLiteral("k")).has_value(),
-        "input waits behind the tail that is still replaying");
 
     int  calls        = 0;
     bool whole_images = true;
@@ -15931,6 +15934,262 @@ bool test_settled_tail_replays_heavy_sixel_work_across_drains()
             term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
             snapshot_contains_text(*snapshot, QStringLiteral("tail-text")),
         "the replayed tail shows the image and the text after it");
+    return ok;
+}
+
+// A callback longer than a drain window, whose first window pauses in sixel
+// work and ends with an escape the next window completes, stays one logical
+// command: it records one final result, and its callback epoch settles once
+// every byte is applied, so input written after it is accepted.
+bool test_paused_window_stays_inside_its_command()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{160, 160};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "paused window session starts");
+
+    QByteArray output = budget_filling_sixel_image();
+    output += QByteArray(4095 - output.size(), 'x');
+    output += QByteArrayLiteral("\x1b[31mZ");
+    output += QByteArray(100, 'y');
+    ok &= check(backend->emit_output(output), "the long callback queues");
+    const std::uint64_t callback_epoch = session->backend_callback_enqueue_epoch();
+
+    int calls = 0;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    ok &= check(calls > 3, "the first window pauses in sixel work");
+    ok &= check(session->backend_callback_processed_epoch() >= callback_epoch,
+        "the callback epoch settles once all its bytes are applied");
+    ok &= check(session->output_chunks() ==
+            std::vector<QByteArray>{output.first(4096), output.sliced(4096)},
+        "each window is recorded once");
+    ok &= check(session->write_user_bytes(QByteArrayLiteral("k")).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "input after the callback is accepted");
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    // The text after the image covers its first 26 rows.
+    ok &= check(snapshot.has_value() &&
+            term::render_snapshot_row_image(*snapshot, 60) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("Zyyy")),
+        "the image and the text after it are applied");
+    return ok;
+}
+
+// Settling a request whose tail answers a query before a heavy image stays
+// asynchronous: the settle call does not replay the image, and the reply
+// follows the tail in order once the drains have replayed it.
+bool test_settle_with_a_reply_before_a_heavy_image_stays_asynchronous()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "reply-before-image settle session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    if (!check(requests.size() == 1U && requests.front().request.has_value(),
+            "the resize request reaches the host"))
+    {
+        return false;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[c") + budget_filling_sixel_image() +
+            QByteArrayLiteral("tail-text")),
+        "the tail is held");
+    session->process_backend_callback_events();
+    const std::size_t writes_before = backend->writes.size();
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+            requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            term::terminal_grid_size_t{90, 160},
+        }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the host answer is accepted");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the settle call leaves the heavy image to the drains");
+
+    int calls = 0;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("tail-text")),
+        "the drains replay the image and the text after it");
+    ok &= check(backend->writes.size() == writes_before + 1U &&
+            backend->writes.back().startsWith(QByteArrayLiteral("\x1b[?")),
+        "the query is answered once");
+    return ok;
+}
+
+// A process that exits while its output is held for a resize answer keeps
+// the tail's order: the tail replays first, arbitration off, across budgeted
+// drains, and the exit follows it.
+bool test_exit_waits_behind_a_heavy_held_tail()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "held-tail exit session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    ok &= check(arbitration_requests(*session).size() == 1U, "the resize request reaches the host");
+
+    ok &= check(backend->emit_output(budget_filling_sixel_image() +
+            QByteArrayLiteral("tail-text\x1b[8;50;100t")),
+        "the tail is held");
+    backend->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+
+    int  calls              = 0;
+    bool exit_before_tail   = false;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        const std::optional<term::Terminal_render_snapshot> published =
+            session->latest_render_snapshot();
+        exit_before_tail = exit_before_tail ||
+            (session->exit_status().has_value() &&
+                (!published.has_value() ||
+                    !snapshot_contains_text(*published, QStringLiteral("tail-text"))));
+    }
+    ok &= check(calls > 3, "the held tail replays across several drains");
+    ok &= check(!exit_before_tail && session->exit_status().has_value(),
+        "the exit follows the replayed tail");
+    ok &= check(arbitration_requests(*session).size() == 1U,
+        "the replayed tail asks the host nothing more");
+    return ok;
+}
+
+// A forced release of a stale synchronized update ends the application's
+// hold but not the hold of an image being placed: the release neither
+// finishes the placement nor publishes part of it, and the drains finish it.
+bool test_forced_release_keeps_a_placement_budgeted()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{160, 160};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "forced release session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("start")), "the first output queues");
+    session->process_backend_callback_events();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h") +
+            QByteArrayLiteral("\x1bPq\"1;1;1448;1448\x1b\\done")),
+        "the held image queues");
+
+    // One step allocates and fills the declared raster, the next starts
+    // placing its 73 bands.
+    session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the image is still being placed");
+
+    ok &= check(session->force_release_synchronized_output_without_backend_drain().code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "the stale update is released");
+    const std::optional<term::Terminal_render_snapshot> released =
+        session->latest_render_snapshot();
+    ok &= check(session->has_pending_backend_callback_events() &&
+            session->render_publication_blocked(),
+        "the release does not finish the placement");
+    ok &= check(released.has_value() && snapshot_image_rows_whole(*released, 0, 73) &&
+            term::render_snapshot_row_image(*released, 0) == nullptr,
+        "the release publishes nothing of the partly placed image");
+
+    int calls = 0;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    ok &= check(calls > 1 && snapshot.has_value() &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("done")) &&
+            !session->render_publication_blocked(),
+        "the drains finish the image and publish it whole");
+    return ok;
+}
+
+// Input keeps its contract while a settled tail is still replaying: it drains
+// all the output before it, the tail included, without a budget, and is
+// written after it.
+bool test_input_drains_a_replaying_tail_first()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "replaying-tail input session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    if (!check(requests.size() == 1U && requests.front().request.has_value(),
+            "the resize request reaches the host"))
+    {
+        return false;
+    }
+    ok &= check(backend->emit_output(budget_filling_sixel_image() + QByteArrayLiteral("tail-text")),
+        "the tail is held");
+    session->process_backend_callback_events();
+    ok &= check(session->settle_text_area_resize_arbitration({
+            requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            term::terminal_grid_size_t{90, 160},
+        }).code == term::Terminal_session_result_code::ACCEPTED &&
+            session->has_pending_backend_callback_events(),
+        "the tail is still replaying after the answer");
+
+    const std::optional<term::Terminal_session_result> written =
+        session->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
+            QByteArrayLiteral("k"));
+    const std::optional<term::Terminal_render_snapshot> snapshot = session->latest_render_snapshot();
+    ok &= check(written.has_value() && written->code == term::Terminal_session_result_code::ACCEPTED &&
+            !backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("k"),
+        "the input is written");
+    ok &= check(!session->has_pending_backend_callback_events() && snapshot.has_value() &&
+            snapshot_contains_text(*snapshot, QStringLiteral("tail-text")),
+        "the tail is replayed before the input");
     return ok;
 }
 
@@ -20851,6 +21110,11 @@ int main()
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
     ok &= test_budgeted_backend_callback_drain_resumes_sixel_work();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
+    ok &= test_paused_window_stays_inside_its_command();
+    ok &= test_settle_with_a_reply_before_a_heavy_image_stays_asynchronous();
+    ok &= test_exit_waits_behind_a_heavy_held_tail();
+    ok &= test_forced_release_keeps_a_placement_budgeted();
+    ok &= test_input_drains_a_replaying_tail_first();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
     ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
     ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();

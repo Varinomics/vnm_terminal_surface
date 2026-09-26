@@ -887,17 +887,20 @@ Terminal_screen_model_result Terminal_screen_model::force_release_synchronized_o
         nullptr,
         resize_transition_publication);
 
-    // A forced release must not show a partly placed image, so a pending
-    // placement completes first; the changes it held are released with it.
-    if (m_sixel_placement.has_value()) {
-        advance_sixel_placement(result.actions);
-        collect_synchronized_changes();
-        if (!m_modes.synchronized_output) {
-            release_synchronized_changes(publication);
+    // A forced release ends the application's hold, not the hold of a sixel
+    // placement in progress: that one keeps everything collected so far until
+    // later ingests have placed the image, and never places it here.
+    if (m_sixel_placement_held) {
+        if (m_modes.synchronized_output) {
+            finish_primary_repaint_recovery_candidate(false);
+            m_modes.synchronized_output = false;
+            mark_mode_state_changed();
+            collect_synchronized_changes();
         }
-        m_sixel_placement_held = false;
     }
-    set_synchronized_output_mode(false, &publication);
+    else {
+        set_synchronized_output_mode(false, &publication);
+    }
     assign_trailing_changes(resize_transition_publication, trailing_changes);
 
     result_change_overrides_t overrides;

@@ -243,6 +243,14 @@ public:
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;
     bool render_publication_blocked() const;
+    // The application's synchronized-output hold, which a stale-hold recovery
+    // may end; a sixel placement in progress also blocks publication, but
+    // ends on its own.
+    bool synchronized_output_hold_active() const;
+    // A settled text-area resize tail still replaying. Its callbacks were
+    // processed when they were held, so it waits for drains whatever the
+    // callback epochs say.
+    bool backend_output_replay_pending() const;
     Terminal_synchronized_output_scroll_policy effective_synchronized_output_scroll_policy() const;
     bool has_pending_backend_callback_events() const;
     std::size_t pending_backend_callback_event_count() const;
@@ -1107,6 +1115,8 @@ private:
     // its bytes it left; see ingest_backend_output_bytes.
     bool                                                   m_backend_output_stopped = false;
     qsizetype                                              m_unconsumed_backend_output_bytes = 0;
+    // The command being processed must run again once the tail replay ends.
+    bool                                                   m_command_waits_for_tail_replay = false;
     // A released text-area resize tail that is still being replayed, and
     // the settlement it belongs to.
     struct Text_area_resize_tail_replay
