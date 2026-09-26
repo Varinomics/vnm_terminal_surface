@@ -623,6 +623,53 @@ bool test_sixel_geometry_saturates()
     return ok;
 }
 
+bool test_sixel_header_limit_is_chunk_independent()
+{
+    bool ok = true;
+
+    // A DCS header counts against the DCS payload limit however the stream is
+    // split: a header whose parameter bytes fit the limit makes a sixel image,
+    // and one byte more makes an over-limit DCS.
+    const std::size_t limit = term::k_dcs_payload_limit_bytes;
+    for (const std::size_t header_size : {limit, limit + 1U}) {
+        const QByteArray bytes =
+            QByteArray("\x1bP") + QByteArray(static_cast<qsizetype>(header_size), '0') +
+            QByteArray("q~\x1b\\");
+        const qsizetype final_byte = 2 + static_cast<qsizetype>(header_size);
+        const bool      fits       = header_size <= limit;
+        for (const qsizetype split : {
+            qsizetype{0},
+            qsizetype{3},
+            final_byte / 2,
+            final_byte - 1,
+            final_byte,
+            final_byte + 1,
+            bytes.size() - 1})
+        {
+            const std::string label =
+                "header of " + std::to_string(header_size) + " bytes split at " + std::to_string(split);
+            term::Terminal_byte_stream_parser parser;
+            std::vector<term::Parser_action> actions = parser.ingest(bytes.first(split));
+            for (term::Parser_action& action : parser.ingest(bytes.sliced(split))) {
+                actions.push_back(std::move(action));
+            }
+
+            const std::vector<term::Parser_payload_diagnostic> diagnostics = diagnostics_in(actions);
+            ok &= check(images_in(actions).size() == (fits ? 1U : 0U), label + ": image");
+            ok &= check(diagnostics.size() == (fits ? 0U : 1U),        label + ": diagnostic");
+            if (!fits && diagnostics.size() == 1U) {
+                ok &= check(
+                    diagnostics[0].code == term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED &&
+                    diagnostics[0].family == term::Parser_sequence_family::DCS &&
+                    diagnostics[0].raw_payload_size == limit + 1U,
+                    label + ": over-limit DCS");
+            }
+        }
+    }
+
+    return ok;
+}
+
 bool test_model_supplies_the_cap()
 {
     bool ok = true;
@@ -680,6 +727,7 @@ int main()
     ok &= test_sixel_decoded_size_cap();
     ok &= test_sixel_growth_near_the_cap();
     ok &= test_sixel_geometry_saturates();
+    ok &= test_sixel_header_limit_is_chunk_independent();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }

@@ -1228,7 +1228,7 @@ void Terminal_byte_stream_parser::continue_string(
     std::vector<Parser_action>&    actions)
 {
     if (m_dcs_header_pending) {
-        classify_dcs_header(bytes, offset);
+        classify_dcs_header(bytes, offset, actions);
     }
 
     Parser_string_terminator terminator = Parser_string_terminator::END_OF_INPUT;
@@ -1284,21 +1284,27 @@ void Terminal_byte_stream_parser::start_string(
 
 void Terminal_byte_stream_parser::classify_dcs_header(
     QByteArrayView                 bytes,
-    qsizetype&                     offset)
+    qsizetype&                     offset,
+    std::vector<Parser_action>&    actions)
 {
-    // A header that overran the payload limit belongs to a string that is
-    // already being discarded, whatever its final byte turns out to be.
-    if (m_string_over_limit) {
-        m_dcs_header_pending = false;
-        return;
-    }
-
-    // Undecided header bytes are buffered like any DCS payload, so a DCS
-    // that is not sixel keeps its whole payload under the DCS limit.
+    // Undecided header bytes are buffered like any DCS payload, and the
+    // header counts against the DCS limit byte by byte however the stream is
+    // split: one byte past the limit makes the string an over-limit discard
+    // before any final byte can make it sixel. Within the limit the buffered
+    // bytes never trip it either, since they are all header bytes.
+    const std::size_t limit    = k_dcs_payload_limit_bytes;
+    const std::size_t buffered = static_cast<std::size_t>(m_string_payload.size());
     qsizetype decision_offset = offset;
     while (decision_offset < bytes.size() &&
         dcs_header_continues(byte_at(bytes, decision_offset)))
     {
+        if (buffered + static_cast<std::size_t>(decision_offset - offset) == limit) {
+            actions.push_back(make_dcs_payload_limit_diagnostic(limit + 1U));
+            m_string_payload.clear();
+            m_string_over_limit  = true;
+            m_dcs_header_pending = false;
+            return;
+        }
         ++decision_offset;
     }
 

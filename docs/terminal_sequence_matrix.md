@@ -48,7 +48,7 @@ sequence: DCS string payload
 feature: string payload hard limit
 status: supported
 action_category: payload-limit
-behavior: accepts payloads up to 1048576 raw bytes before unsupported discard; sixel data is never buffered and is bounded by dcs-sixel-decoded-limit instead
+behavior: accepts payloads up to 1048576 raw bytes before unsupported discard; the header counts against the limit however the stream is split, so a header of more than 1048576 bytes before its final byte is discarded over the limit, sixel or not; sixel data after the header is never buffered and is bounded by dcs-sixel-decoded-limit instead
 host_policy: none
 payload_limit: 1048576 raw bytes
 recovery: discard over-limit payload until ST or recovery boundary

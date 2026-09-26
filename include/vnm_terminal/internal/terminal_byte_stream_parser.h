@@ -64,7 +64,8 @@ private:
 
     void classify_dcs_header(
         QByteArrayView                 bytes,
-        qsizetype&                     offset);
+        qsizetype&                     offset,
+        std::vector<Parser_action>&    actions);
 
     void start_string(
         Parser_sequence_family         family,
