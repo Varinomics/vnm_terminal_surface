@@ -82,10 +82,13 @@ public:
     bool failed() const;
     QString error_message() const;
 
+    // The cell pixel size is the one in effect at start, which sizes images
+    // and answers the child's cell size queries.
     bool record_session_start(
-        std::uint64_t                  session_sequence,
-        const Terminal_launch_config&  launch_config,
-        const Terminal_session_config& session_config);
+        std::uint64_t                             session_sequence,
+        const Terminal_launch_config&             launch_config,
+        const Terminal_session_config&            session_config,
+        std::optional<terminal_cell_pixel_size_t> cell_pixel_size);
 
     bool record_backend_output(
         std::uint64_t  session_sequence,

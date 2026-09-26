@@ -4866,7 +4866,8 @@ Terminal_session_result Terminal_session::process_start_command(
         (void)m_config.transcript_recorder->record_session_start(
             command.sequence,
             *command.launch_config,
-            m_config);
+            m_config,
+            m_cell_pixel_size);
     }
 #endif
     const Terminal_backend_result backend_result =

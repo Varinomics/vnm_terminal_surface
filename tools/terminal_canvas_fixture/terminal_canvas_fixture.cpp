@@ -894,24 +894,32 @@ bool write_shell_pixel_size()
 }
 #endif
 
-// The reply is read through its final byte. The bound keeps a reply that never
-// ends from hanging the fixture.
-int run_shell_cell_size_query()
+// Asks for the cell size with CSI 16 t and reads the reply through its final
+// byte. The bound keeps a reply that never ends from hanging the fixture.
+bool query_cell_size(std::vector<unsigned char>& reply)
 {
     if (!write_all_stdout("\x1b[16t")) {
-        return 86;
+        return false;
     }
 
     constexpr std::size_t k_max_reply_bytes = 32U;
-    std::vector<unsigned char> reply;
     do {
         unsigned char byte = 0U;
         if (std::fread(&byte, 1U, 1U, stdin) != 1U) {
-            return 87;
+            return false;
         }
         reply.push_back(byte);
     }
     while (reply.back() != 't' && reply.size() < k_max_reply_bytes);
+    return true;
+}
+
+int run_shell_cell_size_query()
+{
+    std::vector<unsigned char> reply;
+    if (!query_cell_size(reply)) {
+        return 87;
+    }
 
     std::string line(
         term::terminal_canvas_fixture_shell_like_smoke_contract().cell_size_reply_prefix);
@@ -1646,10 +1654,12 @@ int run_quick_exit()
 
 // Writes one sixel cursor-sync case, then reports the console cursor that the
 // console host computed for it, relative to the window, as "<row> <column>".
-// The report is renamed into place so the test never reads it half written,
-// and the fixture then waits for one input byte, so the test samples its own
-// cursor while nothing else is written. Only a console host has a cursor to
-// read this way.
+// A cell size query follows the case and the report waits for its reply: the
+// terminal answers only after applying everything before the query, so by the
+// time the report exists its cursor has taken in the whole case. The report is
+// renamed into place so the test never reads it half written, and the fixture
+// then waits for one input byte, so the test samples its own cursor while
+// nothing else is written. Only a console host has a cursor to read this way.
 int run_sixel_cursor_sync(std::string_view case_name, const std::string& report_path)
 {
 #if defined(_WIN32)
@@ -1671,6 +1681,10 @@ int run_sixel_cursor_sync(std::string_view case_name, const std::string& report_
     }
     if (!write_all_stdout(found->payload)) {
         return 94;
+    }
+    std::vector<unsigned char> reply;
+    if (!query_cell_size(reply)) {
+        return 99;
     }
 
     CONSOLE_SCREEN_BUFFER_INFO info{};

@@ -1630,8 +1630,9 @@ int cursor_moves_after_image(const QByteArray& output)
 // image, while ConPTY forwards the image unanswered, so the model must reach
 // the same cell by itself or later cursor-relative output lands elsewhere.
 // Each case runs in a fresh session: the child writes it through the packaged
-// ConPTY, reports its console cursor and waits, and the model cursor is
-// sampled once the output has settled. Observation cases are only recorded.
+// ConPTY followed by a cell size query, reports its console cursor once the
+// reply is back and waits, and the model cursor is sampled then. Observation
+// cases are only recorded.
 bool test_sixel_cursor_stays_in_sync_with_openconsole(const QString& fixture_path)
 {
     bool ok = true;
@@ -1674,30 +1675,18 @@ bool test_sixel_cursor_stays_in_sync_with_openconsole(const QString& fixture_pat
             return bytes;
         };
 
-        // Settled: the child has reported and ConPTY has sent nothing new for
-        // a while, so the model has applied everything the image produced.
+        // The child reports only after the model has answered the query that
+        // follows the image, so by then the model has applied the whole case.
         const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
-        qsizetype  observed_size  = -1;
-        auto       observed_since = std::chrono::steady_clock::now();
-        bool       settled        = false;
-        while (std::chrono::steady_clock::now() < deadline) {
+        bool       reported = false;
+        while (!reported && std::chrono::steady_clock::now() < deadline) {
             session.process_backend_callback_events();
-            const qsizetype size = output().size();
-            const auto      now  = std::chrono::steady_clock::now();
-            if (size != observed_size) {
-                observed_size  = size;
-                observed_since = now;
+            reported = QFileInfo::exists(report_path);
+            if (!reported) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            else
-            if (QFileInfo::exists(report_path) &&
-                now - observed_since >= std::chrono::milliseconds(300))
-            {
-                settled = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        ok &= check(settled, label + ": the child reports and the output settles");
+        ok &= check(reported, label + ": the child reports after the model answers its query");
 
         int console_row    = -1;
         int console_column = -1;

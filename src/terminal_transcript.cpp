@@ -105,6 +105,14 @@ QJsonObject grid_size_object(terminal_grid_size_t grid_size)
     };
 }
 
+QJsonObject cell_pixel_size_object(terminal_cell_pixel_size_t cell_pixel_size)
+{
+    return {
+        {QStringLiteral("width"),  cell_pixel_size.width},
+        {QStringLiteral("height"), cell_pixel_size.height},
+    };
+}
+
 QJsonObject position_object(terminal_grid_position_t position)
 {
     return {
@@ -883,6 +891,33 @@ bool validate_grid_size_object(
         require_object_field(object, field_name, line_number, out_error, &grid_size) &&
         require_nonnegative_int_field(grid_size, QStringLiteral("rows"), line_number, out_error) &&
         require_nonnegative_int_field(grid_size, QStringLiteral("columns"), line_number, out_error);
+}
+
+bool validate_cell_pixel_size_object(
+    const QJsonObject& object,
+    const QString&     field_name,
+    int                line_number,
+    QString*           out_error)
+{
+    QJsonObject cell_pixel_size;
+    int         width  = 0;
+    int         height = 0;
+    if (!require_object_field(object, field_name, line_number, out_error, &cell_pixel_size) ||
+        !require_nonnegative_int_field(
+            cell_pixel_size, QStringLiteral("width"), line_number, out_error, &width) ||
+        !require_nonnegative_int_field(
+            cell_pixel_size, QStringLiteral("height"), line_number, out_error, &height))
+    {
+        return false;
+    }
+    if (!is_valid_cell_pixel_size({width, height})) {
+        return fail_read(
+            out_error,
+            QStringLiteral("transcript line %1 %2 is not a positive size")
+                .arg(line_number)
+                .arg(field_name));
+    }
+    return true;
 }
 
 bool validate_position_object(
@@ -1751,6 +1786,12 @@ bool post_validate_session_start(
             validate_grid_size_object(
                 object,
                 QStringLiteral("initial_grid_size"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("cell_pixel_size")) ||
+            validate_cell_pixel_size_object(
+                object,
+                QStringLiteral("cell_pixel_size"),
                 line_number,
                 out_error));
 }
@@ -2666,15 +2707,19 @@ QString Terminal_transcript_recorder::error_message() const
 }
 
 bool Terminal_transcript_recorder::record_session_start(
-    std::uint64_t                  session_sequence,
-    const Terminal_launch_config&  launch_config,
-    const Terminal_session_config& session_config)
+    std::uint64_t                             session_sequence,
+    const Terminal_launch_config&             launch_config,
+    const Terminal_session_config&            session_config,
+    std::optional<terminal_cell_pixel_size_t> cell_pixel_size)
 {
     QJsonObject object;
     object.insert(QStringLiteral("kind"), QStringLiteral("session.start"));
     insert_u64(object, QStringLiteral("session_sequence"), session_sequence);
     if (launch_config.initial_grid_size.has_value()) {
         object.insert(QStringLiteral("initial_grid_size"), grid_size_object(*launch_config.initial_grid_size));
+    }
+    if (cell_pixel_size.has_value()) {
+        object.insert(QStringLiteral("cell_pixel_size"), cell_pixel_size_object(*cell_pixel_size));
     }
     object.insert(QStringLiteral("session_config"), session_config_object(session_config));
     object.insert(QStringLiteral("argv"), QJsonArray::fromStringList(launch_config.argv));

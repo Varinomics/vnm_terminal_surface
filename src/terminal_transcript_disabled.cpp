@@ -91,7 +91,8 @@ QString Terminal_transcript_recorder::error_message() const
 bool Terminal_transcript_recorder::record_session_start(
     std::uint64_t,
     const Terminal_launch_config&,
-    const Terminal_session_config&)
+    const Terminal_session_config&,
+    std::optional<terminal_cell_pixel_size_t>)
 {
     return false;
 }
