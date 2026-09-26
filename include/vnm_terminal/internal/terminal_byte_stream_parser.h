@@ -28,7 +28,12 @@ Terminal_csi_byte_kind terminal_csi_byte_kind(unsigned char byte);
 class Terminal_byte_stream_parser
 {
 public:
-    std::vector<Parser_action> ingest(QByteArrayView bytes);
+    // Parses bytes from offset on and stops right after a sixel image
+    // completes, so its caller applies each image before the next is decoded
+    // and at most one decoded raster is alive at a time, however many images
+    // one chunk describes. offset advances past what was parsed; the caller
+    // calls again until it reaches bytes.size().
+    std::vector<Parser_action> ingest(QByteArrayView bytes, qsizetype& offset);
 
     // The decoded size a sixel image may reach; its owner keeps it equal to
     // the retained history's largest record.
@@ -44,8 +49,9 @@ private:
         CONSUMED,
     };
 
-    std::vector<Parser_action> ingest_buffer(
-        QByteArrayView                 bytes);
+    qsizetype ingest_buffer(
+        QByteArrayView                 bytes,
+        std::vector<Parser_action>&    actions);
 
     String_state_result try_start_string(
         QByteArrayView                 bytes,

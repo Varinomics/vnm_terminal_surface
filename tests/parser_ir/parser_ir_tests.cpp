@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "helpers/parser_ingest.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
@@ -14,6 +15,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+using vnm_terminal::test_helpers::ingest_all;
 
 const term::Screen_print_text_mutation& print_mutation_from(
     const term::Parser_action& action)
@@ -226,7 +228,7 @@ bool test_parser_printable_ascii_classification()
     }
 
     term::Terminal_byte_stream_parser parser;
-    const std::vector<term::Parser_action> long_actions = parser.ingest(long_ascii);
+    const std::vector<term::Parser_action> long_actions = ingest_all(parser, long_ascii);
     ok &= check(long_actions.size() == 1U, "long ASCII run emits one action");
     if (long_actions.size() == 1U) {
         const term::Screen_print_text_mutation& mutation =
@@ -247,16 +249,16 @@ bool test_parser_printable_ascii_classification()
             std::make_move_iterator(actions.end()));
     };
 
-    append_actions(mixed_parser.ingest(QByteArray("abc\x1b", 4)));
+    append_actions(ingest_all(mixed_parser, QByteArray("abc\x1b", 4)));
 
     QByteArray second_chunk = QByteArrayLiteral("[31mdef\n");
     second_chunk.append(static_cast<char>(0xc3));
-    append_actions(mixed_parser.ingest(second_chunk));
+    append_actions(ingest_all(mixed_parser, second_chunk));
 
     QByteArray third_chunk;
     third_chunk.append(static_cast<char>(0xa9));
     third_chunk += QByteArrayLiteral("ghi");
-    append_actions(mixed_parser.ingest(third_chunk));
+    append_actions(ingest_all(mixed_parser, third_chunk));
 
     ok &= check(mixed_actions.size() == 5U,
         "mixed chunked stream emits split print and control actions");
