@@ -9,6 +9,7 @@
 #include <QImage>
 #include <QString>
 #include <QtGui/qrgb.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -694,6 +695,65 @@ bool test_sixel_geometry_saturates()
     const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
     ok &= check(!images.empty() && images[0].final_cursor_y == k_int_max,
         "far geometry: the cursor saturates");
+
+    // With both extents saturated, four times their product passes INT64_MAX
+    // and the decoded size is still reported exactly.
+    QByteArray widest("\"32767;1");
+    widest.append(QByteArray(10924, '-'));
+    for (int i = 0; i < 65539; ++i) {
+        widest.append("!32767?");
+    }
+    widest.append('G');
+
+    std::vector<term::Parser_action> widest_actions;
+    try {
+        widest_actions = parse(sixel_dcs("0;1", widest));
+    }
+    catch (const std::exception& error) {
+        return check(false, std::string("saturated geometry: decoding threw ") + error.what());
+    }
+
+    constexpr std::uint64_t k_saturated_bytes =
+        static_cast<std::uint64_t>(k_int_max) * static_cast<std::uint64_t>(k_int_max) * 4ULL;
+    static_assert(k_saturated_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+    ok &= check_over_cap(
+        widest_actions,
+        static_cast<std::size_t>(k_saturated_bytes),
+        term::terminal_history_ring_max_record_bytes(
+            term::k_terminal_default_retained_history_capacity_bytes),
+        k_int_max,
+        k_int_max,
+        "saturated geometry");
+    const std::vector<term::Screen_sixel_image_mutation> widest_images = images_in(widest_actions);
+    ok &= check(!widest_images.empty() && widest_images[0].final_cursor_y == k_int_max,
+        "saturated geometry: the cursor saturates");
+    return ok;
+}
+
+bool test_sixel_cap_trips_inside_a_scaled_band()
+{
+    bool ok = true;
+
+    // Above 1:1 a band's rows are expanded when the band closes. When the cap
+    // trips inside a band, the raster and the band waiting to be expanded go
+    // together; the band still closes, later data draws nothing, and the
+    // geometry is tracked to the terminator.
+    constexpr std::size_t k_limit = 4096U;
+    term::Terminal_byte_stream_parser parser;
+    parser.set_sixel_raster_limit_bytes(k_limit);
+
+    std::vector<term::Parser_action> actions;
+    try {
+        actions = ingest_all(parser, sixel_dcs("2;1", "#1!20~$!400~-!10~"));
+    }
+    catch (const std::exception& error) {
+        return check(false, std::string("cap inside a 5:1 band: decoding threw ") + error.what());
+    }
+
+    ok &= check_over_cap(actions, 400U * 30U * 4U, k_limit, 400, 60, "cap inside a 5:1 band");
+    const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+    ok &= check(!images.empty() && images[0].final_cursor_y == 30,
+        "cap inside a 5:1 band: the cursor still moves a band down");
     return ok;
 }
 
@@ -784,6 +844,108 @@ bool test_parser_stops_after_each_image()
     return ok;
 }
 
+// One label per action, enough to tell the kinds and their order apart.
+std::string action_label(const term::Parser_action& action)
+{
+    switch (term::parser_action_kind(action)) {
+        case term::Parser_action_kind::SCREEN_MUTATION:
+        {
+            const term::Screen_mutation& mutation = std::get<term::Screen_mutation>(action.payload);
+            if (const auto* print = std::get_if<term::Screen_print_text_mutation>(&mutation)) {
+                return "print:" + print->text.toStdString();
+            }
+            return std::get_if<term::Screen_sixel_image_mutation>(&mutation) != nullptr
+                ? "image"
+                : "screen";
+        }
+        case term::Parser_action_kind::STYLE_MUTATION:
+            return "style";
+        case term::Parser_action_kind::CONTROL_SEQUENCE:
+            return "control:" +
+                std::get<term::Parser_control_sequence>(action.payload).final_bytes.toStdString();
+        case term::Parser_action_kind::DIAGNOSTIC:
+            return "diagnostic:" +
+                std::get<term::Parser_payload_diagnostic>(action.payload).source_sequence.toStdString();
+        case term::Parser_action_kind::TERMINAL_REPLY:
+            return "reply:" + std::get<term::Terminal_reply>(action.payload).source_sequence.toStdString();
+        default:
+            return "other";
+    }
+}
+
+bool test_parser_stops_after_each_image_across_chunks()
+{
+    bool ok = true;
+
+    // The stops after images hold across chunks that split a UTF-8 scalar or
+    // an escape, at an image that ends exactly at a chunk end, around empty
+    // input, and next to a cancelled image, a recovered one and a query:
+    // every call returns at most one image, as its last action, and the
+    // actions keep the order of the stream.
+    const QByteArray image = sixel_dcs({}, "~");
+    const std::vector<QByteArray> chunks = {
+        QByteArray("\xc3"),
+        QByteArray("\xa9") + image,
+        QByteArray("\x1b"),
+        QByteArray("Pq~\x1b\\\x1b[c"),
+        QByteArray(),
+        QByteArray("\x1bPq~\x18") + QByteArray("\x1bPq~\x1b[0m") + image + "Z",
+    };
+
+    term::Terminal_byte_stream_parser parser;
+    std::vector<std::string> labels;
+    for (const QByteArray& chunk : chunks) {
+        qsizetype parsed = 0;
+        do {
+            const std::vector<term::Parser_action> batch = parser.ingest(chunk, parsed);
+            const std::size_t batch_images = images_in(batch).size();
+            ok &= check(batch_images <= 1U, "a call returns at most one image");
+            if (batch_images == 1U) {
+                ok &= check(action_label(batch.back()) == "image", "the image ends its call");
+            }
+            for (const term::Parser_action& action : batch) {
+                labels.push_back(action_label(action));
+            }
+        }
+        while (parsed < chunk.size());
+    }
+
+    const std::vector<std::string> expected = {
+        "print:\xc3\xa9",
+        "image",
+        "image",
+        "control:c",
+        "diagnostic:DCS recovery",
+        "style",
+        "image",
+        "print:Z",
+    };
+    ok &= check(labels == expected, "the actions keep the order of the stream");
+
+    // The model answers the query after placing the images before it.
+    term::Terminal_screen_model_config config;
+    config.grid_size       = {24, 80};
+    config.cell_pixel_size = term::terminal_cell_pixel_size_t{10, 20};
+    term::Terminal_screen_model model(config);
+    std::vector<std::string> model_labels;
+    for (const QByteArray& chunk : chunks) {
+        for (const term::Parser_action& action : model.ingest(chunk).actions) {
+            model_labels.push_back(action_label(action));
+        }
+    }
+    const std::vector<std::string> ordered = {"image", "image", "control:c", "reply:DA1", "image"};
+    auto next = model_labels.begin();
+    for (const std::string& label : ordered) {
+        next = std::find(next, model_labels.end(), label);
+        ok &= check(next != model_labels.end(), "the model keeps " + label + " in stream order");
+        if (next == model_labels.end()) {
+            break;
+        }
+        ++next;
+    }
+    return ok;
+}
+
 bool test_model_supplies_the_cap()
 {
     bool ok = true;
@@ -842,8 +1004,10 @@ int main()
     ok &= test_sixel_decoded_size_cap();
     ok &= test_sixel_growth_near_the_cap();
     ok &= test_sixel_geometry_saturates();
+    ok &= test_sixel_cap_trips_inside_a_scaled_band();
     ok &= test_sixel_header_limit_is_chunk_independent();
     ok &= test_parser_stops_after_each_image();
+    ok &= test_parser_stops_after_each_image_across_chunks();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }
