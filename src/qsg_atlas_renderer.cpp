@@ -8383,6 +8383,9 @@ void Qsg_atlas_recorder::record_prepare(
     const std::lock_guard<std::mutex> lock(m_mutex);
     ++m_report.prepare_count;
     m_report.prepare_elapsed_ns            += prepare_elapsed_ns;
+    m_report.image_texture_creations_total +=
+        static_cast<std::uint64_t>(render_summary.images.texture_creations);
+    m_report.image_uploaded_bytes_total    += render_summary.images.uploaded_bytes;
     m_report.command_buffer_non_null        = command_buffer_non_null;
     m_report.render_target_non_null         = render_target_non_null;
     m_report.rhi_non_null                   = rhi_non_null;
