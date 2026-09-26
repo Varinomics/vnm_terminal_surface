@@ -15744,6 +15744,114 @@ bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
     return ok;
 }
 
+bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
+{
+    bool ok = true;
+
+    // A sixel image described in a few bytes can expand into one as large as
+    // the decoded-size cap, so a budgeted drain ends its slice where an image
+    // completes and meets its deadline before decoding the next one. The
+    // images and the text around them end up as one unbudgeted drain leaves
+    // them, a query between them is answered the same, and images inside a
+    // synchronized update stay unpublished until it ends.
+    const QByteArray image    = QByteArrayLiteral("\x1bPq\"1;1;40;40#1~\x1b\\");
+    const QByteArray before   = QByteArrayLiteral("before ");
+    const QByteArray query    = QByteArrayLiteral("\x1b[c");
+    const QByteArray sync_on  = QByteArrayLiteral("\x1b[?2026h");
+    const QByteArray sync_off = QByteArrayLiteral("\x1b[?2026l");
+    const QByteArray after    = QByteArrayLiteral(" after");
+    const QByteArray output =
+        before + image + query + sync_on + image + image + sync_off + after;
+
+    struct drain_result_t
+    {
+        std::vector<QByteArray>                      chunks;
+        std::vector<QByteArray>                      writes;
+        std::vector<term::terminal_grid_position_t>  published_cursors;
+        std::optional<term::Terminal_render_snapshot> snapshot;
+        int                                          calls = 0;
+    };
+    const auto drain = [&](bool budgeted, const std::string& label) {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        session->set_cell_pixel_size({10, 20});
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            label + ": session starts");
+        ok &= check(backend->emit_output(output), label + ": output queues");
+
+        // The published cursor is recorded after each drain that takes output;
+        // a later drain may only send the reply.
+        drain_result_t result;
+        while (session->has_pending_backend_callback_events() && result.calls < 16) {
+            ++result.calls;
+            const std::size_t chunks_before = session->output_chunks().size();
+            if (budgeted) {
+                session->process_backend_callback_events_for(
+                    std::chrono::steady_clock::duration::zero());
+                ok &= check(session->output_chunks().size() <= chunks_before + 1U,
+                    label + ": an owner drain takes at most one slice");
+            }
+            else {
+                session->process_backend_callback_events();
+            }
+            if (session->output_chunks().size() == chunks_before) {
+                continue;
+            }
+            const std::optional<term::Terminal_render_snapshot> published =
+                session->latest_render_snapshot();
+            result.published_cursors.push_back(published.has_value()
+                ? published->cursor.position
+                : term::terminal_grid_position_t{});
+        }
+        result.chunks   = session->output_chunks();
+        result.writes   = backend->writes;
+        result.snapshot = session->latest_render_snapshot();
+        return result;
+    };
+
+    const drain_result_t budgeted   = drain(true,  "budgeted sixel drain");
+    const drain_result_t unbudgeted = drain(false, "unbudgeted sixel drain");
+
+    ok &= check(budgeted.chunks == std::vector<QByteArray>{
+            before + image, query + sync_on + image, image, sync_off + after},
+        "budgeted sixel drain ends a slice after each image");
+    ok &= check(!budgeted.writes.empty() && budgeted.writes == unbudgeted.writes,
+        "budgeted sixel drain answers the query between images as one drain does");
+    ok &= check(budgeted.published_cursors.size() == 4U &&
+            budgeted.published_cursors[1] == budgeted.published_cursors[0] &&
+            budgeted.published_cursors[2] == budgeted.published_cursors[0] &&
+            budgeted.published_cursors[3] != budgeted.published_cursors[0],
+        "budgeted sixel drain publishes nothing inside the synchronized update");
+    ok &= check(unbudgeted.chunks == std::vector<QByteArray>{output},
+        "unbudgeted sixel drain takes the output whole");
+    ok &= check(budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value(),
+        "both sixel drains publish a snapshot");
+    if (budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value()) {
+        const term::Terminal_render_snapshot& left  = *budgeted.snapshot;
+        const term::Terminal_render_snapshot& right = *unbudgeted.snapshot;
+        ok &= check(left.cursor.position == right.cursor.position,
+            "budgeted sixel drain leaves the cursor where one drain does");
+        bool same_rows = left.grid_size.rows == right.grid_size.rows;
+        for (int row = 0; same_rows && row < left.grid_size.rows; ++row) {
+            const auto left_image  = term::render_snapshot_row_image(left,  row);
+            const auto right_image = term::render_snapshot_row_image(right, row);
+            same_rows =
+                snapshot_row_text(left, row) == snapshot_row_text(right, row) &&
+                (left_image == nullptr) == (right_image == nullptr) &&
+                (left_image == nullptr || left_image->pixels == right_image->pixels);
+        }
+        ok &= check(same_rows,
+            "budgeted sixel drain leaves the text and images one drain does");
+        ok &= check(snapshot_contains_text(left, QStringLiteral("after")),
+            "budgeted sixel drain reaches the text after the images");
+    }
+
+    return ok;
+}
+
 bool test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot()
 {
     bool ok = true;
@@ -20659,6 +20767,7 @@ int main()
     ok &= test_worker_thread_callback_is_delivered();
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
+    ok &= test_budgeted_backend_callback_drain_yields_after_each_sixel_image();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
     ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
     ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();

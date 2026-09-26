@@ -619,6 +619,12 @@ public:
         QByteArrayView bytes,
         const terminal_screen_model_resize_transition_sink_t*
             resize_transition_sink = nullptr);
+    // Where a caller that yields after each sixel image should end the next
+    // chunk it ingests; see Terminal_byte_stream_parser::sixel_image_boundary.
+    qsizetype sixel_image_boundary(QByteArrayView bytes) const
+    {
+        return m_parser.sixel_image_boundary(bytes);
+    }
     Terminal_screen_model_result resize(
         terminal_grid_size_t grid_size,
         const terminal_screen_model_resize_transition_sink_t*

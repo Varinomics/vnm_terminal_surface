@@ -1865,6 +1865,16 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
         }
 
         if (event.kind == QStringLiteral("session.start")) {
+            // Before the start, as the recording host set it: the cell sizes
+            // images and answers the child's cell size queries.
+            if (event.object.contains(QStringLiteral("cell_pixel_size"))) {
+                const QJsonObject cell =
+                    event.object.value(QStringLiteral("cell_pixel_size")).toObject();
+                session->set_cell_pixel_size({
+                    cell.value(QStringLiteral("width")).toInt(),
+                    cell.value(QStringLiteral("height")).toInt(),
+                });
+            }
             const term::Terminal_session_result result =
                 session->start(launch_config_from_event(event));
             if (result.code != term::Terminal_session_result_code::ACCEPTED) {

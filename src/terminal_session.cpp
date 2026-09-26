@@ -4629,12 +4629,22 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             record_processed_command(command);
         }
 
-        const bool slice_backend_output =
-            deadline.has_value()                                          &&
+        // A deadline-bound drain takes backend output in bounded slices and
+        // also ends a slice where a sixel image may complete, so the deadline
+        // is checked between images: a description of a few bytes can expand
+        // into an image as large as the decoded-size cap. Each slice scans
+        // only its own bytes for that boundary.
+        qsizetype slice_bytes = command.bytes.size();
+        if (deadline.has_value()                                          &&
             command.kind == Terminal_session_command_kind::BACKEND_OUTPUT &&
-            command.bytes.size() > k_backend_output_drain_slice_bytes     &&
             m_screen_model.has_value()                                    &&
-            !should_ignore_backend_output_after_stop(command.sequence);
+            !should_ignore_backend_output_after_stop(command.sequence))
+        {
+            const QByteArrayView window = QByteArrayView(command.bytes).first(
+                std::min(command.bytes.size(), k_backend_output_drain_slice_bytes));
+            slice_bytes = m_screen_model->sixel_image_boundary(window);
+        }
+        const bool slice_backend_output = slice_bytes < command.bytes.size();
         if (slice_backend_output) {
             // A sliced BACKEND_OUTPUT remains one logical queued command. Bytes
             // are released per slice, but command-count/backpressure accounting
@@ -4645,9 +4655,8 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             // to the backing store before removing it from the remainder.
             // A uniquely owned Qt 6 QByteArray can drop a prefix without
             // copying the tail. An external trace reference detaches once.
-            command.bytes = QByteArray(
-                remainder.bytes.constData(), k_backend_output_drain_slice_bytes);
-            remainder.bytes.remove(0, k_backend_output_drain_slice_bytes);
+            command.bytes = QByteArray(remainder.bytes.constData(), slice_bytes);
+            remainder.bytes.remove(0, slice_bytes);
             m_pending_commands.push_front(std::move(remainder));
             m_budgeted_backend_output_sequence = command.sequence;
         }
@@ -4857,7 +4866,8 @@ Terminal_session_result Terminal_session::process_start_command(
         (void)m_config.transcript_recorder->record_session_start(
             command.sequence,
             *command.launch_config,
-            m_config);
+            m_config,
+            m_cell_pixel_size);
     }
 #endif
     const Terminal_backend_result backend_result =

@@ -498,6 +498,41 @@ bool rewrite_first_snapshot_dirty_ranges(const QString& path)
     return rewritten && write_transcript_lines(path, lines);
 }
 
+// An undefined value removes the field.
+bool rewrite_session_start_cell_pixel_size(const QString& path, const QJsonValue& cell_pixel_size)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    bool rewritten = false;
+    std::vector<QByteArray> lines;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return false;
+        }
+
+        QJsonObject object = document.object();
+        if (object.value(QStringLiteral("kind")).toString() == QStringLiteral("session.start")) {
+            if (cell_pixel_size.isUndefined()) {
+                object.remove(QStringLiteral("cell_pixel_size"));
+            }
+            else {
+                object.insert(QStringLiteral("cell_pixel_size"), cell_pixel_size);
+            }
+            rewritten = true;
+        }
+        lines.push_back(json_line(object));
+    }
+    file.close();
+
+    return rewritten && write_transcript_lines(path, lines);
+}
+
 bool rewrite_first_snapshot_reason(const QString& path, const QString& reason)
 {
     QFile file(path);
@@ -2205,7 +2240,8 @@ bool test_writer_reader_schema_roundtrip()
     term::Terminal_session_config session_config;
     session_config.scrollback_limit = 32;
     session_config.retained_history_capacity_bytes = 2U * 1024U * 1024U;
-    ok &= check(recorder->record_session_start(1U, launch_config, session_config), "session.start writes");
+    ok &= check(recorder->record_session_start(1U, launch_config, session_config, std::nullopt),
+        "session.start writes");
     ok &= check(recorder->record_backend_output(2U, QByteArrayLiteral("out")), "backend.output writes");
     ok &= check(recorder->record_host_write(3U, QStringLiteral("user"), QByteArrayLiteral("in")),
         "host.write writes");
@@ -2669,7 +2705,7 @@ bool test_writer_records_recovery_flag_values()
         term::Terminal_session_config session_config;
         session_config.recover_scrollback_from_primary_repaints = recovery_enabled;
         ok &= check(
-            recorder->record_session_start(1U, valid_launch_config(), session_config),
+            recorder->record_session_start(1U, valid_launch_config(), session_config, std::nullopt),
             label);
         recorder.reset();
 
@@ -2765,7 +2801,8 @@ bool test_snapshot_timing_diagnostics_include_snapshot_metadata()
     term::Terminal_viewport_state viewport;
     term::Terminal_render_snapshot snapshot =
         term::make_empty_render_snapshot(grid_size, viewport, 17U);
-    ok &= check(recorder->record_session_start(1U, valid_launch_config(), session_config),
+    ok &= check(
+        recorder->record_session_start(1U, valid_launch_config(), session_config, std::nullopt),
         "snapshot timing session.start writes");
     ok &= check(recorder->record_snapshot(1U, snapshot_reason, snapshot),
         "snapshot timing snapshot writes");
@@ -3984,6 +4021,96 @@ bool test_replay_tool_preserves_recorded_disabled_recovery_flag(
     if (!ok) {
         print_replay_tool_output(replay);
     }
+    return ok;
+}
+
+// The cell pixel size in effect at start sizes images and answers the child's
+// cell size queries, so a replay has to start with the recorded one.
+bool test_replay_tool_applies_recorded_cell_pixel_size(const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "cell pixel size replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "cell pixel size replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("cell-pixel-size.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "cell pixel size replay recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+    session.set_cell_pixel_size({10, 20});
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{6, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "cell pixel size replay captured session starts");
+    // A 24 pixel tall image spans two 20 pixel rows, and the query's reply
+    // carries the cell.
+    backend_ptr->emit_output(QByteArrayLiteral("a\x1bPq#1!10~-!10~-!10~-!10~\x1b\\b\x1b[16t"));
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session.latest_render_snapshot();
+    ok &= check(snapshot.has_value() && snapshot->cursor.position.row > 0,
+        "the recorded image moves the cursor down");
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "cell pixel size transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+    const std::optional<term::Terminal_transcript_event> start =
+        first_event(*events, QStringLiteral("session.start"));
+    const QJsonObject cell = start.has_value()
+        ? start->object.value(QStringLiteral("cell_pixel_size")).toObject()
+        : QJsonObject();
+    ok &= check(cell.value(QStringLiteral("width")).toInt() == 10 &&
+            cell.value(QStringLiteral("height")).toInt() == 20,
+        "session.start records the cell pixel size in effect");
+    const std::optional<term::Terminal_transcript_event> reply =
+        first_event(*events, QStringLiteral("host.write"));
+    ok &= check(reply.has_value() && event_bytes(*reply) == QByteArrayLiteral("\x1b[6;20;10t"),
+        "the recorded session answers the cell size query");
+
+    Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished && replay.exit_status == QProcess::NormalExit &&
+            replay.exit_code == 0 && replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "a replay with the recorded cell pixel size matches the recording");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+
+    ok &= check(rewrite_session_start_cell_pixel_size(path, QJsonValue(QJsonValue::Undefined)),
+        "cell pixel size is removed from the recorded session.start");
+    replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished && replay.exit_status == QProcess::NormalExit &&
+            replay.exit_code != 0,
+        "a replay without the cell pixel size diverges from the recording");
+
+    ok &= check(rewrite_session_start_cell_pixel_size(path, QJsonObject{
+                {QStringLiteral("width"),  0},
+                {QStringLiteral("height"), 20},
+            }),
+        "an empty cell pixel size is written into session.start");
+    ok &= check(!term::read_terminal_transcript(path, &error).has_value(),
+        "the reader rejects an empty cell pixel size");
     return ok;
 }
 
@@ -5556,6 +5683,7 @@ int main(int argc, char** argv)
     const QString replay_tool_path =
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
     ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
+    ok &= test_replay_tool_applies_recorded_cell_pixel_size(replay_tool_path);
     ok &= test_replay_tool_compares_recovered_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_defaults_missing_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);

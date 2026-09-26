@@ -35,6 +35,14 @@ public:
     // calls again until it reaches bytes.size().
     std::vector<Parser_action> ingest(QByteArrayView bytes, qsizetype& offset);
 
+    // Where a caller that yields after each sixel image should end the next
+    // chunk it hands over: just past the first byte of bytes that could
+    // complete an image, or bytes.size() when none can. The bound is
+    // conservative, so a chunk may end early but never holds two image ends.
+    // It reads the parser's state without changing it and scans each byte of
+    // bytes at most once, up to the bound.
+    qsizetype sixel_image_boundary(QByteArrayView bytes) const;
+
     // The decoded size a sixel image may reach; its owner keeps it equal to
     // the retained history's largest record.
     void set_sixel_raster_limit_bytes(std::size_t limit_bytes)
