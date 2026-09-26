@@ -4747,19 +4747,30 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
         return finalize_result(std::move(result));
     }
 
+    // A decrease lowers the decoded-size cap, possibly below row images the
+    // model holds, which then drop. The drop's diagnostic and dirty-row
+    // storage are prepared before the resize, so that once the ring has
+    // changed nothing can throw until the lookup index matches it again and
+    // the images are dropped.
+    const std::size_t new_cap_bytes = terminal_history_ring_max_record_bytes(aligned_capacity);
+    const std::size_t dropped_image_bytes =
+        aligned_capacity < m_config.retained_history_capacity_bytes
+            ? drop_row_images_over_cap(new_cap_bytes, false)
+            : 0U;
+    if (dropped_image_bytes > 0U) {
+        result.actions.push_back(make_payload_limit_diagnostic(
+            QStringLiteral("DCS sixel"),
+            dropped_image_bytes,
+            new_cap_bytes,
+            Parser_sequence_family::DCS));
+        reserve_dirty_row_marks(static_cast<std::size_t>(m_config.grid_size.rows));
+    }
+
     const int scrollback_rows_before = scrollback_size();
     const Retained_history_capacity_resize_result resize =
         m_primary_backing.resize_retained_history_capacity(aligned_capacity);
     m_config.retained_history_capacity_bytes = aligned_capacity;
     m_parser.set_sixel_raster_limit_bytes(sixel_raster_limit_bytes());
-    const std::size_t dropped_image_bytes = drop_screen_images_over_cap();
-    if (dropped_image_bytes > 0U) {
-        result.actions.push_back(make_payload_limit_diagnostic(
-            QStringLiteral("DCS sixel"),
-            dropped_image_bytes,
-            sixel_raster_limit_bytes(),
-            Parser_sequence_family::DCS));
-    }
     for (const terminal_history_handle_t handle : resize.evicted_handles) {
         erase_retained_lookup_entry(
             Terminal_buffer_id::PRIMARY,
@@ -4775,6 +4786,9 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
                 found->second.history_handle = entry.history_handle;
             }
         }
+    }
+    if (dropped_image_bytes > 0U) {
+        drop_row_images_over_cap(new_cap_bytes, true);
     }
 
     const int evicted_rows = static_cast<int>(resize.evicted_handles.size());
@@ -7473,7 +7487,7 @@ std::size_t Terminal_screen_model::place_image_band(
     if (clear_covered_text(false)) {
         before_cells = screen_row.cells;
     }
-    reserve_dirty_row_mark();
+    reserve_dirty_row_marks(1U);
 
     // A row that shows an image starts its own logical line (owner decision
     // D2), so placing one hard-terminates the soft wraps into and out of its
@@ -7492,15 +7506,19 @@ std::size_t Terminal_screen_model::place_image_band(
     return refused_composite_bytes;
 }
 
-// A lower capacity lowers the decoded-size cap, possibly below images the
-// screens show. As a history record over the record limit keeps its text and
-// drops its image (A7), a screen row whose image is over the cap drops it and
-// keeps its text, so no row image exceeds the cap (I5).
-std::size_t Terminal_screen_model::drop_screen_images_over_cap()
+// As a history record over the record limit keeps its text and drops its
+// image (A7), every row on the screens, and every row a repaint-recovery
+// candidate copied from the primary screen, drops an image over the cap and
+// keeps its text and metadata, so no row image the model holds exceeds the
+// cap (I5). Applying allocates nothing once dirty marks for the active
+// screen's rows are reserved, and only a drop on the active screen changes
+// what the terminal shows.
+std::size_t Terminal_screen_model::drop_row_images_over_cap(std::size_t cap_bytes, bool apply)
 {
-    const std::int64_t cap = static_cast<std::int64_t>(sixel_raster_limit_bytes());
-    std::size_t largest_dropped_bytes = 0U;
-    const auto drop_over_cap = [&](std::vector<Terminal_screen_row>& rows, bool active) {
+    const std::int64_t cap = static_cast<std::int64_t>(cap_bytes);
+    std::size_t largest_bytes = 0U;
+    bool        shown_row_changed = false;
+    const auto visit = [&](std::vector<Terminal_screen_row>& rows, bool active) {
         for (std::size_t index = 0; index < rows.size(); ++index) {
             Terminal_screen_row& row = rows[index];
             if (row.image_slice == nullptr) {
@@ -7511,23 +7529,27 @@ std::size_t Terminal_screen_model::drop_screen_images_over_cap()
             if (bytes <= cap) {
                 continue;
             }
-            largest_dropped_bytes = std::max(largest_dropped_bytes, static_cast<std::size_t>(bytes));
-            row.image_slice.reset();
-            if (active) {
-                mark_dirty(static_cast<int>(index));
+            largest_bytes = std::max(largest_bytes, static_cast<std::size_t>(bytes));
+            if (apply) {
+                row.image_slice.reset();
+                if (active) {
+                    mark_dirty(static_cast<int>(index));
+                    shown_row_changed = true;
+                }
             }
         }
     };
-    drop_over_cap(
+    visit(
         m_primary_backing.active_grid_state().rows,
         m_active_buffer_id == Terminal_buffer_id::PRIMARY);
-    drop_over_cap(
+    visit(
         m_alternate_grid.active_grid_state().rows,
         m_active_buffer_id == Terminal_buffer_id::ALTERNATE);
-    if (largest_dropped_bytes > 0U) {
+    visit(m_primary_repaint_recovery_candidate.rows, false);
+    if (shown_row_changed) {
         mark_terminal_content_changed();
     }
-    return largest_dropped_bytes;
+    return largest_bytes;
 }
 
 std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_slice(
@@ -7780,15 +7802,17 @@ void Terminal_screen_model::size_dirty_row_flags()
     }
 }
 
-// Allocates what the next mark_dirty of a grid row can need, so a change that
-// must not fail halfway can reserve it first and mark its row afterwards.
-void Terminal_screen_model::reserve_dirty_row_mark()
+// Allocates what the next `marks` calls of mark_dirty on grid rows can need,
+// so a change that must not fail halfway can reserve it first and mark its
+// rows afterwards.
+void Terminal_screen_model::reserve_dirty_row_marks(std::size_t marks)
 {
     size_dirty_row_flags();
-    // A mark appends at most one row; growing as push_back would keeps the
-    // reserve amortized.
-    if (m_dirty_rows.size() == m_dirty_rows.capacity()) {
-        m_dirty_rows.reserve(std::max<std::size_t>(8U, 2U * m_dirty_rows.size()));
+    // Each mark appends at most one row. Growing at least as push_back would
+    // keeps repeated reserves amortized.
+    const std::size_t needed = m_dirty_rows.size() + marks;
+    if (needed > m_dirty_rows.capacity()) {
+        m_dirty_rows.reserve(std::max<std::size_t>(needed, 2U * m_dirty_rows.size()));
     }
 }
 
