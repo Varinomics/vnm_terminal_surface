@@ -479,6 +479,12 @@ terminal_canvas_fixture_sixel_cursor_cases()
         0U,
         true,
     });
+    // A 12-row region clamps the ratio to (12 x 20) / 6 = 40, so the cursor
+    // ends on the region's top row; unclamped, 50:1 would put it 3 rows above.
+    cases.push_back({
+        "aspect ratio above the scroll region's clamp",
+        "\x1b[13;24r" + cursor_to(12, 0) + image("7;1", "\"50;1" + sixel_rows(30, 2)),
+    });
     cases.push_back({
         "empty image at the bottom",
         cursor_to(23, 0) + image("0;1", "---"),

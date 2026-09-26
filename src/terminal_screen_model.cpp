@@ -425,6 +425,33 @@ QImage composite_image_band(
     return combined;
 }
 
+// A pixel row y of an image decoded at `decoded_aspect` rows per sixel pixel,
+// at `aspect` rows instead: every run of `decoded_aspect` rows keeps its
+// first `aspect` rows.
+std::int64_t sixel_row_at_aspect(std::int64_t y, int decoded_aspect, int aspect)
+{
+    return y / decoded_aspect * aspect + std::min<std::int64_t>(y % decoded_aspect, aspect);
+}
+
+// The decoder's raster at a smaller aspect ratio, which is the raster it
+// would have decoded at that ratio.
+QImage sixel_raster_at_aspect(const QImage& raster, int decoded_aspect, int aspect)
+{
+    const int height = static_cast<int>(sixel_row_at_aspect(raster.height(), decoded_aspect, aspect));
+    QImage result(raster.width(), height, raster.format());
+    // QImage reports a failed allocation with a null image, not an exception.
+    if (result.isNull()) {
+        throw std::bad_alloc();
+    }
+    for (int y = 0; y < height; ++y) {
+        std::memcpy(
+            result.scanLine(y),
+            raster.constScanLine(y / aspect * decoded_aspect + y % aspect),
+            static_cast<std::size_t>(raster.width()) * sizeof(std::uint32_t));
+    }
+    return result;
+}
+
 bool action_is_session_visible(const Parser_action& action)
 {
     switch (parser_action_kind(action)) {
@@ -7191,9 +7218,30 @@ void Terminal_screen_model::place_sixel_image(
     }
 
     const terminal_cell_pixel_size_t cell = *m_config.cell_pixel_size;
-    const int band_count = image.raster.isNull()
+
+    // As in OpenConsole, one sixel row is at most as tall as the rows the
+    // image can scroll, the scroll region or with DECSDM set the page (owner
+    // decision D5), which also bounds the scrolling a graphics new line
+    // causes. A larger aspect ratio is clamped here, after decoding: each
+    // sixel pixel keeps the rows the clamped ratio gives it, and the final
+    // sixel row and the scrolls follow the clamped ratio.
+    const std::int64_t aspect_rows = m_sixel_display_mode
+        ? m_config.grid_size.rows
+        : m_scroll_bottom - m_scroll_top + 1;
+    const int decoded_aspect = image.pixel_aspect_ratio;
+    const int aspect = static_cast<int>(std::clamp<std::int64_t>(
+        aspect_rows * cell.height / 6,
+        1,
+        decoded_aspect));
+    const QImage raster = aspect < decoded_aspect && !image.raster.isNull()
+        ? sixel_raster_at_aspect(image.raster, decoded_aspect, aspect)
+        : image.raster;
+    const std::int64_t final_cursor_y =
+        sixel_row_at_aspect(image.final_cursor_y, decoded_aspect, aspect);
+
+    const int band_count = raster.isNull()
         ? 0
-        : (image.raster.height() + cell.height - 1) / cell.height;
+        : (raster.height() + cell.height - 1) / cell.height;
 
     // A row whose images together would exceed the decoded-size cap keeps the
     // newer one; the largest refused composite is reported once per image.
@@ -7215,7 +7263,7 @@ void Terminal_screen_model::place_sixel_image(
         for (int band = 0; band < std::min(band_count, m_config.grid_size.rows); ++band) {
             refused_composite_bytes = std::max(
                 refused_composite_bytes,
-                place_image_band(image.raster, band * cell.height, band, 0, cell));
+                place_image_band(raster, band * cell.height, band, 0, cell));
         }
         report_refused_composite();
         return;
@@ -7231,9 +7279,7 @@ void Terminal_screen_model::place_sixel_image(
     // The VT340 puts the text cursor on the row that the top of the final
     // sixel row falls in, at the image's first column, and scrolls the region
     // just enough for that whole sixel row to fit above the bottom margin.
-    const std::int64_t final_sixel_row_bottom =
-        static_cast<std::int64_t>(image.final_cursor_y) +
-        static_cast<std::int64_t>(6 * image.pixel_aspect_ratio);
+    const std::int64_t final_sixel_row_bottom = final_cursor_y + 6 * aspect;
     const std::int64_t covered_rows =
         (final_sixel_row_bottom + cell.height - 1) / cell.height;
     const std::int64_t scroll_count = std::max<std::int64_t>(
@@ -7257,7 +7303,7 @@ void Terminal_screen_model::place_sixel_image(
         refused_composite_bytes = std::max(
             refused_composite_bytes,
             place_image_band(
-                image.raster,
+                raster,
                 band * cell.height,
                 static_cast<int>(row),
                 origin.column,
@@ -7266,24 +7312,18 @@ void Terminal_screen_model::place_sixel_image(
     report_refused_composite();
 
     // The image's geometry may ask for far more scrolls than its pixels fill.
-    // Once the region has scrolled its full height it is blank, and once the
-    // scrollback limit more have fed history, so is all of history; further
-    // scrolls change nothing, so they are skipped. The cursor row still
-    // follows the full count.
-    const bool scrolls_feed_history =
-        m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
-        m_scroll_top == 0;
-    const std::int64_t state_changing_scrolls =
-        static_cast<std::int64_t>(m_scroll_bottom - m_scroll_top + 1) +
-        (scrolls_feed_history ? m_config.scrollback_limit : 0);
-    const std::int64_t trailing_scrolls =
-        std::min(scroll_count - scrolls, state_changing_scrolls);
+    // Once the region has scrolled its full height it is blank, so further
+    // scrolls are skipped (owner decision D5): the screen and the cursor end
+    // as if they ran, and history gains at most one region of blank rows.
+    const std::int64_t trailing_scrolls = std::min<std::int64_t>(
+        scroll_count - scrolls,
+        m_scroll_bottom - m_scroll_top + 1);
     for (std::int64_t step = 0; step < trailing_scrolls; ++step) {
         scroll_active_region_up();
     }
 
     const std::int64_t cursor_row = std::clamp<std::int64_t>(
-        origin.row - scroll_count + image.final_cursor_y / cell.height,
+        origin.row - scroll_count + final_cursor_y / cell.height,
         0,
         m_config.grid_size.rows - 1);
     if (scroll_count > 0 || cursor_row != origin.row) {

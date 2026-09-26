@@ -258,7 +258,8 @@ struct Screen_sixel_image_mutation
     // the VT340 puts the text cursor on the row this pixel falls in.
     int        final_cursor_y     = 0;
     // Rows each sixel pixel covers, the same for the whole image. Placement
-    // can reduce it exactly by keeping that many of each run of rows.
+    // clamps it so one sixel row is at most one scroll region tall, keeping
+    // that many rows of each run (owner decision D5).
     int        pixel_aspect_ratio = 1;
 };
 

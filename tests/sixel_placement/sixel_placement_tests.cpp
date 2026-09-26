@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -26,7 +27,8 @@
 // row the top of the final sixel row falls in, at the image's first column),
 // whose Windows side is checked by the ConPTY cursor-sync gate; the owner
 // decisions D1 (an image erases the text it covers), D2 (image rows break
-// incoming and outgoing soft wraps) and S4 (images on one row composite);
+// incoming and outgoing soft wraps), D5 (a sixel row is at most one scroll
+// region tall, as in OpenConsole) and S4 (images on one row composite);
 // the anchors A1 (one slice per row, owned by the row and then its
 // history record), A2/I5 (the decoded-size cap keeps geometry) and A7/I9 (a
 // row record over the record limit keeps its text and drops its image).
@@ -429,6 +431,53 @@ bool test_sixel_display_mode()
     return ok;
 }
 
+bool test_aspect_ratios_clamp_to_one_region()
+{
+    bool ok = true;
+
+    // D5, as OpenConsole: a sixel row is at most as tall as the scroll region,
+    // or the page with DECSDM set, so a larger ratio places exactly what the
+    // largest one that fits places: (rows x 20) / 6 on 20-pixel cells.
+    const auto place = [](int rows, const QByteArray& setup, const QByteArray& aspect) {
+        term::Terminal_screen_model model = make_model(rows, 12);
+        model.ingest(setup + sixel("9;1", "\"" + aspect + ";1" + patterned_rows(3)));
+        return model;
+    };
+    const auto same_placement = [](
+        const term::Terminal_screen_model& left,
+        const term::Terminal_screen_model& right,
+        int                                rows)
+    {
+        bool same =
+            left.scrollback_size()          == right.scrollback_size()          &&
+            left.cursor_position().row      == right.cursor_position().row      &&
+            left.cursor_position().column   == right.cursor_position().column;
+        bool drawn = false;
+        for (int row = 0; same && row < left.scrollback_size() + rows; ++row) {
+            const auto l = left.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+            const auto r = right.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+            drawn = drawn || l != nullptr;
+            same  = (l == nullptr) == (r == nullptr) &&
+                (l == nullptr || (l->first_column == r->first_column && l->pixels == r->pixels));
+        }
+        return same && drawn;
+    };
+
+    ok &= check(same_placement(place(10, "", "40"), place(10, "", "33"), 10),
+        "a ratio above the screen's clamp places what the clamped ratio places, history included");
+    ok &= check(same_placement(
+            place(10, "\x1b[3;6r\x1b[3;1H", "20"),
+            place(10, "\x1b[3;6r\x1b[3;1H", "13"),
+            10),
+        "a scroll region clamps the ratio to its own height");
+    const QByteArray display_mode("\x1b[?80h\x1b[2;4r");
+    ok &= check(same_placement(place(5, display_mode, "30"), place(5, display_mode, "16"), 5) &&
+            !same_placement(place(5, display_mode, "16"), place(5, display_mode, "15"), 5),
+        "with DECSDM set the page height, not the region, clamps the ratio");
+
+    return ok;
+}
+
 bool test_images_erase_the_text_they_cover()
 {
     bool ok = true;
@@ -545,7 +594,8 @@ bool test_images_without_geometry_or_pixels()
         "an image without a cell pixel size places nothing and moves nothing");
 
     // Over the decoded-size cap (1 MiB ring: 131072 bytes) the image keeps
-    // its geometry: it scrolls and moves the cursor but stores no pixels.
+    // its geometry: it scrolls and moves the cursor but stores no pixels. Of
+    // its six scrolls the sixth, of an already blank screen, is skipped (D5).
     term::Terminal_screen_model capped = make_model(5, 30, k_cell, 100, 1024U * 1024U);
     const term::Terminal_screen_model_result capped_result =
         capped.ingest(sixel("9;1", solid_rows(200, 34)));
@@ -553,7 +603,7 @@ bool test_images_without_geometry_or_pixels()
             diagnostics_in(capped_result)[0].code ==
                 term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED,
         "an image over the decoded-size cap is diagnosed once");
-    ok &= check(capped.scrollback_size() == 6 && capped.cursor_position().row == 3,
+    ok &= check(capped.scrollback_size() == 5 && capped.cursor_position().row == 3,
         "an image over the cap still scrolls and moves the cursor");
     bool capped_has_slice = false;
     for (int row = 0; row < capped.scrollback_size() + 5; ++row) {
@@ -569,12 +619,24 @@ bool test_images_without_geometry_or_pixels()
             slice_at(empty, 1) == nullptr && slice_at(empty, 2) == nullptr,
         "an empty image moves the cursor by its graphics new lines and stores nothing");
 
-    // Geometry far past the screen does not scroll without end: once the
-    // region and the scrollback limit are blank, further scrolls change nothing.
-    term::Terminal_screen_model runaway = make_model(4, 10, k_cell, 10);
-    runaway.ingest(QByteArray("keep\r\n") + sixel("9;1", QByteArray("\"32767;1") + QByteArray(5, '-')));
-    ok &= check(runaway.scrollback_size() == 10 && runaway.visible_text().trimmed().isEmpty(),
-        "a runaway image height leaves a blank screen and a full blank history");
+    // Geometry far past the screen is bounded work even with the product's
+    // unlimited scrollback (D5): a graphics new line moves at most one region,
+    // and the scrolls past the pixels stop once the region is blank. Before
+    // the clamp these 1016 bytes asked for 9.8 million scrolls.
+    term::Terminal_screen_model runaway =
+        make_model(24, 10, k_cell, std::numeric_limits<int>::max());
+    const term::Terminal_screen_model_result runaway_result = runaway.ingest(
+        QByteArray("keep\r\n") + sixel("9;1", QByteArray("\"32767;1") + QByteArray(1000, '-')));
+    int appended_rows = 0;
+    for (const term::terminal_backing_delta_t& delta : runaway_result.backing_deltas) {
+        appended_rows += delta.appended_scrollback_rows;
+    }
+    ok &= check(appended_rows == 24 && runaway.scrollback_size() == 24,
+        "a runaway image height scrolls one region into history");
+    ok &= check(history_row_text(runaway, 0) == QStringLiteral("keep") &&
+            runaway.visible_text().trimmed().isEmpty() &&
+            runaway.cursor_position().row == 0,
+        "a runaway image height leaves a blank screen with the cursor at its top");
 
     return ok;
 }
@@ -1418,6 +1480,7 @@ int main()
     ok &= test_cursor_follows_the_final_sixel_row();
     ok &= test_images_scroll_the_region_into_history();
     ok &= test_sixel_display_mode();
+    ok &= test_aspect_ratios_clamp_to_one_region();
     ok &= test_images_erase_the_text_they_cover();
     ok &= test_images_on_one_row_composite();
     ok &= test_images_without_geometry_or_pixels();
