@@ -15,6 +15,7 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -1307,6 +1308,192 @@ bool run_with_chunks(
     return ok;
 }
 
+// Every retained history row as it is recorded: metadata with the wrap state,
+// each cell, and the row's image, for comparing two models exactly.
+std::vector<QByteArray> history_records(const term::Terminal_screen_model& model)
+{
+    std::vector<QByteArray> records;
+    for (int row = 0; row < model.scrollback_size(); ++row) {
+        QByteArray record;
+        const std::optional<term::terminal_retained_row_record_metadata_t> metadata =
+            model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+        if (metadata.has_value()) {
+            record += QByteArray::number(metadata->source_width) + ':' +
+                QByteArray::number(static_cast<int>(metadata->style_reference)) + ':' +
+                QByteArray::number(static_cast<int>(metadata->wrap_state)) + '|';
+        }
+        const auto cells =
+            model.retained_history_row_cells_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+        if (cells.has_value()) {
+            for (const term::terminal_retained_history_cell_state_for_testing_t& cell : *cells) {
+                record += cell.text.toUtf8() + ':' +
+                    QByteArray::number(static_cast<int>(cell.text_category)) + ':' +
+                    QByteArray::number(cell.display_width) + ':' +
+                    QByteArray::number(cell.natural_display_width) + ':' +
+                    QByteArray::number(cell.wide_continuation ? 1 : 0) + ':' +
+                    QByteArray::number(cell.occupied ? 1 : 0) + ':' +
+                    QByteArray::number(static_cast<qulonglong>(cell.style_id)) + ':' +
+                    QByteArray::number(static_cast<qulonglong>(cell.hyperlink_id)) + ';';
+            }
+        }
+        const std::shared_ptr<const term::Terminal_image_slice> image =
+            model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row);
+        if (image != nullptr) {
+            record += '|' + QByteArray::number(image->first_column) + ':' +
+                QByteArray::number(image->cell_pixel_size.width) + 'x' +
+                QByteArray::number(image->cell_pixel_size.height) + ':' +
+                QByteArray::number(image->pixels.width()) + 'x' +
+                QByteArray::number(image->pixels.height()) + ':';
+            for (int y = 0; y < image->pixels.height(); ++y) {
+                record.append(
+                    reinterpret_cast<const char*>(image->pixels.constScanLine(y)),
+                    image->pixels.width() * 4);
+            }
+        }
+        records.push_back(std::move(record));
+    }
+    return records;
+}
+
+// The same chunks with a sixel work budget for every step: each chunk is
+// handed over again from where the model stopped, and a waiting placement is
+// continued with no bytes, until the chunk is applied. A zero seed gives every
+// step one unit, so each step does the least work it can; any other seed draws
+// each step's budget at random, from a unit to a whole image's worth.
+bool run_with_budget(
+    const Test_case&          test_case,
+    const Chunk_plan&         plan,
+    std::uint64_t             budget_seed,
+    const std::string&        label,
+    Run_result&               out_result,
+    std::vector<QByteArray>&  out_history)
+{
+    term::Terminal_screen_model model(test_case.config);
+    std::vector<std::string> actions;
+    std::vector<std::string> side_effects;
+    std::vector<term::Parser_payload_diagnostic> diagnostics;
+    std::vector<term::Terminal_reply> replies;
+    std::size_t   offset   = 0U;
+    std::uint64_t sequence = 1U;
+    bool          ok       = true;
+    Deterministic_rng rng(budget_seed);
+    const auto step_units = [&]() -> std::uint64_t {
+        if (budget_seed == 0U) {
+            return 1U;
+        }
+        return 1U + static_cast<std::uint64_t>(rng.bounded(rng.bounded(2) == 0 ? 4096 : 1 << 21));
+    };
+
+    const auto collect = [&](const term::Terminal_screen_model_result& result) {
+        for (const term::Parser_action& action : result.actions) {
+            std::string summary = action_summary(action);
+            if (is_side_effect_action_kind(term::parser_action_kind(action))) {
+                side_effects.push_back(summary);
+            }
+            if (term::parser_action_kind(action) == term::Parser_action_kind::DIAGNOSTIC) {
+                diagnostics.push_back(std::get<term::Parser_payload_diagnostic>(action.payload));
+            }
+            if (term::parser_action_kind(action) == term::Parser_action_kind::TERMINAL_REPLY) {
+                replies.push_back(std::get<term::Terminal_reply>(action.payload));
+            }
+            actions.push_back(std::move(summary));
+        }
+    };
+
+    for (std::size_t chunk_index = 0U; chunk_index < plan.chunk_sizes.size(); ++chunk_index) {
+        const std::size_t remaining  = static_cast<std::size_t>(test_case.bytes.size()) - offset;
+        const std::size_t chunk_size = std::min<std::size_t>(
+            remaining,
+            static_cast<std::size_t>(plan.chunk_sizes[chunk_index]));
+        QByteArrayView chunk(
+            test_case.bytes.constData() + static_cast<qsizetype>(offset),
+            static_cast<qsizetype>(chunk_size));
+
+        term::Terminal_screen_model_result result;
+        int steps = 0;
+        do {
+            term::Sixel_work_budget budget(step_units());
+            result = model.sixel_placement_pending()
+                ? model.ingest({}, nullptr, &budget)
+                : model.ingest(chunk, nullptr, &budget);
+            collect(result);
+            chunk = chunk.sliced(result.consumed_bytes);
+            ++steps;
+        }
+        while ((result.sixel_work_pending || !chunk.empty()) && steps < 1000000);
+        ok &= check(chunk.empty() && !model.sixel_placement_pending(),
+            label + "/" + std::to_string(chunk_index) + ": the budgeted chunk is applied");
+
+        ok &= validate_ingest_result(
+            test_case,
+            model,
+            result,
+            sequence,
+            label + "/" + std::to_string(chunk_index));
+        offset += chunk_size;
+        ++sequence;
+    }
+
+    out_result = collect_run_result(
+        model,
+        sequence,
+        std::move(actions),
+        std::move(side_effects),
+        std::move(diagnostics),
+        std::move(replies));
+    out_history = history_records(model);
+    return ok;
+}
+
+// Budgeted runs of one chunk plan against its unbudgeted run, which is the
+// oracle: every observable state and ordered effect is the same.
+bool check_budgeted_runs(const Test_case& test_case, const Chunk_plan& plan)
+{
+    bool ok = true;
+    Run_result oracle;
+    ok &= run_with_chunks(test_case, plan, oracle);
+    std::vector<QByteArray> oracle_history;
+    {
+        term::Terminal_screen_model model(test_case.config);
+        std::size_t offset = 0U;
+        for (const int chunk_size : plan.chunk_sizes) {
+            const std::size_t size = std::min<std::size_t>(
+                static_cast<std::size_t>(test_case.bytes.size()) - offset,
+                static_cast<std::size_t>(chunk_size));
+            model.ingest(QByteArrayView(
+                test_case.bytes.constData() + static_cast<qsizetype>(offset),
+                static_cast<qsizetype>(size)));
+            offset += size;
+        }
+        oracle_history = history_records(model);
+    }
+
+    std::uint64_t plan_seed = test_case.chunk_seed;
+    for (const char c : plan.name) {
+        plan_seed = (plan_seed ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL;
+    }
+    for (const std::uint64_t budget_seed : {0ULL, plan_seed, plan_seed ^ 0x9e3779b97f4a7c15ULL}) {
+        const std::string label = test_case.name + "/" + plan.name + "/budget seed " +
+            std::to_string(budget_seed);
+        Run_result budgeted;
+        std::vector<QByteArray> budgeted_history;
+        ok &= run_with_budget(test_case, plan, budget_seed, label, budgeted, budgeted_history);
+        ok &= check(budgeted.actions == oracle.actions,
+            label + ": ordered actions differ from the unbudgeted run");
+        ok &= check(budgeted.visible_text == oracle.visible_text &&
+                budgeted.title == oracle.title &&
+                budgeted.icon_name == oracle.icon_name &&
+                budgeted.cursor == oracle.cursor &&
+                budgeted.active_buffer == oracle.active_buffer &&
+                budgeted.scrollback_size == oracle.scrollback_size,
+            label + ": state differs from the unbudgeted run");
+        ok &= snapshots_equivalent(budgeted.snapshot, oracle.snapshot, label);
+        ok &= check(budgeted_history == oracle_history,
+            label + ": history records differ from the unbudgeted run");
+    }
+    return ok;
+}
+
 std::vector<int> one_chunk_plan(std::size_t byte_count)
 {
     return {static_cast<int>(byte_count)};
@@ -1639,6 +1826,12 @@ bool run_case(const Test_case& test_case)
             ok &= check(chunked.actions == baseline.actions,
                 test_case.name + "/" + plans[i].name + ": parser actions differ from one-shot");
         }
+    }
+
+    // Sixel work stops and resumes wherever a budget runs out; for every
+    // chunk plan that must leave exactly what the unbudgeted plan leaves.
+    for (const Chunk_plan& plan : plans) {
+        ok &= check_budgeted_runs(test_case, plan);
     }
 
     return ok;
@@ -2261,6 +2454,42 @@ void append_dcs_cases(std::vector<Test_case>& cases)
         },
         0xa51c7e4d82b9f063ULL));
 
+    // Sixel work resumed at every budget and byte cut: styled text that wraps,
+    // an image that scrolls rows into history, a reply, a sixel recovery
+    // diagnostic and a C1 image, so that the budgeted runs compare replies,
+    // diagnostics, styles, wrap metadata and history records with the oracle.
+    {
+        QByteArray bytes = QByteArrayLiteral("\x1b[1;31mstyled wrap text!\x1b[0m\r\n");
+        bytes += QByteArrayLiteral("\x1bP0;1;0q\"1;1;24;96#1;2;100;0;0#2;2;0;0;100");
+        for (int row = 0; row < 16; ++row) {
+            bytes += row % 2 == 0 ? QByteArrayLiteral("#1!24~-") : QByteArrayLiteral("#2!12N!12~-");
+        }
+        bytes += QByteArrayLiteral("\x1b\\\x1b]10;?\x1b\\\x1bPq#1~~\x1b[0m");
+        bytes += QByteArray("\x90", 1) + QByteArrayLiteral("q#1;2;0;100;0!12~-!12~") +
+            QByteArray("\x9c", 1);
+        bytes += QByteArrayLiteral("\x1b[4mend\x1b[0m");
+
+        Test_case test_case;
+        test_case.name                   = "generated_sixel_budget_resume";
+        test_case.config                 = {term::terminal_grid_size_t{3, 12}, 6, 4};
+        test_case.config.cell_pixel_size = term::terminal_cell_pixel_size_t{10, 20};
+        test_case.bytes                  = bytes;
+        test_case.chunk_seed             = 0x5d0c3a91e2b7f468ULL;
+        test_case.expected_reply_count   = 1;
+        set_expected_diagnostics(
+            test_case,
+            {
+                expected_diagnostic(
+                    term::Parser_diagnostic_code::MALFORMED_INPUT,
+                    QStringLiteral("DCS recovery"),
+                    term::Parser_sequence_family::DCS,
+                    0U,
+                    0U,
+                    term::Parser_recovery_strategy::RESET_TO_GROUND),
+            });
+        cases.push_back(std::move(test_case));
+    }
+
     // DECRQSS and XTGETTCAP end in 'q' too; their intermediates keep them the
     // unsupported DCS they are, payload and diagnostic included.
     cases.push_back(make_dcs_test_case(
@@ -2455,6 +2684,7 @@ std::vector<Test_case> generated_cases()
             test_case.name == "generated_control_mix_primary"    ||
             test_case.name == "generated_control_mix_scrollback" ||
             test_case.name == "generated_malformed_utf8"         ||
+            test_case.name == "generated_sixel_budget_resume"    ||
             test_case.name.starts_with("generated_over_limit_");
         test_case.compare_actions = !actions_depend_on_chunk_boundaries;
     }
