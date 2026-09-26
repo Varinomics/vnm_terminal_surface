@@ -408,6 +408,28 @@ target_link_libraries(my_canvas PRIVATE
 
 Installed consumers can use the exported package:
 
+Package producers require an installed `vnm_msdf_text` with `qt_lcd`, even
+when MSDF atlas rendering is disabled. Configure the producer with
+`VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON` and provide that package
+through `CMAKE_PREFIX_PATH` or `vnm_msdf_text_DIR`. An atlas-enabled producer
+also requires the provider's `atlas` component. Missing requested components
+are errors; package discovery never falls back to a second source provider.
+
+Source development builds keep their source dependencies. Their registered
+package tests stage a genuine LCD-only provider and a separate atlas-disabled
+surface package producer, then check normal, renderer-only and Qt-minor-mismatch
+consumers. Installed-atlas builds exercise those package tests against their
+atlas-enabled producer.
+
+The source-only test driver `cmake/prepare_source_package.cmake` is shared with
+the maintained terminal application. It takes explicit `msdf_source_dir` and
+`producer_source_dir` checkouts, `package_root`, `package_binary_dir`,
+`package_context`, `install_config`, and the generated `VNM_TOOLCHAIN_CONTEXT`
+and `VNM_PACKAGE_DEPENDENCY_CONTEXT` cache files. It builds the real top-level
+LCD package and an atlas-disabled producer, then writes the installed-provider
+cache context for that producer's public-consumer tests. It is not an installed
+package API; source callers select the owning surface checkout explicitly.
+
 ```cmake
 find_package(vnm_terminal_surface CONFIG REQUIRED)
 target_link_libraries(my_terminal PRIVATE

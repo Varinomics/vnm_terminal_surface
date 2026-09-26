@@ -45,7 +45,7 @@ option(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER
     "Build the MSDF text renderer"
     ON)
 set(VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS OFF CACHE BOOL
-    "Prefer find_package dependencies for the MSDF text renderer dependency.")
+    "Require installed vnm_msdf_text LCD and enabled atlas components.")
 set(VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR "" CACHE PATH
     "Optional vnm_msdf_text source checkout used by the MSDF text renderer.")
 set(VNM_QT_DISPATCH_SOURCE_DIR "" CACHE PATH

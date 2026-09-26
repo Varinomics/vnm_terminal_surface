@@ -28,18 +28,22 @@ function(vnm_terminal_msdf_text_make_available out_var)
         return()
     endif()
 
+    if(TARGET vnm_msdf_text::lcd_contract)
+        message(FATAL_ERROR
+            "The existing vnm_msdf_text provider does not supply the required "
+            "qt_lcd/atlas components. Enable those components in its owning "
+            "source build or install a package that provides them.")
+    endif()
+
     if(_vnm_terminal_msdf_text_USE_SYSTEM_LIBS)
         set(VNM_MSDF_TEXT_FETCH_DEPS OFF CACHE BOOL "" FORCE)
         set(_components qt_lcd)
         if(vnm_terminal_msdf_atlas_required)
             list(APPEND _components atlas)
         endif()
-        find_package(vnm_msdf_text CONFIG QUIET COMPONENTS ${_components})
-        if(TARGET vnm_msdf_text::qt_lcd AND
-           (NOT vnm_terminal_msdf_atlas_required OR TARGET vnm_msdf_text::vnm_msdf_text))
-            set(${out_var} ON PARENT_SCOPE)
-            return()
-        endif()
+        find_package(vnm_msdf_text CONFIG REQUIRED COMPONENTS ${_components})
+        set(${out_var} ON PARENT_SCOPE)
+        return()
     else()
         set(VNM_MSDF_TEXT_FETCH_DEPS ON CACHE BOOL "" FORCE)
     endif()
