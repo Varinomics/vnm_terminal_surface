@@ -1429,6 +1429,9 @@ private:
         int                            first_column,
         terminal_cell_pixel_size_t     cell_pixel_size);
 
+    // Returns the size of the largest image dropped, zero when none was.
+    std::size_t drop_screen_images_over_cap();
+
     std::shared_ptr<const Terminal_image_slice> image_slice_without_cells(
         const Terminal_screen_row&     row,
         int                            first_column,

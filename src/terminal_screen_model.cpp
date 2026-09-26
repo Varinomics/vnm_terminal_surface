@@ -4752,6 +4752,14 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
         m_primary_backing.resize_retained_history_capacity(aligned_capacity);
     m_config.retained_history_capacity_bytes = aligned_capacity;
     m_parser.set_sixel_raster_limit_bytes(sixel_raster_limit_bytes());
+    const std::size_t dropped_image_bytes = drop_screen_images_over_cap();
+    if (dropped_image_bytes > 0U) {
+        result.actions.push_back(make_payload_limit_diagnostic(
+            QStringLiteral("DCS sixel"),
+            dropped_image_bytes,
+            sixel_raster_limit_bytes(),
+            Parser_sequence_family::DCS));
+    }
     for (const terminal_history_handle_t handle : resize.evicted_handles) {
         erase_retained_lookup_entry(
             Terminal_buffer_id::PRIMARY,
@@ -7482,6 +7490,44 @@ std::size_t Terminal_screen_model::place_image_band(
         advance_row_content_generation_if_changed(screen_row, before_cells);
     }
     return refused_composite_bytes;
+}
+
+// A lower capacity lowers the decoded-size cap, possibly below images the
+// screens show. As a history record over the record limit keeps its text and
+// drops its image (A7), a screen row whose image is over the cap drops it and
+// keeps its text, so no row image exceeds the cap (I5).
+std::size_t Terminal_screen_model::drop_screen_images_over_cap()
+{
+    const std::int64_t cap = static_cast<std::int64_t>(sixel_raster_limit_bytes());
+    std::size_t largest_dropped_bytes = 0U;
+    const auto drop_over_cap = [&](std::vector<Terminal_screen_row>& rows, bool active) {
+        for (std::size_t index = 0; index < rows.size(); ++index) {
+            Terminal_screen_row& row = rows[index];
+            if (row.image_slice == nullptr) {
+                continue;
+            }
+            const std::int64_t bytes =
+                std::int64_t{row.image_slice->pixels.width()} * row.image_slice->pixels.height() * 4;
+            if (bytes <= cap) {
+                continue;
+            }
+            largest_dropped_bytes = std::max(largest_dropped_bytes, static_cast<std::size_t>(bytes));
+            row.image_slice.reset();
+            if (active) {
+                mark_dirty(static_cast<int>(index));
+            }
+        }
+    };
+    drop_over_cap(
+        m_primary_backing.active_grid_state().rows,
+        m_active_buffer_id == Terminal_buffer_id::PRIMARY);
+    drop_over_cap(
+        m_alternate_grid.active_grid_state().rows,
+        m_active_buffer_id == Terminal_buffer_id::ALTERNATE);
+    if (largest_dropped_bytes > 0U) {
+        mark_terminal_content_changed();
+    }
+    return largest_dropped_bytes;
 }
 
 std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_slice(

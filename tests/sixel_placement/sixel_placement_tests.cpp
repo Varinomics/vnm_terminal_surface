@@ -945,6 +945,52 @@ bool test_capacity_shrink_signals_a_history_rewrite()
     return ok;
 }
 
+bool test_capacity_decrease_drops_screen_images_over_the_cap()
+{
+    bool ok = true;
+
+    // I5 on the screens, by A7's rule for history rows: a 1400 x 32 image row
+    // is 179200 bytes, within the default cap and over the 131072 byte cap of
+    // a 1 MiB ring, so the decrease drops it on both screens and the rows keep
+    // their text; a 100 x 32 image stays.
+    const term::terminal_cell_pixel_size_t cell{16, 32};
+    const QByteArray large_image = sixel("1;0", "\"1;1;1400;32");
+    term::Terminal_screen_model model = make_model(4, 90, cell);
+    model.ingest(
+        cursor_to(1, 88) + "ab" + cursor_to(1, 0) + large_image +
+        cursor_to(2, 0) + sixel("1;0", "\"1;1;100;32") +
+        "\x1b[?1049h" + cursor_to(0, 88) + "cd" + cursor_to(0, 0) + large_image);
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 1) != nullptr &&
+            model.image_slice_for_testing(term::Terminal_buffer_id::ALTERNATE, 0) != nullptr,
+        "the large images are placed under the default cap");
+
+    const term::Terminal_screen_model_result result =
+        model.set_retained_history_capacity_bytes(1024U * 1024U);
+    const std::vector<term::Parser_payload_diagnostic> diagnostics = diagnostics_in(result);
+    ok &= check(diagnostics.size() == 1U &&
+            diagnostics[0].code == term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED &&
+            diagnostics[0].family == term::Parser_sequence_family::DCS &&
+            diagnostics[0].raw_payload_size == 179200U &&
+            diagnostics[0].limit_bytes == term::terminal_history_ring_max_record_bytes(
+                term::terminal_history_ring_aligned_capacity(1024U * 1024U)),
+        "the dropped screen images are reported once, with the largest size and the cap");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::ALTERNATE, 0) == nullptr &&
+            model.row_text(0).endsWith(QStringLiteral("cd")),
+        "the active screen's row drops its image and keeps its text");
+    ok &= check(result.terminal_content_changed &&
+            std::find(result.dirty_rows.begin(), result.dirty_rows.end(), 0) != result.dirty_rows.end(),
+        "the active screen's row is published");
+
+    model.ingest("\x1b[?1049l");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 1) == nullptr &&
+            model.row_text(1).endsWith(QStringLiteral("ab")),
+        "the inactive screen's row drops its image and keeps its text");
+    ok &= check(model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 2) != nullptr,
+        "an image within the lower cap stays");
+
+    return ok;
+}
+
 // One sixel row of `cells` ten-pixel blocks, each in its own color, so a
 // moved or cleared block shows in the pixels.
 QByteArray striped_cells(int cells)
@@ -1513,6 +1559,7 @@ int main()
     ok &= test_capacity_shrink_keeps_text_rows_around_an_oversized_image();
     ok &= test_capacity_shrink_rebuilds_a_nearly_full_ring();
     ok &= test_capacity_shrink_signals_a_history_rewrite();
+    ok &= test_capacity_decrease_drops_screen_images_over_the_cap();
     ok &= test_text_writes_and_erases_clear_image_cells();
     ok &= test_ich_and_dch_move_image_columns();
     ok &= test_image_rows_start_their_own_logical_lines();

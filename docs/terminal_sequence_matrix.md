@@ -160,12 +160,12 @@ sequence: DCS P1 ; P2 ; P3 q sixel data ST
 feature: decoded sixel image hard limit
 status: supported
 action_category: payload-limit
-behavior: caps an image at the retained history's largest record, ring capacity / 8, following capacity changes; the decoded size is extent width x height x 4 bytes and is checked whenever the extent grows and again at ST, never against declared raster attributes alone; an image over the cap keeps no pixels but still ends with its extent, final sixel cursor row top, and aspect ratio
+behavior: caps an image at the retained history's largest record, ring capacity / 8, following capacity changes; the decoded size is extent width x height x 4 bytes and is checked whenever the extent grows and again at ST, never against declared raster attributes alone; an image over the cap keeps no pixels but still ends with its extent, final sixel cursor row top, and aspect ratio; a capacity decrease that lowers the cap below a row image on either screen drops that image and keeps the row's text, as a history record over the record limit does
 host_policy: the retained history capacity sets the cap
 payload_limit: decoded image up to retained history capacity / 8 bytes, 8388608 at the default 67108864 byte ring
 recovery: drop the pixels and keep decoding geometry until ST or a recovery boundary
 reply: no-reply
-diagnostic: DCS sixel payload-limit diagnostic with the decoded size and the cap
+diagnostic: DCS sixel payload-limit diagnostic with the decoded size and the cap; for the screen row images a capacity decrease drops, one such diagnostic with the largest dropped size
 oracle: product-decision-vnm-terminal
 
 ## apc-unsupported-discard

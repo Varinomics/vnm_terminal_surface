@@ -108,7 +108,9 @@ would exceed the ring's record limit, an eighth of its capacity, keeps its
 text and drops its image, both when it is appended and when the capacity
 shrinks. Such a shrink re-encodes the rows it keeps, so their retained history
 handles change: a current search match on them no longer proves its identity,
-and search resolves it again as after any other lost identity.
+and search resolves it again as after any other lost identity. A shrink also
+drops the image of a row on either screen that exceeds the lowered
+decoded-size cap, and the row keeps its text.
 
 ## Rendering
 
