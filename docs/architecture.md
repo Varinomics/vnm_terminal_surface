@@ -151,7 +151,9 @@ for OSC, DCS, APC, PM, SOS, CSI pending data, and title payloads are declared
 with the parser action contract. A sixel DCS is the exception to buffering: its
 data streams to `Sixel_decoder` (`src/sixel_decoder.cpp`) as it arrives, and
 the decoded image, not the string, is capped at the retained history's largest
-record.
+record. The parser stops after each completed image and the model applies it
+before parsing on, so one input chunk holds at most one decoded image at a time
+however many it describes.
 
 The screen-model ingestion path runs the parser, applies actions to the model,
 collects dirty rows and viewport changes, and returns a

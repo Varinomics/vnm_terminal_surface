@@ -2,6 +2,7 @@
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "helpers/parser_ingest.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
@@ -9,7 +10,10 @@
 #include <QString>
 #include <QtGui/qrgb.h>
 #include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <variant>
@@ -27,6 +31,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+using vnm_terminal::test_helpers::ingest_all;
 
 constexpr QRgb k_transparent = 0U;
 constexpr QRgb k_black       = qRgb(0, 0, 0);
@@ -88,7 +93,7 @@ bool has_printed_text(const std::vector<term::Parser_action>& actions, const QSt
 std::vector<term::Parser_action> parse(const QByteArray& bytes)
 {
     term::Terminal_byte_stream_parser parser;
-    return parser.ingest(bytes);
+    return ingest_all(parser, bytes);
 }
 
 // Decodes a string that must yield exactly one image and no diagnostic.
@@ -489,7 +494,7 @@ bool test_sixel_decoded_size_cap()
     parser.set_sixel_raster_limit_bytes(k_limit);
 
     const std::vector<term::Parser_action> grown =
-        parser.ingest(sixel_dcs("0;1", "\"1;1!20~-!20~-!20~"));
+        ingest_all(parser, sixel_dcs("0;1", "\"1;1!20~-!20~-!20~"));
     ok &= check_over_cap(grown, 20U * 18U * 4U, k_limit, 20, 18, "grown past the cap");
     const std::vector<term::Screen_sixel_image_mutation> grown_images = images_in(grown);
     ok &= check(!grown_images.empty() && grown_images[0].final_cursor_y == 12,
@@ -497,7 +502,7 @@ bool test_sixel_decoded_size_cap()
 
     // A transparent image is only what it draws, whatever raster it declares.
     const std::vector<term::Parser_action> declared_large =
-        parser.ingest(sixel_dcs("0;1", "\"1;1;100;100~"));
+        ingest_all(parser, sixel_dcs("0;1", "\"1;1;100;100~"));
     ok &= check(diagnostics_in(declared_large).empty(), "large declared raster alone is not over");
     const std::vector<term::Screen_sixel_image_mutation> declared_images = images_in(declared_large);
     ok &= check(declared_images.size() == 1U && !declared_images[0].raster.isNull(),
@@ -505,7 +510,7 @@ bool test_sixel_decoded_size_cap()
 
     // A small declared raster does not bound what the data draws.
     ok &= check_over_cap(
-        parser.ingest(sixel_dcs("0;1", "\"1;1;2;2!300~")),
+        ingest_all(parser, sixel_dcs("0;1", "\"1;1;2;2!300~")),
         300U * 6U * 4U,
         k_limit,
         300,
@@ -514,7 +519,7 @@ bool test_sixel_decoded_size_cap()
 
     // A filled background is part of the image, drawn or not.
     ok &= check_over_cap(
-        parser.ingest(sixel_dcs({}, "\"1;1;100;100")),
+        ingest_all(parser, sixel_dcs({}, "\"1;1;100;100")),
         100U * 100U * 4U,
         k_limit,
         100,
@@ -535,7 +540,8 @@ bool test_sixel_growth_near_the_cap()
     term::Terminal_byte_stream_parser parser;
     parser.set_sixel_raster_limit_bytes(k_limit);
     const auto decode = [&](const QByteArray& data, const std::string& label) {
-        const std::vector<term::Parser_action>              actions = parser.ingest(sixel_dcs("0;1", data));
+        const std::vector<term::Parser_action> actions =
+            ingest_all(parser, sixel_dcs("0;1", data));
         const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
         ok &= check(images.size() == 1U,              label + ": one image");
         ok &= check(diagnostics_in(actions).empty(), label + ": within the cap");
@@ -576,6 +582,133 @@ bool test_sixel_growth_near_the_cap()
     ok &= check_size(wide, 2648, 6, "row");
     ok &= check_pixel(wide, 0,    0, k_red, "row");
     ok &= check_pixel(wide, 2647, 5, k_red, "row");
+
+    return ok;
+}
+
+bool test_sixel_geometry_saturates()
+{
+    bool ok = true;
+
+    // Repeats of blank sixels, graphics new lines and a large aspect ratio
+    // move the image cursor far past anything an image holds: here the extent
+    // reaches 2^30 x 2^34 pixels, whose product is 2^64. The geometry
+    // saturates at the largest value the image carries, the cap trips, and
+    // the image still ends with that geometry for placement.
+    QByteArray data("\"16384;1");
+    data.append(QByteArray(174762, '-'));
+    for (int i = 0; i < 32769; ++i) {
+        data.append("!32767?");
+    }
+    data.append('G');
+
+    std::vector<term::Parser_action> actions;
+    try {
+        actions = parse(sixel_dcs("0;1", data));
+    }
+    catch (const std::exception& error) {
+        return check(false, std::string("far geometry: decoding threw ") + error.what());
+    }
+
+    constexpr int           k_int_max        = std::numeric_limits<int>::max();
+    constexpr std::uint64_t k_expected_bytes = (1ULL << 30U) * static_cast<std::uint64_t>(k_int_max) * 4ULL;
+    ok &= check_over_cap(
+        actions,
+        static_cast<std::size_t>(k_expected_bytes),
+        term::terminal_history_ring_max_record_bytes(
+            term::k_terminal_default_retained_history_capacity_bytes),
+        1 << 30,
+        k_int_max,
+        "far geometry");
+    const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+    ok &= check(!images.empty() && images[0].final_cursor_y == k_int_max,
+        "far geometry: the cursor saturates");
+    return ok;
+}
+
+bool test_sixel_header_limit_is_chunk_independent()
+{
+    bool ok = true;
+
+    // A DCS header counts against the DCS payload limit however the stream is
+    // split: a header whose parameter bytes fit the limit makes a sixel image,
+    // and one byte more makes an over-limit DCS.
+    const std::size_t limit = term::k_dcs_payload_limit_bytes;
+    for (const std::size_t header_size : {limit, limit + 1U}) {
+        const QByteArray bytes =
+            QByteArray("\x1bP") + QByteArray(static_cast<qsizetype>(header_size), '0') +
+            QByteArray("q~\x1b\\");
+        const qsizetype final_byte = 2 + static_cast<qsizetype>(header_size);
+        const bool      fits       = header_size <= limit;
+        for (const qsizetype split : {
+            qsizetype{0},
+            qsizetype{3},
+            final_byte / 2,
+            final_byte - 1,
+            final_byte,
+            final_byte + 1,
+            bytes.size() - 1})
+        {
+            const std::string label =
+                "header of " + std::to_string(header_size) + " bytes split at " + std::to_string(split);
+            term::Terminal_byte_stream_parser parser;
+            std::vector<term::Parser_action> actions = ingest_all(parser, bytes.first(split));
+            for (term::Parser_action& action : ingest_all(parser, bytes.sliced(split))) {
+                actions.push_back(std::move(action));
+            }
+
+            const std::vector<term::Parser_payload_diagnostic> diagnostics = diagnostics_in(actions);
+            ok &= check(images_in(actions).size() == (fits ? 1U : 0U), label + ": image");
+            ok &= check(diagnostics.size() == (fits ? 0U : 1U),        label + ": diagnostic");
+            if (!fits && diagnostics.size() == 1U) {
+                ok &= check(
+                    diagnostics[0].code == term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED &&
+                    diagnostics[0].family == term::Parser_sequence_family::DCS &&
+                    diagnostics[0].raw_payload_size == limit + 1U,
+                    label + ": over-limit DCS");
+            }
+        }
+    }
+
+    return ok;
+}
+
+bool test_parser_stops_after_each_image()
+{
+    bool ok = true;
+
+    // A few bytes can describe an image as large as the cap, so a chunk that
+    // describes several must not decode them all before any is applied: the
+    // parser stops after each completed image, with the text around the
+    // images in order, and resumes where it stopped.
+    const QByteArray image = sixel_dcs({}, "\"1;1;4;4");
+    const QByteArray bytes = QByteArray("A") + image + "B" + image + image + "C";
+    const qsizetype  image_size = image.size();
+
+    term::Terminal_byte_stream_parser parser;
+    const struct
+    {
+        qsizetype   parsed;
+        std::size_t images;
+        const char* text;
+    }
+    expected_stops[] = {
+        {1 + image_size,     1U, "A"},
+        {2 + 2 * image_size, 1U, "B"},
+        {2 + 3 * image_size, 1U, nullptr},
+        {bytes.size(),       0U, "C"},
+    };
+
+    qsizetype parsed = 0;
+    for (const auto& stop : expected_stops) {
+        const std::string label = "stop at " + std::to_string(stop.parsed);
+        const std::vector<term::Parser_action> actions = parser.ingest(bytes, parsed);
+        ok &= check(parsed == stop.parsed,                    label + ": parsed up to the image end");
+        ok &= check(images_in(actions).size() == stop.images, label + ": images");
+        if (stop.text != nullptr) {
+            ok &= check(has_printed_text(actions, QString::fromLatin1(stop.text)), label + ": text");
+        }
+    }
 
     return ok;
 }
@@ -636,6 +769,9 @@ int main()
     ok &= test_sixel_background();
     ok &= test_sixel_decoded_size_cap();
     ok &= test_sixel_growth_near_the_cap();
+    ok &= test_sixel_geometry_saturates();
+    ok &= test_sixel_header_limit_is_chunk_independent();
+    ok &= test_parser_stops_after_each_image();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }

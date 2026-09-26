@@ -675,11 +675,6 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
     clear_recovery_proposals();
     clear_selection_continuity();
     clear_dirty();
-    std::vector<Parser_action> parser_actions;
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::parser_ingest");
-        parser_actions = m_parser.ingest(bytes);
-    }
 
     ingest_publication_t publication;
     ingest_publication_t resize_transition_publication;
@@ -688,9 +683,20 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         resize_transition_sink,
         resize_transition_publication);
 
-    {
+    // The parser stops after each sixel image, so each image is applied and
+    // its raster released before the next one is decoded: however many images
+    // one chunk describes, at most one decoded raster is alive at a time.
+    // Only a model that retains its structural actions keeps them all.
+    qsizetype parsed = 0;
+    do {
+        std::vector<Parser_action> parser_actions;
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::parser_ingest");
+            parser_actions = m_parser.ingest(bytes, parsed);
+        }
+
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::apply_parser_actions");
-        if (m_config.retain_structural_actions) {
+        if (m_config.retain_structural_actions && result.actions.empty()) {
             result.actions.reserve(parser_actions.size());
         }
 
@@ -749,6 +755,7 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
             }
         }
     }
+    while (parsed < bytes.size());
 
     if (m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
         clear_dirty();

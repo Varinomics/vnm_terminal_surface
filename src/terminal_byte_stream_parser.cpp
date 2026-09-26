@@ -304,6 +304,20 @@ bool dcs_header_continues(unsigned char byte)
     return byte < 0x20U && byte != 0x1bU && byte != 0x18U && byte != 0x1aU;
 }
 
+// A completed sixel image is the last action its string produces.
+bool ends_with_sixel_image(const std::vector<Parser_action>& actions)
+{
+    if (actions.empty() ||
+        parser_action_kind(actions.back()) != Parser_action_kind::SCREEN_MUTATION)
+    {
+        return false;
+    }
+
+    return
+        screen_mutation_kind(std::get<Screen_mutation>(actions.back().payload)) ==
+        Screen_mutation_kind::SIXEL_IMAGE;
+}
+
 Parser_action make_string_recovery_diagnostic(Parser_sequence_family family)
 {
     return
@@ -935,21 +949,35 @@ bool parse_sgr_parameter_groups(
     return finish_group();
 }
 
-std::vector<Parser_action> Terminal_byte_stream_parser::ingest(QByteArrayView bytes)
+std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
+    QByteArrayView bytes,
+    qsizetype&     offset)
 {
+    const QByteArrayView unparsed = bytes.sliced(offset);
+    std::vector<Parser_action> actions;
     if (m_pending_prefix.isEmpty()) {
-        return ingest_buffer(bytes);
+        offset += ingest_buffer(unparsed, actions);
+        return actions;
     }
 
     QByteArray prefixed = std::move(m_pending_prefix);
     m_pending_prefix.clear();
-    prefixed.append(bytes.data(), bytes.size());
-    return ingest_buffer(prefixed);
+    const qsizetype prefix_size = prefixed.size();
+    prefixed.append(unparsed.data(), unparsed.size());
+    const qsizetype parsed = ingest_buffer(prefixed, actions);
+
+    // An image ends at a string terminator, and a pending prefix holds a
+    // sequence its own bytes could not complete, so a stop at an image always
+    // falls past the prefix.
+    Q_ASSERT(parsed >= prefix_size);
+    offset += parsed - prefix_size;
+    return actions;
 }
 
-std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArrayView bytes)
+qsizetype Terminal_byte_stream_parser::ingest_buffer(
+    QByteArrayView                 bytes,
+    std::vector<Parser_action>&    actions)
 {
-    std::vector<Parser_action> actions;
     QString print_text;
     bool    print_text_printable_ascii_only = true;
 
@@ -967,7 +995,8 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
         print_text_printable_ascii_only = true;
     };
 
-    for (qsizetype offset = 0; offset < bytes.size();) {
+    qsizetype offset = 0;
+    while (offset < bytes.size()) {
         if (m_discarding_csi) {
             flush_print_text();
             continue_discarded_csi(bytes, offset);
@@ -983,6 +1012,9 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
         if (is_string_family(m_string_family)) {
             flush_print_text();
             continue_string(bytes, offset, actions);
+            if (ends_with_sixel_image(actions)) {
+                break;
+            }
             continue;
         }
 
@@ -1007,6 +1039,9 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
         if (try_start_string(bytes, offset, actions)          == String_state_result::CONSUMED ||
             try_consume_escape_or_csi(bytes, offset, actions) == String_state_result::CONSUMED)
         {
+            if (ends_with_sixel_image(actions)) {
+                break;
+            }
             continue;
         }
 
@@ -1023,6 +1058,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
             if (should_buffer_incomplete_utf8(bytes, offset)) {
                 flush_print_text();
                 m_pending_prefix = QByteArray(bytes.data() + offset, bytes.size() - offset);
+                offset           = bytes.size();
                 break;
             }
 
@@ -1045,7 +1081,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
     }
 
     flush_print_text();
-    return actions;
+    return offset;
 }
 
 Terminal_byte_stream_parser::String_state_result Terminal_byte_stream_parser::try_start_string(
@@ -1228,7 +1264,7 @@ void Terminal_byte_stream_parser::continue_string(
     std::vector<Parser_action>&    actions)
 {
     if (m_dcs_header_pending) {
-        classify_dcs_header(bytes, offset);
+        classify_dcs_header(bytes, offset, actions);
     }
 
     Parser_string_terminator terminator = Parser_string_terminator::END_OF_INPUT;
@@ -1284,21 +1320,27 @@ void Terminal_byte_stream_parser::start_string(
 
 void Terminal_byte_stream_parser::classify_dcs_header(
     QByteArrayView                 bytes,
-    qsizetype&                     offset)
+    qsizetype&                     offset,
+    std::vector<Parser_action>&    actions)
 {
-    // A header that overran the payload limit belongs to a string that is
-    // already being discarded, whatever its final byte turns out to be.
-    if (m_string_over_limit) {
-        m_dcs_header_pending = false;
-        return;
-    }
-
-    // Undecided header bytes are buffered like any DCS payload, so a DCS
-    // that is not sixel keeps its whole payload under the DCS limit.
+    // Undecided header bytes are buffered like any DCS payload, and the
+    // header counts against the DCS limit byte by byte however the stream is
+    // split: one byte past the limit makes the string an over-limit discard
+    // before any final byte can make it sixel. Within the limit the buffered
+    // bytes never trip it either, since they are all header bytes.
+    const std::size_t limit    = k_dcs_payload_limit_bytes;
+    const std::size_t buffered = static_cast<std::size_t>(m_string_payload.size());
     qsizetype decision_offset = offset;
     while (decision_offset < bytes.size() &&
         dcs_header_continues(byte_at(bytes, decision_offset)))
     {
+        if (buffered + static_cast<std::size_t>(decision_offset - offset) == limit) {
+            actions.push_back(make_dcs_payload_limit_diagnostic(limit + 1U));
+            m_string_payload.clear();
+            m_string_over_limit  = true;
+            m_dcs_header_pending = false;
+            return;
+        }
         ++decision_offset;
     }
 
