@@ -2575,12 +2575,11 @@ public:
                 prepare_result.warm_lazy,
                 prepared_generation_committed);
         }
-        // A committed frame whose image resources failed keeps its text; the
-        // bounded retry brings the images back once the failure passes.
-        const bool image_retry_wanted =
-            prepared_generation_committed &&
-            prepare_result.render.images.resource_failures > 0;
-        if (prepared_generation_committed && !image_retry_wanted) {
+        // A committed frame whose image resources failed still committed its
+        // text, so the shared retry budget resets as for any committed frame.
+        // Its images are retried by the next prepare the surface asks for; a
+        // lasting image failure must not spend that budget or keep repainting.
+        if (prepared_generation_committed) {
             m_retry->reset();
         }
         else {
@@ -7199,6 +7198,13 @@ private:
         QRhiRenderTarget*         target,
         Qsg_atlas_render_summary& render_summary)
     {
+        // Every committed draw samples a cached texture, so without a plan and
+        // a cached texture there is nothing to draw, create or evict.
+        if (m_image_draw_plan.empty() && m_image_textures.size() == 0U) {
+            Q_ASSERT(m_image_draw_bindings.empty());
+            return;
+        }
+
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::commit_image_pass");
 
         Qsg_atlas_image_summary&                 summary = render_summary.images;
@@ -7231,8 +7237,10 @@ private:
                         continue;
                     }
 
-                    // The upload honours the image's bytesPerLine; the
-                    // batch keeps its own reference to the pixels.
+                    // Some backends upload a whole image as tightly packed
+                    // rows, which every slice producer keeps. The batch holds
+                    // its own reference to the pixels.
+                    Q_ASSERT(pixels.bytesPerLine() == pixels.width() * 4);
                     if (updates == nullptr) {
                         updates = rhi->nextResourceUpdateBatch();
                     }

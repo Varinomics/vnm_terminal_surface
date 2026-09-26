@@ -21878,9 +21878,76 @@ bool test_atlas_rejected_prepare_keeps_committed_images(QGuiApplication& app)
     return ok;
 }
 
+// Processes events without asking for a frame, so only the surface's own
+// requests, such as its bounded prepare retry, can prepare one.
+bool pump_atlas_idle_until(
+    QGuiApplication&                                                 app,
+    VNM_TerminalSurface&                                             surface,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>& predicate,
+    int                                                              timeout_ms = 3000)
+{
+    QElapsedTimer deadline;
+    deadline.start();
+    while (deadline.elapsed() < timeout_ms) {
+        app.processEvents(QEventLoop::AllEvents, 5);
+        if (predicate(term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface))) {
+            return true;
+        }
+        QThread::msleep(1);
+    }
+    return false;
+}
+
+// Publishes one image row over text while image textures fail to create, and
+// waits for the prepare that commits the text.
+bool publish_atlas_failing_image_frame(
+    QGuiApplication&               app,
+    QQuickWindow&                  window,
+    VNM_TerminalSurface&           surface,
+    const Atlas_image_fixture&     fixture,
+    std::uint64_t                  sequence,
+    QColor                         color,
+    term::Qsg_atlas_frame_report&  report)
+{
+    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(sequence);
+    term::set_render_snapshot_row_image(
+        snapshot,
+        0,
+        make_atlas_test_image_slice(3, fixture.device_cell, 2, color, sequence * 1000U));
+    term::qsg_atlas_fail_image_texture_create_for_testing(true);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot)));
+    const bool committed = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& current) {
+            return
+                current.prepared_generation_committed &&
+                current.render_snapshot_sequence == sequence;
+        });
+    report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    return
+        committed                                   &&
+        report.frame_build.glyph_instances > 0      &&
+        report.render.images.quads == 1             &&
+        report.render.images.resource_failures == 1 &&
+        report.render.images.draws == 0;
+}
+
+struct Atlas_image_fault_guard
+{
+    ~Atlas_image_fault_guard()
+    {
+        term::qsg_atlas_fail_image_texture_create_for_testing(false);
+        term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    }
+};
+
 // Oracles: the capability rule (a failed image resource costs images only; the
-// frame still commits its text) and I4 (without new output, the bounded retry
-// brings the image back once the failure passes).
+// frame still commits its text) and I4 (the next publish after the failure
+// passes draws the image).
 bool test_atlas_failed_image_texture_keeps_text_and_recovers(QGuiApplication& app)
 {
     QQuickWindow        window;
@@ -21889,61 +21956,97 @@ bool test_atlas_failed_image_texture_keeps_text_and_recovers(QGuiApplication& ap
     if (!seed_atlas_image_fixture(app, window, surface, 20130U, fixture)) {
         return false;
     }
-    struct Clear_fault
-    {
-        ~Clear_fault() { term::qsg_atlas_fail_image_texture_create_for_testing(false); }
-    } clear_fault;
-
-    const auto pump_idle_until = [&](const auto& predicate) {
-        QElapsedTimer deadline;
-        deadline.start();
-        while (deadline.elapsed() < 3000) {
-            app.processEvents(QEventLoop::AllEvents, 5);
-            if (predicate(term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface))) {
-                return true;
-            }
-            QThread::msleep(1);
-        }
-        return false;
-    };
+    const Atlas_image_fault_guard fault_guard;
 
     const QColor red(220, 30, 30);
-    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(20131U);
-    term::set_render_snapshot_row_image(
-        snapshot, 0, make_atlas_test_image_slice(3, fixture.device_cell, 2, red, 20131001U));
-    term::qsg_atlas_fail_image_texture_create_for_testing(true);
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(snapshot));
-    const bool text_committed = pump_idle_until(
-        [&](const term::Qsg_atlas_frame_report& report) {
-            return
-                report.prepared_generation_committed &&
-                report.render_snapshot_sequence == 20131U;
-        });
-    const term::Qsg_atlas_frame_report failed =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    term::Qsg_atlas_frame_report failed;
+    const bool text_committed =
+        publish_atlas_failing_image_frame(app, window, surface, fixture, 20131U, red, failed);
     const QImage failed_image = window.grabWindow();
     term::qsg_atlas_fail_image_texture_create_for_testing(false);
 
     bool ok = true;
-    ok &= check(text_committed && failed.frame_build.glyph_instances > 0 &&
-            failed.render.images.quads == 1 &&
-            failed.render.images.resource_failures == 1 &&
-            failed.render.images.draws == 0,
+    ok &= check(text_committed,
         "a failed image texture leaves the frame committed with its text");
     ok &= check(!failed_image.isNull() &&
             !colors_near(atlas_image_cell_color(failed_image, fixture, 0, 2), red),
         "a failed image texture draws no image pixels");
 
-    const bool recovered = pump_idle_until(
-        [&](const term::Qsg_atlas_frame_report& report) {
-            return report.render.images.draws == 1 && report.render.images.resource_failures == 0;
-        });
+    term::Terminal_render_snapshot next = make_atlas_image_text_snapshot(20132U);
+    term::set_render_snapshot_row_image(
+        next, 0, make_atlas_test_image_slice(3, fixture.device_cell, 2, red, 20131U * 1000U));
+    term::Qsg_atlas_frame_report recovered;
+    const bool drawn = publish_atlas_image_snapshot(app, window, surface, next, recovered, 1);
     const QImage recovered_image = window.grabWindow();
-    ok &= check(recovered && !recovered_image.isNull() &&
+    ok &= check(drawn && recovered.render.images.resource_failures == 0 &&
+            !recovered_image.isNull() &&
             colors_near(atlas_image_cell_color(recovered_image, fixture, 0, 2), red),
-        "the bounded retry draws the image once the failure passes, without new output");
+        "the next publish draws the image once the failure passes");
+    return ok;
+}
+
+// Oracle: the bounded prepare retry belongs to rejected prepares. A frame that
+// committed its text but not its images must neither prepare frames on its own
+// nor spend that retry budget, so a later rejected prepare still recovers.
+bool test_atlas_lasting_image_failure_leaves_text_retries(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20140U, fixture)) {
+        return false;
+    }
+    const Atlas_image_fault_guard fault_guard;
+
+    term::Qsg_atlas_frame_report failed;
+    bool ok = check(
+        publish_atlas_failing_image_frame(
+            app, window, surface, fixture, 20141U, QColor(220, 30, 30), failed),
+        "a lasting image failure leaves the frame committed with its text");
+
+    // Let frames the publishing pump asked for finish, then watch longer than
+    // the rest of the retry schedule (its last two delays are 256 and 512 ms).
+    const auto pump_idle_for = [&](int milliseconds) {
+        pump_atlas_idle_until(
+            app,
+            surface,
+            [](const term::Qsg_atlas_frame_report&) { return false; },
+            milliseconds);
+    };
+    pump_idle_for(300);
+    const term::Qsg_atlas_frame_report quiet =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    pump_idle_for(1500);
+    const term::Qsg_atlas_frame_report settled =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    ok &= check(settled.prepare_count == quiet.prepare_count,
+        "a lasting image failure prepares no frames of its own");
+
+    // A rejected prepare of the same content now needs the bounded retry.
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(20141U);
+    surface.update();
+    window.requestUpdate();
+    const bool rejected = pump_atlas_idle_until(
+        app,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                report.prepare_count > settled.prepare_count &&
+                !report.prepared_generation_committed;
+        });
+    const term::Qsg_atlas_frame_report rejected_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    const bool retried = pump_atlas_idle_until(
+        app,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                report.prepare_count > rejected_report.prepare_count &&
+                report.prepared_generation_committed;
+        });
+    ok &= check(rejected && retried,
+        "a rejected prepare after a lasting image failure still recovers through its retry");
     return ok;
 }
 
@@ -22404,6 +22507,7 @@ int main(int argc, char** argv)
         bool ok = test_atlas_persistent_rect_failure_is_bounded(app);
         ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
         ok &= test_atlas_failed_image_texture_keeps_text_and_recovers(app);
+        ok &= test_atlas_lasting_image_failure_leaves_text_retries(app);
         return ok ? 0 : 1;
     }
     if (post_verification_failure_contract) {
