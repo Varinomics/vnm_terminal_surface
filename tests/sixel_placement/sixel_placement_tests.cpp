@@ -1280,6 +1280,70 @@ bool test_encoder_session_end_to_end()
 // XTSMGRAPHICS reports a geometry within the decoded-size cap (anchor A2, owner
 // decision D4), so at the smallest ring an encoder that fills it gets its image
 // decoded and placed, not discarded over the cap.
+// I5: no stored image exceeds the decoded-size cap. Two small images on one
+// row can span more than the cap together, and a row image kept across a cell
+// enlargement is resampled larger. A composite that would exceed the cap
+// gives way to the newer band, with the cap's diagnostic, and the image's
+// cursor and scroll geometry stand.
+bool test_row_images_stay_within_the_decoded_size_cap()
+{
+    bool ok = true;
+
+    const std::size_t capacity_bytes = 1024U * 1024U;
+    const std::size_t cap_bytes      = term::terminal_history_ring_max_record_bytes(
+        term::terminal_history_ring_aligned_capacity(capacity_bytes));
+
+    const auto check_newer_band_only = [&](
+        const term::Terminal_screen_model&                 model,
+        const term::Terminal_screen_model_result&          result,
+        int                                                first_column,
+        term::terminal_cell_pixel_size_t                   cell,
+        std::size_t                                        composite_bytes,
+        const char*                                        label)
+    {
+        const std::shared_ptr<const term::Terminal_image_slice> slice = slice_at(model, 0);
+        ok &= check(slice != nullptr &&
+                slice->first_column == first_column &&
+                slice->cell_pixel_size == cell &&
+                slice->pixels.width() == cell.width &&
+                slice->pixels.height() == cell.height,
+            label);
+        const std::vector<term::Parser_payload_diagnostic> diagnostics = diagnostics_in(result);
+        ok &= check(diagnostics.size() == 1U &&
+                diagnostics[0].code == term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED &&
+                diagnostics[0].family == term::Parser_sequence_family::DCS &&
+                diagnostics[0].raw_payload_size == composite_bytes &&
+                diagnostics[0].limit_bytes == cap_bytes,
+            "a row image that would exceed the cap is reported with its size and the cap");
+        ok &= check(model.cursor_position().row == 0 && model.cursor_position().column == first_column,
+            "a refused composite leaves the image's cursor geometry as it was");
+    };
+
+    // Two 10 x 40 images at the two ends of a 160-column row of 10 x 40 cells
+    // would span 1600 x 40 pixels: 256000 bytes against a 131072 byte cap.
+    const term::terminal_cell_pixel_size_t tall_cell{10, 40};
+    term::Terminal_screen_model spread = make_model(3, 160, tall_cell, 100, capacity_bytes);
+    spread.ingest(sixel("1;0", "\"1;1;10;40"));
+    const term::Terminal_screen_model_result spread_result =
+        spread.ingest(cursor_to(0, 159) + sixel("1;0", "\"1;1;10;40"));
+    check_newer_band_only(spread, spread_result, 159, tall_cell, 256000U,
+        "two images whose union exceeds the cap leave the newer one on the row");
+
+    // An 800 x 20 image kept across a cell doubling is resampled to 1600 x 40,
+    // and with a 20 x 40 image at column 100 the union is 2020 x 40 pixels:
+    // 323200 bytes.
+    term::Terminal_screen_model enlarged = make_model(3, 120, k_cell, 100, capacity_bytes);
+    enlarged.ingest(sixel("1;0", "\"1;1;800;20"));
+    const term::terminal_cell_pixel_size_t doubled_cell{20, 40};
+    enlarged.set_cell_pixel_size(doubled_cell);
+    const term::Terminal_screen_model_result enlarged_result =
+        enlarged.ingest(cursor_to(0, 100) + sixel("1;0", "\"1;1;20;40"));
+    check_newer_band_only(enlarged, enlarged_result, 100, doubled_cell, 323200U,
+        "an image resampled larger by a cell change gives way to the newer band");
+
+    return ok;
+}
+
 bool test_reported_geometry_decodes_within_the_cap()
 {
     bool ok = true;
@@ -1348,5 +1412,6 @@ int main()
     ok &= test_recovered_history_rows_keep_their_images();
     ok &= test_encoder_session_end_to_end();
     ok &= test_reported_geometry_decodes_within_the_cap();
+    ok &= test_row_images_stay_within_the_decoded_size_cap();
     return ok ? 0 : 1;
 }

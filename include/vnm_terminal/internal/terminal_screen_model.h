@@ -1415,7 +1415,9 @@ private:
         const Screen_sixel_image_mutation& image,
         std::vector<Parser_action>&        generated_actions);
 
-    void place_image_band(
+    // Returns the size of a composite refused over the decoded-size cap, zero
+    // when none was.
+    std::size_t place_image_band(
         const QImage&                  raster,
         int                            band_top,
         int                            row,

@@ -334,39 +334,73 @@ bool image_block_has_drawn_pixel(const QImage& pixels, int x_first, int x_end)
     return false;
 }
 
-// Draws a band over its row's earlier image, drawn pixels over earlier ones,
-// into one image over the union of their columns. An earlier image placed on
-// another cell is first resampled to this one, the size a renderer draws it
-// at, so a row's image keeps a single cell size.
-QImage composite_image_band(
+// Where a band and its row's earlier image end up in their composite, worked
+// out before anything is allocated, so a composite over the decoded-size cap
+// is never made. An earlier image placed on another cell is resampled to this
+// one, the size a renderer draws it at, so a row's image keeps one cell size.
+struct composite_layout_t
+{
+    int           first_column   = 0;
+    int           earlier_width  = 0;
+    int           earlier_height = 0;
+    int           earlier_x      = 0;
+    int           band_x         = 0;
+    int           width          = 0;
+    int           height         = 0;
+    std::int64_t  bytes          = 0;
+};
+
+composite_layout_t composite_image_layout(
     const Terminal_image_slice& earlier,
     const QImage&               band,
     int                         band_first_column,
-    terminal_cell_pixel_size_t  cell,
-    int&                        out_first_column)
+    terminal_cell_pixel_size_t  cell)
+{
+    composite_layout_t layout;
+    layout.earlier_width  = earlier.pixels.width();
+    layout.earlier_height = earlier.pixels.height();
+    if (earlier.cell_pixel_size != cell) {
+        const double x_scale = static_cast<double>(cell.width)  / earlier.cell_pixel_size.width;
+        const double y_scale = static_cast<double>(cell.height) / earlier.cell_pixel_size.height;
+        layout.earlier_width  = std::max(1, static_cast<int>(std::lround(layout.earlier_width * x_scale)));
+        layout.earlier_height = std::clamp(
+            static_cast<int>(std::lround(layout.earlier_height * y_scale)),
+            1,
+            cell.height);
+    }
+
+    layout.first_column = std::min(earlier.first_column, band_first_column);
+    layout.earlier_x    = (earlier.first_column - layout.first_column) * cell.width;
+    layout.band_x       = (band_first_column    - layout.first_column) * cell.width;
+    layout.width        = std::max(layout.earlier_x + layout.earlier_width, layout.band_x + band.width());
+    layout.height       = std::max(layout.earlier_height, band.height());
+    layout.bytes        = std::int64_t{layout.width} * layout.height * 4;
+    return layout;
+}
+
+// Draws a band over its row's earlier image, drawn pixels over earlier ones,
+// into one image over the union of their columns.
+QImage composite_image_band(
+    const Terminal_image_slice& earlier,
+    const QImage&               band,
+    const composite_layout_t&   layout)
 {
     QImage earlier_pixels = earlier.pixels;
-    if (earlier.cell_pixel_size != cell) {
-        const double x_scale       = static_cast<double>(cell.width)  / earlier.cell_pixel_size.width;
-        const double y_scale       = static_cast<double>(cell.height) / earlier.cell_pixel_size.height;
-        const int    scaled_width  = static_cast<int>(std::lround(earlier_pixels.width()  * x_scale));
-        const int    scaled_height = static_cast<int>(std::lround(earlier_pixels.height() * y_scale));
+    if (earlier_pixels.width()  != layout.earlier_width ||
+        earlier_pixels.height() != layout.earlier_height)
+    {
         earlier_pixels = earlier_pixels
             .scaled(
-                std::max(1, scaled_width),
-                std::clamp(scaled_height, 1, cell.height),
+                layout.earlier_width,
+                layout.earlier_height,
                 Qt::IgnoreAspectRatio,
                 Qt::FastTransformation)
             .convertToFormat(QImage::Format_RGBA8888_Premultiplied);
     }
 
-    out_first_column = std::min(earlier.first_column, band_first_column);
-    const int earlier_x = (earlier.first_column - out_first_column) * cell.width;
-    const int band_x    = (band_first_column    - out_first_column) * cell.width;
-    const int width     = std::max(earlier_x + earlier_pixels.width(), band_x + band.width());
-    const int height    = std::max(earlier_pixels.height(), band.height());
-
-    QImage combined(width, height, QImage::Format_RGBA8888_Premultiplied);
+    const int earlier_x = layout.earlier_x;
+    const int band_x    = layout.band_x;
+    QImage combined(layout.width, layout.height, QImage::Format_RGBA8888_Premultiplied);
     // QImage reports a failed allocation with a null image, not an exception.
     if (combined.isNull() || earlier_pixels.isNull()) {
         throw std::bad_alloc();
@@ -3524,34 +3558,44 @@ Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_
 
     struct Kept_record
     {
-        Terminal_history_row_record record;
-        std::size_t                 index = 0U;
+        std::size_t index      = 0U;
+        bool        drop_image = false;
+    };
+
+    // Decodes one retained record. Only one is decoded at a time: a decoded
+    // row is as wide as its source, whatever its compact record holds.
+    const auto decode_record = [this](
+        std::size_t                              index,
+        Terminal_history_row_record_image_decode image_decode)
+    {
+        const terminal_history_handle_t handle = retained_history.index[index].history_handle;
+        const Terminal_history_ring_read_scope read =
+            retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
+        Terminal_history_row_record_decode_result decoded =
+            decode_terminal_history_row_record(read, image_decode, handle);
+        if (decoded.status != Terminal_history_row_record_codec_status::OK) {
+            throw_retained_history_storage_failure();
+        }
+        return std::move(decoded.record);
     };
 
     // Choose the kept rows as the ring would, newest first, stopping at the
     // first record still over the record limit or at the capacity, but with
-    // each oversized image dropped from its row first.
+    // each oversized image dropped from its row first. Record sizes come from
+    // the index; only a row that loses its image is decoded, to size it.
     const std::size_t new_capacity = terminal_history_ring_aligned_capacity(capacity_bytes);
     const std::size_t new_max_record_bytes = terminal_history_ring_max_record_bytes(new_capacity);
     std::vector<Kept_record> kept;
     std::size_t kept_bytes = 0U;
     for (std::size_t index = retained_history.index.size(); index-- > 0U;) {
-        const terminal_history_handle_t handle = retained_history.index[index].history_handle;
-        const Terminal_history_ring_read_scope read =
-            retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
-        Terminal_history_row_record_decode_result decoded = decode_terminal_history_row_record(
-            read,
-            Terminal_history_row_record_image_decode::DECODE_PIXELS,
-            handle);
-        if (decoded.status != Terminal_history_row_record_codec_status::OK) {
-            throw_retained_history_storage_failure();
-        }
-
-        std::size_t record_bytes = handle.record_bytes;
-        if (record_bytes > new_max_record_bytes && decoded.record.image_slice != nullptr) {
-            record_bytes -= terminal_history_row_record_image_section_bytes(
-                *decoded.record.image_slice);
-            decoded.record.image_slice.reset();
+        const auto& entry = retained_history.index[index];
+        std::size_t record_bytes = entry.history_handle.record_bytes;
+        const bool drop_image =
+            entry.has_image_section && record_bytes > new_max_record_bytes;
+        if (drop_image) {
+            const Terminal_history_row_record record =
+                decode_record(index, Terminal_history_row_record_image_decode::DECODE_PIXELS);
+            record_bytes -= terminal_history_row_record_image_section_bytes(*record.image_slice);
         }
         if (record_bytes > new_max_record_bytes ||
             kept_bytes   > new_capacity - record_bytes)
@@ -3559,25 +3603,32 @@ Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_
             break;
         }
 
-        kept.push_back({std::move(decoded.record), index});
+        kept.push_back({index, drop_image});
         kept_bytes += record_bytes;
     }
 
-    // Re-encode oldest first into a ring of the new capacity. The kept
-    // records fit it together, so no append evicts another; each keeps its
-    // ordinal and row sequence. Until the swap below nothing the model reads
-    // has changed, so a failure here leaves history as it was.
+    // Re-encode oldest first into a ring of the new capacity, decoding each
+    // row just before it is encoded. The kept records fit the ring together,
+    // so no append evicts another; each keeps its ordinal and row sequence.
+    // Until the swap below nothing the model reads has changed, so a failure
+    // here leaves history as it was.
     std::unique_ptr<Terminal_history_ring> ring = make_retained_history_ring(new_capacity);
     std::vector<terminal_history_handle_t> kept_handles(kept.size());
     for (std::size_t kept_index = kept.size(); kept_index-- > 0U;) {
         const Kept_record& kept_record = kept[kept_index];
+        const auto& entry = retained_history.index[kept_record.index];
+        const Terminal_history_row_record record = decode_record(
+            kept_record.index,
+            entry.has_image_section && !kept_record.drop_image
+                ? Terminal_history_row_record_image_decode::DECODE_PIXELS
+                : Terminal_history_row_record_image_decode::SKIP_PIXELS);
         const Terminal_history_row_record_append_result append =
             encode_terminal_history_row_record_to_ring(
                 *ring,
-                kept_record.record,
+                record,
                 {
                     k_terminal_history_retained_identity_epoch,
-                    retained_history.index[kept_record.index].history_handle.row_sequence,
+                    entry.history_handle.row_sequence,
                 });
         if (append.status != Terminal_history_row_record_codec_status::OK ||
             append.commit.tail_advanced)
@@ -3601,7 +3652,7 @@ Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_without_
     for (std::size_t kept_index = 0U; kept_index < kept.size(); ++kept_index) {
         auto& entry = retained_history.index[kept[kept_index].index];
         entry.history_handle    = kept_handles[kept_index];
-        entry.has_image_section = kept[kept_index].record.image_slice != nullptr;
+        entry.has_image_section = entry.has_image_section && !kept[kept_index].drop_image;
     }
     retained_history.discard_index_prefix(dropped_rows);
     return result;
@@ -7136,13 +7187,29 @@ void Terminal_screen_model::place_sixel_image(
         ? 0
         : (image.raster.height() + cell.height - 1) / cell.height;
 
+    // A row whose images together would exceed the decoded-size cap keeps the
+    // newer one; the largest refused composite is reported once per image.
+    std::size_t refused_composite_bytes = 0U;
+    const auto report_refused_composite = [&]() {
+        if (refused_composite_bytes > 0U) {
+            generated_actions.push_back(make_payload_limit_diagnostic(
+                QStringLiteral("DCS sixel"),
+                refused_composite_bytes,
+                sixel_raster_limit_bytes(),
+                Parser_sequence_family::DCS));
+        }
+    };
+
     // DECSDM set: the image starts at the page home whatever the origin mode
     // and margins say, never scrolls, is clipped at the bottom of the page and
     // leaves the cursor where it was.
     if (m_sixel_display_mode) {
         for (int band = 0; band < std::min(band_count, m_config.grid_size.rows); ++band) {
-            place_image_band(image.raster, band * cell.height, band, 0, cell);
+            refused_composite_bytes = std::max(
+                refused_composite_bytes,
+                place_image_band(image.raster, band * cell.height, band, 0, cell));
         }
+        report_refused_composite();
         return;
     }
 
@@ -7179,13 +7246,16 @@ void Terminal_screen_model::place_sixel_image(
             ++scrolls;
             row = m_scroll_bottom;
         }
-        place_image_band(
-            image.raster,
-            band * cell.height,
-            static_cast<int>(row),
-            origin.column,
-            cell);
+        refused_composite_bytes = std::max(
+            refused_composite_bytes,
+            place_image_band(
+                image.raster,
+                band * cell.height,
+                static_cast<int>(row),
+                origin.column,
+                cell));
     }
+    report_refused_composite();
 
     // The image's geometry may ask for far more scrolls than its pixels fill.
     // Once the region has scrolled its full height it is blank, and once the
@@ -7216,7 +7286,7 @@ void Terminal_screen_model::place_sixel_image(
     }
 }
 
-void Terminal_screen_model::place_image_band(
+std::size_t Terminal_screen_model::place_image_band(
     const QImage&              raster,
     int                        band_top,
     int                        row,
@@ -7272,71 +7342,97 @@ void Terminal_screen_model::place_image_band(
 
     // A band with nothing drawn leaves the row as it was.
     if (!any_covered) {
-        return;
+        return 0U;
     }
+
+    // Everything that can fail is prepared first: the row's new image, then
+    // the copy of its cells a text change needs. Only then do the row's text,
+    // wraps and image change, together.
+    Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+
+    // S4 draws the band over an earlier image on the row, unless their
+    // composite would exceed the decoded-size cap (I5): the newer band then
+    // replaces the earlier image, and the refused size is reported.
+    std::size_t refused_composite_bytes = 0U;
+    int         slice_first_column      = first_column;
+    if (screen_row.image_slice != nullptr) {
+        const composite_layout_t layout = composite_image_layout(
+            *screen_row.image_slice,
+            band.pixels,
+            first_column,
+            cell);
+        if (layout.bytes > static_cast<std::int64_t>(sixel_raster_limit_bytes())) {
+            refused_composite_bytes = static_cast<std::size_t>(layout.bytes);
+        }
+        else {
+            band.pixels        = composite_image_band(*screen_row.image_slice, band.pixels, layout);
+            slice_first_column = layout.first_column;
+        }
+    }
+    std::shared_ptr<const Terminal_image_slice> image =
+        make_image_slice(std::move(band.pixels), slice_first_column, cell);
 
     // Text under an image would draw over it, so a covered cell loses its
     // text and hyperlink and keeps its style, the way an erase leaves a cell;
     // a wide glyph with a covered cell is cleared whole.
-    Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+    const auto clear_covered_text = [&](bool apply)
+    {
+        bool changed = false;
+        for (int index = 0; index < band_columns; ++index) {
+            if (covered_columns[static_cast<std::size_t>(index)] == 0U) {
+                continue;
+            }
+
+            const int base_column = cell_base_column_in_row(screen_row, first_column + index);
+            const Cell& base_cell = screen_row.cells[static_cast<std::size_t>(base_column)];
+            const int span_end = std::min(
+                m_config.grid_size.columns,
+                base_column + std::max(1, base_cell.display_width));
+            Cell cleared;
+            if (base_cell.style_id != k_default_terminal_style_id) {
+                cleared.occupied = true;
+                cleared.style_id = base_cell.style_id;
+            }
+
+            for (int column = base_column; column < span_end; ++column) {
+                Cell& cell_to_clear = screen_row.cells[static_cast<std::size_t>(column)];
+                const bool already_cleared =
+                    cell_to_clear.occupied          == cleared.occupied          &&
+                    cell_to_clear.style_id          == cleared.style_id          &&
+                    cell_to_clear.hyperlink_id      == cleared.hyperlink_id      &&
+                    cell_to_clear.wide_continuation == cleared.wide_continuation &&
+                    cell_to_clear.display_width     == cleared.display_width     &&
+                    cell_to_clear.text              == cleared.text;
+                if (!already_cleared) {
+                    changed = true;
+                    if (apply) {
+                        cell_to_clear = cleared;
+                    }
+                }
+            }
+        }
+        return changed;
+    };
+    std::vector<Cell> before_cells;
+    if (clear_covered_text(false)) {
+        before_cells = screen_row.cells;
+    }
 
     // A row that shows an image starts its own logical line (owner decision
     // D2), so placing one hard-terminates the soft wraps into and out of its
     // row, and reflow never has to split one image over several rows.
     break_soft_wrap_before(row);
     screen_row.soft_wrap_columns = 0;
-
-    std::vector<Cell> before_cells;
-    for (int index = 0; index < band_columns; ++index) {
-        if (covered_columns[static_cast<std::size_t>(index)] == 0U) {
-            continue;
-        }
-
-        const int base_column = cell_base_column_in_row(screen_row, first_column + index);
-        const Cell& base_cell = screen_row.cells[static_cast<std::size_t>(base_column)];
-        const int span_end = std::min(
-            m_config.grid_size.columns,
-            base_column + std::max(1, base_cell.display_width));
-        Cell cleared;
-        if (base_cell.style_id != k_default_terminal_style_id) {
-            cleared.occupied = true;
-            cleared.style_id = base_cell.style_id;
-        }
-
-        for (int column = base_column; column < span_end; ++column) {
-            Cell& cell_to_clear = screen_row.cells[static_cast<std::size_t>(column)];
-            const bool already_cleared =
-                cell_to_clear.occupied          == cleared.occupied          &&
-                cell_to_clear.style_id          == cleared.style_id          &&
-                cell_to_clear.hyperlink_id      == cleared.hyperlink_id      &&
-                cell_to_clear.wide_continuation == cleared.wide_continuation &&
-                cell_to_clear.display_width     == cleared.display_width     &&
-                cell_to_clear.text              == cleared.text;
-            if (already_cleared) {
-                continue;
-            }
-            if (before_cells.empty()) {
-                before_cells = screen_row.cells;
-            }
-            cell_to_clear = cleared;
-        }
+    if (!before_cells.empty()) {
+        clear_covered_text(true);
     }
+    screen_row.image_slice = std::move(image);
+    mark_terminal_content_changed();
+    mark_dirty(row);
     if (!before_cells.empty()) {
         advance_row_content_generation_if_changed(screen_row, before_cells);
     }
-
-    int slice_first_column = first_column;
-    if (screen_row.image_slice != nullptr) {
-        band.pixels = composite_image_band(
-            *screen_row.image_slice,
-            band.pixels,
-            first_column,
-            cell,
-            slice_first_column);
-    }
-    screen_row.image_slice = make_image_slice(std::move(band.pixels), slice_first_column, cell);
-    mark_terminal_content_changed();
-    mark_dirty(row);
+    return refused_composite_bytes;
 }
 
 std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::make_image_slice(
