@@ -7119,19 +7119,20 @@ void Terminal_screen_model::line_feed()
 
 void Terminal_screen_model::wrap_line()
 {
-    // A row that shows an image starts its own logical line (D2), so text
-    // wrapping onto one wraps hard. Text wrapping off one stays soft. At the
-    // bottom margin the wrap scrolls onto a fresh row instead.
+    // Image rows break incoming and outgoing text wraps (D2), so later text
+    // cannot join them into another logical line. At the bottom margin the
+    // wrap scrolls onto a fresh row instead.
     const int  next_row = m_cursor.row + 1;
     const bool wraps_onto_image_row =
         m_cursor.row != m_scroll_bottom         &&
         next_row     <  m_config.grid_size.rows &&
         active_grid_rows()[(std::size_t)next_row].image_slice != nullptr;
-    int soft_wrap_columns = m_pending_wrap ? m_config.grid_size.columns : m_cursor.column;
-    if (wraps_onto_image_row) {
+    Terminal_screen_row& row = active_grid_rows()[(std::size_t)m_cursor.row];
+    int soft_wrap_columns    = m_pending_wrap ? m_config.grid_size.columns : m_cursor.column;
+    if (row.image_slice != nullptr || wraps_onto_image_row) {
         soft_wrap_columns = 0;
     }
-    active_grid_rows()[(std::size_t)m_cursor.row].soft_wrap_columns = soft_wrap_columns;
+    row.soft_wrap_columns = soft_wrap_columns;
     carriage_return();
     advance_row();
 }

@@ -166,14 +166,14 @@ A decoded sixel image is placed against the cell pixel size and cut into one
 immutable `Terminal_image_slice` (`render_snapshot.h`) per text row it covers;
 there is no image store. The row owns its slice, which moves and dies with the
 row and reaches retained history with it. Text written or erased over a row's
-image clears the image under those cells, ICH and DCH move image columns with
-the cells, and a screen row with an image always starts its logical line, so
-reflow keeps the image on the line's first row. A history row record carries its
-slice in a presence-flagged section, so image-free records keep their exact
-encoding, and a decode materializes the pixels only when a reader asks for
-them. Each slice records the cell size it was placed on and a revision unique
-in the process, so a renderer can scale it and key a cache on the revision
-alone, also across a session replacement.
+image clears the image under those cells, and ICH and DCH move image columns with
+the cells. Image placement and later printing break soft wraps into and out of
+screen rows that show images, so reflow keeps each image on its logical line's
+first row. A history row record carries its slice in a presence-flagged section,
+so image-free records keep their exact encoding, and a decode materializes the
+pixels only when a reader asks for them. Each slice records the cell size it was
+placed on and a revision unique in the process, so a renderer can scale it and
+key a cache on the revision alone, also across a session replacement.
 
 Terminal cell widths come from generated Unicode 16.0.0 tables in
 `unicode_width_tables`. Ambiguous East Asian Width characters are narrow,

@@ -25,8 +25,9 @@
 // scrolls the text); the adopted cursor rule V1 (the text cursor ends on the
 // row the top of the final sixel row falls in, at the image's first column),
 // whose Windows side is checked by the ConPTY cursor-sync gate; the owner
-// decisions D1 (an image erases the text it covers) and S4 (images on one row
-// composite); the anchors A1 (one slice per row, owned by the row and then its
+// decisions D1 (an image erases the text it covers), D2 (image rows break
+// incoming and outgoing soft wraps) and S4 (images on one row composite);
+// the anchors A1 (one slice per row, owned by the row and then its
 // history record), A2/I5 (the decoded-size cap keeps geometry) and A7/I9 (a
 // row record over the record limit keeps its text and drops its image).
 // Behavior no oracle settles yet is marked provisional where it is asserted.
@@ -1084,14 +1085,35 @@ bool test_image_rows_start_their_own_logical_lines()
     ok &= check(wrapped_onto.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 1) != nullptr,
         "the wrapped text leaves the image cells it does not reach");
 
-    // Text wrapping off an image row stays soft (provisional: no reference
-    // decides it; only wraps onto an image row have to be hard).
+    // D2 also keeps text printed after an image on a separate logical line
+    // when it runs past that row's margin. Reflow must not join it back.
     term::Terminal_screen_model wrapped_off = make_model(4, 10);
-    wrapped_off.ingest(
-        cursor_to(1, 0) + sixel("9;1", solid_rows(3, 1)) + cursor_to(1, 5) + "vwxyz12" +
+    wrapped_off.ingest(cursor_to(1, 0) + sixel("9;1", solid_rows(3, 1)));
+    const std::shared_ptr<const term::Terminal_image_slice> placed_slice = slice_at(wrapped_off, 1);
+    wrapped_off.ingest(cursor_to(1, 5) + "vwxyz12");
+    wrapped_off.resize(term::terminal_grid_size_t{4, 20});
+    ok &= check(wrapped_off.row_text(1) == QStringLiteral("     vwxyz") &&
+            wrapped_off.row_text(2) == QStringLiteral("12"),
+        "widening leaves later text beyond an image row on its own logical line");
+    wrapped_off.resize(term::terminal_grid_size_t{4, 10});
+    ok &= check(slice_at(wrapped_off, 1) == placed_slice,
+        "wrapping off an image row and resizing keeps its original pixels");
+    wrapped_off.ingest(push_into_history);
+    ok &= check(history_wrap_state(wrapped_off, 1) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "text wrapping off an image row keeps a hard boundary in history");
+    ok &= check(slices_equal(
+            wrapped_off.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 1),
+            placed_slice),
+        "the hard-bounded image row reaches history without losing pixels");
+
+    // At the bottom margin the source row scrolls upward while the text
+    // continues onto a fresh row. Its outgoing boundary still belongs to it.
+    term::Terminal_screen_model scrolled_off = make_model(4, 10);
+    scrolled_off.ingest(
+        cursor_to(3, 0) + sixel("9;1", solid_rows(3, 1)) + cursor_to(3, 5) + "vwxyz12" +
         push_into_history);
-    ok &= check(history_wrap_state(wrapped_off, 1) == term::Terminal_retained_row_wrap_state::SOFT_WRAP,
-        "text wrapping off an image row wraps softly (provisional)");
+    ok &= check(history_wrap_state(scrolled_off, 3) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "wrapping off an image at the bottom margin keeps its hard boundary after scrolling");
 
     return ok;
 }
