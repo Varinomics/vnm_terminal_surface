@@ -1518,6 +1518,93 @@ bool check_budgeted_runs(
     return ok;
 }
 
+// Every stop a sixel work budget makes is a place a chunk could end. For
+// every byte boundary of a compact sixel corpus, the corpus up to it taken in
+// unit budget steps leaves the state that taking it as one chunk leaves: fed
+// the same suffix, both runs give the same ordered actions, screen, live row
+// images and history. The corpus holds parameters pending across the
+// boundaries, an ignored ESC, both ST forms, CAN, SUB, a recovery and UTF-8
+// sequences whose continuation bytes are C1 terminators, and scrolls image
+// rows into history.
+bool check_budget_stops_are_chunk_cuts()
+{
+    bool ok = true;
+
+    QByteArray corpus("A");
+    corpus += QByteArray("\x1bP0;1q\"1;1;8;40#1;2;100;0;0#1!8~-\x1bX#1!8~-~");
+    corpus += QByteArray("\xc2\x9c~\xe2\x80\x9b~\x1b\\B\r\n");
+    corpus += QByteArray("\x1bPq\"1;1;6;24#2;2;0;100;0!6~-!6~\x9c");
+    corpus += QByteArray("\x1bPq\"1;1;3;3#1~\x18");
+    corpus += QByteArray("\x1bPq#1~~\x1a");
+    corpus += QByteArray("\x1bPq#1~~\x1b[1mC\x1b[0m");
+    corpus += QByteArray("\r\nx\r\ny\r\nz\r\nend");
+
+    term::Terminal_screen_model_config config{term::terminal_grid_size_t{3, 12}, 6, 4};
+    config.cell_pixel_size = term::terminal_cell_pixel_size_t{10, 20};
+
+    struct Run
+    {
+        std::vector<std::string>  actions;
+        bool                      progress = true;
+    };
+    const auto collect = [](Run& run, const term::Terminal_screen_model_result& result) {
+        for (const term::Parser_action& action : result.actions) {
+            run.actions.push_back(action_summary(action));
+        }
+    };
+
+    bool same_everywhere = true;
+    bool progress_everywhere = true;
+    for (qsizetype boundary = 0; boundary <= corpus.size(); ++boundary) {
+        const std::string label = "budget stops as chunk cuts at byte " + std::to_string(boundary);
+        const QByteArrayView prefix = QByteArrayView(corpus).first(boundary);
+        const QByteArrayView suffix = QByteArrayView(corpus).sliced(boundary);
+
+        // The prefix in unit budget steps: each call takes a byte, resolves
+        // one it held, or continues a placement.
+        term::Terminal_screen_model stepped(config);
+        Run stepped_run;
+        QByteArrayView rest = prefix;
+        for (int calls = 0; (!rest.empty() || stepped.sixel_placement_pending()) && calls < 100000; ++calls) {
+            term::Sixel_work_budget budget(1U);
+            const bool continuing = stepped.sixel_placement_pending();
+            const term::Terminal_screen_model_result result = continuing
+                ? stepped.ingest({}, nullptr, &budget)
+                : stepped.ingest(rest, nullptr, &budget);
+            collect(stepped_run, result);
+            stepped_run.progress = stepped_run.progress &&
+                (continuing || result.consumed_bytes > 0 || !result.actions.empty());
+            rest = rest.sliced(result.consumed_bytes);
+        }
+        collect(stepped_run, stepped.ingest(suffix));
+
+        // The prefix as one chunk.
+        term::Terminal_screen_model chunked(config);
+        Run chunked_run;
+        collect(chunked_run, chunked.ingest(prefix));
+        collect(chunked_run, chunked.ingest(suffix));
+
+        progress_everywhere = progress_everywhere && rest.empty() && stepped_run.progress;
+        const bool same =
+            stepped_run.actions == chunked_run.actions &&
+            stepped.visible_text() == chunked.visible_text() &&
+            stepped.cursor_position() == chunked.cursor_position() &&
+            history_records(stepped) == history_records(chunked) &&
+            snapshots_equivalent(stepped.render_snapshot(1U), chunked.render_snapshot(1U), label);
+        if (!same) {
+            ok &= check(stepped_run.actions == chunked_run.actions,
+                label + ": ordered actions differ from the chunk cut");
+            ok &= check(history_records(stepped) == history_records(chunked),
+                label + ": history records differ from the chunk cut");
+        }
+        same_everywhere = same_everywhere && same;
+    }
+    ok &= check(progress_everywhere, "every budgeted call takes a byte or advances held work");
+    ok &= check(same_everywhere,
+        "every budget stop leaves the state of a chunk cut, for every byte boundary");
+    return ok;
+}
+
 std::vector<int> one_chunk_plan(std::size_t byte_count)
 {
     return {static_cast<int>(byte_count)};
@@ -2740,6 +2827,7 @@ int main(int argc, char** argv)
     for (const Test_case& test_case : cases) {
         ok &= run_case(test_case);
     }
+    ok &= check_budget_stops_are_chunk_cuts();
 
     return ok ? 0 : 1;
 }
