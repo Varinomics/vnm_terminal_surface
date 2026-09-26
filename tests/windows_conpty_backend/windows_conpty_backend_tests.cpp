@@ -4873,6 +4873,7 @@ bool test_future_queued_interrupt_does_not_keep_cleared_exit_130_observation(
         "future-interrupt fixture accepts clearing ordinary write");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-normal-read")),
         "future-interrupt fixture consumes ordinary byte after interrupt");
+    const auto cleared_state = backend->write_state_for_testing();
 
     constexpr std::size_t blocking_write_size =
         term::k_native_backend_max_queued_write_bytes - 1U;
@@ -4887,14 +4888,35 @@ bool test_future_queued_interrupt_does_not_keep_cleared_exit_130_observation(
     const term::Terminal_backend_result future_interrupt = backend->interrupt();
     ok &= check(future_interrupt.code == term::Terminal_backend_result_code::ACCEPTED,
         "future-interrupt fixture accepts queued future interrupt");
+    const auto queued_state = backend->write_state_for_testing();
     ok &= check(write_gate_file(gate_path),
         "future-interrupt fixture exit gate is released");
     ok &= check(capture.wait_for_exit(), "future-interrupt fixture exits");
+    const auto exited_state = backend->write_state_for_testing();
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
-    ok &= check(exit.has_value() &&
+    const bool natural_exit = exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::EXITED &&
-        exit->exit_code == 130,
+        exit->exit_code == 130;
+    if (!natural_exit) {
+        const auto report_state = [](const char* phase, const auto& state) {
+            std::cerr << "future-interrupt state: phase=" << phase
+                      << " queued_bytes=" << state.queued_write_bytes
+                      << " queued_count=" << state.queued_write_count
+                      << " in_flight=" << state.in_flight_write_bytes
+                      << " successful=" << state.successful_write_count
+                      << " failed=" << state.failed_write_count
+                      << " interrupt_left_queue=" << state.interrupt_left_write_queue
+                      << " stopping=" << state.stopping << '\n';
+        };
+        std::cerr << "future-interrupt exit: present=" << exit.has_value()
+                  << " reason=" << (exit ? static_cast<int>(exit->reason) : -1)
+                  << " code=" << (exit ? exit->exit_code : -1) << '\n';
+        report_state("after-clearing-output", cleared_state);
+        report_state("after-future-enqueue", queued_state);
+        report_state("after-exit-wait", exited_state);
+    }
+    ok &= check(natural_exit,
         "future queued interrupt does not keep cleared code-130 observation");
     ok &= check_no_backend_errors(capture,
         "future-interrupt fixture produces no backend errors");
