@@ -21985,6 +21985,95 @@ bool test_atlas_failed_image_texture_keeps_text_and_recovers(QGuiApplication& ap
     return ok;
 }
 
+// Oracle: I4 makes the GPU image cache disposable. Qt scene-graph invalidation
+// must restore the committed image from its unchanged immutable snapshot.
+bool test_atlas_images_recover_after_scene_graph_invalidation(QGuiApplication& app)
+{
+    std::atomic<bool> invalidated = false;
+    auto window = std::make_unique<QQuickWindow>();
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, *window, surface, 20150U, fixture)) {
+        return false;
+    }
+
+    const QColor red(220, 30, 30);
+    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(20151U);
+    term::set_render_snapshot_row_image(
+        snapshot,
+        0,
+        make_atlas_test_image_slice(3, fixture.device_cell, 2, red, 20151001U));
+    term::Qsg_atlas_frame_report committed;
+    if (!check(publish_atlas_image_snapshot(app, *window, surface, snapshot, committed, 1),
+            "image invalidation fixture commits its image"))
+    {
+        return false;
+    }
+    const QImage committed_image = window->grabWindow();
+    if (!check(!committed_image.isNull() &&
+            colors_near(atlas_image_cell_color(committed_image, fixture, 0, 2), red),
+            "image invalidation fixture visibly draws its committed image"))
+    {
+        return false;
+    }
+
+    QObject::connect(window.get(), &QQuickWindow::sceneGraphInvalidated, &surface,
+        [&] { invalidated.store(true, std::memory_order_release); }, Qt::DirectConnection);
+    // The basic render loop keeps its scene graph after hide/releaseResources.
+    // Destroy its window owner so both render loops actually invalidate it,
+    // while the terminal item and its committed snapshot survive.
+    const QSize window_size = window->size();
+    window->hide();
+    surface.setParentItem(nullptr);
+    window.reset();
+    const bool resources_released = pump_atlas_idle_until(
+        app,
+        surface,
+        [&](const term::Qsg_atlas_frame_report&) {
+            return invalidated.load(std::memory_order_acquire);
+        });
+    if (!check(resources_released, "Qt invalidates the populated image scene graph")) {
+        return false;
+    }
+
+    window = std::make_unique<QQuickWindow>();
+    window->resize(window_size);
+    surface.setParentItem(window->contentItem());
+    window->show();
+    const bool restored = pump_until(
+        app,
+        *window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return
+                report.prepare_count > committed.prepare_count &&
+                atlas_report_render_state_ready(report)        &&
+                report.prepared_generation_committed           &&
+                report.render_snapshot_sequence == 20151U      &&
+                report.render.images.draws == 1;
+        });
+    const term::Qsg_atlas_frame_report recovered =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const QImage recovered_image = window->grabWindow();
+    bool ok = check(restored && recovered.render.images.cached_textures == 1 &&
+            recovered.render.images.resource_failures == 0,
+        "scene-graph recovery restores the committed image without a new snapshot");
+    ok &= check_same_frame(committed_image, recovered_image,
+        "scene-graph recovery preserves committed image and text pixels");
+
+    const std::uint64_t previous_prepare =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface).prepare_count;
+    term::Qsg_atlas_frame_report steady;
+    ok &= check(pump_next_atlas_report(app, *window, surface, previous_prepare, steady) &&
+            steady.render_snapshot_sequence == 20151U &&
+            steady.render.images.draws == 1           &&
+            steady.render.images.cached_textures == 1 &&
+            steady.render.images.texture_creations == 0 &&
+            steady.render.images.uploaded_bytes == 0U,
+        "steady image repaint after invalidation reuses the restored texture without upload");
+    return ok;
+}
+
 // Oracle: the bounded prepare retry belongs to rejected prepares. A frame that
 // committed its text but not its images must neither prepare frames on its own
 // nor spend that retry budget, so a later rejected prepare still recovers.
@@ -22507,6 +22596,7 @@ int main(int argc, char** argv)
         bool ok = test_atlas_persistent_rect_failure_is_bounded(app);
         ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
         ok &= test_atlas_failed_image_texture_keeps_text_and_recovers(app);
+        ok &= test_atlas_images_recover_after_scene_graph_invalidation(app);
         ok &= test_atlas_lasting_image_failure_leaves_text_retries(app);
         return ok ? 0 : 1;
     }
