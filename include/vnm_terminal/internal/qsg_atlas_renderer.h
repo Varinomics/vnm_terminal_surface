@@ -817,6 +817,10 @@ struct Qsg_atlas_frame_report
     std::uint64_t capture_count                   = 0U;
     std::uint64_t prepare_count                   = 0U;
     std::uint64_t prepare_elapsed_ns              = 0U;
+    // Image texture creations and uploaded bytes summed over every prepare
+    // recorded, which a reader polling between prepares cannot sum itself.
+    std::uint64_t image_texture_creations_total   = 0U;
+    std::uint64_t image_uploaded_bytes_total      = 0U;
     std::uint64_t render_count                    = 0U;
     std::uint64_t render_elapsed_ns               = 0U;
     std::uint64_t capture_sequence                = 0U;

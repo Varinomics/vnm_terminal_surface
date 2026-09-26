@@ -22035,13 +22035,12 @@ bool test_atlas_images_recover_after_scene_graph_invalidation(QGuiApplication& a
         return false;
     }
 
-    // A frame report counts only its own prepare, so the recovery prepares are
-    // summed as they are seen; a skipped prepare could hide a second creation.
-    std::uint64_t last_prepare_count =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface).prepare_count;
-    bool          every_prepare_seen = true;
-    int           texture_creations  = 0;
-    std::uint64_t uploaded_bytes     = 0U;
+    // A frame report's image counts cover only its own prepare, and polling
+    // misses prepares whenever the threaded render loop renders two frames
+    // between polls, so the recovery is measured by the recorder's totals
+    // over every prepare since the invalidation.
+    const term::Qsg_atlas_frame_report invalidated_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     window = std::make_unique<QQuickWindow>();
     window->resize(window_size);
     surface.setParentItem(window->contentItem());
@@ -22051,13 +22050,6 @@ bool test_atlas_images_recover_after_scene_graph_invalidation(QGuiApplication& a
         *window,
         surface,
         [&](const term::Qsg_atlas_frame_report& report) {
-            if (report.prepare_count != last_prepare_count) {
-                every_prepare_seen =
-                    every_prepare_seen && report.prepare_count == last_prepare_count + 1U;
-                last_prepare_count = report.prepare_count;
-                texture_creations += report.render.images.texture_creations;
-                uploaded_bytes    += report.render.images.uploaded_bytes;
-            }
             return
                 report.prepare_count > committed.prepare_count &&
                 atlas_report_render_state_ready(report)        &&
@@ -22071,8 +22063,12 @@ bool test_atlas_images_recover_after_scene_graph_invalidation(QGuiApplication& a
     bool ok = check(restored && recovered.render.images.cached_textures == 1 &&
             recovered.render.images.resource_failures == 0,
         "scene-graph recovery restores the committed image without a new snapshot");
-    ok &= check(every_prepare_seen && texture_creations == 1 &&
-            uploaded_bytes == static_cast<std::uint64_t>(image_slice->pixels.sizeInBytes()),
+    ok &= check(
+        recovered.image_texture_creations_total ==
+                invalidated_report.image_texture_creations_total + 1U &&
+            recovered.image_uploaded_bytes_total ==
+                invalidated_report.image_uploaded_bytes_total +
+                    static_cast<std::uint64_t>(image_slice->pixels.sizeInBytes()),
         "scene-graph recovery creates the image texture once and uploads the slice once");
     ok &= check_same_frame(committed_image, recovered_image,
         "scene-graph recovery preserves committed image and text pixels");
@@ -22084,8 +22080,8 @@ bool test_atlas_images_recover_after_scene_graph_invalidation(QGuiApplication& a
             steady.render_snapshot_sequence == 20151U &&
             steady.render.images.draws == 1           &&
             steady.render.images.cached_textures == 1 &&
-            steady.render.images.texture_creations == 0 &&
-            steady.render.images.uploaded_bytes == 0U,
+            steady.image_texture_creations_total == recovered.image_texture_creations_total &&
+            steady.image_uploaded_bytes_total == recovered.image_uploaded_bytes_total,
         "steady image repaint after invalidation reuses the restored texture without upload");
     return ok;
 }
