@@ -1180,6 +1180,21 @@ bool snapshots_equivalent(
         label + ": selection spans changed");
     ok &= check(modes_equal(left.modes, right.modes), label + ": modes changed");
 
+    // Each live row's image: its pixels, geometry and producing cell size.
+    // Revisions are unique in the process, so two runs never share them.
+    for (int row = 0; row < std::min(left.grid_size.rows, right.grid_size.rows); ++row) {
+        const std::shared_ptr<const term::Terminal_image_slice> left_image =
+            term::render_snapshot_row_image(left, row);
+        const std::shared_ptr<const term::Terminal_image_slice> right_image =
+            term::render_snapshot_row_image(right, row);
+        ok &= check((left_image == nullptr) == (right_image == nullptr) &&
+                (left_image == nullptr ||
+                    (left_image->first_column == right_image->first_column &&
+                        left_image->cell_pixel_size == right_image->cell_pixel_size &&
+                        left_image->pixels == right_image->pixels)),
+            label + ": live row image changed at row " + std::to_string(row));
+    }
+
     return ok;
 }
 
@@ -1445,28 +1460,37 @@ bool run_with_budget(
     return ok;
 }
 
+// The history records an unbudgeted run of one chunk plan leaves.
+std::vector<QByteArray> unbudgeted_history(const Test_case& test_case, const Chunk_plan& plan)
+{
+    term::Terminal_screen_model model(test_case.config);
+    std::size_t offset = 0U;
+    for (const int chunk_size : plan.chunk_sizes) {
+        const std::size_t size = std::min<std::size_t>(
+            static_cast<std::size_t>(test_case.bytes.size()) - offset,
+            static_cast<std::size_t>(chunk_size));
+        model.ingest(QByteArrayView(
+            test_case.bytes.constData() + static_cast<qsizetype>(offset),
+            static_cast<qsizetype>(size)));
+        offset += size;
+    }
+    return history_records(model);
+}
+
 // Budgeted runs of one chunk plan against its unbudgeted run, which is the
-// oracle: every observable state and ordered effect is the same.
-bool check_budgeted_runs(const Test_case& test_case, const Chunk_plan& plan)
+// oracle for ordered effects: every observable state and ordered effect is
+// the same. History records, like the live screen, do not depend on the cuts
+// either, so every plan's, budgeted or not, matches the one baseline.
+bool check_budgeted_runs(
+    const Test_case&                test_case,
+    const Chunk_plan&               plan,
+    const std::vector<QByteArray>&  baseline_history)
 {
     bool ok = true;
     Run_result oracle;
     ok &= run_with_chunks(test_case, plan, oracle);
-    std::vector<QByteArray> oracle_history;
-    {
-        term::Terminal_screen_model model(test_case.config);
-        std::size_t offset = 0U;
-        for (const int chunk_size : plan.chunk_sizes) {
-            const std::size_t size = std::min<std::size_t>(
-                static_cast<std::size_t>(test_case.bytes.size()) - offset,
-                static_cast<std::size_t>(chunk_size));
-            model.ingest(QByteArrayView(
-                test_case.bytes.constData() + static_cast<qsizetype>(offset),
-                static_cast<qsizetype>(size)));
-            offset += size;
-        }
-        oracle_history = history_records(model);
-    }
+    ok &= check(unbudgeted_history(test_case, plan) == baseline_history,
+        test_case.name + "/" + plan.name + ": history records differ from the one-shot baseline");
 
     std::uint64_t plan_seed = test_case.chunk_seed;
     for (const char c : plan.name) {
@@ -1488,8 +1512,8 @@ bool check_budgeted_runs(const Test_case& test_case, const Chunk_plan& plan)
                 budgeted.scrollback_size == oracle.scrollback_size,
             label + ": state differs from the unbudgeted run");
         ok &= snapshots_equivalent(budgeted.snapshot, oracle.snapshot, label);
-        ok &= check(budgeted_history == oracle_history,
-            label + ": history records differ from the unbudgeted run");
+        ok &= check(budgeted_history == baseline_history,
+            label + ": history records differ from the one-shot baseline");
     }
     return ok;
 }
@@ -1830,8 +1854,9 @@ bool run_case(const Test_case& test_case)
 
     // Sixel work stops and resumes wherever a budget runs out; for every
     // chunk plan that must leave exactly what the unbudgeted plan leaves.
+    const std::vector<QByteArray> baseline_history = unbudgeted_history(test_case, plans.front());
     for (const Chunk_plan& plan : plans) {
-        ok &= check_budgeted_runs(test_case, plan);
+        ok &= check_budgeted_runs(test_case, plan, baseline_history);
     }
 
     return ok;
