@@ -8,8 +8,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
-#include <utility>
 #include <vector>
 
 namespace vnm_terminal::internal {
@@ -21,12 +19,12 @@ constexpr std::int64_t k_sixel_bytes_per_pixel      = 4;
 
 // The sixel work one bounded drain step may do, in units of about one pixel
 // written or copied. A description of a few bytes can expand into an image as
-// large as the decoded-size cap, so decoding and placement charge each step
-// before it runs and stop when the next one does not fit; the caller resumes
-// them in a later step. The first charge of a budget always fits, so every
-// step makes progress. A raster reservation is priced from the byte that
-// causes it and paid for with that byte, before anything changes; only an
-// image end is charged afterwards. No budget means no limit.
+// large as the decoded-size cap. Decoding charges the work each byte does once
+// it is done, allocations included, and stops after the byte that spends the
+// budget, never before a byte, so its stops are the places a chunk could end.
+// Placement charges each of its steps before it runs and waits when the next
+// one does not fit. The first charge of a budget always fits, so every step
+// makes progress. No budget means no limit.
 class Sixel_work_budget final
 {
 public:
@@ -100,10 +98,10 @@ public:
 
     void begin(QByteArrayView header_parameters);
 
-    // Decodes data until it ends or the budget cannot pay for the next byte's
-    // work (a draw, a graphics new line, a raster reservation), and returns how
-    // many bytes it took; the caller hands over the rest later, and a byte
-    // left over has changed nothing, the command it would complete included. With the string's UTF-8 scan state it also
+    // Decodes data until it ends, or until a byte's work spends the budget:
+    // that byte is taken and charged, and decoding stops after it. Returns how
+    // many bytes it took; the caller hands over the rest later, exactly as if
+    // the chunk had ended there. With the string's UTF-8 scan state it also
     // stops before a byte that could end the string (ESC, CAN, SUB, ST or
     // CSI outside a UTF-8 sequence), and advances that state over exactly
     // the bytes it looks at, so the caller scans no byte twice.
@@ -139,14 +137,7 @@ private:
     void draw_sixel(int bits, int repeat);
     void expand_band();
     void next_line();
-    // The capacity reserve() grows a raster of the given capacity to for a
-    // request; none when the capacity already covers it.
-    std::optional<std::pair<std::int64_t, std::int64_t>> grown_capacity(
-        std::int64_t capacity_width,
-        std::int64_t capacity_height,
-        std::int64_t width,
-        std::int64_t height) const;
-    std::uint64_t reservation_cost(unsigned char byte) const;
+    void decode_byte(unsigned char byte);
     void reserve(std::int64_t width, std::int64_t height);
     void grow_extent_within_limit();
     std::int64_t limit_pixels() const;
@@ -178,8 +169,8 @@ private:
     std::uint32_t*             m_pixels              = nullptr;
     std::int64_t               m_stride_pixels       = 0;
 
-    // Every pixel raster reservations have allocated, so that an image end
-    // charges for the growth it causes.
+    // Every pixel raster reservations have allocated, so that the byte or the
+    // image end that causes one is charged for it.
     std::uint64_t              m_reserved_pixels     = 0U;
 
     std::size_t                m_limit_bytes;

@@ -620,10 +620,10 @@ public:
     Terminal_screen_model(Terminal_screen_model&&)            = default;
     Terminal_screen_model& operator=(Terminal_screen_model&&) = default;
 
-    // Applies bytes. With a budget, sixel decoding and placement stop where
-    // the budget cannot pay for their next step, and an image end that spends
-    // the budget ends the call; the result says how much was consumed and
-    // that work is pending. While a placement is pending, the only valid call
+    // Applies bytes. With a budget, sixel decoding stops after the byte whose
+    // work spends the budget, where a chunk could have ended, and placement
+    // before a step the budget cannot pay for; the result says how much was
+    // consumed and that work is pending. While a placement is pending, the only valid call
     // is one with no bytes, which continues it: nothing else is parsed, and
     // no other mutation (resize, capacity, scrollback, color or cell pixel
     // size) may run until it ends; the session completes pending work before

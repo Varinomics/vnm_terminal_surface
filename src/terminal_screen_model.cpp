@@ -764,7 +764,16 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         std::vector<Parser_action> parser_actions;
         {
             VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::parser_ingest");
+            const qsizetype parsed_before = parsed;
+            const bool budget_spent_before =
+                sixel_work_budget != nullptr && sixel_work_budget->exhausted();
             parser_actions = m_parser.ingest(bytes, parsed, sixel_work_budget);
+            // Every parse makes progress: it takes bytes, or it resolves input
+            // it held before (a recovery at a held ESC emits its diagnostic).
+            // Only a budget work earlier in the step already spent, such as a
+            // placement continuation's, may end it before it takes anything.
+            Q_ASSERT(bytes.empty() || parsed > parsed_before || !parser_actions.empty() ||
+                budget_spent_before);
         }
 
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::apply_parser_actions");

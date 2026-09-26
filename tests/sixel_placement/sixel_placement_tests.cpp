@@ -1753,45 +1753,54 @@ bool test_composites_are_paid_for()
     return ok;
 }
 
-// Budgeted work ends the ingest at the end of its sixel string whatever ends
-// the string: a raster allocated and then cancelled (CAN, SUB), abandoned at
-// a recovery, or discarded over the cap stops the call as a completed image
-// does, so a run of such strings cannot allocate past the budget.
-bool test_every_sixel_string_end_is_a_budget_boundary()
+// A raster allocated and then abandoned (CAN, SUB, a recovery) is charged to
+// the byte that allocated it, and the call stops right after that byte, so a
+// run of such strings allocates at most one raster per call however each
+// string ends; later calls end each string and take the text after them.
+bool test_abandoned_rasters_take_one_allocation_per_call()
 {
     bool ok = true;
 
-    struct Case
-    {
-        const char* name;
-        QByteArray  image;
-        qsizetype   consumed;
-    };
     const QByteArray allocated("\x1bPq\"1;1;1448;1448#1");
-    const std::vector<Case> cases = {
-        {"CAN", allocated + QByteArray("\x18"), allocated.size() + 1},
-        {"SUB", allocated + QByteArray("\x1a"), allocated.size() + 1},
-        // A recovery leaves its CSI to be parsed after the string.
-        {"recovery", allocated + QByteArray("\x1b[0m"), allocated.size()},
+    const std::vector<std::pair<const char*, QByteArray>> cases = {
+        {"CAN", allocated + QByteArray("\x18")},
+        {"SUB", allocated + QByteArray("\x1a")},
+        {"recovery", allocated + QByteArray("\x1b[0m")},
     };
-    for (const Case& test_case : cases) {
-        const QByteArray bytes =
-            test_case.image + test_case.image + test_case.image + QByteArray("done");
-        term::Terminal_screen_model model = make_model(20, 160);
-        term::Sixel_work_budget budget(1U);
-        const term::Terminal_screen_model_result result = model.ingest(bytes, nullptr, &budget);
-        ok &= check(result.sixel_work_pending && result.consumed_bytes == test_case.consumed,
-            std::string(test_case.name) + ": an abandoned image that spent the budget ends the call");
-
-        qsizetype offset = result.consumed_bytes;
-        int calls = 1;
-        for (; offset < bytes.size() && calls < 32; ++calls) {
-            term::Sixel_work_budget next(1U);
-            offset += model.ingest(QByteArrayView(bytes).sliced(offset), nullptr, &next).consumed_bytes;
+    for (const auto& [name, image] : cases) {
+        const QByteArray bytes = image + image + image + QByteArray("done");
+        // The byte that completes each raster's attributes allocates it.
+        std::vector<qsizetype> allocations;
+        for (qsizetype index = bytes.indexOf('"'); index >= 0; index = bytes.indexOf('"', index + 1)) {
+            allocations.push_back(bytes.indexOf('#', index));
         }
+
+        term::Terminal_screen_model model = make_model(20, 160);
+        qsizetype offset = 0;
+        int calls = 0;
+        int most_per_call = 0;
+        qsizetype first_stop = -1;
+        for (; offset < bytes.size() && calls < 32; ++calls) {
+            const qsizetype before = offset;
+            term::Sixel_work_budget budget(1U);
+            offset += model.ingest(QByteArrayView(bytes).sliced(offset), nullptr, &budget).consumed_bytes;
+            if (first_stop < 0) {
+                first_stop = offset;
+            }
+            most_per_call = std::max(most_per_call, static_cast<int>(std::count_if(
+                allocations.begin(),
+                allocations.end(),
+                [before, offset](qsizetype allocation) {
+                    return allocation >= before && allocation < offset;
+                })));
+        }
+        ok &= check(first_stop == allocations.front() + 1,
+            std::string(name) + ": the first call stops right after the byte that allocated");
+        ok &= check(most_per_call == 1,
+            std::string(name) + ": no call allocates more than one raster");
         ok &= check(offset == bytes.size() && calls >= 3 &&
                 model.visible_text().contains(QStringLiteral("done")),
-            std::string(test_case.name) + ": later calls take one string each and then the text");
+            std::string(name) + ": later calls end each string and take the text after them");
     }
     return ok;
 }
@@ -1827,6 +1836,6 @@ int main()
     ok &= test_budgeted_placement_matches_an_unbudgeted_one();
     ok &= test_spent_budget_ends_the_ingest_at_an_image_end();
     ok &= test_composites_are_paid_for();
-    ok &= test_every_sixel_string_end_is_a_budget_boundary();
+    ok &= test_abandoned_rasters_take_one_allocation_per_call();
     return ok ? 0 : 1;
 }

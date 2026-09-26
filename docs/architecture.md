@@ -157,17 +157,19 @@ however many it describes.
 
 A few bytes of sixel data can describe work as large as the cap, so a drain
 with a deadline gives each step a `Sixel_work_budget` (`sixel_decoder.h`),
-counted in pixels written or copied. Decoding stops before a draw or graphics
-new line the budget cannot pay for, and placement goes a band or a scroll at
-a time; the model reports what it consumed and that work is pending. Every
-end of a sixel string (the image completes, or a cancel, a recovery or an
-over-cap discard abandons it) is a place where the parser returns, so a spent
-budget is seen there whatever ended the string. An image end, which
-allocates, fills and expands the whole raster, is one step that always runs,
-and a budget it spends ends the step there, placed or not; it is the largest
-indivisible step, so a drain call can overrun its deadline by about that much
-(accepted allowance: about 10 ms on the reference host for a cap-size image,
-typically 2 to 6 ms). A placement that has started holds publication like
+counted in pixels written or copied. Decoding never refuses a byte: it charges
+the work each byte does once it is done, its draw, band expansion or raster
+allocation, and stops after the byte that spends the budget, before looking at
+the next one, so each stop is a place a chunk could have ended (an ESC taken as
+data and the byte after it that decided so are one transition). Placement
+goes a band or a scroll at a time, each paid for before it runs; the model
+reports what it consumed and that work is pending. Every end of a sixel
+string (the image completes, or a cancel, a recovery or an over-cap discard
+abandons it) is a place where the parser returns, so a spent budget is seen
+there whatever ended the string. A single byte's work, and an image end, which
+allocates, fills and expands the whole raster, cannot be divided, so a drain
+call can overrun its deadline by about that much (accepted allowance: about
+10 ms on the reference host for a cap-size image). A placement that has started holds publication like
 synchronized output until it ends, so no published snapshot shows part of an
 image; a forced release of a stale synchronized update ends only the
 application's hold, and never places or publishes part of an image.

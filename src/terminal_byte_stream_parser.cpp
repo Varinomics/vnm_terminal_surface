@@ -1310,25 +1310,45 @@ void Terminal_byte_stream_parser::continue_string(
 }
 
 // Sixel data streams to the decoder, which stops before a byte that could end
-// the string or where its budget runs out, and advances the string's UTF-8
-// scan state over exactly the bytes it looks at: no byte is scanned twice,
-// and a stop leaves the rest unscanned. The terminators and their handling are
-// find_string_terminator's.
+// the string, or after the byte that spends the budget, and advances the
+// string's UTF-8 scan state over exactly the bytes it takes: no byte is
+// scanned twice, and a stop leaves the rest unscanned. A spent budget ends the
+// call before any byte after it is looked at, so every stop is a place a chunk
+// could end. The terminators and their handling are find_string_terminator's.
 void Terminal_byte_stream_parser::continue_sixel_string(
     QByteArrayView                 bytes,
     qsizetype&                     offset,
     std::vector<Parser_action>&    actions)
 {
+    const auto budget_spent = [this]() {
+        return m_sixel_work_budget != nullptr && m_sixel_work_budget->exhausted();
+    };
+
+    // An ESC taken as data and the byte after it, which decided that, are
+    // one transition: no stop comes between them.
+    bool deciding_byte = false;
     while (offset < bytes.size()) {
-        offset += m_sixel_decoder.decode(
+        if (!deciding_byte && budget_spent()) {
+            m_sixel_work_deferred = true;
+            return;
+        }
+
+        const qsizetype taken = m_sixel_decoder.decode(
             bytes.sliced(offset),
             actions,
             m_sixel_work_budget,
             &m_string_utf8_scan_state);
+        offset += taken;
         if (offset == bytes.size()) {
             return;
         }
+        if (taken > 0 && budget_spent()) {
+            m_sixel_work_deferred = true;
+            return;
+        }
+        deciding_byte = false;
 
+        // The decoder stopped before a byte that could end the string.
         Parser_string_terminator terminator = Parser_string_terminator::END_OF_INPUT;
         const unsigned char byte = byte_at(bytes, offset);
         if (byte == 0x9cU) {
@@ -1342,8 +1362,8 @@ void Terminal_byte_stream_parser::continue_sixel_string(
         if (byte == 0x18U || byte == 0x1aU) {
             terminator = Parser_string_terminator::CANCEL;
         }
-        else
-        if (byte == 0x1bU) {
+        else {
+            Q_ASSERT(byte == 0x1bU);
             // What an ESC at the end starts is the next chunk's to say.
             if (offset + 1 == bytes.size()) {
                 m_pending_prefix = QByteArray(bytes.data() + offset, 1);
@@ -1360,18 +1380,15 @@ void Terminal_byte_stream_parser::continue_sixel_string(
             }
             else {
                 // Any other ESC is data, which the decoder ignores; it still
-                // ends a command collecting parameters.
+                // ends a command collecting parameters. The byte after it is
+                // taken in the same transition.
                 offset += m_sixel_decoder.decode(
                     bytes.sliced(offset, 1),
                     actions,
                     m_sixel_work_budget);
+                deciding_byte = true;
                 continue;
             }
-        }
-        else {
-            // The budget ran out before a draw or graphics new line.
-            m_sixel_work_deferred = true;
-            return;
         }
 
         reset_utf8_scan_state(m_string_utf8_scan_state);

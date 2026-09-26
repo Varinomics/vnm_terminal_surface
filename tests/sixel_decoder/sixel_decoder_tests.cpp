@@ -1061,10 +1061,11 @@ bool test_parser_stops_after_each_image_across_chunks()
     return ok;
 }
 
-// With a sixel work budget the parser stops where the budget cannot pay for
-// the next draw, graphics new line or image end, and the bytes it leaves are
-// handed over again in the next step. However small the budget, parsing a
-// stream step by step gives exactly the actions and images of parsing it whole.
+// With a sixel work budget the parser stops after the byte whose work spends
+// it, a draw, a graphics new line, a raster reservation or an image end, and
+// the bytes after it are handed over in the next step. However small the
+// budget, parsing a stream step by step gives exactly the actions and images
+// of parsing it whole.
 bool test_sixel_budget_steps_match_a_whole_parse()
 {
     bool ok = true;
@@ -1150,13 +1151,13 @@ bool test_sixel_budget_steps_match_a_whole_parse()
     return ok;
 }
 
-// A raster reservation is paid for before it allocates. Raster attributes
-// that alternate between two shapes each replace a near-cap transparent
-// raster, which no draw or graphics new line pays for; a budget that cannot
-// pay for the next reservation leaves the byte that would complete the
-// attributes, and the command it completes, for a later call. So a call makes
-// at most one such allocation after its first charge, at a unit budget and at
-// a drain step's budget, and the steps parse exactly as a whole parse does.
+// A raster reservation is charged to the byte that causes it. Raster
+// attributes that alternate between two shapes each replace a near-cap
+// transparent raster, which no draw or graphics new line pays for; the byte
+// that completes them is charged for its allocation, and decoding stops after
+// it once that spends the budget. So a call makes at most one such allocation
+// past its budget, at a unit budget and at a drain step's budget, and the
+// steps parse exactly as a whole parse does.
 bool test_sixel_raster_reservations_are_budgeted()
 {
     bool ok = true;
@@ -1224,6 +1225,58 @@ bool test_sixel_raster_reservations_are_budgeted()
     return ok;
 }
 
+// The two inputs that once stalled or misread a suspended string, at unit
+// budgets: an ignored ESC after raster attributes whose completion spends the
+// budget (it was retried at no progress, forever, inside one call; the test's
+// TIMEOUT bounds that), and a UTF-8 lead byte completing them whose
+// continuation is ST's C1 byte (it was read as ST). Both strings end at CAN
+// without an image, whole and cut right after the ESC or between the two
+// UTF-8 bytes, and every call makes progress.
+bool test_suspension_takes_every_byte_once()
+{
+    bool ok = true;
+
+    const QByteArray prefix("\x1bP0;1q\"1;1;1;1#0\"1;1;2;2");
+    const std::vector<std::pair<std::string, QByteArray>> cases = {
+        {"an ignored ESC", QByteArray("\x1bX\x18", 3)},
+        {"a UTF-8 lead byte", QByteArray("\xc2\x9c\x18", 3)},
+    };
+    for (const auto& [name, tail] : cases) {
+        const QByteArray stream = prefix + tail + QByteArray("after");
+        const std::vector<term::Parser_action> whole = parse(stream);
+        for (const std::optional<qsizetype> split :
+            {std::optional<qsizetype>{}, std::optional<qsizetype>{prefix.size() + 1}})
+        {
+            const std::string label = name + (split.has_value() ? ", cut inside it" : ", whole");
+            term::Terminal_byte_stream_parser parser;
+            std::vector<term::Parser_action> stepped;
+            bool progress = true;
+            qsizetype parsed = 0;
+            const std::vector<QByteArrayView> windows = split.has_value()
+                ? std::vector<QByteArrayView>{
+                    QByteArrayView(stream).first(*split), QByteArrayView(stream).sliced(*split)}
+                : std::vector<QByteArrayView>{QByteArrayView(stream)};
+            for (const QByteArrayView window : windows) {
+                qsizetype offset = 0;
+                for (int calls = 0; offset < window.size() && calls < 1000; ++calls) {
+                    const qsizetype before = offset;
+                    term::Sixel_work_budget budget(1U);
+                    const std::vector<term::Parser_action> actions =
+                        parser.ingest(window, offset, &budget);
+                    progress = progress && (offset > before || !actions.empty());
+                    stepped.insert(stepped.end(), actions.begin(), actions.end());
+                }
+                parsed += offset;
+            }
+            ok &= check(parsed == stream.size() && progress,
+                label + ": every call takes a byte, and the whole stream is taken");
+            ok &= check(images_in(stepped).empty() && same_actions(stepped, whole),
+                label + ": the string ends at CAN without an image, as parsed whole");
+        }
+    }
+    return ok;
+}
+
 // An image end is one step that always runs, whatever is left of the budget:
 // it fills and expands the raster, charges that afterwards, and the draws of
 // the next image wait for a later step.
@@ -1244,7 +1297,7 @@ bool test_sixel_image_end_is_one_step()
     const std::vector<term::Parser_action> next = parser.ingest(stream, offset, &budget);
     ok &= check(images_in(next).empty() && parser.sixel_work_deferred() &&
             offset < stream.size(),
-        "the next image's draw waits for a later step");
+        "with the budget spent, the next image's data waits for a later step");
 
     term::Sixel_work_budget fresh(5000U);
     const std::vector<term::Parser_action> rest = parser.ingest(stream, offset, &fresh);
@@ -1323,6 +1376,7 @@ int main()
     ok &= test_sixel_budget_steps_match_a_whole_parse();
     ok &= test_sixel_image_end_is_one_step();
     ok &= test_sixel_raster_reservations_are_budgeted();
+    ok &= test_suspension_takes_every_byte_once();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }
