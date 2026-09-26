@@ -9839,31 +9839,31 @@ bool test_text_renderer_report_names()
     ok &= check(
         std::strcmp(
             term::qsg_atlas_lcd_subpixel_order_name(
-                term::Terminal_lcd_subpixel_order::NONE),
+                term::Resolved_lcd_subpixel_order::NONE),
             "none") == 0,
         "LCD subpixel order name reports none");
     ok &= check(
         std::strcmp(
             term::qsg_atlas_lcd_subpixel_order_name(
-                term::Terminal_lcd_subpixel_order::RGB),
+                term::Resolved_lcd_subpixel_order::RGB),
             "rgb") == 0,
         "LCD subpixel order name reports rgb");
     ok &= check(
         std::strcmp(
             term::qsg_atlas_lcd_subpixel_order_name(
-                term::Terminal_lcd_subpixel_order::BGR),
+                term::Resolved_lcd_subpixel_order::BGR),
             "bgr") == 0,
         "LCD subpixel order name reports bgr");
     ok &= check(
         std::strcmp(
             term::qsg_atlas_lcd_subpixel_order_name(
-                term::Terminal_lcd_subpixel_order::VRGB),
+                term::Resolved_lcd_subpixel_order::VRGB),
             "vrgb") == 0,
         "LCD subpixel order name reports vrgb");
     ok &= check(
         std::strcmp(
             term::qsg_atlas_lcd_subpixel_order_name(
-                term::Terminal_lcd_subpixel_order::VBGR),
+                term::Resolved_lcd_subpixel_order::VBGR),
             "vbgr") == 0,
         "LCD subpixel order name reports vbgr");
     return ok;
@@ -21424,7 +21424,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         "LCD atlas probe fixture meets the LCD opaque-color precondition");
     ok &= check(
         atlas.atlas_report.render.msdf_lcd_subpixel_order ==
-            term::Terminal_lcd_subpixel_order::RGB,
+            term::Resolved_lcd_subpixel_order::RGB,
         "LCD atlas probe resolves the forced RGB LCD subpixel order");
     ok &= check(
         atlas.atlas_report.render.msdf_lcd_text_enabled,
@@ -21442,7 +21442,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         "LCD atlas probe captures the NONE grayscale control render");
     ok &= check(
         grayscale_control_atlas.atlas_report.render.msdf_lcd_subpixel_order ==
-            term::Terminal_lcd_subpixel_order::NONE &&
+            term::Resolved_lcd_subpixel_order::NONE &&
             !grayscale_control_atlas.atlas_report.render.msdf_lcd_text_enabled &&
             grayscale_control_atlas.atlas_report.render.msdf_text_draw_calls > 0,
         "LCD atlas probe NONE control run draws grayscale MSDF text");

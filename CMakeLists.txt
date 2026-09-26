@@ -168,61 +168,25 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Lin
     set(vnm_terminal_surface_process_custody_required ON)
 endif()
 
-add_library(vnm_terminal_lcd_subpixel_policy STATIC
-    include/vnm_terminal/internal/lcd_subpixel_policy_platform.h
-    include/vnm_terminal/lcd_subpixel_policy.h
-    src/lcd_subpixel_policy.cpp
-)
-
-target_include_directories(vnm_terminal_lcd_subpixel_policy PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
-)
-
-target_link_libraries(vnm_terminal_lcd_subpixel_policy PUBLIC
-    Qt6::Gui
-)
-
-target_link_libraries(vnm_terminal_lcd_subpixel_policy PRIVATE
-    Qt6::GuiPrivate
-)
-
-if(WIN32)
-    target_link_libraries(vnm_terminal_lcd_subpixel_policy PRIVATE
-        user32
-    )
+set(VNM_MSDF_TEXT_BUILD_QT_LCD ON CACHE BOOL "" FORCE)
+option(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT
+    "Make vnm_msdf_text available to the qsg atlas test executable." ON)
+set(vnm_terminal_msdf_atlas_required ${VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER})
+if(vnm_terminal_surface_testing_enabled AND VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT)
+    set(vnm_terminal_msdf_atlas_required ON)
 endif()
-
-if(MSVC)
-    target_compile_options(vnm_terminal_lcd_subpixel_policy PRIVATE
-        /FS
-    )
+if(vnm_terminal_msdf_atlas_required)
+    set(VNM_MSDF_TEXT_BUILD_ATLAS ON CACHE BOOL "" FORCE)
+elseif(NOT DEFINED VNM_MSDF_TEXT_BUILD_ATLAS AND NOT VNM_MSDF_TEXT_BUILD_RHI)
+    set(VNM_MSDF_TEXT_BUILD_ATLAS OFF CACHE BOOL "")
 endif()
-
-if(VNM_TERMINAL_SANITIZE_ADDRESS)
-    if(MSVC)
-        target_compile_options(vnm_terminal_lcd_subpixel_policy PRIVATE
-            /fsanitize=address)
-        target_compile_definitions(vnm_terminal_lcd_subpixel_policy PRIVATE
-            _DISABLE_VECTOR_ANNOTATION
-            _DISABLE_STRING_ANNOTATION
-        )
-    else()
-        target_compile_options(vnm_terminal_lcd_subpixel_policy PRIVATE
-            -fsanitize=address)
-        target_link_options(vnm_terminal_lcd_subpixel_policy PUBLIC
-            -fsanitize=address)
-    endif()
-endif()
-
-cmake_language(DEFER CALL
-    vnm_terminal_validate_qt_link_interface
-    vnm_terminal_lcd_subpixel_policy)
-
-add_library(
-    vnm_terminal_surface::vnm_terminal_lcd_subpixel_policy
-    ALIAS
-    vnm_terminal_lcd_subpixel_policy)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
+vnm_terminal_msdf_text_make_available(
+    vnm_terminal_msdf_text_renderer_enabled
+    CONTEXT "vnm_terminal_surface"
+    REQUIRED_BY "LCD display resolution"
+    SOURCE_DIR_VAR VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
+    USE_SYSTEM_LIBS "${VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS}")
 
 set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/terminal_canvas_appearance.h
@@ -283,6 +247,7 @@ target_include_directories(vnm_terminal_surface_renderer PUBLIC
 
 target_link_libraries(vnm_terminal_surface_renderer PUBLIC
     ${vnm_terminal_qt_targets}
+    vnm_msdf_text::lcd_contract
 )
 
 target_link_libraries(vnm_terminal_surface_renderer PRIVATE
@@ -456,7 +421,7 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 target_link_libraries(vnm_terminal_surface PRIVATE
     Qt6::GuiPrivate
     Qt6::QuickPrivate
-    vnm_terminal_surface::vnm_terminal_lcd_subpixel_policy
+    vnm_msdf_text::qt_lcd
     vnm_qt_dispatch::vnm_qt_dispatch
 )
 if(vnm_terminal_surface_process_custody_required)
@@ -475,13 +440,6 @@ target_compile_definitions(vnm_terminal_surface PRIVATE
 endif()
 
 if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
-    vnm_terminal_msdf_text_make_available(
-        vnm_terminal_msdf_text_renderer_enabled
-        CONTEXT "vnm_terminal_surface"
-        REQUIRED_BY "MSDF text renderer"
-        SOURCE_DIR_VAR VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
-        USE_SYSTEM_LIBS "${VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS}")
     get_target_property(
         vnm_terminal_msdf_text_package_dependency
         vnm_msdf_text::vnm_msdf_text
@@ -544,7 +502,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 set(vnm_terminal_surface_install_targets
-    vnm_terminal_lcd_subpixel_policy
     vnm_terminal_surface_renderer
 )
 if(VNM_TERMINAL_SURFACE_BUILD_FULL)
@@ -573,7 +530,6 @@ endif()
 
 install(FILES
     include/vnm_terminal/terminal_canvas_appearance.h
-    include/vnm_terminal/lcd_subpixel_policy.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/vnm_terminal_canvas.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"

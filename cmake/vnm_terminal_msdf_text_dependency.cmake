@@ -22,15 +22,21 @@ function(vnm_terminal_msdf_text_make_available out_var)
 
     set(${out_var} OFF PARENT_SCOPE)
 
-    if(TARGET vnm_msdf_text::vnm_msdf_text)
+    if(TARGET vnm_msdf_text::qt_lcd AND
+       (NOT vnm_terminal_msdf_atlas_required OR TARGET vnm_msdf_text::vnm_msdf_text))
         set(${out_var} ON PARENT_SCOPE)
         return()
     endif()
 
     if(_vnm_terminal_msdf_text_USE_SYSTEM_LIBS)
         set(VNM_MSDF_TEXT_FETCH_DEPS OFF CACHE BOOL "" FORCE)
-        find_package(vnm_msdf_text CONFIG QUIET)
-        if(TARGET vnm_msdf_text::vnm_msdf_text)
+        set(_components qt_lcd)
+        if(vnm_terminal_msdf_atlas_required)
+            list(APPEND _components atlas)
+        endif()
+        find_package(vnm_msdf_text CONFIG QUIET COMPONENTS ${_components})
+        if(TARGET vnm_msdf_text::qt_lcd AND
+           (NOT vnm_terminal_msdf_atlas_required OR TARGET vnm_msdf_text::vnm_msdf_text))
             set(${out_var} ON PARENT_SCOPE)
             return()
         endif()
@@ -67,10 +73,11 @@ function(vnm_terminal_msdf_text_make_available out_var)
     endif()
 
     FetchContent_MakeAvailable(vnm_msdf_text)
-    if(NOT TARGET vnm_msdf_text::vnm_msdf_text)
+    if(NOT TARGET vnm_msdf_text::qt_lcd OR
+       (vnm_terminal_msdf_atlas_required AND NOT TARGET vnm_msdf_text::vnm_msdf_text))
         message(FATAL_ERROR
             "vnm_msdf_text was requested for ${_vnm_terminal_msdf_text_REQUIRED_BY} "
-            "but did not define vnm_msdf_text::vnm_msdf_text")
+            "but did not define its required LCD/atlas components")
     endif()
 
     set(${out_var} ON PARENT_SCOPE)

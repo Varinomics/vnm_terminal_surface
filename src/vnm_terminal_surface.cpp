@@ -1,6 +1,6 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 
-#include "vnm_terminal/lcd_subpixel_policy.h"
+#include <vnm_msdf_text/qt/lcd_resolver.h>
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/interaction_trace.h"
@@ -1232,44 +1232,25 @@ term::Terminal_text_renderer_policy terminal_text_renderer_policy(
     return term::Terminal_text_renderer_policy::AUTO;
 }
 
-vnm_terminal::Lcd_subpixel_order_policy lcd_subpixel_order_policy(
+vnm::msdf_text::lcd::Lcd_subpixel_order_policy lcd_subpixel_order_policy(
     VNM_TerminalSurface::Lcd_subpixel_order order)
 {
     switch (order) {
         case VNM_TerminalSurface::Lcd_subpixel_order::AUTO:
-            return vnm_terminal::Lcd_subpixel_order_policy::AUTO;
+            return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::AUTO;
         case VNM_TerminalSurface::Lcd_subpixel_order::NONE:
-            return vnm_terminal::Lcd_subpixel_order_policy::NONE;
+            return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::NONE;
         case VNM_TerminalSurface::Lcd_subpixel_order::RGB:
-            return vnm_terminal::Lcd_subpixel_order_policy::RGB;
+            return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::RGB;
         case VNM_TerminalSurface::Lcd_subpixel_order::BGR:
-            return vnm_terminal::Lcd_subpixel_order_policy::BGR;
+            return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::BGR;
         case VNM_TerminalSurface::Lcd_subpixel_order::VRGB:
-            return vnm_terminal::Lcd_subpixel_order_policy::VRGB;
+            return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::VRGB;
         case VNM_TerminalSurface::Lcd_subpixel_order::VBGR:
-            return vnm_terminal::Lcd_subpixel_order_policy::VBGR;
+            return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::VBGR;
     }
 
-    return vnm_terminal::Lcd_subpixel_order_policy::NONE;
-}
-
-term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order(
-    vnm_terminal::Resolved_lcd_subpixel_order order)
-{
-    switch (order) {
-        case vnm_terminal::Resolved_lcd_subpixel_order::NONE:
-            return term::Terminal_lcd_subpixel_order::NONE;
-        case vnm_terminal::Resolved_lcd_subpixel_order::RGB:
-            return term::Terminal_lcd_subpixel_order::RGB;
-        case vnm_terminal::Resolved_lcd_subpixel_order::BGR:
-            return term::Terminal_lcd_subpixel_order::BGR;
-        case vnm_terminal::Resolved_lcd_subpixel_order::VRGB:
-            return term::Terminal_lcd_subpixel_order::VRGB;
-        case vnm_terminal::Resolved_lcd_subpixel_order::VBGR:
-            return term::Terminal_lcd_subpixel_order::VBGR;
-    }
-
-    return term::Terminal_lcd_subpixel_order::NONE;
+    return vnm::msdf_text::lcd::Lcd_subpixel_order_policy::NONE;
 }
 
 term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurface& surface)
@@ -1303,11 +1284,10 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
         terminal_text_renderer_policy(surface.text_renderer_mode());
     QQuickWindow* const window = surface.window();
     options.msdf_lcd_subpixel_order = options.invert_brightness
-        ? term::Terminal_lcd_subpixel_order::NONE
-        : terminal_lcd_subpixel_order(
-            vnm_terminal::resolve_lcd_subpixel_order(
-                lcd_subpixel_order_policy(surface.lcd_subpixel_order()),
-                window != nullptr ? window->screen() : nullptr));
+        ? term::Resolved_lcd_subpixel_order::NONE
+        : vnm::msdf_text::lcd::resolve_lcd_subpixel_order_for_screen(
+            vnm::msdf_text::lcd::lcd_request_from_policy(lcd_subpixel_order_policy(surface.lcd_subpixel_order())),
+            window != nullptr ? window->screen() : nullptr);
     return options;
 }
 

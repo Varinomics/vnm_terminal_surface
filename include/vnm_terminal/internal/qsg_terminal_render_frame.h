@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/cell_stable_shaping.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include <QByteArray>
+#include <vnm_msdf_text/lcd_contract.h>
 #include <QColor>
 #include <QPointF>
 #include <QRectF>
@@ -39,14 +40,7 @@ enum class Terminal_text_renderer_kind
     MIXED,
 };
 
-enum class Terminal_lcd_subpixel_order
-{
-    NONE,
-    RGB,
-    BGR,
-    VRGB,
-    VBGR,
-};
+using vnm::msdf_text::lcd::Resolved_lcd_subpixel_order;
 
 enum class Terminal_render_arc_kind
 {
@@ -79,9 +73,9 @@ struct Terminal_render_options
     Terminal_text_renderer_policy
                                text_renderer_policy =
                                    Terminal_text_renderer_policy::AUTO;
-    Terminal_lcd_subpixel_order
+    Resolved_lcd_subpixel_order
                                msdf_lcd_subpixel_order =
-                                   Terminal_lcd_subpixel_order::NONE;
+                                   Resolved_lcd_subpixel_order::NONE;
 };
 
 // Matches Windows Terminal's selected-text contrast policy.

@@ -31,6 +31,19 @@ not a target build dependency. ShaderTools is not linked to
 `vnm_terminal_surface`, not part of the Qt posture link allowlist, and not an
 installed package dependency.
 
+Automatic LCD layout comes from `vnm_msdf_text::qt_lcd`. On Windows it uses
+the window's native monitor identity and DEVMODE physical rotation. Flat or
+invalid per-monitor layout disables LCD; when the identified monitor has no
+override, the global fallback requires enabled ClearType font smoothing.
+Explicit application choices bypass display probing. Resolved rendering orders
+use the shared LCD contract; the surface's QML enum is only the request boundary.
+
+The MSDF fragment imports the filter from `vnm_msdf_text`'s installed
+`share/vnm_msdf_text/shaders` directory (or its source `shaders` directory).
+Regenerate its checked-in package by running `tools/bake_msdf_shader.cmake`
+with `QSB`, `MSDF_SHADER_DIR`, and a build-tree `STAGING_DIR` defined. Run this
+shader compilation through `queued-build --slots 1` on managed build hosts.
+
 The glyph coverage atlas is a texture array, so its OpenGL ES program requires
 GLSL ES 3.00. `atlas_glyph.vert.qsb` and
 `atlas_glyph_alpha.frag.qsb` must expose the same `300 es` target and must not

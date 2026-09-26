@@ -626,9 +626,9 @@ struct Qsg_atlas_render_summary
                       Terminal_text_renderer_kind::NONE;
     bool          text_renderer_fallback_allowed     = true;
     bool          text_renderer_fallback_used        = false;
-    Terminal_lcd_subpixel_order
+    Resolved_lcd_subpixel_order
                   msdf_lcd_subpixel_order            =
-                      Terminal_lcd_subpixel_order::NONE;
+                      Resolved_lcd_subpixel_order::NONE;
     bool          msdf_lcd_text_enabled              = false;
     int           msdf_text_supported_runs           = 0;
     int           msdf_text_runs                     = 0;
@@ -866,9 +866,9 @@ struct Qsg_atlas_frame_report
                       Terminal_text_renderer_kind::NONE;
     bool          text_renderer_fallback_allowed     = true;
     bool          text_renderer_fallback_used        = false;
-    Terminal_lcd_subpixel_order
+    Resolved_lcd_subpixel_order
                   msdf_lcd_subpixel_order            =
-                      Terminal_lcd_subpixel_order::NONE;
+                      Resolved_lcd_subpixel_order::NONE;
     bool          msdf_lcd_text_enabled              = false;
     bool          msdf_text_renderer_enabled =
         k_qsg_atlas_msdf_text_renderer_enabled;
@@ -993,7 +993,7 @@ const char* qsg_atlas_text_renderer_kind_name(
     Terminal_text_renderer_kind kind);
 
 const char* qsg_atlas_lcd_subpixel_order_name(
-    Terminal_lcd_subpixel_order order);
+    Resolved_lcd_subpixel_order order);
 
 QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 

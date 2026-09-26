@@ -1511,24 +1511,24 @@ Terminal_text_renderer_kind qsg_atlas_effective_text_renderer(
 }
 
 bool qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
-    Terminal_lcd_subpixel_order order)
+    Resolved_lcd_subpixel_order order)
 {
-    return order != Terminal_lcd_subpixel_order::NONE;
+    return order != Resolved_lcd_subpixel_order::NONE;
 }
 
 float qsg_atlas_lcd_subpixel_order_shader_value(
-    Terminal_lcd_subpixel_order order)
+    Resolved_lcd_subpixel_order order)
 {
     switch (order) {
-        case Terminal_lcd_subpixel_order::RGB:
+        case Resolved_lcd_subpixel_order::RGB:
             return 1.0f;
-        case Terminal_lcd_subpixel_order::BGR:
+        case Resolved_lcd_subpixel_order::BGR:
             return 2.0f;
-        case Terminal_lcd_subpixel_order::VRGB:
+        case Resolved_lcd_subpixel_order::VRGB:
             return 3.0f;
-        case Terminal_lcd_subpixel_order::VBGR:
+        case Resolved_lcd_subpixel_order::VBGR:
             return 4.0f;
-        case Terminal_lcd_subpixel_order::NONE:
+        case Resolved_lcd_subpixel_order::NONE:
             return 0.0f;
     }
 
@@ -8868,18 +8868,18 @@ const char* qsg_atlas_text_renderer_kind_name(
 }
 
 const char* qsg_atlas_lcd_subpixel_order_name(
-    Terminal_lcd_subpixel_order order)
+    Resolved_lcd_subpixel_order order)
 {
     switch (order) {
-        case Terminal_lcd_subpixel_order::NONE:
+        case Resolved_lcd_subpixel_order::NONE:
             return "none";
-        case Terminal_lcd_subpixel_order::RGB:
+        case Resolved_lcd_subpixel_order::RGB:
             return "rgb";
-        case Terminal_lcd_subpixel_order::BGR:
+        case Resolved_lcd_subpixel_order::BGR:
             return "bgr";
-        case Terminal_lcd_subpixel_order::VRGB:
+        case Resolved_lcd_subpixel_order::VRGB:
             return "vrgb";
-        case Terminal_lcd_subpixel_order::VBGR:
+        case Resolved_lcd_subpixel_order::VBGR:
             return "vbgr";
     }
 

@@ -28,9 +28,12 @@ if(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE)
     endif()
 endif()
 
+set(_vnm_terminal_msdf_components qt_lcd)
 if(VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED)
-    find_dependency(vnm_msdf_text CONFIG)
+    list(APPEND _vnm_terminal_msdf_components atlas)
 endif()
+find_dependency(vnm_msdf_text CONFIG COMPONENTS ${_vnm_terminal_msdf_components})
+unset(_vnm_terminal_msdf_components)
 
 if((NOT "${Qt6_VERSION_MAJOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}") OR
     (NOT "${Qt6_VERSION_MINOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"))
