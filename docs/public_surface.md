@@ -368,6 +368,15 @@ replayed publications are counted but remain nonfatal. A transcript without
 snapshot diagnostics fails the strict gate. Final-only snapshot replay is not a
 supported mode.
 
+Known limitation (accepted): a drain with a deadline spreads sixel work over
+steps within one recorded `backend.output` event (an image's decoding, its
+placement, the output after it), publishing coherent snapshots between the
+steps. Replay takes each event whole, so it reproduces the final semantic run
+but not those intermediate checkpoints: strict replay reports them as divergent
+snapshot events and exits with failure (3), while causal structure and the
+final state still match. Transcripts of output without sixel images, or drained
+without a deadline, are unaffected.
+
 The summary reports recorded/replayed causal-group counts, causal-driver and
 causal-protocol divergences, semantic run and scheduling-surplus counts,
 fixed-digest object checks,

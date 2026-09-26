@@ -161,12 +161,17 @@ counted in pixels written or copied. Decoding stops before a draw or graphics
 new line the budget cannot pay for, and placement goes a band or a scroll at
 a time; the model reports what it consumed and that work is pending, the
 session keeps the rest of the output at the front of its queue, and the next
-step continues. An image end, which fills and expands the whole raster, is
-one step that always runs. A placement that has started holds publication
-like synchronized output until it ends, so no published snapshot shows part
-of an image. A settled text-area resize tail replays through the same steps.
-Drains without a deadline, which include the synchronous calls that settle
-the input frontier, run sixel work to completion.
+step continues. An image end, which allocates, fills and expands the whole
+raster, is one step that always runs, and a budget it spends ends the step
+there, placed or not; it is the largest indivisible step, so a drain call can
+overrun its deadline by about that much (accepted allowance: about 10 ms on the
+reference host for a cap-size image, typically 2 to 6 ms). A placement that has
+started holds publication like synchronized output until it ends, so no
+published snapshot shows part of an image; a forced release of a stale
+synchronized update ends only the application's hold. A settled text-area
+resize tail, and the exit that follows one, replay through the same steps, a
+window at a time. Drains without a deadline, which include the synchronous
+calls that settle the input frontier, run sixel work to completion.
 
 The screen-model ingestion path runs the parser, applies actions to the model,
 collects dirty rows and viewport changes, and returns a

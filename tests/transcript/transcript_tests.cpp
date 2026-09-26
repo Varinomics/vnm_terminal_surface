@@ -4116,8 +4116,10 @@ bool test_replay_tool_applies_recorded_cell_pixel_size(const QString& replay_too
 
 // A drain with a deadline takes a near-cap sixel image over several steps. The
 // transcript still records each output byte once, before its effects, so the
-// replay finds a valid causal structure. The snapshots published between the
-// steps are not replayed: the replay takes each output event whole.
+// replay finds the recorded causal structure and the final state. The
+// snapshots published between the steps are not replayed, since the replay
+// takes each output event whole: strict replay reports them as divergent and
+// fails, which is the accepted, documented limitation (public_surface.md).
 bool test_replay_tool_reads_output_drained_in_sixel_steps(const QString& replay_tool_path)
 {
     bool ok = true;
@@ -4179,6 +4181,18 @@ bool test_replay_tool_reads_output_drained_in_sixel_steps(const QString& replay_
             replay.stdout_text.contains("causal_driver_divergences=0") &&
             replay.stdout_text.contains("causal_protocol_divergences=0"),
         "a replay of output drained in sixel steps finds the recorded causal structure");
+    ok &= check(
+        replay.stdout_text.contains(
+            "recorded_snapshot_runs=2 replayed_snapshot_runs=1 matching_snapshot_runs=1 "
+            "divergent_snapshot_runs=1") &&
+            replay.stdout_text.contains("text=\"after"),
+        "the final snapshot run matches the recording");
+    ok &= check(
+        replay.stdout_text.contains(
+            "recorded_snapshot_events=3 replayed_snapshot_events=1 matching_snapshot_events=1 "
+            "divergent_snapshot_events=2") &&
+            replay.exit_code == 3,
+        "strict replay reports exactly the two snapshots published between the steps");
     if (!ok) {
         print_replay_tool_output(replay);
     }
