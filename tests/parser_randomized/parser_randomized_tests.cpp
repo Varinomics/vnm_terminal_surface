@@ -1496,7 +1496,8 @@ bool check_budgeted_runs(
     for (const char c : plan.name) {
         plan_seed = (plan_seed ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL;
     }
-    for (const std::uint64_t budget_seed : {0ULL, plan_seed, plan_seed ^ 0x9e3779b97f4a7c15ULL}) {
+    const std::uint64_t budget_seeds[] = {0U, plan_seed, plan_seed ^ 0x9e3779b97f4a7c15ULL};
+    for (const std::uint64_t budget_seed : budget_seeds) {
         const std::string label = test_case.name + "/" + plan.name + "/budget seed " +
             std::to_string(budget_seed);
         Run_result budgeted;
