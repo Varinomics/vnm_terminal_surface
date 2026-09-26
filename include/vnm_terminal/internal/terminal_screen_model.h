@@ -1478,8 +1478,9 @@ private:
         int                            first_column,
         terminal_cell_pixel_size_t     cell_pixel_size);
 
-    // Returns the size of the largest image dropped, zero when none was.
-    std::size_t drop_screen_images_over_cap();
+    // Returns the size of the largest row image over the cap, zero when none
+    // is; drops those images only when `apply` is set.
+    std::size_t drop_row_images_over_cap(std::size_t cap_bytes, bool apply);
 
     std::shared_ptr<const Terminal_image_slice> image_slice_without_cells(
         const Terminal_screen_row&     row,
@@ -1497,7 +1498,7 @@ private:
     void mark_dirty(int row);
     void mark_dirty_rows(int first, int last);
     void size_dirty_row_flags();
-    void reserve_dirty_row_mark();
+    void reserve_dirty_row_marks(std::size_t marks);
     void mark_terminal_content_changed();
     void mark_active_buffer_changed();
     void mark_grid_reflow_changed();

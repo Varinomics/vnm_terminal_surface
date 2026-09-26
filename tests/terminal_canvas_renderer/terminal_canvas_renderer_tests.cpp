@@ -8,6 +8,7 @@
 #include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QImage>
+#include <QPoint>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QThread>
@@ -182,6 +183,100 @@ bool authoritative_grid_glyph_positions(
     return ok;
 }
 
+bool rendered_pixel_matches(
+    QGuiApplication&  application,
+    QQuickWindow&     window,
+    VNM_TerminalCanvas& canvas,
+    QPoint            logical_position,
+    QColor            expected)
+{
+    const qreal dpr = window.devicePixelRatio();
+    const QPoint position(
+        qRound(logical_position.x() * dpr),
+        qRound(logical_position.y() * dpr));
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        canvas.update();
+        window.requestUpdate();
+        application.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const QImage image = window.grabWindow();
+        if (!image.rect().contains(position) ||
+            canvas.rendered_frame_generation() != canvas.frame_generation())
+        {
+            continue;
+        }
+        const QColor actual = image.pixelColor(position);
+        if (std::abs(actual.red()   - expected.red())   <= 1 &&
+            std::abs(actual.green() - expected.green()) <= 1 &&
+            std::abs(actual.blue()  - expected.blue())  <= 1)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool row_images_follow_pixels_placement_and_lifecycle(
+    QGuiApplication&  application,
+    QQuickWindow&     window,
+    VNM_TerminalCanvas& canvas)
+{
+    bool ok = true;
+    auto frame = make_frame(30U);
+    frame->cursor.visible = false;
+    QImage pixels(30, 20, QImage::Format_RGBA8888_Premultiplied);
+    const QColor red(200, 40, 40);
+    const QColor green(20, 160, 80);
+    const QColor background = QColor::fromRgba(frame->default_background_rgba);
+    pixels.fill(red);
+    frame->images.emplace();
+    frame->images->rows.push_back({1, 2, 10, 20, 3U, pixels});
+    canvas.set_authoritative_cell_metrics_enabled(true);
+    window.resize(120, 40);
+    canvas.setSize(QSizeF(120, 40));
+    ok &= check(canvas.set_canvas_frame(frame), "public row image frame is accepted");
+    ok &= check(rendered_pixel_matches(application, window, canvas, {35, 30}, red),
+        "row image pixels reach their source cell location through the canvas renderer");
+    ok &= check(rendered_pixel_matches(application, window, canvas, {65, 30}, background),
+        "image pixels occupy only their source width");
+
+    auto replacement = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    ++replacement->sequence;
+    replacement->images->rows.front().pixels.fill(green);
+    ok &= check(canvas.set_canvas_frame(replacement), "replacement image frame is accepted");
+    ok &= check(rendered_pixel_matches(application, window, canvas, {35, 30}, green),
+        "a new source with a repeated sender revision cannot reuse stale image texels");
+
+    auto moved = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*replacement);
+    ++moved->sequence;
+    moved->images->rows.front().row = 0;
+    moved->images->rows.front().first_column = 4;
+    ok &= check(canvas.set_canvas_frame(moved), "moved row image frame is accepted");
+    ok &= check(rendered_pixel_matches(application, window, canvas, {55, 10}, green) &&
+            rendered_pixel_matches(application, window, canvas, {35, 30}, background),
+        "image row and column movement retires the original placement");
+
+    auto scaled = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*moved);
+    ++scaled->sequence;
+    scaled->cell_width = 20.0;
+    scaled->cell_height = 40.0;
+    scaled->content_width = 240.0;
+    scaled->content_height = 80.0;
+    window.resize(240, 80);
+    canvas.setSize(QSizeF(240, 80));
+    ok &= check(canvas.set_canvas_frame(scaled), "scaled row image frame is accepted");
+    ok &= check(rendered_pixel_matches(application, window, canvas, {110, 20}, green),
+        "image pixels scale from placement cell size to authoritative presentation cells");
+
+    auto cleared = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*scaled);
+    ++cleared->sequence;
+    cleared->images->rows.clear();
+    ok &= check(canvas.set_canvas_frame(cleared), "image-clear publication is accepted");
+    ok &= check(rendered_pixel_matches(application, window, canvas, {110, 20}, background),
+        "image-free replacement clears prior pixels while keeping terminal text");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -219,6 +314,7 @@ int main(int argc, char** argv)
 
     if (!rendered.isNull()) {
         ok &= authoritative_grid_glyph_positions(application, window, canvas);
+        ok &= row_images_follow_pixels_placement_and_lifecycle(application, window, canvas);
     }
 
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");

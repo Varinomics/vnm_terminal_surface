@@ -17,6 +17,8 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -96,6 +98,119 @@ std::vector<term::Parser_action> parse(const QByteArray& bytes)
 {
     term::Terminal_byte_stream_parser parser;
     return ingest_all(parser, bytes);
+}
+
+// Every field of every action payload, so that two action lists compare
+// exactly, payloads and order.
+auto fields(const term::Screen_print_text_mutation& mutation)
+{
+    return std::tie(mutation.text, mutation.row, mutation.column, mutation.printable_ascii_only);
+}
+auto fields(const term::Screen_carriage_return_mutation&) { return std::tuple<>(); }
+auto fields(const term::Screen_line_feed_mutation&)       { return std::tuple<>(); }
+auto fields(const term::Screen_backspace_mutation&)       { return std::tuple<>(); }
+auto fields(const term::Screen_horizontal_tab_mutation&)  { return std::tuple<>(); }
+auto fields(const term::Screen_bell_mutation&)            { return std::tuple<>(); }
+auto fields(const term::Screen_set_title_mutation& mutation)     { return std::tie(mutation.title); }
+auto fields(const term::Screen_set_icon_name_mutation& mutation) { return std::tie(mutation.icon_name); }
+auto fields(const term::Screen_set_hyperlink_mutation& mutation) { return std::tie(mutation.identity_key); }
+auto fields(const term::Screen_sixel_image_mutation& image)
+{
+    return std::tie(
+        image.raster, image.width, image.height, image.final_cursor_y, image.pixel_aspect_ratio);
+}
+auto fields(const term::Terminal_sgr_operation& operation)
+{
+    return std::tie(
+        operation.kind,
+        operation.attributes,
+        operation.color.kind,
+        operation.color.palette_index,
+        operation.color.rgba);
+}
+auto fields(const term::Parser_control_sequence& sequence)
+{
+    return std::tie(
+        sequence.family,
+        sequence.action,
+        sequence.parameters,
+        sequence.private_marker,
+        sequence.intermediates,
+        sequence.final_bytes,
+        sequence.payload,
+        sequence.terminator,
+        sequence.raw_bytes);
+}
+auto fields(const term::Terminal_reply& reply)
+{
+    return std::tie(reply.wire_bytes, reply.source_sequence, reply.kind, reply.source_family);
+}
+auto fields(const term::Terminal_color_query& query)
+{
+    return std::tie(query.kind, query.palette_index, query.source_sequence);
+}
+auto fields(const term::Parser_payload_diagnostic& diagnostic)
+{
+    return std::tie(
+        diagnostic.code,
+        diagnostic.source_sequence,
+        diagnostic.raw_payload_size,
+        diagnostic.limit_bytes,
+        diagnostic.family,
+        diagnostic.recovery);
+}
+auto fields(const term::Parser_notification& notification)
+{
+    return std::tie(notification.kind, notification.text, notification.rows, notification.columns);
+}
+auto fields(const term::Terminal_osc52_write_request& request)
+{
+    return std::tie(
+        request.request_id,
+        request.target_selection,
+        request.decoded_payload,
+        request.raw_payload_size,
+        request.source_sequence);
+}
+
+bool same(const term::Terminal_sgr_sequence& left, const term::Terminal_sgr_sequence& right)
+{
+    return left.raw_parameters == right.raw_parameters &&
+        std::equal(
+            left.operations.begin(), left.operations.end(),
+            right.operations.begin(), right.operations.end(),
+            [](const term::Terminal_sgr_operation& l, const term::Terminal_sgr_operation& r) {
+                return fields(l) == fields(r);
+            });
+}
+
+template <typename T>
+bool same(const T& left, const T& right)
+{
+    return fields(left) == fields(right);
+}
+
+template <typename... Types>
+bool same(const std::variant<Types...>& left, const std::variant<Types...>& right)
+{
+    return left.index() == right.index() &&
+        std::visit(
+            [&right](const auto& left_value) {
+                return same(left_value, std::get<std::decay_t<decltype(left_value)>>(right));
+            },
+            left);
+}
+
+bool same_actions(
+    const std::vector<term::Parser_action>& left,
+    const std::vector<term::Parser_action>& right)
+{
+    return std::equal(
+        left.begin(), left.end(),
+        right.begin(), right.end(),
+        [](const term::Parser_action& l, const term::Parser_action& r) {
+            return same(l.payload, r.payload);
+        });
 }
 
 // Decodes a string that must yield exactly one image and no diagnostic.
@@ -970,12 +1085,6 @@ bool test_sixel_budget_steps_match_a_whole_parse()
 
     for (const auto& [name, stream] : streams) {
         const std::vector<term::Parser_action> whole = parse(stream);
-        std::vector<std::string> whole_labels;
-        for (const term::Parser_action& action : whole) {
-            whole_labels.push_back(action_label(action));
-        }
-        const std::vector<term::Screen_sixel_image_mutation> whole_images = images_in(whole);
-
         for (const std::uint64_t units : {1ULL, 7ULL, 600ULL}) {
             const std::string label = name + " in steps of " + std::to_string(units) + " units";
             term::Terminal_byte_stream_parser parser;
@@ -991,27 +1100,53 @@ bool test_sixel_budget_steps_match_a_whole_parse()
             }
             ok &= check(offset == stream.size(), label + ": the whole stream is parsed");
             ok &= check(deferred || units == 600U, label + ": a small budget defers work");
-
-            std::vector<std::string> stepped_labels;
-            for (const term::Parser_action& action : stepped) {
-                stepped_labels.push_back(action_label(action));
-            }
-            ok &= check(stepped_labels == whole_labels, label + ": the same actions in order");
-
-            const std::vector<term::Screen_sixel_image_mutation> stepped_images =
-                images_in(stepped);
-            bool same_images = stepped_images.size() == whole_images.size();
-            for (std::size_t i = 0; same_images && i < whole_images.size(); ++i) {
-                same_images =
-                    stepped_images[i].width              == whole_images[i].width              &&
-                    stepped_images[i].height             == whole_images[i].height             &&
-                    stepped_images[i].final_cursor_y     == whole_images[i].final_cursor_y     &&
-                    stepped_images[i].pixel_aspect_ratio == whole_images[i].pixel_aspect_ratio &&
-                    stepped_images[i].raster             == whole_images[i].raster;
-            }
-            ok &= check(same_images, label + ": the same images");
+            ok &= check(same_actions(stepped, whole), label + ": exactly the same actions");
         }
     }
+
+    // For every split of a stream into two windows, including one inside each
+    // terminator, which leaves its ESC pending in the parser, parsing each
+    // window in steps of one unit gives exactly the actions of parsing the
+    // windows whole. The stream has images ended by both ST forms, a
+    // cancelled image, one a CSI abandons, an OSC ended by ST and a query.
+    const QByteArray image = sixel_dcs({}, "~~-~");
+    const QByteArray image_8bit_st("\x1bPq#1;2;100;0;0~~\x9c");
+    const QByteArray mixed =
+        "A" + image + image_8bit_st + QByteArray("\x1b]2;t\x1b\\") +
+        QByteArray("\x1bPq~~\x18") + QByteArray("\x1bPq~~\x1b[1m") + image + "\x1b[cB";
+    const auto parse_windows = [](
+        const QByteArray&            bytes,
+        qsizetype                    split,
+        std::optional<std::uint64_t> units)
+    {
+        term::Terminal_byte_stream_parser parser;
+        std::vector<term::Parser_action> actions;
+        for (const QByteArrayView window : {
+            QByteArrayView(bytes).first(split), QByteArrayView(bytes).sliced(split)})
+        {
+            qsizetype offset = 0;
+            for (int step = 0; offset < window.size() && step < 10000; ++step) {
+                std::optional<term::Sixel_work_budget> budget;
+                if (units.has_value()) {
+                    budget.emplace(*units);
+                }
+                const std::vector<term::Parser_action> step_actions = parser.ingest(
+                    window,
+                    offset,
+                    budget.has_value() ? &*budget : nullptr);
+                actions.insert(actions.end(), step_actions.begin(), step_actions.end());
+            }
+        }
+        return actions;
+    };
+    bool same_as_whole = true;
+    for (qsizetype split = 0; split <= mixed.size(); ++split) {
+        const std::vector<term::Parser_action> whole   = parse_windows(mixed, split, std::nullopt);
+        const std::vector<term::Parser_action> stepped = parse_windows(mixed, split, 1U);
+        same_as_whole = same_as_whole && images_in(whole).size() == 3U &&
+            same_actions(stepped, whole);
+    }
+    ok &= check(same_as_whole, "budget steps keep every action exactly for every split");
     return ok;
 }
 

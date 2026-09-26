@@ -992,6 +992,49 @@ bool test_capacity_decrease_drops_screen_images_over_the_cap()
     return ok;
 }
 
+bool test_capacity_decrease_drops_recovery_candidate_images_over_the_cap()
+{
+    bool ok = true;
+
+    // A repaint-recovery candidate copies the screen rows, images included,
+    // so it can hold an image the screen has already erased. A 1650 x 20 row
+    // image is 132000 bytes, over the 131072 byte cap of a 1 MiB ring.
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {4, 170};
+    config.scrollback_limit                         = 8;
+    config.cell_pixel_size                          = k_cell;
+    config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model model(config);
+    model.ingest(QByteArray("\x1b[1;1Haa\x1b[2;1Hbb\x1b[3;1Hcc\x1b[4;1Hdd") +
+        cursor_to(0, 4) + sixel("1;0", "\"1;1;1650;20"));
+    const std::shared_ptr<const term::Terminal_image_slice> placed = slice_at(model, 0);
+
+    // The hidden-cursor home starts the candidate; the repaint's erase then
+    // clears the image from the screen row, so only the candidate holds it.
+    model.ingest("\x1b[?25l\x1b[1;1Hbb\x1b[K");
+    ok &= check(placed != nullptr && slice_at(model, 0) == nullptr && placed.use_count() == 2,
+        "the recovery candidate alone keeps the erased row's image");
+
+    const term::Terminal_screen_model_result result =
+        model.set_retained_history_capacity_bytes(1024U * 1024U);
+    const std::vector<term::Parser_payload_diagnostic> diagnostics = diagnostics_in(result);
+    ok &= check(diagnostics.size() == 1U &&
+            diagnostics[0].code == term::Parser_diagnostic_code::PAYLOAD_LIMIT_EXCEEDED &&
+            diagnostics[0].raw_payload_size == 132000U,
+        "a candidate image over the lowered cap is dropped and reported");
+    ok &= check(placed.use_count() == 1,
+        "the model holds no image over the lowered cap");
+
+    // The candidate keeps its text and recovery state: the rest of the repaint
+    // still recovers the row that left the screen, without its image.
+    model.ingest("\x1b[2;1Hcc\x1b[K\x1b[3;1Hdd\x1b[K\x1b[4;1Hee\x1b[K\x1b[?25h");
+    ok &= check(model.scrollback_size() == 1 && history_row_text(model, 0) == QStringLiteral("aa") &&
+            model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0) == nullptr,
+        "the repaint after the decrease still recovers the row, without its image");
+
+    return ok;
+}
+
 // One sixel row of `cells` ten-pixel blocks, each in its own color, so a
 // moved or cleared block shows in the pixels.
 QByteArray striped_cells(int cells)
@@ -1680,6 +1723,7 @@ int main()
     ok &= test_capacity_shrink_rebuilds_a_nearly_full_ring();
     ok &= test_capacity_shrink_signals_a_history_rewrite();
     ok &= test_capacity_decrease_drops_screen_images_over_the_cap();
+    ok &= test_capacity_decrease_drops_recovery_candidate_images_over_the_cap();
     ok &= test_text_writes_and_erases_clear_image_cells();
     ok &= test_ich_and_dch_move_image_columns();
     ok &= test_image_rows_start_their_own_logical_lines();

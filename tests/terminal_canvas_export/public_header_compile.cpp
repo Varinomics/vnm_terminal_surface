@@ -12,6 +12,9 @@ bool terminal_canvas_public_header_contract()
     static_assert(std::is_same_v<
         decltype(vnm_terminal::Terminal_canvas_frame{}.content_extent),
         std::optional<vnm_terminal::terminal_canvas_content_extent_t>>);
+    static_assert(std::is_same_v<
+        decltype(vnm_terminal::Terminal_canvas_frame{}.images),
+        std::optional<vnm_terminal::Terminal_canvas_images>>);
 
     const vnm_terminal::terminal_canvas_content_extent_t extent;
     return

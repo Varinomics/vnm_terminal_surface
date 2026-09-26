@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QImage>
 #include <QString>
 #include <QtGlobal>
 #include <cstddef>
@@ -151,6 +152,79 @@ struct Terminal_canvas_cursor
     bool                         blink_enabled = false;
 };
 
+inline constexpr std::uint16_t k_terminal_canvas_images_version = 1U;
+inline constexpr int k_terminal_canvas_image_column_limit = 4'096;
+
+enum class Terminal_canvas_images_status
+{
+    AVAILABLE,
+    INVALID,
+    OVER_LIMIT,
+};
+
+// One row's immutable RGBA8888 premultiplied pixels, measured against the
+// physical cell where they were placed. A narrower receiving grid clips the
+// slice; it does not change its original scale or first column. Revisions
+// identify source pixels and may repeat across independent source processes.
+struct Terminal_canvas_image_slice
+{
+    int           row               = 0;
+    int           first_column      = 0;
+    int           cell_pixel_width  = 0;
+    int           cell_pixel_height = 0;
+    std::uint64_t revision          = 0U;
+    QImage        pixels;
+};
+
+// The record shares the enclosing frame's identity and is installed or cleared
+// with it. Unknown versions leave only images unavailable. A known unavailable
+// status carries no rows, so a failed transfer cannot masquerade as a partial
+// image. Transport owners impose their own decoded-byte budgets.
+struct Terminal_canvas_images
+{
+    std::uint16_t record_version = k_terminal_canvas_images_version;
+    Terminal_canvas_images_status status = Terminal_canvas_images_status::AVAILABLE;
+    std::vector<Terminal_canvas_image_slice> rows;
+};
+
+inline bool terminal_canvas_images_are_valid(
+    const Terminal_canvas_images& images,
+    int                           frame_rows)
+{
+    if (images.record_version != k_terminal_canvas_images_version) {
+        return true;
+    }
+    switch (images.status) {
+        case Terminal_canvas_images_status::INVALID:
+        case Terminal_canvas_images_status::OVER_LIMIT:
+            return images.rows.empty();
+        case Terminal_canvas_images_status::AVAILABLE:
+            break;
+        default:
+            return false;
+    }
+    int previous_row = -1;
+    for (const Terminal_canvas_image_slice& slice : images.rows) {
+        if (slice.row <= previous_row || slice.row >= frame_rows ||
+            slice.revision == 0U || slice.pixels.isNull() ||
+            slice.pixels.format() != QImage::Format_RGBA8888_Premultiplied ||
+            slice.pixels.bytesPerLine() != static_cast<qint64>(slice.pixels.width()) * 4 ||
+            slice.cell_pixel_width <= 0 || slice.cell_pixel_height <= 0 ||
+            slice.pixels.height() > slice.cell_pixel_height || slice.first_column < 0)
+        {
+            return false;
+        }
+        const std::int64_t column_span =
+            (static_cast<std::int64_t>(slice.pixels.width()) + slice.cell_pixel_width - 1) /
+            slice.cell_pixel_width;
+        if (slice.first_column + column_span > k_terminal_canvas_image_column_limit) {
+            return false;
+        }
+        previous_row = slice.row;
+    }
+    return true;
+}
+
 struct Terminal_canvas_frame
 {
     std::uint32_t                    api_version = k_terminal_canvas_frame_api_version;
@@ -177,6 +251,7 @@ struct Terminal_canvas_frame
     // the semantic-extent capability unavailable.
     std::optional<terminal_canvas_content_extent_t> content_extent;
     std::optional<Terminal_canvas_color_references> color_references;
+    std::optional<Terminal_canvas_images> images;
     std::vector<Terminal_canvas_style> styles;
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;
