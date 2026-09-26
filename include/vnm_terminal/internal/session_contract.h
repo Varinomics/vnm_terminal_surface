@@ -195,15 +195,6 @@ struct Terminal_session_command
     std::uint64_t                              backend_callback_epoch = 0U;
     Terminal_session_command_kind              kind     = Terminal_session_command_kind::BACKEND_OUTPUT;
     QByteArray                                 bytes;
-    // Backend output the model left for a later drain step. Its bytes were
-    // recorded (output chunks, transcript) when the step took them, and when
-    // more of the same callback waits behind it, it is not the callback's
-    // last piece.
-    bool                                       output_recorded = false;
-    bool                                       output_remainder_follows = false;
-    // A command that waited for an earlier command's continuation and runs
-    // again; its trace already holds it.
-    bool                                       resumed = false;
     std::optional<Terminal_launch_config>      launch_config;
     std::optional<Terminal_resize_transaction> resize;
     std::optional<Terminal_backend_exit>       exit;

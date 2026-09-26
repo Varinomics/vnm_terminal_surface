@@ -1988,7 +1988,11 @@ bool test_surface_pending_frame_fallback_advances_snapshot_without_frame(
     return ok;
 }
 
-bool test_surface_frame_fallback_requires_callback_epoch_progress(
+// The frame-progress watchdog escalates to a posted drain only when the head
+// operation stalls: every runner step a frame takes restarts its deadline,
+// a partial slice of one callback included, and a stall of one watchdog
+// interval with no step fires it once.
+bool test_surface_frame_fallback_requires_runner_progress(
     QGuiApplication& app)
 {
     bool ok = true;
@@ -2081,24 +2085,39 @@ bool test_surface_frame_fallback_requires_callback_epoch_progress(
         deadline_before_progress.has_value() &&
         deadline_after_progress.has_value()  &&
         *deadline_after_progress > *deadline_before_progress,
-        "epoch-progress watchdog restarts its deadline after callback-epoch progress");
+        "frame-progress watchdog restarts its deadline after a frame's step");
     ok &= check(!term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
             surface),
         "epoch-progress watchdog keeps completed epoch progress on the frame path");
 
+    // Another frame after most of an interval takes another partial slice,
+    // which is progress: the deadline restarts and nothing is posted.
     const std::chrono::milliseconds watchdog_interval =
         term::VNM_TerminalSurface_render_bridge::
             backend_callback_frame_progress_watchdog_interval_for_testing();
-    QThread::msleep(static_cast<unsigned long>(watchdog_interval.count() + 20));
+    QThread::msleep(static_cast<unsigned long>(watchdog_interval.count() - 20));
     term::VNM_TerminalSurface_render_bridge::simulate_update_polish(surface);
-
+    const std::optional<std::chrono::steady_clock::time_point>
+        deadline_after_partial_slice =
+            term::VNM_TerminalSurface_render_bridge::
+                backend_callback_frame_progress_deadline_for_testing(surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
-            surface) == processed_epoch_after_first_slice,
-        "epoch-progress watchdog does not mistake another partial slice for epoch progress");
-    ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
-            surface),
-        "epoch-progress watchdog posts catch-up after the incomplete epoch bound");
+            surface) == processed_epoch_after_first_slice &&
+        deadline_after_partial_slice.has_value() &&
+        *deadline_after_partial_slice > *deadline_after_progress &&
+        !term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(surface),
+        "frame-progress watchdog counts a partial slice of the callback as progress");
+
+    // Then no frame for a whole interval: the head stalls and the watchdog
+    // posts the catch-up.
+    QThread::msleep(static_cast<unsigned long>(watchdog_interval.count() + 20));
+    ok &= check(pump_until(app, [&] {
+        return term::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface)
+            .frame_progress_watchdog_firings >
+                stats_before_slices.frame_progress_watchdog_firings;
+    }),
+        "frame-progress watchdog posts catch-up once the head stalls for an interval");
     ok &= check(pump_until(app, [&] {
         return
             term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
@@ -2115,7 +2134,7 @@ bool test_surface_frame_fallback_requires_callback_epoch_progress(
     ok &= check(
         stats_after_catchup.frame_progress_watchdog_firings ==
             stats_before_slices.frame_progress_watchdog_firings + 1U,
-        "epoch-progress watchdog records exactly one watchdog firing");
+        "frame-progress watchdog records exactly one watchdog firing");
 
     return ok;
 }
@@ -13307,10 +13326,12 @@ bool test_text_area_resize_arbitration_does_not_spin_the_backend_drain(QGuiAppli
     return ok;
 }
 
-// A settled tail whose sixel work outlasts one drain step is replayed by the
-// frames of a visible surface that receives nothing more: its callbacks were
-// all processed when they were held, so no newer callback epoch asks for the
-// catch-up.
+// A settled tail whose sixel work outlasts many drain steps is replayed by the
+// frames of a visible surface that receives nothing more: the tail is an open
+// operation, so frames catch up on it though no newer callback epoch asks,
+// and each of its steps counts as progress, so the frame-progress watchdog
+// never fires. The tail's reply is written through that catch-up, and input
+// afterwards encodes with the modes the tail set.
 bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
 {
     bool ok = true;
@@ -13338,10 +13359,16 @@ bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
     if (observer.requests.empty()) {
         return false;
     }
+    const QByteArray image("\x1bPq\"1;1;1448;1448\x1b\\");
     backend_ptr->emit_output(
-        QByteArrayLiteral("\x1bPq\"1;1;1448;1448\x1b\\tail-text"));
+        image + image + image + image + image +
+        QByteArrayLiteral("\x1b[c\x1b[?1000;1006htail-text"));
     pump_events(app);
 
+    const std::size_t writes_before = backend_ptr->writes.size();
+    const std::uint64_t firings_before =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface)
+            .frame_progress_watchdog_firings;
     ok &= check(fixture.surface.respond_text_area_resize(
         observer.requests.front().request_id,
         VNM_TerminalSurface::Text_area_resize_arbitration_decision::ACCEPT,
@@ -13349,7 +13376,8 @@ bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
         80),
         "the heavy tail answer is accepted");
 
-    // Frames alone, with no events processed in between.
+    // Frames a few milliseconds apart, with events processed between them as
+    // a window's event loop would, and no further output or input.
     const auto tail_shown = [&fixture] {
         const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
@@ -13357,11 +13385,34 @@ bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
             snapshot_contains_text(*snapshot, QStringLiteral("tail-text"));
     };
     int frames = 0;
-    while (!tail_shown() && frames < 200) {
+    while (!tail_shown() && frames < 400) {
         term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+        app.processEvents(QEventLoop::AllEvents, 0);
+        QThread::msleep(5);
         ++frames;
     }
-    ok &= check(tail_shown(), "the frames replay the heavy tail to its end");
+    ok &= check(tail_shown() && frames > 1, "the frames replay the heavy tail to its end");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface)
+            .frame_progress_watchdog_firings == firings_before,
+        "the frame-progress watchdog does not fire while the frames make progress");
+    ok &= check(backend_ptr->writes.size() == writes_before + 1U &&
+            backend_ptr->writes.back().startsWith(QByteArrayLiteral("\x1b[?")),
+        "the tail's query is answered once, through the frames");
+
+    // Input after the tail encodes with the modes the tail set.
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        point_in_grid_cell(fixture.surface, 2, 3),
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "the press after the tail is reported");
+    ok &= check(backend_ptr->writes.size() == writes_before + 2U &&
+            backend_ptr->writes.back().startsWith(QByteArrayLiteral("\x1b[<0;")),
+        "the press is encoded in the SGR mode the tail enabled, after the tail's reply");
     return ok;
 }
 
@@ -20426,7 +20477,7 @@ int main(int argc, char** argv)
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
     ok &= test_surface_pending_frame_fallback_advances_snapshot_without_frame(app);
-    ok &= test_surface_frame_fallback_requires_callback_epoch_progress(app);
+    ok &= test_surface_frame_fallback_requires_runner_progress(app);
     ok &= test_surface_after_frame_owner_release_rechecks_pending_callbacks(app);
     ok &= test_surface_output_backpressure_uses_posted_callback_owner(app);
     ok &= test_surface_pressure_bypasses_active_after_frame_owner(app);

@@ -4120,6 +4120,117 @@ bool test_replay_tool_applies_recorded_cell_pixel_size(const QString& replay_too
 // snapshots published between the steps are not replayed, since the replay
 // takes each output event whole: strict replay reports them as divergent and
 // fails, which is the accepted, documented limitation (public_surface.md).
+// A drain taken in single sixel steps records the same causal order as an
+// unbudgeted one: each output byte once, before its effects; each reply after
+// its query's output and before later input; the exit last. Only the
+// snapshots published between the steps differ.
+bool test_budgeted_drain_records_the_unbudgeted_causal_order()
+{
+    bool ok = true;
+
+    QByteArray image = QByteArrayLiteral("\x1bPq\"1;1;8;120#1;2;100;0;0");
+    for (int band = 0; band < 20; ++band) {
+        image += band + 1 < 20 ? QByteArrayLiteral("#1!8~-") : QByteArrayLiteral("#1!8~");
+    }
+    image += QByteArrayLiteral("\x1b\\");
+    const std::vector<QByteArray> outputs = {
+        QByteArrayLiteral("hello\x1b[c\x1b[16t\r\n\x1b[31G"),
+        image,
+        QByteArrayLiteral("\r\x1b[?1000h\x1b[?1006h\x1b[6n world\r\nline"),
+    };
+
+    const auto record = [&](bool budgeted, std::vector<QString>& causal) -> bool {
+        QTemporaryDir temp_dir;
+        if (!temp_dir.isValid()) {
+            return false;
+        }
+        const QString path = temp_dir.filePath(QStringLiteral("causal-order.ndjson"));
+        QString error;
+        std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+            term::Terminal_transcript_recorder::create(path, true, &error);
+        if (recorder == nullptr) {
+            std::cerr << error.toStdString() << '\n';
+            return false;
+        }
+        {
+            auto backend = std::make_unique<Scripted_backend>();
+            Scripted_backend* backend_ptr = backend.get();
+            term::Terminal_session_config config;
+            config.transcript_recorder    = recorder;
+            config.backend_event_notifier = [] {};
+            term::Terminal_session session(std::move(backend), config);
+            session.set_cell_pixel_size({10, 20});
+            term::Terminal_launch_config launch_config = valid_launch_config();
+            launch_config.initial_grid_size = term::terminal_grid_size_t{10, 40};
+            if (session.start(launch_config).code != term::Terminal_session_result_code::ACCEPTED) {
+                return false;
+            }
+            session.process_backend_callback_events();
+            if (budgeted) {
+                session.set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+            }
+            for (const QByteArray& output : outputs) {
+                backend_ptr->emit_output(output);
+            }
+            // The input arrives while the budgeted drains are mid-image.
+            for (int calls = 0; budgeted && calls < 8; ++calls) {
+                (void)session.process_backend_callback_events_for(
+                    std::chrono::steady_clock::duration::zero());
+            }
+            (void)session.write_user_bytes(QByteArrayLiteral("k"));
+            backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+            session.process_backend_callback_events();
+        }
+        recorder.reset();
+
+        const std::optional<std::vector<term::Terminal_transcript_event>> events =
+            term::read_terminal_transcript(path, &error);
+        if (!events.has_value()) {
+            std::cerr << error.toStdString() << '\n';
+            return false;
+        }
+        for (const term::Terminal_transcript_event& event : *events) {
+            if (event.kind == QStringLiteral("snapshot") ||
+                event.kind.startsWith(QStringLiteral("transcript.")))
+            {
+                continue;
+            }
+            causal.push_back(
+                event.kind + QLatin1Char('|') +
+                QString::number(event.object.value(QStringLiteral("session_sequence")).toInteger()) +
+                QLatin1Char('|') + event.object.value(QStringLiteral("source")).toString() +
+                QLatin1Char('|') + event.object.value(QStringLiteral("bytes_base64")).toString());
+        }
+        return true;
+    };
+
+    std::vector<QString> budgeted;
+    std::vector<QString> unbudgeted;
+    ok &= check(record(true, budgeted) && record(false, unbudgeted),
+        "both causal-order transcripts are recorded");
+    int replies = 0;
+    std::size_t input_index = budgeted.size();
+    for (std::size_t index = 0U; index < budgeted.size(); ++index) {
+        if (budgeted[index].startsWith(QStringLiteral("host.write|")) &&
+            budgeted[index].contains(QStringLiteral("|terminal_reply|")))
+        {
+            ok &= check(index < input_index, "every reply is recorded before the later input");
+            ++replies;
+        }
+        if (budgeted[index].startsWith(QStringLiteral("host.write|")) &&
+            budgeted[index].contains(QStringLiteral("|user|")))
+        {
+            input_index = index;
+        }
+    }
+    ok &= check(replies == 3 && input_index < budgeted.size() &&
+            !budgeted.empty() && budgeted.back().startsWith(QStringLiteral("session.process_exit|")),
+        "the budgeted transcript records three replies, then the input, then the exit");
+    ok &= check(budgeted == unbudgeted,
+        "the budgeted drain records the same causal order as the unbudgeted one");
+    return ok;
+}
+
 bool test_replay_tool_reads_output_drained_in_sixel_steps(const QString& replay_tool_path)
 {
     bool ok = true;
@@ -5770,6 +5881,7 @@ int main(int argc, char** argv)
     ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
     ok &= test_replay_tool_applies_recorded_cell_pixel_size(replay_tool_path);
     ok &= test_replay_tool_reads_output_drained_in_sixel_steps(replay_tool_path);
+    ok &= test_budgeted_drain_records_the_unbudgeted_causal_order();
     ok &= test_replay_tool_compares_recovered_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_defaults_missing_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);

@@ -710,7 +710,7 @@ bool protocol_callbacks_before_input_frontier_pending(
 {
     const std::optional<std::uint64_t> frontier = session.input_frontier_epoch();
     return frontier.has_value()
-        ? session.backend_callback_processed_epoch() < *frontier
+        ? !session.backend_callbacks_settled(*frontier)
         : session.has_pending_backend_callback_events();
 }
 
@@ -8328,8 +8328,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     }
 
     const std::uint64_t session_generation = m_private->session_generation;
-    const std::uint64_t callback_processed_epoch_before =
-        session->backend_callback_processed_epoch();
+    const std::uint64_t output_steps_before = session->backend_output_step_count();
     const auto session_processing_started = std::chrono::steady_clock::now();
     if (target_backend_callback_epoch.has_value()) {
         result.stop =
@@ -8394,9 +8393,11 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         }
         else
         if (m_private->backend_callback_frame_progress_deadline.has_value() &&
-            session->backend_callback_processed_epoch() >
-                callback_processed_epoch_before)
+            session->backend_output_step_count() > output_steps_before)
         {
+            // A step of the head operation is progress, whether or not it
+            // completed a callback epoch: the watchdog trips only on a
+            // stalled head.
             m_private->restart_backend_callback_frame_progress_watchdog();
         }
     }
@@ -9033,17 +9034,16 @@ void VNM_TerminalSurface::updatePolish()
         return;
     }
 
-    // A settled tail still replaying had its callbacks processed when they
-    // were held, so it is catch-up work whatever the callback epochs say.
-    if (target_epoch > session->backend_callback_processed_epoch() ||
-        session->backend_output_replay_pending())
-    {
+    // Output up to the frame's frontier is caught up only once it is
+    // settled, with or without newer callbacks: an open operation (such as a
+    // released text-area resize tail) is catch-up work too.
+    if (!session->backend_callbacks_settled(target_epoch)) {
         (void)drain_backend_callback_events_until_epoch(
             target_epoch,
             m_private->backend_callback_frame_catchup_budget());
     }
     if (m_private->active_session_matches(session, session_generation) &&
-        session->backend_callback_processed_epoch() >= target_epoch)
+        session->backend_callbacks_settled(target_epoch))
     {
         refresh_grid_metrics_if_device_pixel_ratio_changed();
     }
