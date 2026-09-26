@@ -377,8 +377,6 @@ struct Terminal_canvas_fixture_sixel_cursor_case
     std::string        payload;
     // Zero keeps the session's default retained history capacity.
     std::size_t        retained_history_capacity_bytes = 0U;
-    // Recorded, not asserted: no adopted rule covers the case yet.
-    bool               observation_only                = false;
 };
 
 // Written for a 24 x 80 screen and the fixed 10 x 20 cell OpenConsole places
@@ -476,8 +474,6 @@ terminal_canvas_fixture_sixel_cursor_cases()
     cases.push_back({
         "origin above the scroll region, overflowing it",
         "\x1b[10;15r" + cursor_to(5, 0) + image("7;1", sixel_rows(30, 40)),
-        0U,
-        true,
     });
     // A 12-row region clamps the ratio to (12 x 20) / 6 = 40, so the cursor
     // ends on the region's top row; unclamped, 50:1 would put it 3 rows above.

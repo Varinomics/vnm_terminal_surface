@@ -357,8 +357,8 @@ bool test_images_scroll_the_region_into_history()
             "the last bands stay on the screen");
     }
 
-    // Inside DECSTBM the region scrolls and nothing reaches history. The
-    // scroll counts are provisional until the ConPTY cursor-sync gate.
+    // Inside DECSTBM the region scrolls and nothing reaches history; the
+    // ConPTY cursor-sync gate matches these scroll counts with OpenConsole.
     term::Terminal_screen_model region_model = make_model(6, 10);
     region_model.ingest(
         QByteArray("r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5\x1b[2;4r\x1b[4;1H") + sixel("9;1", data));
@@ -373,13 +373,33 @@ bool test_images_scroll_the_region_into_history()
         "the region's last row holds the image's last band");
 
     // An image that would start below the bottom margin is dropped, as
-    // OpenConsole drops it (provisional until the cursor-sync gate).
+    // OpenConsole drops it (checked by the cursor-sync gate).
     term::Terminal_screen_model below_model = make_model(6, 10);
     below_model.ingest(QByteArray("\x1b[2;4r\x1b[6;3H") + sixel("9;1", solid_rows(12, 4)));
     ok &= check(below_model.cursor_position().row    == 5 &&
             below_model.cursor_position().column == 2 &&
             slice_at(below_model, 5) == nullptr,
         "an image starting below the bottom margin is not placed and leaves the cursor");
+
+    // An image starting above the top margin keeps its bands above the region
+    // where they are drawn and scrolls only the region; the cursor-sync gate
+    // matches the cursor this leaves with OpenConsole's. Twelve bands from
+    // row 1 over the region of rows 4 to 7 scroll it five times.
+    const QByteArray above_data = solid_rows(12, 40);
+    const term::Screen_sixel_image_mutation above_image = decoded_image("9;1", above_data);
+    term::Terminal_screen_model above_model = make_model(10, 10);
+    above_model.ingest(QByteArray("\x1b[5;8r") + cursor_to(1, 0) + sixel("9;1", above_data));
+    bool above_bands_placed = slice_at(above_model, 0) == nullptr &&
+        slice_at(above_model, 8) == nullptr && slice_at(above_model, 9) == nullptr;
+    for (int row = 1; row <= 7; ++row) {
+        const int band = row <= 3 ? row - 1 : row + 4;
+        above_bands_placed = above_bands_placed &&
+            slice_equals_band(slice_at(above_model, row), above_image.raster, band * 20, 12, 0);
+    }
+    ok &= check(above_bands_placed && above_model.scrollback_size() == 0,
+        "an image from above the region keeps its upper bands and scrolls only the region");
+    ok &= check(above_model.cursor_position().row == 7,
+        "the cursor ends on the region row of the final sixel row's top");
 
     return ok;
 }
@@ -980,15 +1000,17 @@ QImage raster_with_moved_cells(const QImage& raster, int width, const std::vecto
     return expected;
 }
 
-term::Terminal_retained_row_wrap_state history_wrap_state(
+// Empty when history has no such row, so no wrap state matches a missing row.
+std::optional<term::Terminal_retained_row_wrap_state> history_wrap_state(
     const term::Terminal_screen_model& model,
     int                                row)
 {
     const std::optional<term::terminal_retained_row_record_metadata_t> metadata =
         model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, row);
-    return metadata.has_value()
-        ? metadata->wrap_state
-        : term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
+    if (!metadata.has_value()) {
+        return std::nullopt;
+    }
+    return metadata->wrap_state;
 }
 
 bool test_text_writes_and_erases_clear_image_cells()
@@ -1174,7 +1196,8 @@ bool test_image_rows_start_their_own_logical_lines()
     scrolled_off.ingest(
         cursor_to(3, 0) + sixel("9;1", solid_rows(3, 1)) + cursor_to(3, 5) + "vwxyz12" +
         push_into_history);
-    ok &= check(history_wrap_state(scrolled_off, 3) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+    ok &= check(scrolled_off.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 3) != nullptr &&
+            history_wrap_state(scrolled_off, 3) == term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
         "wrapping off an image at the bottom margin keeps its hard boundary after scrolling");
 
     return ok;

@@ -1721,13 +1721,10 @@ bool test_sixel_cursor_stays_in_sync_with_openconsole(const QString& fixture_pat
             << " | console " << console_row << ',' << console_column
             << " | model " << model_row << ',' << model_column
             << " | " << (match ? "match" : "MISMATCH")
-            << (sixel_case.observation_only ? " (observation)" : "")
             << " | image forwarded: " << (received.contains("\x1bP") ? "yes" : "no")
             << " | ConPTY cursor moves after the image: " << cursor_moves_after_image(received)
             << '\n';
-        if (!sixel_case.observation_only) {
-            ok &= check(match, label + ": the model cursor matches OpenConsole's");
-        }
+        ok &= check(match, label + ": the model cursor matches OpenConsole's");
 
         ok &= check(session.write_user_bytes("q").code ==
                 term::Terminal_session_result_code::ACCEPTED,
