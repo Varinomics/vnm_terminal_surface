@@ -176,7 +176,7 @@ private:
         if (record.label == "reply-handling") {
             m_reply_seen =
                 m_reply_queries_seen                           &&
-                contains_hex(payload, "1b5b3f313b3263")        &&
+                contains_hex(payload, "1b5b3f36313b3463")      &&
                 contains_hex(payload, "1b5b32343b383052")      &&
                 contains_hex(payload, "1b5b3f323030343b312479");
             return m_reply_seen;

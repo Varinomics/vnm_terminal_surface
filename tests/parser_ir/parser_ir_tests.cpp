@@ -401,10 +401,10 @@ bool test_terminal_reply_ir()
     bool ok = true;
 
     const term::Parser_action da1 =
-        term::make_da1_reply_action(QByteArrayLiteral("\x1b[?1;2c"));
+        term::make_da1_reply_action(QByteArrayLiteral("\x1b[?61;4c"));
     const auto& da1_reply = std::get<term::Terminal_reply>(da1.payload);
     ok &= check(da1_reply.kind == term::Terminal_reply_kind::DA1, "DA1 reply kind");
-    ok &= check(da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?1;2c"),
+    ok &= check(da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;4c"),
         "DA1 reply bytes");
     ok &= check(da1_reply.source_family == term::Parser_sequence_family::CSI,
         "DA1 reply source family");
@@ -463,6 +463,39 @@ bool test_terminal_reply_ir()
         "cell pixel size reply bytes");
     ok &= check(cell_pixel_size_reply.source_family == term::Parser_sequence_family::CSI,
         "cell pixel size reply source family");
+
+    // xterm ctlseqs XTSMGRAPHICS: CSI ? Pi ; Ps ; Pv S, the geometry as width ;
+    // height, and no value after a status other than success.
+    const term::Parser_action graphics_geometry =
+        term::make_graphics_attribute_reply_action(
+            2,
+            term::Terminal_graphics_attribute_status::SUCCESS,
+            {800, 480});
+    const auto& graphics_geometry_reply =
+        std::get<term::Terminal_reply>(graphics_geometry.payload);
+    ok &= check(graphics_geometry_reply.kind == term::Terminal_reply_kind::GRAPHICS_ATTRIBUTE,
+        "graphics attribute reply kind");
+    ok &= check(graphics_geometry_reply.wire_bytes == QByteArrayLiteral("\x1b[?2;0;800;480S"),
+        "graphics geometry reply bytes");
+    ok &= check(graphics_geometry_reply.source_family == term::Parser_sequence_family::CSI,
+        "graphics attribute reply source family");
+
+    const term::Parser_action color_registers =
+        term::make_graphics_attribute_reply_action(
+            1,
+            term::Terminal_graphics_attribute_status::SUCCESS,
+            {256});
+    ok &= check(std::get<term::Terminal_reply>(color_registers.payload).wire_bytes ==
+            QByteArrayLiteral("\x1b[?1;0;256S"),
+        "color register count reply bytes");
+
+    const term::Parser_action item_error =
+        term::make_graphics_attribute_reply_action(
+            3,
+            term::Terminal_graphics_attribute_status::ITEM_ERROR);
+    ok &= check(std::get<term::Terminal_reply>(item_error.payload).wire_bytes ==
+            QByteArrayLiteral("\x1b[?3;1S"),
+        "graphics attribute error reply carries no value");
 
     const term::Parser_action osc = term::make_osc_query_reply_action(
         QByteArrayLiteral("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),

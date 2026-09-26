@@ -6,7 +6,10 @@
 #include "helpers/test_check.h"
 
 #include <QByteArray>
+#include <QColor>
 #include <QImage>
+#include <QList>
+#include <QSize>
 #include <QString>
 #include <algorithm>
 #include <cstddef>
@@ -1170,6 +1173,155 @@ bool test_recovered_history_rows_keep_their_images()
     return ok;
 }
 
+// The width and height of an XTSMGRAPHICS geometry reply, CSI ? 2 ; 0 ; w ; h S.
+QSize reported_geometry(const std::vector<term::Terminal_reply>& replies)
+{
+    if (replies.size() != 1U || !replies[0].wire_bytes.startsWith("\x1b[?2;0;")) {
+        return {};
+    }
+    const QByteArray&       wire_bytes = replies[0].wire_bytes;
+    const QList<QByteArray> fields     = wire_bytes.mid(3, wire_bytes.size() - 4).split(';');
+    return fields.size() == 4 ? QSize(fields[2].toInt(), fields[3].toInt()) : QSize();
+}
+
+// A client session as an encoder such as img2sixel drives it: it reads DA1 for
+// attribute 4, XTSMGRAPHICS for the geometry and CSI 16 t for the cell, sends an
+// image with raster attributes, color definitions, repeats, a graphics carriage
+// return and a trailing graphics new line in the pieces a pty delivers, and the
+// shell prints after it. Oracles: xterm ctlseqs (the replies), DEC ch. 14 (the
+// sixel data, the image at the cursor scrolling the screen), V1 (the cursor on
+// the row of the final sixel row's top, confirmed against OpenConsole by the
+// ConPTY cursor-sync gate). The byte stream is hand-written.
+bool test_encoder_session_end_to_end()
+{
+    bool ok = true;
+
+    // Four rows of 40 columns of 10 x 20 pixel cells: a 400 x 80 pixel text area.
+    term::Terminal_screen_model model = make_model(4, 40);
+    model.ingest(QByteArray("$ img2sixel photo.png\r\n"));
+
+    const term::Terminal_screen_model_result query_result =
+        model.ingest(QByteArray("\x1b[c\x1b[?2;1;0S\x1b[16t"));
+    const std::vector<term::Terminal_reply> replies = replies_in(query_result);
+    ok &= check(diagnostics_in(query_result).empty() && replies.size() == 3U &&
+            replies[0].wire_bytes == QByteArray("\x1b[?61;4c") &&
+            replies[1].wire_bytes == QByteArray("\x1b[?2;0;400;80S") &&
+            replies[2].wire_bytes == QByteArray("\x1b[6;20;10t"),
+        "the encoder learns of sixel graphics, a 400 x 80 geometry and a 10 x 20 cell");
+
+    // 30 x 60 pixels at 1:1 in ten sixel rows: the upper five red on the left
+    // half and green on the right, the lower five blue with a green stripe at x
+    // 12 to 17 drawn over the blue after a graphics carriage return.
+    QByteArray data("\"1;1;30;60#1;2;100;0;0#2;2;0;100;0#3;2;0;0;100");
+    for (int row = 0; row < 5; ++row) {
+        data += "#1!15~#2!15~-";
+    }
+    for (int row = 0; row < 5; ++row) {
+        data += "#3!30~$!12?#2!6~-";
+    }
+    const QByteArray image_bytes = sixel("0;1;0", data);
+    const term::Screen_sixel_image_mutation image = decoded_image("0;1;0", data);
+    ok &= check(image.raster.width() == 30 && image.raster.height() == 60,
+        "the image decodes to its 30 x 60 raster");
+
+    bool image_diagnostics = false;
+    for (qsizetype offset = 0; offset < image_bytes.size(); offset += 7) {
+        image_diagnostics |= !diagnostics_in(model.ingest(image_bytes.mid(offset, 7))).empty();
+    }
+    ok &= check(!image_diagnostics, "the image arrives in pieces without diagnostics");
+
+    // From row 1, the final sixel row's top at 60 pixels falls three rows down
+    // and the sixel row below it needs a fifth row: the screen scrolls once.
+    ok &= check(model.scrollback_size() == 1 &&
+            history_row_text(model, 0) == QStringLiteral("$ img2sixel photo.png"),
+        "the image scrolls the command line into history");
+    for (int band = 0; band < 3; ++band) {
+        ok &= check(slice_equals_band(slice_at(model, band), image.raster, band * 20, 30, 0),
+            "each band of the image lies on its row after the scroll");
+    }
+    ok &= check(model.cursor_position().row == 3 && model.cursor_position().column == 0,
+        "the cursor ends below the image, where the trailing graphics new line puts it");
+
+    const auto pixel_is = [&](int row, int x, int y, const QColor& color) {
+        const std::shared_ptr<const term::Terminal_image_slice> slice = slice_at(model, row);
+        return slice != nullptr && slice->pixels.pixelColor(x, y) == color;
+    };
+    const QColor red(255, 0, 0);
+    const QColor green(0, 255, 0);
+    const QColor blue(0, 0, 255);
+    ok &= check(pixel_is(0, 0, 0, red) && pixel_is(0, 29, 19, green),
+        "the first band is red on the left and green on the right");
+    ok &= check(pixel_is(1, 0, 9, red) && pixel_is(1, 0, 10, blue) &&
+            pixel_is(1, 14, 15, green) && pixel_is(1, 20, 15, blue),
+        "the second band turns blue at pixel row 30, under the green stripe");
+    ok &= check(pixel_is(2, 12, 19, green) && pixel_is(2, 29, 19, blue),
+        "the third band keeps the stripe drawn after the graphics carriage return");
+
+    model.ingest(QByteArray("done\r\n$ "));
+    ok &= check(model.scrollback_size() == 2 &&
+            slice_equals_band(
+                model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 1),
+                image.raster,
+                0,
+                30,
+                0),
+        "the shell's new line scrolls the first band into history with its row");
+    ok &= check(slice_equals_band(slice_at(model, 0), image.raster, 20, 30, 0) &&
+            slice_equals_band(slice_at(model, 1), image.raster, 40, 30, 0),
+        "the other bands move up with their rows");
+    ok &= check(model.row_text(2) == QStringLiteral("done") && slice_at(model, 2) == nullptr,
+        "the text after the image sits on its own row, clear of the image");
+    ok &= check(model.cursor_position().row == 3 && model.cursor_position().column == 2,
+        "the prompt follows on the next row");
+
+    return ok;
+}
+
+// XTSMGRAPHICS reports a geometry within the decoded-size cap (anchor A2, owner
+// decision D4), so at the smallest ring an encoder that fills it gets its image
+// decoded and placed, not discarded over the cap.
+bool test_reported_geometry_decodes_within_the_cap()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(
+        24,
+        80,
+        k_cell,
+        100,
+        term::k_terminal_min_retained_history_capacity_bytes);
+    const QSize geometry =
+        reported_geometry(replies_in(model.ingest(QByteArray("\x1b[?2;1;0S"))));
+    const qint64 limit_bytes = static_cast<qint64>(term::terminal_history_ring_max_record_bytes(
+        term::k_terminal_min_retained_history_capacity_bytes));
+    ok &= check(!geometry.isEmpty() &&
+            geometry.width() <= 800 && geometry.height() <= 480 &&
+            qint64{geometry.width()} * geometry.height() * 4 <= limit_bytes,
+        "the reported geometry fits the text area and the decoded-size cap");
+
+    // Full sixel rows, then a last one that sets only the bits the height needs.
+    const QByteArray width  = QByteArray::number(geometry.width());
+    const QByteArray height = QByteArray::number(geometry.height());
+    QByteArray data = "\"1;1;" + width + ';' + height + "#1;2;100;0;0";
+    for (int row = 0; row < geometry.height() / 6; ++row) {
+        data += "#1!" + width + "~-";
+    }
+    if (geometry.height() % 6 != 0) {
+        data += "#1!" + width + static_cast<char>('?' + (1 << (geometry.height() % 6)) - 1);
+    }
+
+    const term::Terminal_screen_model_result result = model.ingest(sixel("0;1;0", data));
+    const int bands = (geometry.height() + k_cell.height - 1) / k_cell.height;
+    ok &= check(diagnostics_in(result).empty() &&
+            slice_at(model, 0) != nullptr &&
+            slice_at(model, 0)->pixels.width() == geometry.width() &&
+            slice_at(model, bands - 1) != nullptr &&
+            slice_at(model, bands) == nullptr,
+        "an image of the reported geometry decodes and is placed whole");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -1194,5 +1346,7 @@ int main()
     ok &= test_image_rows_start_their_own_logical_lines();
     ok &= test_reflow_keeps_the_image_on_its_line_first_row();
     ok &= test_recovered_history_rows_keep_their_images();
+    ok &= test_encoder_session_end_to_end();
+    ok &= test_reported_geometry_decodes_within_the_cap();
     return ok ? 0 : 1;
 }

@@ -8,6 +8,7 @@
 #include <variant>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <utility>
 #include <vector>
 
@@ -171,6 +172,16 @@ enum class Terminal_reply_kind
     TEXT_AREA_SIZE,
     TEXT_AREA_PIXEL_SIZE,
     CELL_PIXEL_SIZE,
+    GRAPHICS_ATTRIBUTE,
+};
+
+// The Ps status of an XTSMGRAPHICS reply (xterm ctlseqs).
+enum class Terminal_graphics_attribute_status
+{
+    SUCCESS      = 0,
+    ITEM_ERROR   = 1,
+    ACTION_ERROR = 2,
+    FAILURE      = 3,
 };
 
 enum class Terminal_sgr_operation_kind
@@ -581,6 +592,7 @@ inline Parser_sequence_family source_family_for_reply_kind(Terminal_reply_kind k
         case Terminal_reply_kind::TEXT_AREA_SIZE:
         case Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE:
         case Terminal_reply_kind::CELL_PIXEL_SIZE:
+        case Terminal_reply_kind::GRAPHICS_ATTRIBUTE:
             return Parser_sequence_family::CSI;
     }
 
@@ -657,6 +669,26 @@ inline Parser_action make_cell_pixel_size_reply_action(int height, int width)
             Terminal_reply_kind::CELL_PIXEL_SIZE,
             QByteArray("\x1b[6;") + QByteArray::number(height) + ';' + QByteArray::number(width) + 't',
             QStringLiteral("CSI 16 t"));
+}
+
+// CSI ? Pi ; Ps ; Pv S. Only a success carries values: one for the color
+// registers, width and height for a geometry.
+inline Parser_action make_graphics_attribute_reply_action(
+    int                                item,
+    Terminal_graphics_attribute_status status,
+    std::initializer_list<int>         values = {})
+{
+    QByteArray wire_bytes = QByteArray("\x1b[?") + QByteArray::number(item) + ';' +
+        QByteArray::number(static_cast<int>(status));
+    for (const int value : values) {
+        wire_bytes += ';' + QByteArray::number(value);
+    }
+    wire_bytes += 'S';
+    return
+        make_terminal_reply_action(
+            Terminal_reply_kind::GRAPHICS_ATTRIBUTE,
+            std::move(wire_bytes),
+            QStringLiteral("XTSMGRAPHICS"));
 }
 
 inline Parser_action make_osc_query_reply_action(QByteArray wire_bytes, QString source_sequence)

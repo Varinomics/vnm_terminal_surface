@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
 #include "helpers/primary_backing_observation.h"
 #include "helpers/primary_backing_test_config.h"
@@ -6,6 +7,7 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QList>
 #include <QString>
 #include <algorithm>
 #include <array>
@@ -4980,8 +4982,8 @@ bool test_replies_and_cursor_save_restore()
         dsr_reply.wire_bytes == QByteArrayLiteral("\x1b[2;3R"),
         "DSR cursor reply");
     ok &= check(da1_reply.kind == term::Terminal_reply_kind::DA1 &&
-        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?1;2c"),
-        "DA1 reply");
+        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61c"),
+        "DA1 reply claims no sixel graphics without a cell pixel size");
     ok &= check(da2_reply.kind == term::Terminal_reply_kind::DA2 &&
         da2_reply.wire_bytes == QByteArrayLiteral("\x1b[>0;0;0c"),
         "DA2 reply");
@@ -5421,6 +5423,154 @@ bool test_pixel_size_reports_follow_cell_pixel_size()
     return ok;
 }
 
+// DA1 advertises sixel graphics as attribute 4 of class 61 (owner decision D3;
+// attribute 4 per xterm ctlseqs). XTSMGRAPHICS follows xterm ctlseqs: CSI ? Pi ;
+// Pa ; Pv S is answered with CSI ? Pi ; Ps ; Pv S, Ps 0 success, 1 error in Pi,
+// 2 error in Pa, 3 failure, the geometry as width ; height, and a failure when
+// graphics are not configured, which here means no cell pixel size. The
+// geometry fits both the text area and the decoded-size cap (anchor A2, owner
+// decision D4). Reset, set and maximum over values nothing can change are the
+// product decisions of the csi-xtsmgraphics matrix row.
+bool test_sixel_capability_replies()
+{
+    bool ok = true;
+
+    const auto check_replies = [&](
+        const term::Terminal_screen_model_result& result,
+        const std::vector<QByteArray>&            expected,
+        const char*                               label) {
+        const std::vector<term::Terminal_reply> replies = replies_in(result);
+        bool matches = diagnostic_count(result) == 0 && replies.size() == expected.size();
+        for (std::size_t i = 0; matches && i < replies.size(); ++i) {
+            matches = replies[i].wire_bytes == expected[i];
+        }
+        ok &= check(matches, label);
+    };
+
+    term::Terminal_screen_model_config config;
+    config.grid_size        = term::terminal_grid_size_t{24, 80};
+    config.scrollback_limit = 16;
+    config.tab_width        = 4;
+    config.cell_pixel_size  = term::terminal_cell_pixel_size_t{10, 20};
+    term::Terminal_screen_model model(config);
+    model.ingest(QByteArrayLiteral("top"));
+
+    check_replies(
+        model.ingest(QByteArrayLiteral("\x1b[c")),
+        {QByteArrayLiteral("\x1b[?61;4c")},
+        "DA1 advertises sixel graphics with a cell pixel size");
+
+    term::Terminal_screen_model_result result = model.ingest(QByteArrayLiteral(
+        "\x1b[?1;1;0S\x1b[?1;2;0S\x1b[?1;3;256S\x1b[?1;3;16S\x1b[?1;4;0S"));
+    check_replies(
+        result,
+        {
+            QByteArrayLiteral("\x1b[?1;0;256S"),
+            QByteArrayLiteral("\x1b[?1;0;256S"),
+            QByteArrayLiteral("\x1b[?1;0;256S"),
+            QByteArrayLiteral("\x1b[?1;3S"),
+            QByteArrayLiteral("\x1b[?1;0;256S"),
+        },
+        "color registers: read, reset, set to the count in effect, another set fails, maximum");
+    const std::vector<term::Terminal_reply> register_replies = replies_in(result);
+    ok &= check(!register_replies.empty() &&
+            register_replies.front().kind == term::Terminal_reply_kind::GRAPHICS_ATTRIBUTE &&
+            register_replies.front().source_sequence == QStringLiteral("XTSMGRAPHICS"),
+        "XTSMGRAPHICS replies are graphics attribute replies");
+
+    check_replies(
+        model.ingest(QByteArrayLiteral(
+            "\x1b[?2;1;0S\x1b[?2;2;0S\x1b[?2;3;800;480S\x1b[?2;3;640;480S\x1b[?2;4;0S\x1b[?2;1S")),
+        {
+            QByteArrayLiteral("\x1b[?2;0;800;480S"),
+            QByteArrayLiteral("\x1b[?2;0;800;480S"),
+            QByteArrayLiteral("\x1b[?2;0;800;480S"),
+            QByteArrayLiteral("\x1b[?2;3S"),
+            QByteArrayLiteral("\x1b[?2;0;800;480S"),
+            QByteArrayLiteral("\x1b[?2;0;800;480S"),
+        },
+        "the text area in pixels: read, reset, equal set, another set fails, maximum, omitted Pv");
+
+    check_replies(
+        model.ingest(QByteArrayLiteral("\x1b[?3;1;0S\x1b[?4;1;0S\x1b[?S\x1b[?1;5;0S\x1b[?2S")),
+        {
+            QByteArrayLiteral("\x1b[?3;1S"),
+            QByteArrayLiteral("\x1b[?4;1S"),
+            QByteArrayLiteral("\x1b[?0;1S"),
+            QByteArrayLiteral("\x1b[?1;2S"),
+            QByteArrayLiteral("\x1b[?2;2S"),
+        },
+        "ReGIS and unknown items are errors in Pi, unknown actions errors in Pa");
+
+    ok &= check(model.row_text(0) == QStringLiteral("top") && model.scrollback_size() == 0,
+        "XTSMGRAPHICS never scrolls like SU");
+
+    model.resize(term::terminal_grid_size_t{10, 40});
+    check_replies(
+        model.ingest(QByteArrayLiteral("\x1b[?2;1;0S")),
+        {QByteArrayLiteral("\x1b[?2;0;400;200S")},
+        "the sixel geometry follows a grid resize");
+    model.set_cell_pixel_size({9, 18});
+    check_replies(
+        model.ingest(QByteArrayLiteral("\x1b[?2;1;0S")),
+        {QByteArrayLiteral("\x1b[?2;0;360;180S")},
+        "the sixel geometry follows a cell change");
+
+    // At the smallest ring the cap is 131072 bytes, 32768 pixels, and the 800 x
+    // 480 text area holds 384000: the geometry shrinks to fit the cap.
+    model.resize(term::terminal_grid_size_t{24, 80});
+    model.set_cell_pixel_size({10, 20});
+    model.set_retained_history_capacity_bytes(term::k_terminal_min_retained_history_capacity_bytes);
+    result = model.ingest(QByteArrayLiteral("\x1b[?2;1;0S\x1b[?2;4;0S"));
+    const std::vector<term::Terminal_reply> capped_replies = replies_in(result);
+    ok &= check(capped_replies.size() == 2U &&
+            capped_replies[0].wire_bytes == capped_replies[1].wire_bytes,
+        "the maximum geometry is the geometry read");
+    if (!capped_replies.empty()) {
+        const QByteArray& wire_bytes = capped_replies[0].wire_bytes;
+        const QList<QByteArray> fields =
+            wire_bytes.mid(3, wire_bytes.size() - 4).split(';');
+        const qint64 width  = fields.size() == 4 ? fields[2].toLongLong() : 0;
+        const qint64 height = fields.size() == 4 ? fields[3].toLongLong() : 0;
+        ok &= check(wire_bytes.startsWith(QByteArrayLiteral("\x1b[?2;0;")) &&
+                width  > 0 && width  <= 800 &&
+                height > 0 && height <= 480 &&
+                width * height * 4 <= 131072,
+            "the capped geometry fits both the text area and the decoded-size cap");
+        // Provisional: that the fit keeps the text area's shape is the
+        // implementer's choice, not a confirmed contract.
+        ok &= check(wire_bytes == QByteArrayLiteral("\x1b[?2;0;233;140S"),
+            "the capped geometry keeps the text area's shape");
+    }
+
+    term::Terminal_screen_model unknown_cell_model = make_model(4, 5);
+    check_replies(
+        unknown_cell_model.ingest(QByteArrayLiteral(
+            "\x1b[c\x1b[?1;1;0S\x1b[?2;1;0S\x1b[?2;7;0S\x1b[?3;1;0S")),
+        {
+            QByteArrayLiteral("\x1b[?61c"),
+            QByteArrayLiteral("\x1b[?1;3S"),
+            QByteArrayLiteral("\x1b[?2;3S"),
+            QByteArrayLiteral("\x1b[?2;2S"),
+            QByteArrayLiteral("\x1b[?3;1S"),
+        },
+        "without a cell pixel size DA1 claims no sixel and the graphics items fail");
+
+    for (const QByteArray& malformed : {
+        QByteArrayLiteral("\x1b[?2;1;0;0;0S"),
+        QByteArrayLiteral("\x1b[?2:1;1S"),
+    })
+    {
+        result = model.ingest(malformed);
+        ok &= check(replies_in(result).empty() &&
+                diagnostic_count(result) == 1 &&
+                first_diagnostic(result).code == term::Parser_diagnostic_code::MALFORMED_INPUT,
+            "XTSMGRAPHICS with more than four parameters or sub-parameters is malformed");
+    }
+
+    return ok;
+}
+
 // The session's backend-output prescan and this model's control-sequence
 // dispatch both classify CSI 8 t through this one function. Pinning it directly
 // is what keeps the two from drifting apart about which byte run is a request.
@@ -5652,6 +5802,7 @@ int main()
     ok &= test_replies_and_cursor_save_restore();
     ok &= test_text_area_resize_policy_gates_the_request();
     ok &= test_pixel_size_reports_follow_cell_pixel_size();
+    ok &= test_sixel_capability_replies();
     ok &= test_text_area_resize_request_status_classifier();
     return ok ? 0 : 1;
 }

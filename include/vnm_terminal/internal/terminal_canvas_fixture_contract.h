@@ -283,7 +283,7 @@ terminal_canvas_fixture_contract_script()
         {
             Terminal_canvas_fixture_record_kind::EXPECT_INPUT,
             "reply-handling",
-            "1b5b3f313b32631b5b32343b3830521b5b3f323030343b312479",
+            "1b5b3f36313b34631b5b32343b3830521b5b3f323030343b312479",
             0,
             0,
             0,

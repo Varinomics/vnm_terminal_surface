@@ -888,6 +888,22 @@ reply: no-reply
 diagnostic: malformed sequence diagnostic; unsupported diagnostic for XTHIMOUSE-shaped multi-parameter CSI T
 oracle: xterm-409-reference
 
+## csi-xtsmgraphics
+
+id: csi-xtsmgraphics
+family: CSI
+sequence: XTSMGRAPHICS / CSI ? Pi ; Pa ; Pv S
+feature: sixel graphics attribute report
+status: supported
+action_category: terminal-reply
+behavior: answers without changing terminal state; Pi 1 is the color register count, 256, and Pi 2 the sixel geometry as width ; height, the text area in pixels, or, where that holds more pixels than the decoded-size cap (dcs-sixel-decoded-limit) allows, the text area scaled down to fit the cap with its shape kept; Pi 3, ReGIS, and every other item get status 1, error in Pi; Pa 1 reads, 2 resets, 3 sets and 4 reads the maximum, and other actions get status 2, error in Pa; a success is status 0 followed by the value; as a product decision nothing is settable, so a reset and the maximum report the value in effect as a read does, and a set succeeds only when it asks for that value and otherwise gets status 3, failure; omitted parameters are 0 and Pv is read only by a set; without a cell pixel size both items get status 3, as xterm answers when it is not configured for graphics; the ? private marker sets it apart from SU (csi-scroll-up)
+host_policy: the geometry follows the grid, the cell pixel size (csi-window-op-16) and the retained history capacity that sets the decoded-size cap
+payload_limit: none
+recovery: more than four parameters or sub-parameters discard the sequence and the parser continues
+reply: CSI ? Pi ; Ps S, or CSI ? Pi ; 0 ; Pv S on success, graphics attribute reply through same backend write path
+diagnostic: malformed sequence diagnostic
+oracle: xterm-409-reference
+
 ## csi-decsca
 
 id: csi-decsca
@@ -960,7 +976,7 @@ sequence: DA1
 feature: terminal identity reply
 status: supported
 action_category: terminal-reply
-behavior: emits typed DA1 reply action
+behavior: emits typed DA1 reply action CSI ? 61 ; 4 c, conformance class 61 with attribute 4, sixel graphics (xterm ctlseqs), while a cell pixel size (csi-window-op-16) lets images be placed, and CSI ? 61 c without one
 host_policy: backend write queue capacity applies
 payload_limit: none
 recovery: malformed query ignored with diagnostic

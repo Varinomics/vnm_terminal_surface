@@ -15,7 +15,6 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr QImage::Format k_sixel_raster_format = QImage::Format_RGBA8888_Premultiplied;
-constexpr std::int64_t   k_sixel_bytes_per_pixel = 4;
 constexpr int            k_sixel_row_pixels      = 6;
 constexpr unsigned char  k_sixel_data_first      = 0x3fU;
 constexpr unsigned char  k_sixel_data_last       = 0x7eU;

@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/csi_parameter_parsing.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/sixel_decoder.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
@@ -12,6 +13,7 @@
 #include <QChar>
 #include <QDateTime>
 #include <QImage>
+#include <QSize>
 #include <QStringList>
 #include <algorithm>
 #include <array>
@@ -448,6 +450,33 @@ QByteArray color_reply_payload(quint32 rgba)
         four_digit_hex(blue * 257);
 }
 
+// The sixel geometry XTSMGRAPHICS reports: the text area in pixels, so that an
+// image of that size shows whole, scaled down with its shape kept where it holds
+// more pixels than the decoded-size cap allows, so that such an image decodes.
+QSize sixel_graphics_geometry(
+    terminal_grid_size_t       grid_size,
+    terminal_cell_pixel_size_t cell,
+    std::size_t                limit_bytes)
+{
+    const std::int64_t limit_pixels =
+        static_cast<std::int64_t>(limit_bytes) / k_sixel_bytes_per_pixel;
+    const std::int64_t width  = std::int64_t{grid_size.columns} * cell.width;
+    const std::int64_t height = std::int64_t{grid_size.rows}    * cell.height;
+    if (width <= limit_pixels / height) {
+        return QSize(static_cast<int>(width), static_cast<int>(height));
+    }
+
+    const double scale = std::sqrt(
+        static_cast<double>(limit_pixels) /
+        (static_cast<double>(width) * static_cast<double>(height)));
+    const std::int64_t fitted_width = std::clamp<std::int64_t>(
+        static_cast<std::int64_t>(static_cast<double>(width) * scale),
+        1,
+        std::min(width, limit_pixels));
+    const std::int64_t fitted_height = std::min(height, limit_pixels / fitted_width);
+    return QSize(static_cast<int>(fitted_width), static_cast<int>(fitted_height));
+}
+
 }
 
 const char* terminal_recovery_attempt_status_token(
@@ -563,8 +592,7 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
     m_primary_backing.retained_history.capacity_bytes =
         terminal_history_ring_aligned_capacity(
             m_config.retained_history_capacity_bytes);
-    m_parser.set_sixel_raster_limit_bytes(terminal_history_ring_max_record_bytes(
-        m_primary_backing.retained_history.capacity_bytes));
+    m_parser.set_sixel_raster_limit_bytes(sixel_raster_limit_bytes());
 
     reset_grid();
     refresh_active_grid_retained_lookup_indexes();
@@ -1133,6 +1161,38 @@ void Terminal_screen_model::apply_control_sequence(
         case 'S':
         case 'T':
     {
+                            // CSI ? Pi ; Pa ; Pv S is XTSMGRAPHICS, not a scroll. A
+                            // geometry set carries two values, so four parameters at most.
+                            if (final_byte == 'S' &&
+                                sequence.private_marker == QByteArrayLiteral("?") &&
+                                sequence.intermediates.isEmpty())
+                            {
+                                if (!parse_simple_parameters()) {
+                                    return;
+                                }
+
+                                int item         = 0;
+                                int action       = 0;
+                                int first_value  = 0;
+                                int second_value = 0;
+                                if (parameter_count() > 4U               ||
+                                    !parameter_value(0U, 0, item)        ||
+                                    !parameter_value(1U, 0, action)      ||
+                                    !parameter_value(2U, 0, first_value) ||
+                                    !parameter_value(3U, 0, second_value))
+                                {
+                                    malformed();
+                                    return;
+                                }
+
+                                generated_actions.push_back(graphics_attribute_reply(
+                                    item,
+                                    action,
+                                    first_value,
+                                    second_value));
+                                return;
+                            }
+
                             int count = 1;
                             if (!has_no_prefix) {
                                 malformed();
@@ -1258,7 +1318,12 @@ void Terminal_screen_model::apply_control_sequence(
                                 sequence.private_marker.isEmpty() &&
                                 mode == 0)
                             {
-                                generated_actions.push_back(make_da1_reply_action(QByteArrayLiteral("\x1b[?1;2c")));
+                                // Class 61 with attribute 4, sixel graphics (ctlseqs), claimed
+                                // only while a cell pixel size lets images be placed.
+                                generated_actions.push_back(make_da1_reply_action(
+                                    m_config.cell_pixel_size.has_value()
+                                        ? QByteArrayLiteral("\x1b[?61;4c")
+                                        : QByteArrayLiteral("\x1b[?61c")));
                                 return;
                             }
                             if (sequence.intermediates.isEmpty() &&
@@ -1440,6 +1505,61 @@ void Terminal_screen_model::apply_control_sequence(
             unsupported();
             return;
     }
+}
+
+// XTSMGRAPHICS (xterm ctlseqs) reads or sets item 1, the color register count,
+// or item 2, the sixel geometry; ReGIS, item 3, is an error in Pi like any other
+// item. Nothing here is settable: every image has 256 private registers and the
+// geometry follows the text area and the decoded-size cap. So a reset reports the
+// value in effect as a read does, the maximum is that value, and a set succeeds
+// only when it asks for it. Without a cell pixel size no image can be placed, and
+// the items fail as xterm's do when it is not configured for graphics.
+Parser_action Terminal_screen_model::graphics_attribute_reply(
+    int item,
+    int action,
+    int first_value,
+    int second_value) const
+{
+    using Status = Terminal_graphics_attribute_status;
+
+    constexpr int color_register_item = 1;
+    constexpr int sixel_geometry_item = 2;
+    constexpr int set_action          = 3;
+
+    if (item != color_register_item && item != sixel_geometry_item) {
+        return make_graphics_attribute_reply_action(item, Status::ITEM_ERROR);
+    }
+    // 1 reads, 2 resets, 3 sets and 4 reads the maximum.
+    if (action < 1 || action > 4) {
+        return make_graphics_attribute_reply_action(item, Status::ACTION_ERROR);
+    }
+    if (!m_config.cell_pixel_size.has_value()) {
+        return make_graphics_attribute_reply_action(item, Status::FAILURE);
+    }
+
+    if (item == color_register_item) {
+        if (action == set_action && first_value != k_sixel_color_register_count) {
+            return make_graphics_attribute_reply_action(item, Status::FAILURE);
+        }
+        return make_graphics_attribute_reply_action(
+            item,
+            Status::SUCCESS,
+            {k_sixel_color_register_count});
+    }
+
+    const QSize geometry = sixel_graphics_geometry(
+        m_config.grid_size,
+        *m_config.cell_pixel_size,
+        sixel_raster_limit_bytes());
+    if (action == set_action &&
+        (first_value != geometry.width() || second_value != geometry.height()))
+    {
+        return make_graphics_attribute_reply_action(item, Status::FAILURE);
+    }
+    return make_graphics_attribute_reply_action(
+        item,
+        Status::SUCCESS,
+        {geometry.width(), geometry.height()});
 }
 
 void Terminal_screen_model::apply_sgr_sequence(const Terminal_sgr_sequence& sequence)
@@ -4546,8 +4666,7 @@ Terminal_screen_model::set_retained_history_capacity_bytes(
     const Retained_history_capacity_resize_result resize =
         m_primary_backing.resize_retained_history_capacity(aligned_capacity);
     m_config.retained_history_capacity_bytes = aligned_capacity;
-    m_parser.set_sixel_raster_limit_bytes(terminal_history_ring_max_record_bytes(
-        m_primary_backing.retained_history.capacity_bytes));
+    m_parser.set_sixel_raster_limit_bytes(sixel_raster_limit_bytes());
     for (const terminal_history_handle_t handle : resize.evicted_handles) {
         erase_retained_lookup_entry(
             Terminal_buffer_id::PRIMARY,
@@ -6986,6 +7105,13 @@ void Terminal_screen_model::scroll_active_region_up()
         m_scroll_bottom,
         m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
             m_scroll_top == 0);
+}
+
+// The decoded-size cap is the retained history's largest record.
+std::size_t Terminal_screen_model::sixel_raster_limit_bytes() const
+{
+    return terminal_history_ring_max_record_bytes(
+        m_primary_backing.retained_history.capacity_bytes);
 }
 
 void Terminal_screen_model::place_sixel_image(

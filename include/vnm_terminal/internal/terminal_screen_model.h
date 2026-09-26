@@ -1147,6 +1147,12 @@ private:
         std::vector<Parser_action>&    generated_actions,
         ingest_publication_t*          publication);
 
+    Parser_action graphics_attribute_reply(
+        int                            item,
+        int                            action,
+        int                            first_value,
+        int                            second_value) const;
+
     void apply_sgr_sequence(
         const Terminal_sgr_sequence&   sequence);
 
@@ -1402,6 +1408,8 @@ private:
     void wrap_line();
     void advance_row();
     void scroll_active_region_up();
+
+    std::size_t sixel_raster_limit_bytes() const;
 
     void place_sixel_image(
         const Screen_sixel_image_mutation& image,

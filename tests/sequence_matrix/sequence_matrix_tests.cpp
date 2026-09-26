@@ -282,6 +282,7 @@ const std::set<std::string>& required_sequence_ids()
         "esc-reverse-index",
         "csi-scroll-up",
         "csi-scroll-down",
+        "csi-xtsmgraphics",
         "csi-decsca",
         "bracketed-paste-generated-input",
         "mouse-sgr-1006-generated-input",

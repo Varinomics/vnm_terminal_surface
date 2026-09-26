@@ -10,7 +10,10 @@
 
 namespace vnm_terminal::internal {
 
-constexpr int k_sixel_color_register_count = 256;
+constexpr int          k_sixel_color_register_count = 256;
+
+// A decoded raster is RGBA8: the decoded-size cap bounds width x height x this.
+constexpr std::int64_t k_sixel_bytes_per_pixel      = 4;
 
 // Decodes the data of one sixel device control string (VT330/VT340
 // Programmer Reference Manual vol. 2, chapter 14) as it streams in, so an

@@ -14560,27 +14560,30 @@ bool test_backend_output_replies_use_write_path()
 
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend = make_session(session);
+    session->set_cell_pixel_size({9, 18});
     ok &= check(session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "reply-path session starts");
 
     ok &= check(backend->emit_output(
-        QByteArrayLiteral("A\x1b[6n\x1b[c\x1b[>c\x1b[?25$p\x1b[18t")),
+        QByteArrayLiteral("A\x1b[6n\x1b[c\x1b[>c\x1b[?25$p\x1b[18t\x1b[?2;1;0S")),
         "fake backend emits output with terminal queries");
 
-    ok &= check(backend->writes.size() == 5U,
+    ok &= check(backend->writes.size() == 6U,
         "generated terminal replies reach backend write path");
-    if (backend->writes.size() == 5U) {
+    if (backend->writes.size() == 6U) {
         ok &= check(backend->writes[0] == QByteArrayLiteral("\x1b[1;2R"),
             "DSR reply reports cursor after preceding output");
-        ok &= check(backend->writes[1] == QByteArrayLiteral("\x1b[?1;2c"),
-            "DA1 reply is emitted through backend write");
+        ok &= check(backend->writes[1] == QByteArrayLiteral("\x1b[?61;4c"),
+            "DA1 reply advertising sixel graphics is emitted through backend write");
         ok &= check(backend->writes[2] == QByteArrayLiteral("\x1b[>0;0;0c"),
             "DA2 reply is emitted through backend write");
         ok &= check(backend->writes[3] == QByteArrayLiteral("\x1b[?25;1$y"),
             "DECRQM reply is emitted through backend write");
         ok &= check(backend->writes[4] == QByteArrayLiteral("\x1b[8;24;80t"),
             "text-area size reply is emitted through backend write");
+        ok &= check(backend->writes[5] == QByteArrayLiteral("\x1b[?2;0;720;432S"),
+            "XTSMGRAPHICS geometry reply is emitted through backend write");
     }
 
     const std::vector<term::Terminal_session_command> commands =
@@ -14592,9 +14595,9 @@ bool test_backend_output_replies_use_write_path()
             break;
         }
     }
-    ok &= check(output_index + 5U < commands.size(),
+    ok &= check(output_index + 6U < commands.size(),
         "reply command stream contains backend output followed by replies");
-    if (output_index + 5U < commands.size()) {
+    if (output_index + 6U < commands.size()) {
         ok &= check(commands[output_index + 1U].kind ==
             term::Terminal_session_command_kind::TERMINAL_REPLY &&
             commands[output_index + 2U].kind ==
@@ -14604,6 +14607,8 @@ bool test_backend_output_replies_use_write_path()
             commands[output_index + 4U].kind ==
                 term::Terminal_session_command_kind::TERMINAL_REPLY &&
             commands[output_index + 5U].kind ==
+                term::Terminal_session_command_kind::TERMINAL_REPLY &&
+            commands[output_index + 6U].kind ==
                 term::Terminal_session_command_kind::TERMINAL_REPLY,
             "generated replies are processed after backend output");
     }
@@ -14743,6 +14748,9 @@ bool test_terminal_canvas_fixture_script_through_session()
 
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend = make_session(session, config);
+    // A surface reports its cell before the backend starts, so the scripted
+    // replies are those of a session that can place sixel images.
+    session->set_cell_pixel_size({9, 18});
     term::Terminal_launch_config launch_config = valid_launch_config();
     launch_config.identity.term                = QStringLiteral("xterm-256color");
     launch_config.identity.colorterm           = QStringLiteral("truecolor");
