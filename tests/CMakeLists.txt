@@ -1,5 +1,13 @@
 include("${PROJECT_SOURCE_DIR}/cmake/vnm_cmake_dependency.cmake")
 vnm_write_toolchain_context("${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake")
+add_test(NAME vnm_terminal_surface_source_package_argument_transport
+    COMMAND "${CMAKE_COMMAND}"
+        "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
+        "-Dtest_root=${CMAKE_CURRENT_BINARY_DIR}/package_argument_transport"
+        "-Ddriver=${PROJECT_SOURCE_DIR}/cmake/prepare_source_package.cmake"
+        -P "${PROJECT_SOURCE_DIR}/tests/package_smoke/expect_source_package_arguments.cmake")
+set_tests_properties(vnm_terminal_surface_source_package_argument_transport PROPERTIES
+    LABELS "package;posture" TIMEOUT 120)
 set(vnm_package_dependency_context "${CMAKE_CURRENT_BINARY_DIR}/package-dependencies.cmake")
 file(WRITE "${vnm_package_dependency_context}"
     "set(CMAKE_PREFIX_PATH [==[${CMAKE_PREFIX_PATH}]==] CACHE STRING \"\" FORCE)\n")
