@@ -28,13 +28,15 @@ Terminal_csi_byte_kind terminal_csi_byte_kind(unsigned char byte);
 class Terminal_byte_stream_parser
 {
 public:
-    // Parses bytes from offset on and stops right after a sixel image
-    // completes, so its caller applies each image before the next is decoded
-    // and at most one decoded raster is alive at a time, however many images
-    // one chunk describes. It also stops where the budget cannot pay for the
-    // next sixel step (sixel_work_deferred). offset advances past what was
-    // parsed; the caller calls again until it reaches bytes.size(), handing
-    // deferred bytes over again in a later step.
+    // Parses bytes from offset on and stops right after every sixel string
+    // ends, whatever ends it (the image completes, or a cancel, a recovery or
+    // an over-cap discard abandons it), so its caller applies each image
+    // before the next is decoded, at most one decoded raster is alive at a
+    // time however many images one chunk describes, and a spent budget is
+    // seen at every such boundary. It also stops where the budget cannot pay
+    // for the next sixel step (sixel_work_deferred). offset advances past what
+    // was parsed; the caller calls again until it reaches bytes.size(),
+    // handing deferred bytes over again in a later step.
     std::vector<Parser_action> ingest(
         QByteArrayView       bytes,
         qsizetype&           offset,
@@ -149,6 +151,8 @@ private:
     Sixel_decoder              m_sixel_decoder;
     Sixel_work_budget*         m_sixel_work_budget             = nullptr;
     bool                       m_sixel_work_deferred           = false;
+    // A sixel string ended since the parse loop last looked.
+    bool                       m_sixel_string_ended            = false;
     bool                       m_discarding_csi                = false;
     bool                       m_discarding_escape             = false;
     std::uint64_t              m_next_host_request_id          = 1U;

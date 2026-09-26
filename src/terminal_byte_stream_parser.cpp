@@ -304,20 +304,6 @@ bool dcs_header_continues(unsigned char byte)
     return byte < 0x20U && byte != 0x1bU && byte != 0x18U && byte != 0x1aU;
 }
 
-// A completed sixel image is the last action its string produces.
-bool ends_with_sixel_image(const std::vector<Parser_action>& actions)
-{
-    if (actions.empty() ||
-        parser_action_kind(actions.back()) != Parser_action_kind::SCREEN_MUTATION)
-    {
-        return false;
-    }
-
-    return
-        screen_mutation_kind(std::get<Screen_mutation>(actions.back().payload)) ==
-        Screen_mutation_kind::SIXEL_IMAGE;
-}
-
 Parser_action make_string_recovery_diagnostic(Parser_sequence_family family)
 {
     return
@@ -971,11 +957,15 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
     const qsizetype parsed = ingest_buffer(prefixed, actions);
     m_sixel_work_budget = nullptr;
 
-    // An image ends at a string terminator, and a pending prefix holds a
-    // sequence its own bytes could not complete, so a stop at an image always
-    // falls past the prefix. So does a budget stop, which comes before a draw
-    // or graphics new line, never in a prefix.
-    Q_ASSERT(parsed >= prefix_size);
+    // A pending prefix holds a sequence its own bytes could not complete, so
+    // an image, which ends at its string terminator, and a budget stop, which
+    // comes before a draw or graphics new line, both fall past it. Only a
+    // recovery can end a sixel string at a held ESC, and the ESC then starts
+    // the sequence the next call parses: it is held again.
+    if (parsed < prefix_size) {
+        m_pending_prefix = prefixed.first(prefix_size).sliced(parsed);
+        return actions;
+    }
     offset += parsed - prefix_size;
     return actions;
 }
@@ -1001,6 +991,13 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         print_text_printable_ascii_only = true;
     };
 
+    // A sixel string that ends, however it ends, is a place to return: the
+    // caller applies an image before the next is decoded and sees a spent
+    // budget there, since an abandoned image's raster was paid for too.
+    const auto sixel_boundary_reached = [&]() {
+        return std::exchange(m_sixel_string_ended, false) || m_sixel_work_deferred;
+    };
+
     qsizetype offset = 0;
     while (offset < bytes.size()) {
         if (m_discarding_csi) {
@@ -1018,7 +1015,7 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         if (is_string_family(m_string_family)) {
             flush_print_text();
             continue_string(bytes, offset, actions);
-            if (ends_with_sixel_image(actions) || m_sixel_work_deferred) {
+            if (sixel_boundary_reached()) {
                 break;
             }
             continue;
@@ -1045,7 +1042,7 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         if (try_start_string(bytes, offset, actions)          == String_state_result::CONSUMED ||
             try_consume_escape_or_csi(bytes, offset, actions) == String_state_result::CONSUMED)
         {
-            if (ends_with_sixel_image(actions) || m_sixel_work_deferred) {
+            if (sixel_boundary_reached()) {
                 break;
             }
             continue;
@@ -1583,6 +1580,8 @@ void Terminal_byte_stream_parser::finish_sixel(
     Parser_string_terminator       terminator,
     std::vector<Parser_action>&    actions)
 {
+    m_sixel_string_ended = true;
+
     // Only the string terminator completes an image. A recovery boundary or
     // CAN/SUB abandons it: nothing is placed, and the next image starts from
     // a fresh decoder.

@@ -1753,6 +1753,49 @@ bool test_composites_are_paid_for()
     return ok;
 }
 
+// Budgeted work ends the ingest at the end of its sixel string whatever ends
+// the string: a raster allocated and then cancelled (CAN, SUB), abandoned at
+// a recovery, or discarded over the cap stops the call as a completed image
+// does, so a run of such strings cannot allocate past the budget.
+bool test_every_sixel_string_end_is_a_budget_boundary()
+{
+    bool ok = true;
+
+    struct Case
+    {
+        const char* name;
+        QByteArray  image;
+        qsizetype   consumed;
+    };
+    const QByteArray allocated("\x1bPq\"1;1;1448;1448#1");
+    const std::vector<Case> cases = {
+        {"CAN", allocated + QByteArray("\x18"), allocated.size() + 1},
+        {"SUB", allocated + QByteArray("\x1a"), allocated.size() + 1},
+        // A recovery leaves its CSI to be parsed after the string.
+        {"recovery", allocated + QByteArray("\x1b[0m"), allocated.size()},
+    };
+    for (const Case& test_case : cases) {
+        const QByteArray bytes =
+            test_case.image + test_case.image + test_case.image + QByteArray("done");
+        term::Terminal_screen_model model = make_model(20, 160);
+        term::Sixel_work_budget budget(1U);
+        const term::Terminal_screen_model_result result = model.ingest(bytes, nullptr, &budget);
+        ok &= check(result.sixel_work_pending && result.consumed_bytes == test_case.consumed,
+            std::string(test_case.name) + ": an abandoned image that spent the budget ends the call");
+
+        qsizetype offset = result.consumed_bytes;
+        int calls = 1;
+        for (; offset < bytes.size() && calls < 32; ++calls) {
+            term::Sixel_work_budget next(1U);
+            offset += model.ingest(QByteArrayView(bytes).sliced(offset), nullptr, &next).consumed_bytes;
+        }
+        ok &= check(offset == bytes.size() && calls >= 3 &&
+                model.visible_text().contains(QStringLiteral("done")),
+            std::string(test_case.name) + ": later calls take one string each and then the text");
+    }
+    return ok;
+}
+
 int main()
 {
     bool ok = true;
@@ -1784,5 +1827,6 @@ int main()
     ok &= test_budgeted_placement_matches_an_unbudgeted_one();
     ok &= test_spent_budget_ends_the_ingest_at_an_image_end();
     ok &= test_composites_are_paid_for();
+    ok &= test_every_sixel_string_end_is_a_budget_boundary();
     return ok ? 0 : 1;
 }
