@@ -161,6 +161,27 @@ bool is_parameter_byte(unsigned char byte)
 // Cropping by copy would move up to the whole cap in the drain slice that
 // sees ST, so the image views the extent of the capacity buffer instead, and
 // the view owns that buffer.
+// Holds a call's budget for the raster growth it may cause, and lets go of it
+// however the call ends.
+class Budget_scope final
+{
+public:
+    Budget_scope(Sixel_work_budget*& slot, Sixel_work_budget* budget)
+    :
+        m_slot(slot)
+    {
+        m_slot = budget;
+    }
+
+    ~Budget_scope() { m_slot = nullptr; }
+
+    Budget_scope(const Budget_scope&)            = delete;
+    Budget_scope& operator=(const Budget_scope&) = delete;
+
+private:
+    Sixel_work_budget*& m_slot;
+};
+
 QImage view_of_extent(QImage capacity, int width, int height)
 {
     if (capacity.width() == width && capacity.height() == height) {
@@ -218,21 +239,36 @@ void Sixel_decoder::begin(QByteArrayView header_parameters)
     m_active            = true;
 }
 
-void Sixel_decoder::decode(QByteArrayView data, std::vector<Parser_action>& actions)
+qsizetype Sixel_decoder::decode(
+    QByteArrayView               data,
+    std::vector<Parser_action>&  actions,
+    Sixel_work_budget*           budget)
 {
-    for (const char character : data) {
-        const unsigned char byte = static_cast<unsigned char>(character);
+    qsizetype consumed = 0;
+    Budget_scope budget_scope(m_budget, budget);
+    for (; consumed < data.size(); ++consumed) {
+        const unsigned char byte = static_cast<unsigned char>(data[consumed]);
+        if (m_command != Command::NONE && is_parameter_byte(byte)) {
+            collect_parameter_byte(byte);
+            continue;
+        }
+
+        // A draw or a graphics new line is paid for before anything changes,
+        // so a byte the budget cannot pay for is left whole for later.
+        const bool data_byte = byte >= k_sixel_data_first && byte <= k_sixel_data_last;
+        const std::uint64_t cost =
+            data_byte   ? draw_cost(byte - k_sixel_data_first) :
+            byte == '-' ? band_expansion_cost()                : 0U;
+        if (cost > 0U && !try_charge_sixel_work(budget, cost)) {
+            break;
+        }
 
         int repeat = 1;
         if (m_command != Command::NONE) {
-            if (is_parameter_byte(byte)) {
-                collect_parameter_byte(byte);
-                continue;
-            }
             repeat = finish_command();
         }
 
-        if (byte >= k_sixel_data_first && byte <= k_sixel_data_last) {
+        if (data_byte) {
             draw_sixel(byte - k_sixel_data_first, repeat);
             continue;
         }
@@ -249,16 +285,29 @@ void Sixel_decoder::decode(QByteArrayView data, std::vector<Parser_action>& acti
     }
 
     emit_limit_diagnostic(actions);
+    return consumed;
 }
 
-void Sixel_decoder::finish(std::vector<Parser_action>& actions)
+std::uint64_t Sixel_decoder::finish_cost() const
 {
+    const bool fills = m_background_fill && !m_limit_exceeded;
+    return band_expansion_cost() +
+        (fills ? static_cast<std::uint64_t>(m_extent_width * m_extent_height) : 0U);
+}
+
+void Sixel_decoder::finish(std::vector<Parser_action>& actions, Sixel_work_budget* budget)
+{
+    Budget_scope budget_scope(m_budget, budget);
+
     // A command still collecting parameters completes at the terminator, so
     // a trailing color definition applies. A repeat has nothing to repeat.
     finish_command();
 
     // The cap may have shrunk since the image last grew.
     grow_extent_within_limit();
+    if (budget != nullptr) {
+        budget->charge_after(finish_cost());
+    }
     expand_band();
     emit_limit_diagnostic(actions);
 
@@ -397,6 +446,27 @@ void Sixel_decoder::apply_raster_attributes()
     }
 }
 
+// A draw writes each set bit's first row once per repeat; aspect rows follow
+// in the band expansion. An empty sixel only moves the cursor.
+std::uint64_t Sixel_decoder::draw_cost(int bits) const
+{
+    const int repeat = m_command == Command::REPEAT ? std::max(m_parameters[0], 1) : 1;
+    return bits == 0
+        ? 1U
+        : static_cast<std::uint64_t>(repeat) *
+            static_cast<std::uint64_t>(std::popcount(static_cast<unsigned int>(bits)));
+}
+
+std::uint64_t Sixel_decoder::band_expansion_cost() const
+{
+    if (m_pixel_aspect_ratio <= 1) {
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(m_band_width) *
+        static_cast<std::uint64_t>(std::popcount(static_cast<unsigned int>(m_band_drawn_bits))) *
+        static_cast<std::uint64_t>(m_pixel_aspect_ratio - 1);
+}
+
 void Sixel_decoder::draw_sixel(int bits, int repeat)
 {
     m_raster_locked = true;
@@ -511,6 +581,9 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
     // QImage reports a failed allocation with a null image, not an exception.
     if (grown.isNull()) {
         throw std::bad_alloc();
+    }
+    if (m_budget != nullptr) {
+        m_budget->charge_after(static_cast<std::uint64_t>(grown_width * grown_height));
     }
 
     m_raster        = std::move(grown);

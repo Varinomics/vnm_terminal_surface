@@ -4683,8 +4683,11 @@ bool VNM_TerminalSurface::respond_text_area_resize(
             term::terminal_grid_size_t{effective_rows, effective_columns},
         });
     // The session drains pending work across that call, which can advance the
-    // model and publish a snapshot, so republish before returning.
+    // model and publish a snapshot, so republish before returning. A released
+    // tail with more sixel work than one drain step allows is left for the
+    // drains that follow.
     sync_from_session();
+    m_private->request_backend_callback_frame_update_or_queue_posted_drain(*this);
     if (!is_accepted(result.code)) {
         report_result_failure(result);
         return false;
@@ -4714,6 +4717,7 @@ void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
         {},
     });
     sync_from_session();
+    m_private->request_backend_callback_frame_update_or_queue_posted_drain(*this);
 }
 
 QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const

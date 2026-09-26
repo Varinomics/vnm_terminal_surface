@@ -15744,32 +15744,51 @@ bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
     return ok;
 }
 
-bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
+// A near-cap image: a background-filled 1448 x 1448 raster, 73 rows of 20
+// pixels, whose decoding and placement take several drain steps.
+QByteArray budget_filling_sixel_image()
+{
+    return QByteArrayLiteral("\x1bPq\"1;1;1448;1448#1~\x1b\\");
+}
+
+// Rows [first, first + count) of a snapshot either all carry an image or none
+// do: a published snapshot never shows part of an image.
+bool snapshot_image_rows_whole(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   first,
+    int                                   count)
+{
+    int with_image = 0;
+    for (int row = first; row < first + count && row < snapshot.grid_size.rows; ++row) {
+        with_image += term::render_snapshot_row_image(snapshot, row) != nullptr ? 1 : 0;
+    }
+    return with_image == 0 || with_image == count;
+}
+
+bool test_budgeted_backend_callback_drain_resumes_sixel_work()
 {
     bool ok = true;
 
     // A sixel image described in a few bytes can expand into one as large as
-    // the decoded-size cap, so a budgeted drain ends its slice where an image
-    // completes and meets its deadline before decoding the next one. The
-    // images and the text around them end up as one unbudgeted drain leaves
-    // them, a query between them is answered the same, and images inside a
-    // synchronized update stay unpublished until it ends.
-    const QByteArray image    = QByteArrayLiteral("\x1bPq\"1;1;40;40#1~\x1b\\");
-    const QByteArray before   = QByteArrayLiteral("before ");
-    const QByteArray query    = QByteArrayLiteral("\x1b[c");
-    const QByteArray sync_on  = QByteArrayLiteral("\x1b[?2026h");
-    const QByteArray sync_off = QByteArrayLiteral("\x1b[?2026l");
-    const QByteArray after    = QByteArrayLiteral(" after");
+    // the decoded-size cap. A budgeted drain step pays for its sixel work and
+    // leaves the rest to the next step, which continues where it stopped.
+    // Whatever the steps, the screen, the replies and their order end as one
+    // unbudgeted drain leaves them, the output is recorded once, and no
+    // published snapshot shows part of an image, inside or outside a
+    // synchronized update.
+    const QByteArray image  = budget_filling_sixel_image();
     const QByteArray output =
-        before + image + query + sync_on + image + image + sync_off + after;
+        QByteArrayLiteral("before \x1b[2;1H") + image + QByteArrayLiteral("\x1b[c") +
+        QByteArrayLiteral("\x1b[?2026h\x1b[80;1H") + image + QByteArrayLiteral("\x1b[?2026l") +
+        QByteArrayLiteral(" after");
 
     struct drain_result_t
     {
-        std::vector<QByteArray>                      chunks;
-        std::vector<QByteArray>                      writes;
-        std::vector<term::terminal_grid_position_t>  published_cursors;
+        std::vector<QByteArray>                       chunks;
+        std::vector<QByteArray>                       writes;
         std::optional<term::Terminal_render_snapshot> snapshot;
-        int                                          calls = 0;
+        int                                           calls       = 0;
+        bool                                          whole_images = true;
     };
     const auto drain = [&](bool budgeted, const std::string& label) {
         term::Terminal_session_config config;
@@ -15777,34 +15796,30 @@ bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
         std::unique_ptr<term::Terminal_session> session;
         Scripted_backend* backend = make_session(session, config);
         session->set_cell_pixel_size({10, 20});
-        ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = term::terminal_grid_size_t{160, 160};
+        ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
             label + ": session starts");
         ok &= check(backend->emit_output(output), label + ": output queues");
 
-        // The published cursor is recorded after each drain that takes output;
-        // a later drain may only send the reply.
         drain_result_t result;
-        while (session->has_pending_backend_callback_events() && result.calls < 16) {
+        while (session->has_pending_backend_callback_events() && result.calls < 1000) {
             ++result.calls;
-            const std::size_t chunks_before = session->output_chunks().size();
             if (budgeted) {
                 session->process_backend_callback_events_for(
                     std::chrono::steady_clock::duration::zero());
-                ok &= check(session->output_chunks().size() <= chunks_before + 1U,
-                    label + ": an owner drain takes at most one slice");
             }
             else {
                 session->process_backend_callback_events();
             }
-            if (session->output_chunks().size() == chunks_before) {
-                continue;
-            }
             const std::optional<term::Terminal_render_snapshot> published =
                 session->latest_render_snapshot();
-            result.published_cursors.push_back(published.has_value()
-                ? published->cursor.position
-                : term::terminal_grid_position_t{});
+            if (published.has_value()) {
+                result.whole_images = result.whole_images &&
+                    snapshot_image_rows_whole(*published, 1, 73) &&
+                    snapshot_image_rows_whole(*published, 79, 73);
+            }
         }
         result.chunks   = session->output_chunks();
         result.writes   = backend->writes;
@@ -15815,18 +15830,15 @@ bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
     const drain_result_t budgeted   = drain(true,  "budgeted sixel drain");
     const drain_result_t unbudgeted = drain(false, "unbudgeted sixel drain");
 
-    ok &= check(budgeted.chunks == std::vector<QByteArray>{
-            before + image, query + sync_on + image, image, sync_off + after},
-        "budgeted sixel drain ends a slice after each image");
+    ok &= check(budgeted.calls > 4,
+        "budgeted sixel drain spreads the images over several steps");
+    ok &= check(budgeted.chunks == std::vector<QByteArray>{output} &&
+            unbudgeted.chunks == std::vector<QByteArray>{output},
+        "budgeted sixel drain records the output once");
     ok &= check(!budgeted.writes.empty() && budgeted.writes == unbudgeted.writes,
         "budgeted sixel drain answers the query between images as one drain does");
-    ok &= check(budgeted.published_cursors.size() == 4U &&
-            budgeted.published_cursors[1] == budgeted.published_cursors[0] &&
-            budgeted.published_cursors[2] == budgeted.published_cursors[0] &&
-            budgeted.published_cursors[3] != budgeted.published_cursors[0],
-        "budgeted sixel drain publishes nothing inside the synchronized update");
-    ok &= check(unbudgeted.chunks == std::vector<QByteArray>{output},
-        "unbudgeted sixel drain takes the output whole");
+    ok &= check(budgeted.whole_images,
+        "budgeted sixel drain never publishes part of an image");
     ok &= check(budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value(),
         "both sixel drains publish a snapshot");
     if (budgeted.snapshot.has_value() && unbudgeted.snapshot.has_value()) {
@@ -15845,10 +15857,80 @@ bool test_budgeted_backend_callback_drain_yields_after_each_sixel_image()
         }
         ok &= check(same_rows,
             "budgeted sixel drain leaves the text and images one drain does");
-        ok &= check(snapshot_contains_text(left, QStringLiteral("after")),
-            "budgeted sixel drain reaches the text after the images");
+        ok &= check(snapshot_contains_text(left, QStringLiteral("after")) &&
+                term::render_snapshot_row_image(left, 1) != nullptr &&
+                term::render_snapshot_row_image(left, 79) != nullptr,
+            "budgeted sixel drain reaches both images and the text after them");
     }
 
+    return ok;
+}
+
+// A host answer releases a held tail. Its sixel work beyond one drain step's
+// budget replays in the drains that follow, ahead of later input and output.
+bool test_settled_tail_replays_heavy_sixel_work_across_drains()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    ok &= check(session->start(launch_config_with_grid(100, 160)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "settled heavy tail session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;90;160t")),
+        "the resize request is accepted");
+    session->process_backend_callback_events();
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 1U && requests.front().request.has_value(),
+        "the resize request reaches the host");
+    if (requests.empty() || !requests.front().request.has_value()) {
+        return false;
+    }
+
+    ok &= check(backend->emit_output(
+            budget_filling_sixel_image() + QByteArrayLiteral("\r\ntail-text")),
+        "the tail is held");
+    session->process_backend_callback_events();
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+            requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            term::terminal_grid_size_t{90, 160},
+        }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the host answer is accepted");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the tail's image is still being replayed after the answer");
+    ok &= check(!session->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
+            QByteArrayLiteral("k")).has_value(),
+        "input waits behind the tail that is still replaying");
+
+    int  calls        = 0;
+    bool whole_images = true;
+    while (session->has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+        const std::optional<term::Terminal_render_snapshot> published =
+            session->latest_render_snapshot();
+        if (published.has_value()) {
+            whole_images = whole_images && snapshot_image_rows_whole(*published, 0, 73);
+        }
+    }
+    ok &= check(calls > 1 && !session->has_pending_backend_callback_events(),
+        "the drains after the answer finish the tail");
+    ok &= check(whole_images, "no published snapshot shows part of the tail's image");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            snapshot->grid_size.rows == 90 &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("tail-text")),
+        "the replayed tail shows the image and the text after it");
     return ok;
 }
 
@@ -20767,7 +20849,8 @@ int main()
     ok &= test_worker_thread_callback_is_delivered();
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
-    ok &= test_budgeted_backend_callback_drain_yields_after_each_sixel_image();
+    ok &= test_budgeted_backend_callback_drain_resumes_sixel_work();
+    ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
     ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
     ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();

@@ -433,6 +433,14 @@ std::int64_t sixel_row_at_aspect(std::int64_t y, int decoded_aspect, int aspect)
     return y / decoded_aspect * aspect + std::min<std::int64_t>(y % decoded_aspect, aspect);
 }
 
+// Placement's charges to a Sixel_work_budget, whose unit is about one pixel
+// written or copied: the fixed part of placing one band, and of one region
+// scroll with its history append, per step and per region row. Measured
+// against the decoder's pixel work.
+constexpr std::uint64_t k_sixel_band_step_units   = 2048U;
+constexpr std::uint64_t k_sixel_scroll_step_units = 24576U;
+constexpr std::uint64_t k_sixel_scroll_row_units  = 64U;
+
 // The decoder's raster at a smaller aspect ratio, which is the raster it
 // would have decoded at that ratio.
 QImage sixel_raster_at_aspect(const QImage& raster, int decoded_aspect, int aspect)
@@ -692,7 +700,8 @@ Terminal_screen_model::Resize_transition_scope::~Resize_transition_scope()
 
 Terminal_screen_model_result Terminal_screen_model::ingest(
     QByteArrayView bytes,
-    const terminal_screen_model_resize_transition_sink_t* resize_transition_sink)
+    const terminal_screen_model_resize_transition_sink_t* resize_transition_sink,
+    Sixel_work_budget* sixel_work_budget)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::ingest");
 
@@ -710,16 +719,52 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         resize_transition_sink,
         resize_transition_publication);
 
+    struct Budget_scope
+    {
+        Sixel_work_budget*& slot;
+        ~Budget_scope() { slot = nullptr; }
+    } budget_scope{m_sixel_work_budget};
+    m_sixel_work_budget = sixel_work_budget;
+
+    // A placement left waiting by an earlier call continues first, and
+    // nothing is parsed until it ends. Once it has started, its changes are
+    // held like synchronized output and released when it ends.
+    qsizetype parsed   = 0;
+    bool      deferred = false;
+    if (m_sixel_placement.has_value()) {
+        Q_ASSERT(bytes.empty());
+        clear_dirty();
+        advance_sixel_placement(result.actions);
+        accumulate_pending_changes(resize_transition_publication);
+        deferred = m_sixel_placement.has_value();
+        if (deferred || m_modes.synchronized_output) {
+            collect_synchronized_changes();
+            m_sixel_placement_held = m_sixel_placement_held || deferred;
+        }
+        else
+        if (m_sixel_placement_held) {
+            collect_synchronized_changes();
+            release_synchronized_changes(publication);
+        }
+        else {
+            publish_pending_changes(publication);
+        }
+        if (!deferred) {
+            m_sixel_placement_held = false;
+        }
+    }
+
     // The parser stops after each sixel image, so each image is applied and
     // its raster released before the next one is decoded: however many images
     // one chunk describes, at most one decoded raster is alive at a time.
-    // Only a model that retains its structural actions keeps them all.
-    qsizetype parsed = 0;
-    do {
+    // Only a model that retains its structural actions keeps them all. The
+    // parser also stops where its budget runs out, and a placement that does
+    // not fit the budget waits; either ends this call.
+    if (!deferred) do {
         std::vector<Parser_action> parser_actions;
         {
             VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::parser_ingest");
-            parser_actions = m_parser.ingest(bytes, parsed);
+            parser_actions = m_parser.ingest(bytes, parsed, sixel_work_budget);
         }
 
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::apply_parser_actions");
@@ -781,10 +826,12 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
                 publish_pending_changes(publication);
             }
         }
+        deferred = m_parser.sixel_work_deferred() || m_sixel_placement.has_value();
     }
-    while (parsed < bytes.size());
+    while (!deferred && parsed < bytes.size());
 
-    if (m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
+    // The chunk's end is where an unbudgeted ingest would have finished it.
+    if (!deferred && m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
         clear_dirty();
         finish_primary_repaint_recovery_candidate(false);
         accumulate_pending_changes(resize_transition_publication);
@@ -810,6 +857,8 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::finalize_ingest_result");
         result = finalize_result(std::move(result), overrides);
     }
+    result.consumed_bytes     = parsed;
+    result.sixel_work_pending = deferred;
     return result;
 }
 
@@ -829,6 +878,17 @@ Terminal_screen_model_result Terminal_screen_model::force_release_synchronized_o
         *this,
         nullptr,
         resize_transition_publication);
+
+    // A forced release must not show a partly placed image, so a pending
+    // placement completes first; the changes it held are released with it.
+    if (m_sixel_placement.has_value()) {
+        advance_sixel_placement(result.actions);
+        collect_synchronized_changes();
+        if (!m_modes.synchronized_output) {
+            release_synchronized_changes(publication);
+        }
+        m_sixel_placement_held = false;
+    }
     set_synchronized_output_mode(false, &publication);
     assign_trailing_changes(resize_transition_publication, trailing_changes);
 
@@ -7225,121 +7285,239 @@ void Terminal_screen_model::place_sixel_image(
         return;
     }
 
+    // With DECSDM reset the image starts at the cursor. As in OpenConsole, an
+    // image that would start below the bottom margin is dropped whole.
+    if (!m_sixel_display_mode && m_cursor.row > m_scroll_bottom) {
+        return;
+    }
+
     const terminal_cell_pixel_size_t cell = *m_config.cell_pixel_size;
 
     // As in OpenConsole, one sixel row is at most as tall as the rows the
     // image can scroll, the scroll region or with DECSDM set the page (owner
     // decision D5), which also bounds the scrolling a graphics new line
-    // causes. A larger aspect ratio is clamped here, after decoding: each
-    // sixel pixel keeps the rows the clamped ratio gives it, and the final
-    // sixel row and the scrolls follow the clamped ratio.
+    // causes. A larger aspect ratio is clamped after decoding: each sixel
+    // pixel keeps the rows the clamped ratio gives it, and the final sixel
+    // row and the scrolls follow the clamped ratio.
     const std::int64_t aspect_rows = m_sixel_display_mode
         ? m_config.grid_size.rows
         : m_scroll_bottom - m_scroll_top + 1;
-    const int decoded_aspect = image.pixel_aspect_ratio;
-    const int aspect = static_cast<int>(std::clamp<std::int64_t>(
+    Sixel_placement placement;
+    placement.raster         = image.raster;
+    placement.cell           = cell;
+    placement.display_mode   = m_sixel_display_mode;
+    placement.origin         = m_sixel_display_mode ? terminal_grid_position_t{0, 0} : m_cursor;
+    placement.decoded_aspect = image.pixel_aspect_ratio;
+    placement.aspect         = static_cast<int>(std::clamp<std::int64_t>(
         aspect_rows * cell.height / 6,
         1,
-        decoded_aspect));
-    const QImage raster = aspect < decoded_aspect && !image.raster.isNull()
-        ? sixel_raster_at_aspect(image.raster, decoded_aspect, aspect)
-        : image.raster;
-    const std::int64_t final_cursor_y =
-        sixel_row_at_aspect(image.final_cursor_y, decoded_aspect, aspect);
-
-    const int band_count = raster.isNull()
-        ? 0
-        : (raster.height() + cell.height - 1) / cell.height;
-
-    // A row whose images together would exceed the decoded-size cap keeps the
-    // newer one; the largest refused composite is reported once per image.
-    std::size_t refused_composite_bytes = 0U;
-    const auto report_refused_composite = [&]() {
-        if (refused_composite_bytes > 0U) {
-            generated_actions.push_back(make_payload_limit_diagnostic(
-                QStringLiteral("DCS sixel"),
-                refused_composite_bytes,
-                sixel_raster_limit_bytes(),
-                Parser_sequence_family::DCS));
-        }
-    };
-
-    // DECSDM set: the image starts at the page home whatever the origin mode
-    // and margins say, never scrolls, is clipped at the bottom of the page and
-    // leaves the cursor where it was.
-    if (m_sixel_display_mode) {
-        for (int band = 0; band < std::min(band_count, m_config.grid_size.rows); ++band) {
-            refused_composite_bytes = std::max(
-                refused_composite_bytes,
-                place_image_band(raster, band * cell.height, band, 0, cell));
-        }
-        report_refused_composite();
-        return;
+        placement.decoded_aspect));
+    if (!image.raster.isNull()) {
+        placement.width  = image.raster.width();
+        placement.height = static_cast<int>(sixel_row_at_aspect(
+            image.raster.height(),
+            placement.decoded_aspect,
+            placement.aspect));
+        placement.band_count = (placement.height + cell.height - 1) / cell.height;
     }
-
-    // Otherwise the image starts at the cursor. As in OpenConsole, an image
-    // that would start below the bottom margin is dropped whole.
-    const terminal_grid_position_t origin = m_cursor;
-    if (origin.row > m_scroll_bottom) {
-        return;
-    }
+    placement.final_cursor_y =
+        sixel_row_at_aspect(image.final_cursor_y, placement.decoded_aspect, placement.aspect);
 
     // The VT340 puts the text cursor on the row that the top of the final
     // sixel row falls in, at the image's first column, and scrolls the region
     // just enough for that whole sixel row to fit above the bottom margin.
-    const std::int64_t final_sixel_row_bottom = final_cursor_y + 6 * aspect;
-    const std::int64_t covered_rows =
-        (final_sixel_row_bottom + cell.height - 1) / cell.height;
-    const std::int64_t scroll_count = std::max<std::int64_t>(
-        0,
-        origin.row + covered_rows - 1 - m_scroll_bottom);
+    // With DECSDM set the image never scrolls.
+    std::int64_t placed_bands    = std::min(placement.band_count, m_config.grid_size.rows);
+    std::int64_t planned_scrolls = 0;
+    if (!placement.display_mode) {
+        const std::int64_t final_sixel_row_bottom =
+            placement.final_cursor_y + 6 * placement.aspect;
+        const std::int64_t covered_rows =
+            (final_sixel_row_bottom + cell.height - 1) / cell.height;
+        placement.scroll_count = std::max<std::int64_t>(
+            0,
+            placement.origin.row + covered_rows - 1 - m_scroll_bottom);
+
+        const std::int64_t rows_from_origin = m_scroll_bottom - placement.origin.row + 1;
+        placed_bands = std::min<std::int64_t>(
+            placement.band_count,
+            rows_from_origin + placement.scroll_count);
+        const std::int64_t band_scrolls =
+            std::max<std::int64_t>(0, placed_bands - rows_from_origin);
+        planned_scrolls = band_scrolls + std::min<std::int64_t>(
+            placement.scroll_count - band_scrolls,
+            m_scroll_bottom - m_scroll_top + 1);
+    }
+
+    // What the whole placement costs at most, from the steps it will take.
+    const bool resamples = placement.aspect < placement.decoded_aspect && !image.raster.isNull();
+    placement.total_cost =
+        (resamples
+            ? static_cast<std::uint64_t>(placement.width) *
+                static_cast<std::uint64_t>(placement.height)
+            : 0U) +
+        static_cast<std::uint64_t>(placed_bands) * sixel_band_cost(placement, 0) +
+        static_cast<std::uint64_t>(planned_scrolls) * sixel_scroll_cost();
+    m_sixel_placement = std::move(placement);
+
+    // A placement that fits what the budget has left runs now. One that does
+    // not waits for an ingest of its own, which starts it with a fresh budget,
+    // so a partly placed image never shares an ingest with the output before
+    // it, and the caller can publish that output first.
+    if (m_sixel_work_budget == nullptr ||
+        m_sixel_work_budget->fits(m_sixel_placement->total_cost))
+    {
+        [[maybe_unused]] const bool placed = advance_sixel_placement(generated_actions);
+        Q_ASSERT(placed);
+    }
+}
+
+// Copying a band out of the raster and finding the cells it covers touch each
+// band pixel about twice; making the slice and marking the row cost about as
+// much as k_sixel_band_step_units pixels besides.
+std::uint64_t Terminal_screen_model::sixel_band_cost(
+    const Sixel_placement& placement,
+    int                    band) const
+{
+    const std::int64_t band_width = std::min<std::int64_t>(
+        placement.width,
+        static_cast<std::int64_t>(m_config.grid_size.columns - placement.origin.column) *
+            placement.cell.width);
+    const std::int64_t band_height = std::min<std::int64_t>(
+        placement.cell.height,
+        static_cast<std::int64_t>(placement.height) -
+            static_cast<std::int64_t>(band) * placement.cell.height);
+    return k_sixel_band_step_units +
+        2U * static_cast<std::uint64_t>(std::max<std::int64_t>(0, band_width)) *
+            static_cast<std::uint64_t>(std::max<std::int64_t>(0, band_height));
+}
+
+// One region scroll: the rows move and are marked, and the row leaving the top
+// of a primary region is encoded into history with any image it carries.
+std::uint64_t Terminal_screen_model::sixel_scroll_cost() const
+{
+    const std::uint64_t region_rows =
+        static_cast<std::uint64_t>(m_scroll_bottom - m_scroll_top + 1);
+    const std::uint64_t row_image_pixels = m_config.cell_pixel_size.has_value()
+        ? static_cast<std::uint64_t>(m_config.grid_size.columns) *
+            static_cast<std::uint64_t>(m_config.cell_pixel_size->width) *
+            static_cast<std::uint64_t>(m_config.cell_pixel_size->height)
+        : 0U;
+    return k_sixel_scroll_step_units + region_rows * k_sixel_scroll_row_units + row_image_pixels;
+}
+
+bool Terminal_screen_model::advance_sixel_placement(std::vector<Parser_action>& generated_actions)
+{
+    Q_ASSERT(m_sixel_placement.has_value());
+    Sixel_placement&   placement = *m_sixel_placement;
+    Sixel_work_budget* budget    = m_sixel_work_budget;
+
+    if (!placement.started) {
+        const bool resamples =
+            placement.aspect < placement.decoded_aspect && !placement.raster.isNull();
+        const std::uint64_t cost = resamples
+            ? static_cast<std::uint64_t>(placement.width) *
+                static_cast<std::uint64_t>(placement.height)
+            : 0U;
+        if (!try_charge_sixel_work(budget, cost)) {
+            return false;
+        }
+        if (resamples) {
+            placement.raster = sixel_raster_at_aspect(
+                placement.raster,
+                placement.decoded_aspect,
+                placement.aspect);
+        }
+        placement.started = true;
+    }
 
     // Each band is placed before any scroll moves it, so the bands a region
     // at the top of the screen scrolls off reach history with their rows.
-    // Bands left over once the region has scrolled enough are clipped.
-    std::int64_t scrolls = 0;
-    for (int band = 0; band < band_count; ++band) {
-        std::int64_t row = origin.row + band - scrolls;
-        if (row > m_scroll_bottom) {
-            if (scrolls == scroll_count) {
-                break;
-            }
+    // Bands left over once the region has scrolled enough are clipped; with
+    // DECSDM set they are clipped at the bottom of the page.
+    const terminal_cell_pixel_size_t cell = placement.cell;
+    while (!placement.bands_done && placement.next_band < placement.band_count) {
+        const int band = placement.next_band;
+        std::int64_t row = placement.display_mode
+            ? band
+            : placement.origin.row + band - placement.scrolls;
+        const bool scrolls_first = !placement.display_mode && row > m_scroll_bottom;
+        if ((placement.display_mode && band >= m_config.grid_size.rows) ||
+            (scrolls_first && placement.scrolls == placement.scroll_count))
+        {
+            break;
+        }
+        const std::uint64_t cost =
+            sixel_band_cost(placement, band) + (scrolls_first ? sixel_scroll_cost() : 0U);
+        if (!try_charge_sixel_work(budget, cost)) {
+            return false;
+        }
+        if (scrolls_first) {
             scroll_active_region_up();
-            ++scrolls;
+            ++placement.scrolls;
             row = m_scroll_bottom;
         }
-        refused_composite_bytes = std::max(
-            refused_composite_bytes,
+        placement.refused_composite_bytes = std::max(
+            placement.refused_composite_bytes,
             place_image_band(
-                raster,
+                placement.raster,
                 band * cell.height,
                 static_cast<int>(row),
-                origin.column,
+                placement.origin.column,
                 cell));
+        ++placement.next_band;
     }
-    report_refused_composite();
 
-    // The image's geometry may ask for far more scrolls than its pixels fill.
-    // Once the region has scrolled its full height it is blank, so further
-    // scrolls are skipped (owner decision D5): the screen and the cursor end
-    // as if they ran, and history gains at most one region of blank rows.
-    const std::int64_t trailing_scrolls = std::min<std::int64_t>(
-        scroll_count - scrolls,
-        m_scroll_bottom - m_scroll_top + 1);
-    for (std::int64_t step = 0; step < trailing_scrolls; ++step) {
+    if (!placement.bands_done) {
+        placement.bands_done = true;
+
+        // A row whose images together would exceed the decoded-size cap keeps
+        // the newer one; the largest refused composite is reported once.
+        if (placement.refused_composite_bytes > 0U) {
+            generated_actions.push_back(make_payload_limit_diagnostic(
+                QStringLiteral("DCS sixel"),
+                placement.refused_composite_bytes,
+                sixel_raster_limit_bytes(),
+                Parser_sequence_family::DCS));
+        }
+
+        // The image's geometry may ask for far more scrolls than its pixels
+        // fill. Once the region has scrolled its full height it is blank, so
+        // further scrolls are skipped (owner decision D5): the screen and the
+        // cursor end as if they ran, and history gains at most one region of
+        // blank rows.
+        placement.trailing_scrolls_left = placement.display_mode
+            ? 0
+            : std::min<std::int64_t>(
+                placement.scroll_count - placement.scrolls,
+                m_scroll_bottom - m_scroll_top + 1);
+    }
+
+    while (placement.trailing_scrolls_left > 0) {
+        if (!try_charge_sixel_work(budget, sixel_scroll_cost())) {
+            return false;
+        }
         scroll_active_region_up();
+        --placement.trailing_scrolls_left;
     }
 
-    const std::int64_t cursor_row = std::clamp<std::int64_t>(
-        origin.row - scroll_count + final_cursor_y / cell.height,
-        0,
-        m_config.grid_size.rows - 1);
-    if (scroll_count > 0 || cursor_row != origin.row) {
-        mark_cursor_dirty();
-        m_cursor.row   = static_cast<int>(cursor_row);
-        m_pending_wrap = false;
-        mark_cursor_dirty();
+    // DECSDM set leaves the cursor where it was.
+    if (!placement.display_mode) {
+        const std::int64_t cursor_row = std::clamp<std::int64_t>(
+            placement.origin.row - placement.scroll_count +
+                placement.final_cursor_y / cell.height,
+            0,
+            m_config.grid_size.rows - 1);
+        if (placement.scroll_count > 0 || cursor_row != placement.origin.row) {
+            mark_cursor_dirty();
+            m_cursor.row   = static_cast<int>(cursor_row);
+            m_pending_wrap = false;
+            mark_cursor_dirty();
+        }
     }
+
+    m_sixel_placement.reset();
+    return true;
 }
 
 std::size_t Terminal_screen_model::place_image_band(

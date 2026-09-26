@@ -4114,6 +4114,77 @@ bool test_replay_tool_applies_recorded_cell_pixel_size(const QString& replay_too
     return ok;
 }
 
+// A drain with a deadline takes a near-cap sixel image over several steps. The
+// transcript still records each output byte once, before its effects, so the
+// replay finds a valid causal structure. The snapshots published between the
+// steps are not replayed: the replay takes each output event whole.
+bool test_replay_tool_reads_output_drained_in_sixel_steps(const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "sixel step replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "sixel step replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("sixel-steps.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "sixel step replay recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config config;
+    config.transcript_recorder    = recorder;
+    config.backend_event_notifier = [] {};
+    term::Terminal_session session(std::move(backend), config);
+    session.set_cell_pixel_size({10, 20});
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{80, 160};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "sixel step replay captured session starts");
+    session.process_backend_callback_events();
+    backend_ptr->emit_output(QByteArrayLiteral(
+        "before\x1b[2;1H\x1bPq\"1;1;1448;1448\x1b\\after"));
+    int calls = 0;
+    while (session.has_pending_backend_callback_events() && calls < 1000) {
+        ++calls;
+        session.process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    }
+    ok &= check(calls > 2, "the image takes several drain steps");
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "sixel step transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+    ok &= check(event_count(*events, QStringLiteral("backend.output")) == 1,
+        "the output is recorded once however many steps take it");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished && replay.exit_status == QProcess::NormalExit &&
+            replay.stdout_text.contains("causal_driver_divergences=0") &&
+            replay.stdout_text.contains("causal_protocol_divergences=0"),
+        "a replay of output drained in sixel steps finds the recorded causal structure");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
 bool test_replay_tool_compares_recovered_row_provenance_source(
     const QString& replay_tool_path)
 {
@@ -5684,6 +5755,7 @@ int main(int argc, char** argv)
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
     ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
     ok &= test_replay_tool_applies_recorded_cell_pixel_size(replay_tool_path);
+    ok &= test_replay_tool_reads_output_drained_in_sixel_steps(replay_tool_path);
     ok &= test_replay_tool_compares_recovered_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_defaults_missing_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);

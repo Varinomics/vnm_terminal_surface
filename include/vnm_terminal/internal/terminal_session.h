@@ -675,7 +675,9 @@ private:
     bool scanned_text_area_resize_request(
         unsigned char             final_byte,
         terminal_grid_size_t&     requested_grid_size) const;
-    void flush_text_area_resize_candidate(
+    // Returns how many candidate bytes the model left; see
+    // ingest_backend_output_bytes.
+    qsizetype flush_text_area_resize_candidate(
         std::uint64_t              sequence,
         bool                       decline_request,
         bool                       may_complete_backend_output_callback = false);
@@ -693,9 +695,12 @@ private:
     void prepare_text_area_resize_tail(std::size_t hold_limit_bytes);
     void append_text_area_resize_tail(QByteArrayView bytes);
     void clear_text_area_resize_tail_epoch();
-    void replay_text_area_resize_tail(
+    // Replays the released tail as far as the drain step's sixel budget goes;
+    // true once the tail is done.
+    bool replay_text_area_resize_tail(
         std::uint64_t              sequence,
         bool                       allow_arbitration);
+    bool continue_text_area_resize_tail_replay();
 
     bool hold_text_area_resize_arbitration_output(
         const Terminal_session_command&                command);
@@ -709,7 +714,11 @@ private:
     Terminal_session_result process_text_area_resize_arbitration_command(
         const Terminal_session_command&                command);
 
-    void ingest_backend_output_bytes(
+    // The output ingest layers each return how many of their bytes the model
+    // left for a later step, always their last ones; m_backend_output_stopped
+    // says whether it stopped, which a pending placement can do with nothing
+    // left over.
+    qsizetype ingest_backend_output_bytes(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
         bool                       allow_arbitration = true);
@@ -718,16 +727,20 @@ private:
     // synchronized-output boundaries it contains. The caller states whether this
     // run may complete the in-flight backend output callback; a run that is only
     // a prefix of the command's bytes may not.
-    void ingest_backend_output_run(
+    qsizetype ingest_backend_output_run(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
         Terminal_utf8_scan_state   utf8_seed,
         bool                       may_complete_backend_output_callback);
 
-    void ingest_backend_output_segment(
+    qsizetype ingest_backend_output_segment(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
         bool                       completes_backend_output_callback = false);
+
+    // Continues a sixel placement an earlier step left waiting; true once
+    // none waits.
+    bool advance_pending_sixel_placement(std::uint64_t sequence);
 
     void defer_backend_content_snapshot(
         std::uint64_t                          sequence,
@@ -1087,6 +1100,21 @@ private:
     std::uint64_t                                          m_processing_command_callback_epoch = 0U;
     std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
+    // The sixel work budget of the drain step in progress; none when the
+    // drain has no deadline.
+    Sixel_work_budget*                                     m_sixel_work_budget = nullptr;
+    // Whether the model stopped in the output being ingested, and how many of
+    // its bytes it left; see ingest_backend_output_bytes.
+    bool                                                   m_backend_output_stopped = false;
+    qsizetype                                              m_unconsumed_backend_output_bytes = 0;
+    // A released text-area resize tail that is still being replayed, and
+    // the settlement it belongs to.
+    struct Text_area_resize_tail_replay
+    {
+        std::uint64_t sequence    = 0U;
+        bool          allow_rearm = true;
+    };
+    std::optional<Text_area_resize_tail_replay>            m_text_area_resize_tail_replay;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
     std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;

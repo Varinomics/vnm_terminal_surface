@@ -155,6 +155,19 @@ record. The parser stops after each completed image and the model applies it
 before parsing on, so one input chunk holds at most one decoded image at a time
 however many it describes.
 
+A few bytes of sixel data can describe work as large as the cap, so a drain
+with a deadline gives each step a `Sixel_work_budget` (`sixel_decoder.h`),
+counted in pixels written or copied. Decoding stops before a draw or graphics
+new line the budget cannot pay for, and placement goes a band or a scroll at
+a time; the model reports what it consumed and that work is pending, the
+session keeps the rest of the output at the front of its queue, and the next
+step continues. An image end, which fills and expands the whole raster, is
+one step that always runs. A placement that has started holds publication
+like synchronized output until it ends, so no published snapshot shows part
+of an image. A settled text-area resize tail replays through the same steps.
+Drains without a deadline, which include the synchronous calls that settle
+the input frontier, run sixel work to completion.
+
 The screen-model ingestion path runs the parser, applies actions to the model,
 collects dirty rows and viewport changes, and returns a
 `Terminal_screen_model_result` to the session. The model owns primary and

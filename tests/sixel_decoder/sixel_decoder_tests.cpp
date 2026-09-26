@@ -757,82 +757,6 @@ bool test_sixel_cap_trips_inside_a_scaled_band()
     return ok;
 }
 
-bool test_sixel_image_boundary()
-{
-    bool ok = true;
-
-    // A caller that yields after each image ends its chunk at the boundary:
-    // never past the terminator of the first image in the chunk, and early at
-    // worst.
-    const QByteArray image = sixel_dcs({}, "~");
-    term::Terminal_byte_stream_parser idle;
-    ok &= check(idle.sixel_image_boundary("plain text") == 10, "text has no boundary");
-    ok &= check(idle.sixel_image_boundary("A" + image + "B" + image) == 1 + image.size(),
-        "the boundary follows the first image's terminator");
-    const QByteArray title("\x1b]2;title\x1b\\");
-    ok &= check(idle.sixel_image_boundary(title + image) == title.size() + image.size(),
-        "a terminator before any DCS is no boundary");
-    ok &= check(idle.sixel_image_boundary(QByteArray("\x90q~\x9crest", 8)) == 4,
-        "the C1 forms bound an image too");
-    ok &= check(idle.sixel_image_boundary(QByteArray("x\\y")) == 3,
-        "a backslash outside any DCS is no boundary");
-    const QByteArray other_dcs("\x1bP$qm\x1b\\");
-    ok &= check(idle.sixel_image_boundary(other_dcs + "x") == other_dcs.size() + 1 &&
-            idle.sixel_image_boundary(other_dcs + image + "x") ==
-                other_dcs.size() + image.size(),
-        "a DCS that is not sixel is no boundary");
-
-    // A header the parser already buffers decides the DCS just the same.
-    term::Terminal_byte_stream_parser sixel_header;
-    ingest_all(sixel_header, QByteArray("\x1bP0;1"));
-    ok &= check(sixel_header.sixel_image_boundary(QByteArray("q~\x1b\\tail")) == 4,
-        "a buffered header that ends in q starts an image");
-    term::Terminal_byte_stream_parser other_header;
-    ingest_all(other_header, QByteArray("\x1bP0;1"));
-    ok &= check(other_header.sixel_image_boundary(QByteArray("z\x1b\\") + image + "x") ==
-            3 + image.size(),
-        "a buffered header that ends otherwise is no image");
-    term::Terminal_byte_stream_parser other_payload;
-    ingest_all(other_payload, QByteArray("\x1bPzz"));
-    ok &= check(other_payload.sixel_image_boundary(QByteArray("\x1b\\tail")) == 6,
-        "the end of a DCS in progress that is not sixel is no boundary");
-
-    // Mid-image, the next terminator ends it, including one whose ESC the
-    // caller or the parser still holds.
-    term::Terminal_byte_stream_parser mid_image;
-    ingest_all(mid_image, QByteArray("\x1bPq~~"));
-    ok &= check(mid_image.sixel_image_boundary(QByteArray("~\x1b\\tail")) == 3,
-        "mid-image the terminator is the boundary");
-    ok &= check(mid_image.sixel_image_boundary(QByteArray("\\tail")) == 1,
-        "mid-image a leading backslash may complete the terminator");
-
-    // Cutting a stream at successive boundaries leaves at most one image per
-    // chunk, ending it, and the same actions as parsing the stream whole.
-    const QByteArray stream = "A" + image + image + QByteArray("\x1b]2;t\x1b\\") + image + "B";
-    term::Terminal_byte_stream_parser whole;
-    term::Terminal_byte_stream_parser cut;
-    const std::vector<term::Parser_action> whole_actions = ingest_all(whole, stream);
-    std::vector<term::Parser_action> cut_actions;
-    for (qsizetype offset = 0; offset < stream.size();) {
-        const QByteArrayView rest     = QByteArrayView(stream).sliced(offset);
-        const qsizetype      boundary = cut.sixel_image_boundary(rest);
-        const std::vector<term::Parser_action> chunk_actions = ingest_all(cut, rest.first(boundary));
-        const std::vector<term::Screen_sixel_image_mutation> chunk_images = images_in(chunk_actions);
-        ok &= check(chunk_images.size() <= 1U, "a bounded chunk holds at most one image");
-        if (!chunk_images.empty()) {
-            ok &= check(images_in({chunk_actions.back()}).size() == 1U,
-                "a bounded chunk ends with its image");
-        }
-        cut_actions.insert(cut_actions.end(), chunk_actions.begin(), chunk_actions.end());
-        offset += boundary;
-    }
-    ok &= check(images_in(cut_actions).size() == 3U && images_in(whole_actions).size() == 3U,
-        "cutting at boundaries keeps every image");
-    ok &= check(cut_actions.size() == whole_actions.size(),
-        "cutting at boundaries keeps every action");
-    return ok;
-}
-
 bool test_sixel_header_limit_is_chunk_independent()
 {
     bool ok = true;
@@ -1022,6 +946,109 @@ bool test_parser_stops_after_each_image_across_chunks()
     return ok;
 }
 
+// With a sixel work budget the parser stops where the budget cannot pay for
+// the next draw, graphics new line or image end, and the bytes it leaves are
+// handed over again in the next step. However small the budget, parsing a
+// stream step by step gives exactly the actions and images of parsing it whole.
+bool test_sixel_budget_steps_match_a_whole_parse()
+{
+    bool ok = true;
+
+    const QByteArray overdraw =
+        QByteArray("\x1bP0;1q\"1;1#1;2;100;0;0#2;2;0;100;0") +
+        QByteArray("#1!300~$#2!300~-").repeated(6) + QByteArray("\x1b\\");
+    const std::vector<std::pair<std::string, QByteArray>> streams = {
+        {"images between text",
+            "A" + sixel_dcs({}, "#1~~-~") + "B" + sixel_dcs("2;1", "#1!20~$!40~-!10~") + "C"},
+        {"a background raster", sixel_dcs("0;0", "\"1;1;64;48#0;2;0;0;100#1!64~")},
+        {"overdraw at 2:1", overdraw},
+        {"8-bit controls", QByteArray("\x90q#1!9~-~\x9c", 10) + QByteArray("x")},
+        {"a cancelled and a recovered image",
+            QByteArray("\x1bPq!50~\x18") + QByteArray("\x1bPq!50~\x1b[0m") + sixel_dcs({}, "~~")},
+        {"a query after an image", sixel_dcs({}, "!100~-!100~") + QByteArray("\x1b[c")},
+    };
+
+    for (const auto& [name, stream] : streams) {
+        const std::vector<term::Parser_action> whole = parse(stream);
+        std::vector<std::string> whole_labels;
+        for (const term::Parser_action& action : whole) {
+            whole_labels.push_back(action_label(action));
+        }
+        const std::vector<term::Screen_sixel_image_mutation> whole_images = images_in(whole);
+
+        for (const std::uint64_t units : {1ULL, 7ULL, 600ULL}) {
+            const std::string label = name + " in steps of " + std::to_string(units) + " units";
+            term::Terminal_byte_stream_parser parser;
+            std::vector<term::Parser_action> stepped;
+            bool      deferred = false;
+            qsizetype offset   = 0;
+            for (int step = 0; offset < stream.size() && step < 100000; ++step) {
+                term::Sixel_work_budget budget(units);
+                const std::vector<term::Parser_action> actions =
+                    parser.ingest(stream, offset, &budget);
+                deferred = deferred || parser.sixel_work_deferred();
+                stepped.insert(stepped.end(), actions.begin(), actions.end());
+            }
+            ok &= check(offset == stream.size(), label + ": the whole stream is parsed");
+            ok &= check(deferred || units == 600U, label + ": a small budget defers work");
+
+            std::vector<std::string> stepped_labels;
+            for (const term::Parser_action& action : stepped) {
+                stepped_labels.push_back(action_label(action));
+            }
+            ok &= check(stepped_labels == whole_labels, label + ": the same actions in order");
+
+            const std::vector<term::Screen_sixel_image_mutation> stepped_images =
+                images_in(stepped);
+            bool same_images = stepped_images.size() == whole_images.size();
+            for (std::size_t i = 0; same_images && i < whole_images.size(); ++i) {
+                same_images =
+                    stepped_images[i].width              == whole_images[i].width              &&
+                    stepped_images[i].height             == whole_images[i].height             &&
+                    stepped_images[i].final_cursor_y     == whole_images[i].final_cursor_y     &&
+                    stepped_images[i].pixel_aspect_ratio == whole_images[i].pixel_aspect_ratio &&
+                    stepped_images[i].raster             == whole_images[i].raster;
+            }
+            ok &= check(same_images, label + ": the same images");
+        }
+    }
+    return ok;
+}
+
+// An image end is one step that always runs, whatever is left of the budget:
+// it fills and expands the raster, charges that afterwards, and the draws of
+// the next image wait for a later step.
+bool test_sixel_image_end_is_one_step()
+{
+    bool ok = true;
+
+    // The declared 64 x 64 raster and the draw cost 4104 units, and the end's
+    // 64 x 64 background fill 4096 more.
+    const QByteArray stream("\x1bPq\"1;1;64;64#1!8~\x1b\\\x1bPq!3~\x1b\\");
+    term::Terminal_byte_stream_parser parser;
+    term::Sixel_work_budget budget(5000U);
+    qsizetype offset = 0;
+    std::vector<term::Parser_action> actions = parser.ingest(stream, offset, &budget);
+    ok &= check(images_in(actions).size() == 1U && !parser.sixel_work_deferred(),
+        "the first image ends past what is left of the budget");
+
+    const std::vector<term::Parser_action> next = parser.ingest(stream, offset, &budget);
+    ok &= check(images_in(next).empty() && parser.sixel_work_deferred() &&
+            offset < stream.size(),
+        "the next image's draw waits for a later step");
+
+    term::Sixel_work_budget fresh(5000U);
+    const std::vector<term::Parser_action> rest = parser.ingest(stream, offset, &fresh);
+    actions.insert(actions.end(), next.begin(), next.end());
+    actions.insert(actions.end(), rest.begin(), rest.end());
+    const std::vector<term::Screen_sixel_image_mutation> images = images_in(actions);
+    const std::vector<term::Screen_sixel_image_mutation> whole  = images_in(parse(stream));
+    ok &= check(offset == stream.size() && images.size() == 2U && whole.size() == 2U &&
+            images[0].raster == whole[0].raster && images[1].raster == whole[1].raster,
+        "a later step finishes the next image as a whole parse does");
+    return ok;
+}
+
 bool test_model_supplies_the_cap()
 {
     bool ok = true;
@@ -1084,7 +1111,8 @@ int main()
     ok &= test_sixel_header_limit_is_chunk_independent();
     ok &= test_parser_stops_after_each_image();
     ok &= test_parser_stops_after_each_image_across_chunks();
-    ok &= test_sixel_image_boundary();
+    ok &= test_sixel_budget_steps_match_a_whole_parse();
+    ok &= test_sixel_image_end_is_one_step();
     ok &= test_model_supplies_the_cap();
     return ok ? 0 : 1;
 }

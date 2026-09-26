@@ -18,6 +18,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -1541,6 +1542,125 @@ bool test_reported_geometry_decodes_within_the_cap()
 
 }
 
+// Whether two slices of different models hold the same image; revisions are
+// unique across models.
+bool slice_contents_equal(
+    const std::shared_ptr<const term::Terminal_image_slice>& left,
+    const std::shared_ptr<const term::Terminal_image_slice>& right)
+{
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+    return
+        left->first_column    == right->first_column    &&
+        left->cell_pixel_size == right->cell_pixel_size &&
+        left->pixels          == right->pixels;
+}
+
+// Whether two models hold the same screen, history rows, images and cursor.
+bool models_match(
+    const term::Terminal_screen_model& left,
+    const term::Terminal_screen_model& right,
+    int                                rows)
+{
+    if (left.scrollback_size() != right.scrollback_size() ||
+        left.cursor_position() != right.cursor_position())
+    {
+        return false;
+    }
+    for (int row = 0; row < left.scrollback_size(); ++row) {
+        if (history_row_text(left, row) != history_row_text(right, row) ||
+            !slice_contents_equal(
+                left.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row),
+                right.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, row)))
+        {
+            return false;
+        }
+    }
+    for (int row = 0; row < rows; ++row) {
+        if (left.row_text(row) != right.row_text(row) ||
+            !slice_contents_equal(slice_at(left, row), slice_at(right, row)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// With a sixel work budget the model places an image a step at a time: the
+// caller hands over the bytes an ingest leaves and continues a waiting
+// placement with no bytes. However small the budget, the screen, history,
+// images and cursor end as an unbudgeted model leaves them, and a placement
+// that has started holds its changes until it ends.
+bool test_budgeted_placement_matches_an_unbudgeted_one()
+{
+    bool ok = true;
+
+    struct placement_case_t
+    {
+        const char* name;
+        int         rows;
+        QByteArray  bytes;
+    };
+    const placement_case_t cases[] = {
+        {"an image scrolling the screen into history", 3,
+            QByteArray("top\r\nmid\r\nbottom\x1b[3;1H") + sixel("9;1", solid_rows(12, 20)) +
+                "after"},
+        {"an image in a scroll region", 6,
+            QByteArray("r0\r\nr1\r\nr2\r\nr3\r\nr4\r\nr5\x1b[2;4r\x1b[4;1H") +
+                sixel("9;1", solid_rows(12, 20))},
+        {"an image with DECSDM set", 6,
+            QByteArray("\x1b[?80h") + sixel("9;1", solid_rows(12, 16)) + "x"},
+        {"an aspect ratio clamped to the region", 4,
+            QByteArray("\x1b[4;1H") + sixel("9;1", "\"80;1" + solid_rows(12, 3))},
+        {"trailing graphics new lines", 4,
+            QByteArray("\x1b[4;1H") + sixel("9;1", solid_rows(12, 2) + "------") + "y"},
+        {"two images on one row between text", 4,
+            QByteArray("ab") + sixel("9;1", solid_rows(12, 1)) + "\x1b[1;1H" +
+                sixel("9;1", "#2;2;0;100;0#2!6~") + "cd"},
+    };
+
+    for (const placement_case_t& placement_case : cases) {
+        term::Terminal_screen_model whole = make_model(placement_case.rows, 10);
+        whole.ingest(placement_case.bytes);
+
+        for (const std::uint64_t units : {1ULL, 3000ULL, 50000ULL}) {
+            const std::string label = std::string(placement_case.name) + " in steps of " +
+                std::to_string(units) + " units";
+            term::Terminal_screen_model stepped = make_model(placement_case.rows, 10);
+            qsizetype offset  = 0;
+            bool      held    = true;
+            bool      waited  = false;
+            for (int step = 0; step < 100000; ++step) {
+                term::Sixel_work_budget budget(units);
+                if (stepped.sixel_placement_pending()) {
+                    waited = true;
+                    const term::Terminal_screen_model_result result =
+                        stepped.ingest({}, nullptr, &budget);
+                    held = held &&
+                        (!stepped.sixel_placement_started() || result.dirty_rows.empty());
+                    continue;
+                }
+                if (offset >= placement_case.bytes.size()) {
+                    break;
+                }
+                const term::Terminal_screen_model_result result = stepped.ingest(
+                    QByteArrayView(placement_case.bytes).sliced(offset),
+                    nullptr,
+                    &budget);
+                offset += result.consumed_bytes;
+            }
+            ok &= check(offset == placement_case.bytes.size() && !stepped.sixel_placement_pending(),
+                label + ": every byte is applied");
+            ok &= check(waited || units == 50000U, label + ": a small budget makes placement wait");
+            ok &= check(held, label + ": a started placement publishes nothing until it ends");
+            ok &= check(models_match(stepped, whole, placement_case.rows),
+                label + ": the model ends as an unbudgeted one");
+        }
+    }
+    return ok;
+}
+
 int main()
 {
     bool ok = true;
@@ -1568,5 +1688,6 @@ int main()
     ok &= test_encoder_session_end_to_end();
     ok &= test_reported_geometry_decodes_within_the_cap();
     ok &= test_row_images_stay_within_the_decoded_size_cap();
+    ok &= test_budgeted_placement_matches_an_unbudgeted_one();
     return ok ? 0 : 1;
 }
