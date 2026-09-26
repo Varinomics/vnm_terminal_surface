@@ -13337,6 +13337,9 @@ bool test_visible_frames_replay_a_settled_heavy_tail(QGuiApplication& app)
     bool ok = true;
     Surface_fixture fixture;
     fixture.surface.set_text_area_resize_arbitration_enabled(true);
+    // This fixture owns the host answer; event-loop delays must not settle it
+    // before the heavy tail's frame replay begins.
+    fixture.surface.set_text_area_resize_arbitration_timeout_ms(0);
     pump_events(app);
 
     Text_area_resize_arbitration_observer observer(fixture.surface);
