@@ -4982,8 +4982,8 @@ bool test_replies_and_cursor_save_restore()
         dsr_reply.wire_bytes == QByteArrayLiteral("\x1b[2;3R"),
         "DSR cursor reply");
     ok &= check(da1_reply.kind == term::Terminal_reply_kind::DA1 &&
-        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;22;28c"),
-        "DA1 reply advertises ANSI color and rectangles without sixel when no cell pixel size is known");
+        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;22;28;32c"),
+        "DA1 advertises ANSI color, rectangles and macros without sixel when cell size is unknown");
     ok &= check(da2_reply.kind == term::Terminal_reply_kind::DA2 &&
         da2_reply.wire_bytes == QByteArrayLiteral("\x1b[>0;0;0c"),
         "DA2 reply");
@@ -5457,8 +5457,8 @@ bool test_sixel_capability_replies()
 
     check_replies(
         model.ingest(QByteArrayLiteral("\x1b[c")),
-        {QByteArrayLiteral("\x1b[?61;4;22;28c")},
-        "DA1 advertises sixel graphics, ANSI color and rectangles with a cell pixel size");
+        {QByteArrayLiteral("\x1b[?61;4;22;28;32c")},
+        "DA1 advertises sixel, ANSI color, rectangles and macros with a cell pixel size");
 
     term::Terminal_screen_model_result result = model.ingest(QByteArrayLiteral(
         "\x1b[?1;1;0S\x1b[?1;2;0S\x1b[?1;3;256S\x1b[?1;3;16S\x1b[?1;4;0S"));
@@ -5547,7 +5547,7 @@ bool test_sixel_capability_replies()
         unknown_cell_model.ingest(QByteArrayLiteral(
             "\x1b[c\x1b[?1;1;0S\x1b[?2;1;0S\x1b[?2;7;0S\x1b[?3;1;0S")),
         {
-            QByteArrayLiteral("\x1b[?61;22;28c"),
+            QByteArrayLiteral("\x1b[?61;22;28;32c"),
             QByteArrayLiteral("\x1b[?1;3S"),
             QByteArrayLiteral("\x1b[?2;3S"),
             QByteArrayLiteral("\x1b[?2;2S"),

@@ -234,6 +234,9 @@ const std::set<std::string>& required_sequence_ids()
         "pm-payload-limit",
         "sos-payload-limit",
         "dcs-unsupported-discard",
+        "dcs-decdmac",
+        "csi-decinvm",
+        "csi-macro-space",
         "dcs-sixel-image",
         "dcs-sixel-product-decisions",
         "dcs-sixel-decoded-limit",
@@ -334,6 +337,7 @@ const std::set<std::string>& required_oracle_ids()
         "product-decision-vnm-terminal",
         "independent-vnm-fixture",
         "dec-vt330-vt340-graphics-manual",
+        "dec-vt420-macros",
         "xterm-409-reference",
         "vttest-reference",
         "contour-candidate",
@@ -427,6 +431,8 @@ void validate_matrix_records(
         "rejected-with-recovery",
         "unsupported-discard",
         "payload-limit",
+        "parser-state-mutation",
+        "parser-input-expansion",
     };
 
     const std::set<std::string>           expected_fields = field_set(matrix_fields());

@@ -755,11 +755,10 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
     }
 
     // The parser stops after each sixel image, so each image is applied and
-    // its raster released before the next one is decoded: however many images
-    // one chunk describes, at most one decoded raster is alive at a time.
-    // Only a model that retains its structural actions keeps them all. The
-    // parser also stops where its budget runs out, and a placement that does
-    // not fit the budget waits; either ends this call.
+    // its raster released before the next one is decoded. It also stops at a
+    // macro invocation, then parses the stored bytes before later host bytes.
+    // Only a model that retains its structural actions keeps them all. A
+    // spent sixel budget or deferred placement ends this call.
     if (!deferred) do {
         std::vector<Parser_action> parser_actions;
         {
@@ -773,6 +772,8 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
             // Only a budget work earlier in the step already spent, such as a
             // placement continuation's, may end it before it takes anything.
             Q_ASSERT(bytes.empty() || parsed > parsed_before || !parser_actions.empty() ||
+                m_parser.macro_work_pending() || m_parser.macro_work_advanced() ||
+                m_parser.parse_boundary_reached() ||
                 budget_spent_before);
         }
 
@@ -843,9 +844,9 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
             m_sixel_placement.has_value()  ||
             (sixel_work_budget != nullptr &&
                 sixel_work_budget->exhausted() &&
-                parsed < bytes.size());
+                (parsed < bytes.size() || m_parser.macro_work_pending()));
     }
-    while (!deferred && parsed < bytes.size());
+    while (!deferred && (parsed < bytes.size() || m_parser.macro_work_pending()));
 
     // The chunk's end is where an unbudgeted ingest would have finished it.
     if (!deferred && m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
@@ -1606,12 +1607,12 @@ void Terminal_screen_model::apply_control_sequence(
                                 sequence.private_marker.isEmpty() &&
                                 mode == 0)
                             {
-                                // ANSI color (22) and rectangular editing (28) are
-                                // available; sixel (4) needs a cell pixel size.
+                                // ANSI color (22), rectangular editing (28), and stored
+                                // macros (32) are available. Sixel (4) needs a cell pixel size.
                                 generated_actions.push_back(make_da1_reply_action(
                                     m_config.cell_pixel_size.has_value()
-                                        ? QByteArrayLiteral("\x1b[?61;4;22;28c")
-                                        : QByteArrayLiteral("\x1b[?61;22;28c")));
+                                        ? QByteArrayLiteral("\x1b[?61;4;22;28;32c")
+                                        : QByteArrayLiteral("\x1b[?61;22;28;32c")));
                                 return;
                             }
                             if (sequence.intermediates.isEmpty() &&

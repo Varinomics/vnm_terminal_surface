@@ -2085,6 +2085,218 @@ bool test_string_payload_limits_and_recovery()
     return ok;
 }
 
+bool test_dec_stored_macros()
+{
+    bool ok = true;
+    const auto define = [](int id, int deletion, int encoding, QByteArray body) {
+        return QByteArray("\x1bP") + QByteArray::number(id) + ';' +
+            QByteArray::number(deletion) + ';' + QByteArray::number(encoding) +
+            "!z" + body + "\x1b\\";
+    };
+    const auto invoke = [](int id) {
+        return QByteArray("\x1b[") + QByteArray::number(id) + "*z";
+    };
+
+    term::Terminal_screen_model model = make_model(3, 20);
+    term::Terminal_screen_model_result result = model.ingest(
+        define(1, 0, 0, QByteArrayLiteral("HELLO")) + invoke(1) + 'X');
+    ok &= check(diagnostic_count(result) == 0,
+        "DECDMAC and DECINVM accept literal text");
+    ok &= check(model.row_text(0) == QStringLiteral("HELLOX"),
+        "macro expands before later bytes in the same write");
+
+    model = make_model(3, 20);
+    const QByteArray styled_text = QByteArrayLiteral("\x1b[31mA");
+    result = model.ingest(define(2, 0, 1, styled_text.toHex()) + invoke(2) + 'B');
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("AB"),
+        "hex macro re-enters ordinary text and SGR parsing");
+    const term::Terminal_render_snapshot styled_snapshot = model.render_snapshot(1U);
+    const term::Terminal_render_cell* styled_cell =
+        snapshot_cell_at_position(styled_snapshot, 0, 0);
+    ok &= check(styled_cell != nullptr, "macro SGR prints a styled cell");
+    if (styled_cell != nullptr) {
+        const term::Terminal_text_style& style =
+            styled_snapshot.styles[static_cast<std::size_t>(styled_cell->style_id)];
+        ok &= check(style.foreground.kind == term::Terminal_color_ref_kind::PALETTE_INDEX &&
+                style.foreground.palette_index == 1U,
+            "macro SGR changes the printed cell's foreground");
+    }
+
+    model = make_model(3, 20);
+    result = model.ingest(define(3, 0, 1, QByteArrayLiteral("!3;41;42")) + invoke(3));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("AAAB"),
+        "hex macro repeat expands the specified byte sequence");
+
+    model = make_model(3, 20);
+    const QByteArray null_macro_input =
+        define(12, 0, 1, QByteArrayLiteral("00")) + invoke(12);
+    result = model.ingest(null_macro_input);
+    ok &= check(diagnostic_count(result) == 0 &&
+            result.consumed_bytes == null_macro_input.size() &&
+            model.row_text(0).isEmpty(),
+        "a NUL-only macro completes at the end of host input without a visible action");
+    result = model.ingest(QByteArrayLiteral("N"));
+    ok &= check(model.row_text(0) == QStringLiteral("N"),
+        "ordinary input resumes after an action-free macro");
+
+    term::Terminal_byte_stream_parser parser;
+    const QByteArray null_definition = define(12, 0, 1, QByteArrayLiteral("00"));
+    qsizetype parsed = 0;
+    parser.ingest(null_definition, parsed);
+    const QByteArray null_invocation = invoke(12);
+    parsed = 0;
+    parser.ingest(null_invocation, parsed);
+    ok &= check(parsed == null_invocation.size() && parser.macro_work_pending(),
+        "a NUL-only macro is pending at the end of its invocation");
+    const std::vector<term::Parser_action> null_actions =
+        parser.ingest(null_invocation, parsed);
+    ok &= check(null_actions.empty() && parser.macro_work_advanced() &&
+            !parser.macro_work_pending(),
+        "an action-free macro reports internal parser progress");
+
+    model = make_model(3, 20);
+    result = model.ingest(QByteArrayLiteral("\x1bP4;0;1!z41"));
+    ok &= check(diagnostic_count(result) == 0, "split macro definition waits for ST");
+    result = model.ingest(QByteArrayLiteral("42\x1b"));
+    ok &= check(diagnostic_count(result) == 0, "split macro holds its final ESC");
+    result = model.ingest(QByteArrayLiteral("\\\x1b[4*zC"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("ABC"),
+        "split definition commits only at ST and resumes subsequent input");
+
+    model = make_model(3, 20);
+    model.ingest(define(1, 0, 0, QByteArrayLiteral("A")));
+    model.ingest(define(1, 0, 1, QByteArrayLiteral("4")));
+    model.ingest(define(64, 0, 0, QByteArrayLiteral("C")));
+    model.ingest(define(1, 0, 1, QByteArrayLiteral("!2;4G;")));
+    model.ingest(define(1, 2, 0, QByteArrayLiteral("C")));
+    model.ingest(define(1, 0, 2, QByteArrayLiteral("C")));
+    result = model.ingest(invoke(1));
+    ok &= check(model.row_text(0) == QStringLiteral("A"),
+        "invalid definitions leave an existing definition intact");
+    model.ingest(define(1, 0, 0, QByteArrayLiteral("B")));
+    result = model.ingest(invoke(1));
+    ok &= check(model.row_text(0) == QStringLiteral("AB"),
+        "a valid definition replaces the macro with the same ID");
+    model.ingest(define(2, 1, 0, QByteArrayLiteral("D")));
+    result = model.ingest(invoke(1) + invoke(2));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("ABD"),
+        "invalid definitions preserve stored macros; delete-all replaces the store");
+
+    model = make_model(3, 20);
+    model.ingest(define(1, 0, 0, QByteArrayLiteral("A")));
+    result = model.ingest(QByteArrayLiteral("\x1bP1;0;0!zB\x18") + invoke(1));
+    ok &= check(model.row_text(0) == QStringLiteral("A"),
+        "CAN cancels an incomplete definition and resumes ordinary input");
+    result = model.ingest(QByteArrayLiteral("\x1bP1;0;0!zC\x1a") + invoke(1));
+    ok &= check(model.row_text(0) == QStringLiteral("AA"),
+        "SUB cancels an incomplete definition and preserves the old macro");
+
+    model = make_model(3, 20);
+    QByteArray c1_definition(1, static_cast<char>(0x90));
+    c1_definition += "0;0;0!zM";
+    c1_definition.append(static_cast<char>(0x9c));
+    result = model.ingest(c1_definition + invoke(0) + 'N');
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("MN"),
+        "C1 DCS and ST delimit a macro definition");
+
+    model = make_model(3, 20);
+    model.ingest(define(8, 0, 0, QByteArrayLiteral("X")));
+    model.ingest(define(9, 0, 1, (invoke(8) + 'Y').toHex()));
+    result = model.ingest(invoke(9) + 'Z');
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("XYZ"),
+        "nested macro expansion preserves source order");
+
+    model = make_model(3, 20);
+    const QByteArray sixel = QByteArrayLiteral("\x1bPq~\x1b\\");
+    result = model.ingest(define(10, 0, 1, sixel.toHex()) + invoke(10) + 'R');
+    ok &= check(diagnostic_count(result) == 1 &&
+            model.row_text(0) == QStringLiteral("R"),
+        "macro Sixel takes the ordinary image dispatch and resumes later input");
+
+    model = make_model(3, 20);
+    const QByteArray clipboard_osc = QByteArrayLiteral("\x1b]52;c;Y29weQ==\x1b\\");
+    result = model.ingest(define(5, 0, 1, clipboard_osc.toHex()) + invoke(5));
+    ok &= check(host_request_count(result) == 1 &&
+            first_host_request(result).decoded_payload == QByteArrayLiteral("copy"),
+        "macro OSC 52 remains a host-mediated clipboard request");
+
+    model = make_model(3, 20);
+    const QByteArray self = invoke(6) + 'A';
+    result = model.ingest(define(6, 0, 1, self.toHex()) + invoke(6) + 'B');
+    ok &= check(diagnostic_count(result) == 1 &&
+            model.row_text(0) == QStringLiteral("AB"),
+        "recursive macro invocation is bounded and later input resumes");
+
+    model = make_model(3, 20);
+    model.ingest(define(7, 0, 0, QByteArrayLiteral("A")));
+    result = model.ingest(QByteArrayLiteral("\x1b[?62n"));
+    bool found_space_reply = false;
+    for (const term::Parser_action& action : result.actions) {
+        if (term::parser_action_kind(action) != term::Parser_action_kind::TERMINAL_REPLY) {
+            continue;
+        }
+        const term::Terminal_reply& reply = std::get<term::Terminal_reply>(action.payload);
+        found_space_reply = reply.kind == term::Terminal_reply_kind::MACRO_SPACE &&
+            reply.wire_bytes == QByteArrayLiteral("\x1b[383*{");
+    }
+    ok &= check(found_space_reply, "macro-space report reflects stored byte capacity");
+
+    model = make_model(3, 20);
+    model.ingest(define(0, 0, 0,
+        QByteArray(static_cast<int>(term::Terminal_byte_stream_parser::k_macro_storage_limit_bytes),
+            'A')));
+    model.ingest(define(1, 0, 0, QByteArrayLiteral("B")));
+    result = model.ingest(QByteArrayLiteral("\x1b[?62n") + invoke(1));
+    found_space_reply = false;
+    for (const term::Parser_action& action : result.actions) {
+        if (term::parser_action_kind(action) != term::Parser_action_kind::TERMINAL_REPLY) {
+            continue;
+        }
+        const term::Terminal_reply& reply = std::get<term::Terminal_reply>(action.payload);
+        found_space_reply = reply.kind == term::Terminal_reply_kind::MACRO_SPACE &&
+            reply.wire_bytes == QByteArrayLiteral("\x1b[0*{");
+    }
+    ok &= check(found_space_reply && model.row_text(0).isEmpty(),
+        "macro store rejects definitions past its six-kibibyte capacity");
+
+    model = make_model(3, 20);
+    QByteArray inert_dcs("\x1bP", 2);
+    inert_dcs += QByteArray(6140, 'X');
+    inert_dcs += "\x1b\\";
+    QByteArray bounded_batch = define(11, 0, 1, inert_dcs.toHex());
+    for (int index = 0; index < 172; ++index) {
+        bounded_batch += invoke(11);
+    }
+    bounded_batch += 'Z';
+    result = model.ingest(bounded_batch);
+    int expansion_limit_diagnostics = 0;
+    for (const term::Parser_action& action : result.actions) {
+        if (term::parser_action_kind(action) != term::Parser_action_kind::DIAGNOSTIC) {
+            continue;
+        }
+        const term::Parser_payload_diagnostic& diagnostic =
+            std::get<term::Parser_payload_diagnostic>(action.payload);
+        expansion_limit_diagnostics +=
+            diagnostic.source_sequence == QStringLiteral("DECINVM expansion") ? 1 : 0;
+    }
+    ok &= check(expansion_limit_diagnostics == 2 &&
+            model.row_text(0) == QStringLiteral("Z"),
+        "macro expansion work is bounded and the host stream resumes");
+
+    model = make_model(3, 20);
+    model.ingest(define(7, 0, 0, QByteArrayLiteral("A")));
+    result = model.ingest(QByteArrayLiteral("\x1b" "c") + invoke(7) + 'Z');
+    ok &= check(model.row_text(0) == QStringLiteral("Z"),
+        "RIS clears macro definitions before later input");
+    return ok;
+}
+
 bool test_bounded_csi_recovery()
 {
     bool ok = true;
@@ -2944,6 +3156,7 @@ int main()
     ok &= test_incremental_byte_stream_boundaries();
     ok &= test_osc_title_limit_and_clipboard_deny();
     ok &= test_string_payload_limits_and_recovery();
+    ok &= test_dec_stored_macros();
     ok &= test_bounded_csi_recovery();
     ok &= test_unsupported_escape_does_not_leak();
     ok &= test_escape_intermediates_do_not_leak();

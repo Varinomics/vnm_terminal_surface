@@ -22,6 +22,41 @@ namespace {
 constexpr char32_t k_replacement_codepoint = 0xfffdU;
 constexpr int k_printable_ascii_scan_block_bytes = 32;
 
+bool parse_bounded_decimal(QByteArrayView bytes, int maximum, int& value)
+{
+    value = 0;
+    for (const char character : bytes) {
+        if (character < '0' || character > '9') {
+            return false;
+        }
+        const int digit = character - '0';
+        if (digit > maximum || value > (maximum - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    return true;
+}
+
+int hex_digit(char character)
+{
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    return -1;
+}
+
+bool is_macro_formatting_byte(unsigned char byte)
+{
+    return byte >= 0x08U && byte <= 0x0dU;
+}
+
 bool is_printable_ascii_byte(unsigned char byte)
 {
     return byte >= k_printable_ascii_first && byte <= k_printable_ascii_last;
@@ -942,31 +977,58 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
 {
     m_sixel_work_budget   = budget;
     m_sixel_work_deferred = false;
-    const QByteArrayView unparsed = bytes.sliced(offset);
+    m_macro_work_advanced = false;
+    m_parser_boundary_reached = false;
+    if (offset == 0 && m_macro_frames.empty()) {
+        m_macro_expansion_bytes = 0U;
+    }
     std::vector<Parser_action> actions;
-    if (m_pending_prefix.isEmpty()) {
-        offset += ingest_buffer(unparsed, actions);
-        m_sixel_work_budget = nullptr;
-        return actions;
+    const auto ingest_source = [this, &actions](QByteArrayView source, qsizetype& source_offset) {
+        const QByteArrayView unparsed = source.sliced(source_offset);
+        if (m_pending_prefix.isEmpty()) {
+            const qsizetype parsed = ingest_buffer(unparsed, actions);
+            source_offset += parsed;
+            return parsed;
+        }
+
+        QByteArray prefixed = std::move(m_pending_prefix);
+        m_pending_prefix.clear();
+        const qsizetype prefix_size = prefixed.size();
+        prefixed.append(unparsed.data(), unparsed.size());
+        const qsizetype parsed = ingest_buffer(prefixed, actions);
+
+        // The prefix may itself contain the recovery boundary, leaving its
+        // unconsumed bytes ahead of this source's remaining bytes.
+        if (parsed < prefix_size) {
+            m_pending_prefix = prefixed.first(prefix_size).sliced(parsed);
+            return parsed;
+        }
+        source_offset += parsed - prefix_size;
+        return parsed;
+    };
+
+    while (!m_macro_frames.empty()) {
+        Macro_frame& frame = m_macro_frames.back();
+        if (frame.offset == frame.bytes.size()) {
+            m_macro_frames.pop_back();
+            m_macro_work_advanced = true;
+            continue;
+        }
+
+        m_macro_work_advanced = ingest_source(frame.bytes, frame.offset) > 0 ||
+            m_macro_work_advanced;
+        if (&frame == &m_macro_frames.back() && frame.offset == frame.bytes.size()) {
+            m_macro_frames.pop_back();
+            m_macro_work_advanced = true;
+        }
+        if (m_parser_boundary_reached || !actions.empty()) {
+            m_sixel_work_budget = nullptr;
+            return actions;
+        }
     }
 
-    QByteArray prefixed = std::move(m_pending_prefix);
-    m_pending_prefix.clear();
-    const qsizetype prefix_size = prefixed.size();
-    prefixed.append(unparsed.data(), unparsed.size());
-    const qsizetype parsed = ingest_buffer(prefixed, actions);
+    ingest_source(bytes, offset);
     m_sixel_work_budget = nullptr;
-
-    // A pending prefix holds a sequence its own bytes could not complete, so
-    // an image, which ends at its string terminator, and a budget stop, which
-    // comes before a draw or graphics new line, both fall past it. Only a
-    // recovery can end a sixel string at a held ESC, and the ESC then starts
-    // the sequence the next call parses: it is held again.
-    if (parsed < prefix_size) {
-        m_pending_prefix = prefixed.first(prefix_size).sliced(parsed);
-        return actions;
-    }
-    offset += parsed - prefix_size;
     return actions;
 }
 
@@ -994,8 +1056,13 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
     // A sixel string that ends, however it ends, is a place to return: the
     // caller applies an image before the next is decoded and sees a spent
     // budget there, since an abandoned image's raster was paid for too.
-    const auto sixel_boundary_reached = [&]() {
-        return std::exchange(m_sixel_string_ended, false) || m_sixel_work_deferred;
+    const auto boundary_reached = [&]() {
+        const bool reached =
+            std::exchange(m_sixel_string_ended, false) ||
+            std::exchange(m_macro_boundary_reached, false) ||
+            m_sixel_work_deferred;
+        m_parser_boundary_reached = m_parser_boundary_reached || reached;
+        return reached;
     };
 
     qsizetype offset = 0;
@@ -1015,7 +1082,7 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         if (is_string_family(m_string_family)) {
             flush_print_text();
             continue_string(bytes, offset, actions);
-            if (sixel_boundary_reached()) {
+            if (boundary_reached()) {
                 break;
             }
             continue;
@@ -1042,7 +1109,7 @@ qsizetype Terminal_byte_stream_parser::ingest_buffer(
         if (try_start_string(bytes, offset, actions)          == String_state_result::CONSUMED ||
             try_consume_escape_or_csi(bytes, offset, actions) == String_state_result::CONSUMED)
         {
-            if (sixel_boundary_reached()) {
+            if (boundary_reached()) {
                 break;
             }
             continue;
@@ -1240,6 +1307,14 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
         // The two-byte forms below are two-byte forms; an intermediate run
         // ahead of the same final byte is a different sequence.
         const bool has_no_intermediates = final_offset == offset + 1;
+        if (has_no_intermediates && final_byte == 'c') {
+            // RIS clears downloadable macros even though the screen model's
+            // broader RIS behavior remains unsupported.
+            for (auto& macro : m_macros) {
+                macro.reset();
+            }
+            m_macro_storage_bytes = 0U;
+        }
         if (has_no_intermediates &&
             (final_byte == 'D' || final_byte == 'E' ||
              final_byte == 'M' || final_byte == '7' ||
@@ -1497,17 +1572,19 @@ qsizetype Terminal_byte_stream_parser::find_string_terminator(
             terminator = Parser_string_terminator::ST_7BIT;
             return i;
         }
-        if ((byte == 0x1bU && i + 1 < bytes.size() && byte_at(bytes, i + 1) == '[') ||
+        if ((byte == 0x1bU && i + 1 < bytes.size() &&
+             (family == Parser_sequence_family::DCS || byte_at(bytes, i + 1) == '[')) ||
             byte == 0x9bU)
         {
             reset_utf8_scan_state(m_string_utf8_scan_state);
             terminator = Parser_string_terminator::RECOVERY;
             return i;
         }
-        // CAN and SUB cancel a control string in the DEC parser, which is how
-        // an application abandons an image it has started. Other strings
-        // carry them as payload.
-        if (m_sixel_decoder.active() && (byte == 0x18U || byte == 0x1aU)) {
+        // DEC cancels a DCS definition immediately. Other string families
+        // keep their existing payload treatment.
+        if (family == Parser_sequence_family::DCS &&
+            (byte == 0x18U || byte == 0x1aU))
+        {
             reset_utf8_scan_state(m_string_utf8_scan_state);
             terminator = Parser_string_terminator::CANCEL;
             return i;
@@ -1585,6 +1662,10 @@ void Terminal_byte_stream_parser::finish_string(
         return;
     }
 
+    if (family == Parser_sequence_family::DCS && define_macro(payload)) {
+        return;
+    }
+
     actions.push_back(make_unsupported_sequence_diagnostic(
         source_name_for_family(family),
         family,
@@ -1631,6 +1712,24 @@ void Terminal_byte_stream_parser::finish_csi_sequence(
     }
 
     const unsigned char final_byte = byte_at(bytes, final_offset);
+    if (final_byte == 'n' && parts.private_marker == QByteArrayLiteral("?") &&
+        parts.intermediates.isEmpty() &&
+        parts.parameter_bytes == QByteArrayLiteral("62"))
+    {
+        const std::size_t free_bytes = k_macro_storage_limit_bytes - m_macro_storage_bytes;
+        actions.push_back(make_terminal_reply_action(
+            Terminal_reply_kind::MACRO_SPACE,
+            QByteArray("\x1b[") + QByteArray::number(free_bytes / 16U) + "*{",
+            QStringLiteral("DSR macro space")));
+        return;
+    }
+    if (final_byte == 'z' && parts.private_marker.isEmpty() &&
+        parts.intermediates == QByteArrayLiteral("*"))
+    {
+        invoke_macro(parts.parameter_bytes, actions);
+        return;
+    }
+
     if (final_byte != 'm') {
         actions.push_back(make_csi_dispatch_action_from_parts(parts));
         return;
@@ -1656,6 +1755,206 @@ void Terminal_byte_stream_parser::finish_csi_sequence(
     if (!result.sequence.operations.empty()) {
         actions.push_back(make_sgr_action(std::move(result.sequence)));
     }
+}
+
+bool Terminal_byte_stream_parser::define_macro(QByteArrayView payload)
+{
+    qsizetype header_end = -1;
+    QByteArray header;
+    for (qsizetype index = 0; index < payload.size(); ++index) {
+        const unsigned char byte = static_cast<unsigned char>(payload[index]);
+        if (byte == '!' && index + 1 < payload.size() && payload[index + 1] == 'z') {
+            header_end = index;
+            break;
+        }
+        if (is_macro_formatting_byte(byte)) {
+            continue;
+        }
+        if ((byte < '0' || byte > '9') && byte != ';') {
+            return false;
+        }
+        if (header.size() <= 64) {
+            header.append(static_cast<char>(byte));
+        }
+    }
+    if (header_end < 0) {
+        return false;
+    }
+    if (header.size() > 64) {
+        return true;
+    }
+
+    const QList<QByteArray> parameters = header.split(';');
+    if (parameters.size() > 3) {
+        return true;
+    }
+    int id         = 0;
+    int delete_all = 0;
+    int encoding   = 0;
+    if (!parse_bounded_decimal(parameters.value(0), 63, id)       ||
+        !parse_bounded_decimal(parameters.value(1), 1, delete_all) ||
+        !parse_bounded_decimal(parameters.value(2), 1, encoding))
+    {
+        return true;
+    }
+
+    QByteArray data;
+    const qsizetype data_begin = header_end + 2;
+    for (qsizetype index = data_begin; index < payload.size(); ++index) {
+        const unsigned char byte = static_cast<unsigned char>(payload[index]);
+        if (!is_macro_formatting_byte(byte)) {
+            data.append(static_cast<char>(byte));
+        }
+    }
+
+    QByteArray decoded;
+    if (encoding == 0) {
+        for (const char character : data) {
+            const unsigned char byte = static_cast<unsigned char>(character);
+            if ((byte < 0x20U || byte > 0x7eU) && byte < 0xa0U) {
+                return true;
+            }
+            if (static_cast<std::size_t>(decoded.size()) == k_macro_storage_limit_bytes) {
+                return true;
+            }
+            decoded.append(static_cast<char>(byte));
+        }
+    }
+    else {
+        qsizetype index = 0;
+        while (index < data.size()) {
+            const unsigned char byte = static_cast<unsigned char>(data[index]);
+
+            if (byte == '!') {
+                ++index;
+                QByteArray count_bytes;
+                while (index < data.size() && data[index] != ';') {
+                    count_bytes.append(data[index]);
+                    ++index;
+                }
+                if (index == data.size()) {
+                    return true;
+                }
+                ++index;
+                int count = 1;
+                if (!count_bytes.isEmpty() &&
+                    !parse_bounded_decimal(count_bytes,
+                        static_cast<int>(k_macro_storage_limit_bytes), count))
+                {
+                    return true;
+                }
+
+                QByteArray repeated;
+                while (index < data.size() && data[index] != ';') {
+                    if (index + 1 == data.size()) {
+                        return true;
+                    }
+                    const int high = hex_digit(data[index]);
+                    const int low  = hex_digit(data[index + 1]);
+                    if (high < 0 || low < 0) {
+                        return true;
+                    }
+                    if (static_cast<std::size_t>(repeated.size()) ==
+                        k_macro_storage_limit_bytes)
+                    {
+                        return true;
+                    }
+                    repeated.append(static_cast<char>((high << 4) | low));
+                    index += 2;
+                }
+                if (index < data.size()) {
+                    ++index;
+                }
+                const std::size_t remaining =
+                    k_macro_storage_limit_bytes - static_cast<std::size_t>(decoded.size());
+                if (!repeated.isEmpty() &&
+                    static_cast<std::size_t>(count) >
+                        remaining / static_cast<std::size_t>(repeated.size()))
+                {
+                    return true;
+                }
+                for (int repeat = 0; repeat < count; ++repeat) {
+                    decoded.append(repeated);
+                }
+                continue;
+            }
+
+            if (index + 1 == data.size()) {
+                return true;
+            }
+            const int high = hex_digit(data[index]);
+            const int low  = hex_digit(data[index + 1]);
+            if (high < 0 || low < 0 ||
+                static_cast<std::size_t>(decoded.size()) == k_macro_storage_limit_bytes)
+            {
+                return true;
+            }
+            decoded.append(static_cast<char>((high << 4) | low));
+            index += 2;
+        }
+    }
+
+    const std::size_t old_size = m_macros[static_cast<std::size_t>(id)].has_value()
+        ? static_cast<std::size_t>(m_macros[static_cast<std::size_t>(id)]->size())
+        : 0U;
+    const std::size_t retained_size = delete_all == 1
+        ? 0U
+        : m_macro_storage_bytes - old_size;
+    if (static_cast<std::size_t>(decoded.size()) >
+        k_macro_storage_limit_bytes - retained_size)
+    {
+        return true;
+    }
+    if (delete_all == 1) {
+        for (auto& macro : m_macros) {
+            macro.reset();
+        }
+    }
+    m_macros[static_cast<std::size_t>(id)] = std::move(decoded);
+    m_macro_storage_bytes = retained_size +
+        static_cast<std::size_t>(m_macros[static_cast<std::size_t>(id)]->size());
+    return true;
+}
+
+void Terminal_byte_stream_parser::invoke_macro(
+    QByteArrayView                 parameter_bytes,
+    std::vector<Parser_action>&    actions)
+{
+    int id = 0;
+    if (!parse_bounded_decimal(parameter_bytes, 63, id)) {
+        actions.push_back(make_malformed_recovery_diagnostic(
+            QStringLiteral("DECINVM parameter"),
+            Parser_sequence_family::CSI,
+            Parser_recovery_strategy::DISCARD_SEQUENCE));
+        return;
+    }
+    const std::optional<QByteArray>& macro = m_macros[static_cast<std::size_t>(id)];
+    if (!macro.has_value() || macro->isEmpty()) {
+        return;
+    }
+    for (const Macro_frame& frame : m_macro_frames) {
+        if (frame.id == id) {
+            actions.push_back(make_malformed_recovery_diagnostic(
+                QStringLiteral("DECINVM recursive invocation"),
+                Parser_sequence_family::CSI,
+                Parser_recovery_strategy::DISCARD_SEQUENCE));
+            return;
+        }
+    }
+    if (static_cast<std::size_t>(macro->size()) >
+        k_macro_expansion_limit_bytes - m_macro_expansion_bytes)
+    {
+        actions.push_back(make_payload_limit_diagnostic(
+            QStringLiteral("DECINVM expansion"),
+            m_macro_expansion_bytes + static_cast<std::size_t>(macro->size()),
+            k_macro_expansion_limit_bytes,
+            Parser_sequence_family::CSI));
+        return;
+    }
+
+    m_macro_expansion_bytes += static_cast<std::size_t>(macro->size());
+    m_macro_frames.push_back({id, *macro, 0});
+    m_macro_boundary_reached = true;
 }
 
 void Terminal_byte_stream_parser::handle_osc_payload(

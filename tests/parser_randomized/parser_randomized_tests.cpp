@@ -2528,6 +2528,26 @@ void append_dcs_cases(std::vector<Test_case>& cases)
     cases.push_back(make_dcs_test_case(
         "generated_sixel_c1_image", c1_image, {}, 0xd4a2687f1e05b93cULL));
 
+    // DECDMAC is buffered through ST, and an invoked macro is fed back into
+    // the same parser before later host bytes. This compares every chunking
+    // plan and Sixel budget against one unsplit model run.
+    {
+        const QByteArray inner = QByteArrayLiteral("\x1b[1*zY");
+        const QByteArray image = QByteArrayLiteral("\x1bPq#1~\x1b\\");
+        Test_case test_case;
+        test_case.name = "generated_dec_macro_nested_sixel_budget_resume";
+        test_case.config = {term::terminal_grid_size_t{3, 12}, 4, 4};
+        test_case.config.cell_pixel_size = term::terminal_cell_pixel_size_t{10, 20};
+        test_case.bytes = QByteArrayLiteral("A\x1bP1;0;0!zX\x1b\\") +
+            QByteArrayLiteral("\x1bP2;0;1!z") + inner.toHex() + QByteArrayLiteral("\x1b\\") +
+            QByteArrayLiteral("\x1bP3;0;1!z") + image.toHex() + QByteArrayLiteral("\x1b\\") +
+            QByteArrayLiteral("\x1b[2*z\x1b[3*zB");
+        test_case.chunk_seed = 0x23a4701c9158d4e6ULL;
+        test_case.expected_reply_count = 0;
+        set_expected_diagnostics(test_case, {});
+        cases.push_back(std::move(test_case));
+    }
+
     cases.push_back(make_dcs_test_case(
         "generated_sixel_cancel_can",
         QByteArrayLiteral("\x1bPq#1~~\x18"),

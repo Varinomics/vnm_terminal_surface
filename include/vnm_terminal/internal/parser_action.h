@@ -167,6 +167,7 @@ enum class Terminal_reply_kind
     DA1,
     DA2,
     DSR_CURSOR_POSITION,
+    MACRO_SPACE,
     DECRQM,
     OSC_QUERY,
     TEXT_AREA_SIZE,
@@ -589,6 +590,7 @@ inline Parser_sequence_family source_family_for_reply_kind(Terminal_reply_kind k
         case Terminal_reply_kind::DA1:
         case Terminal_reply_kind::DA2:
         case Terminal_reply_kind::DSR_CURSOR_POSITION:
+        case Terminal_reply_kind::MACRO_SPACE:
         case Terminal_reply_kind::DECRQM:
         case Terminal_reply_kind::TEXT_AREA_SIZE:
         case Terminal_reply_kind::TEXT_AREA_PIXEL_SIZE:

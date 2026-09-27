@@ -6,8 +6,11 @@
 #include <QByteArray>
 #include <QByteArrayView>
 #include <QtGlobal>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <optional>
 #include <vector>
 
 namespace vnm_terminal::internal {
@@ -28,15 +31,13 @@ Terminal_csi_byte_kind terminal_csi_byte_kind(unsigned char byte);
 class Terminal_byte_stream_parser
 {
 public:
-    // Parses bytes from offset on and stops right after every sixel string
-    // ends, whatever ends it (the image completes, or a cancel, a recovery or
-    // an over-cap discard abandons it), so its caller applies each image
-    // before the next is decoded, at most one decoded raster is alive at a
-    // time however many images one chunk describes, and a spent budget is
-    // seen at every such boundary. It also stops where the budget cannot pay
-    // for the next sixel step (sixel_work_deferred). offset advances past what
-    // was parsed; the caller calls again until it reaches bytes.size(),
-    // handing deferred bytes over again in a later step.
+    static constexpr std::size_t k_macro_storage_limit_bytes = 6U * 1024U;
+    static constexpr std::size_t k_macro_expansion_limit_bytes = 1024U * 1024U;
+    // Parses from offset and stops after each sixel string or stored-macro
+    // invocation. This lets the caller apply an image before another is
+    // decoded; the next call expands a macro before resuming later host bytes.
+    // It also stops where the budget cannot pay for the next sixel step.
+    // Call again while input remains or macro_work_pending() is true.
     std::vector<Parser_action> ingest(
         QByteArrayView       bytes,
         qsizetype&           offset,
@@ -44,6 +45,9 @@ public:
 
     // Whether the last ingest stopped because its budget ran out.
     bool sixel_work_deferred() const { return m_sixel_work_deferred; }
+    bool macro_work_pending() const { return !m_macro_frames.empty(); }
+    bool macro_work_advanced() const { return m_macro_work_advanced; }
+    bool parse_boundary_reached() const { return m_parser_boundary_reached; }
 
     // The decoded size a sixel image may reach; its owner keeps it equal to
     // the retained history's largest record.
@@ -121,6 +125,11 @@ private:
         qsizetype                      final_offset,
         std::vector<Parser_action>&    actions);
 
+    bool define_macro(QByteArrayView payload);
+    void invoke_macro(
+        QByteArrayView                 parameter_bytes,
+        std::vector<Parser_action>&    actions);
+
     void handle_osc_payload(
         QByteArray                     payload,
         std::vector<Parser_action>&    actions);
@@ -155,6 +164,19 @@ private:
     bool                       m_sixel_string_ended            = false;
     bool                       m_discarding_csi                = false;
     bool                       m_discarding_escape             = false;
+    struct Macro_frame
+    {
+        int        id = 0;
+        QByteArray bytes;
+        qsizetype  offset = 0;
+    };
+    std::array<std::optional<QByteArray>, 64> m_macros;
+    std::deque<Macro_frame>    m_macro_frames;
+    std::size_t                m_macro_storage_bytes           = 0U;
+    std::size_t                m_macro_expansion_bytes         = 0U;
+    bool                       m_macro_boundary_reached        = false;
+    bool                       m_macro_work_advanced           = false;
+    bool                       m_parser_boundary_reached       = false;
     std::uint64_t              m_next_host_request_id          = 1U;
 };
 

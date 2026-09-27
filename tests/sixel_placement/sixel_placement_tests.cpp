@@ -1411,7 +1411,7 @@ bool test_encoder_session_end_to_end()
         model.ingest(QByteArray("\x1b[c\x1b[?2;1;0S\x1b[16t"));
     const std::vector<term::Terminal_reply> replies = replies_in(query_result);
     ok &= check(diagnostics_in(query_result).empty() && replies.size() == 3U &&
-            replies[0].wire_bytes == QByteArray("\x1b[?61;4;22;28c") &&
+            replies[0].wire_bytes == QByteArray("\x1b[?61;4;22;28;32c") &&
             replies[1].wire_bytes == QByteArray("\x1b[?2;0;400;80S") &&
             replies[2].wire_bytes == QByteArray("\x1b[6;20;10t"),
         "the encoder learns of sixel graphics, a 400 x 80 geometry and a 10 x 20 cell");

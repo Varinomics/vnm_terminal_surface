@@ -112,13 +112,61 @@ sequence: unsupported DCS
 feature: unsupported string recovery
 status: unsupported-discard
 action_category: unsupported-discard
-behavior: discards payload and mutates no screen state; a header with an intermediate, a private marker, or a final byte other than q, such as DECRQSS $q and XTGETTCAP +q, is not sixel
+behavior: discards payload and mutates no screen state; DECRQSS $q and XTGETTCAP +q are neither sixel nor the supported DECDMAC !z form
 host_policy: none
 payload_limit: 1048576 raw bytes
-recovery: recover at ST or recovery boundary
+recovery: recover at ST, CAN, SUB, or an escape recovery boundary
 reply: no-reply
 diagnostic: unsupported DCS diagnostic
 oracle: product-decision-vnm-terminal
+
+## dcs-decdmac
+
+id: dcs-decdmac
+family: DCS
+sequence: DCS Pid ; Pdt ; Pen ! z data ST
+feature: DEC stored macro definition
+status: supported
+action_category: parser-state-mutation
+behavior: IDs 0-63; Pdt 0 or omitted replaces that ID and 1 clears all definitions before storing the new one; Pen 0 or omitted stores graphic bytes, and 1 decodes hex pairs with optional ! Pn ; hex-pairs ; repeats; omitted Pid and repeat count are zero and one respectively; invalid parameters or malformed data leave the previous store unchanged; replayed bytes enter the ordinary parser and host-request path; definitions are session-local, survive DECSTR, and are cleared by RIS even though broader RIS screen behavior remains unsupported
+host_policy: replayed host requests use their normal policy
+payload_limit: 1048576 raw DCS bytes; 6144 decoded stored bytes across all macro IDs
+recovery: incomplete definitions wait for ST; CAN and SUB cancel, and another ESC abandons a definition unless it forms ST
+reply: no-reply
+diagnostic: invalid definitions are ignored; over-limit raw DCS uses the normal payload-limit diagnostic
+oracle: dec-vt420-macros
+
+## csi-decinvm
+
+id: csi-decinvm
+family: CSI
+sequence: CSI Pid * z
+feature: DEC stored macro invocation
+status: supported
+action_category: parser-input-expansion
+behavior: substitutes the stored bytes before later host bytes in the same write; missing IDs are ignored; nested invocations are supported, active-ID recursion is rejected, and total expanded bytes in one host ingest are capped at 1048576; effects persist after replay
+host_policy: replayed host requests use their normal policy
+payload_limit: 1048576 expanded bytes per host ingest
+recovery: invalid ID or recursion emits a diagnostic and later input continues
+reply: no-reply
+diagnostic: malformed ID, recursive invocation, or expansion limit diagnostic
+oracle: dec-vt420-macros
+
+## csi-macro-space
+
+id: csi-macro-space
+family: CSI
+sequence: CSI ? 62 n
+feature: DEC macro storage capacity report
+status: supported
+action_category: terminal-reply
+behavior: reports floor of free decoded macro-storage bytes divided by 16
+host_policy: backend write queue capacity applies
+payload_limit: none
+recovery: no special recovery
+reply: CSI Pn * { through the same backend write path
+diagnostic: no diagnostic
+oracle: dec-vt420-macros
 
 ## dcs-sixel-image
 
@@ -992,7 +1040,7 @@ sequence: DA1
 feature: terminal identity reply
 status: supported
 action_category: terminal-reply
-behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 22 ; 28 c, conformance class 61 with attribute 22 for ANSI color text and attribute 28 for rectangular editing; attribute 4 advertises sixel graphics while a cell pixel size lets images be placed; without one the reply is CSI ? 61 ; 22 ; 28 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
+behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 22 ; 28 ; 32 c, conformance class 61 with attribute 22 for ANSI color text, attribute 28 for rectangular editing, and attribute 32 for stored DEC macros; attribute 4 advertises sixel graphics while a cell pixel size lets images be placed; without one the reply is CSI ? 61 ; 22 ; 28 ; 32 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
 host_policy: backend write queue capacity applies
 payload_limit: none
 recovery: malformed query ignored with diagnostic
