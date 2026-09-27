@@ -1185,6 +1185,146 @@ void Terminal_screen_model::apply_control_sequence(
         return true;
     };
 
+    if (sequence.private_marker.isEmpty() &&
+        sequence.intermediates == QByteArrayLiteral("\"") &&
+        final_byte == 'q')
+    {
+        int mode = 0;
+        if (!single_parameter(0, mode)) {
+            return;
+        }
+        if (mode != 0 && mode != 1 && mode != 2) {
+            unsupported();
+            return;
+        }
+        m_character_protected = mode == 1;
+        return;
+    }
+
+    if (sequence.private_marker.isEmpty() &&
+        sequence.intermediates == QByteArrayLiteral("*") &&
+        final_byte == 'x')
+    {
+        int extent = 0;
+        if (!single_parameter(0, extent)) {
+            return;
+        }
+        if (extent < 0 || extent > 2) {
+            unsupported();
+            return;
+        }
+        m_rectangular_attribute_extent = extent == 2;
+        return;
+    }
+
+    if (sequence.private_marker.isEmpty() &&
+        sequence.intermediates == QByteArrayLiteral("$") &&
+        (final_byte == 'v' || final_byte == 'x' || final_byte == 'z' ||
+         final_byte == '{' || final_byte == 'r' || final_byte == 't'))
+    {
+        if (!parse_simple_parameters()) {
+            return;
+        }
+
+        const bool copy = final_byte == 'v';
+        const bool fill = final_byte == 'x';
+        const bool attributes = final_byte == 'r' || final_byte == 't';
+        const std::size_t area_offset = fill ? 1U : 0U;
+        const std::size_t limit = copy ? 8U : fill ? 5U : 4U;
+        if (!attributes && parameter_count() > limit) {
+            malformed();
+            return;
+        }
+
+        int top    = 1;
+        int left   = 1;
+        int bottom = m_origin_mode
+            ? m_scroll_bottom - m_scroll_top + 1
+            : m_config.grid_size.rows;
+        int right  = m_config.grid_size.columns;
+        if (!parameter_value(area_offset,      1,      top)    ||
+            !parameter_value(area_offset + 1U, 1,      left)   ||
+            !parameter_value(area_offset + 2U, bottom, bottom) ||
+            !parameter_value(area_offset + 3U, right,  right))
+        {
+            malformed();
+            return;
+        }
+        const auto default_if_zero = [](int value, int default_value) {
+            return value == 0 ? default_value : value;
+        };
+        top    = default_if_zero(top,    1);
+        left   = default_if_zero(left,   1);
+        bottom = default_if_zero(bottom, m_origin_mode
+            ? m_scroll_bottom - m_scroll_top + 1
+            : m_config.grid_size.rows);
+        right  = default_if_zero(right, m_config.grid_size.columns);
+
+        const std::optional<rectangular_area_t> area =
+            rectangular_area(top, left, bottom, right);
+        if (!area.has_value()) {
+            return;
+        }
+
+        if (copy) {
+            int source_page      = 1;
+            int destination_top  = 1;
+            int destination_left = 1;
+            int destination_page = 1;
+            if (!parameter_value(4U, 1, source_page)      ||
+                !parameter_value(5U, 1, destination_top)  ||
+                !parameter_value(6U, 1, destination_left) ||
+                !parameter_value(7U, 1, destination_page))
+            {
+                malformed();
+                return;
+            }
+            // The active screen has one page; DEC clamps larger page numbers
+            // to the last page in the arrangement.
+            copy_rectangular_area(
+                *area,
+                default_if_zero(destination_top, 1),
+                default_if_zero(destination_left, 1));
+            return;
+        }
+
+        if (fill) {
+            int character = 0;
+            if (!parameter_value(0U, 0, character)) {
+                malformed();
+                return;
+            }
+            if (!((character >= 32 && character <= 126) ||
+                  (character >= 160 && character <= 255)))
+            {
+                return;
+            }
+            fill_rectangular_area(*area, QChar(static_cast<ushort>(character)));
+            return;
+        }
+
+        if (final_byte == 'z' || final_byte == '{') {
+            erase_rectangular_area(*area, final_byte == '{');
+            return;
+        }
+
+        std::vector<int> visual_attributes;
+        visual_attributes.reserve(parameter_count() > 4U ? parameter_count() - 4U : 1U);
+        for (std::size_t index = 4U; index < parameter_count(); ++index) {
+            int value = 0;
+            if (!parameter_value(index, 0, value)) {
+                malformed();
+                return;
+            }
+            visual_attributes.push_back(value);
+        }
+        if (visual_attributes.empty()) {
+            visual_attributes.push_back(0);
+        }
+        change_rectangular_attributes(*area, visual_attributes, final_byte == 't');
+        return;
+    }
+
     switch (final_byte) {
         case 'A':
         case 'B':
@@ -1466,12 +1606,12 @@ void Terminal_screen_model::apply_control_sequence(
                                 sequence.private_marker.isEmpty() &&
                                 mode == 0)
                             {
-                                // ANSI color (22) is always available; sixel (4) needs
-                                // a cell pixel size so decoded images can be placed.
+                                // ANSI color (22) and rectangular editing (28) are
+                                // available; sixel (4) needs a cell pixel size.
                                 generated_actions.push_back(make_da1_reply_action(
                                     m_config.cell_pixel_size.has_value()
-                                        ? QByteArrayLiteral("\x1b[?61;4;22c")
-                                        : QByteArrayLiteral("\x1b[?61;22c")));
+                                        ? QByteArrayLiteral("\x1b[?61;4;22;28c")
+                                        : QByteArrayLiteral("\x1b[?61;22;28c")));
                                 return;
                             }
                             if (sequence.intermediates.isEmpty() &&
@@ -1747,17 +1887,28 @@ void Terminal_screen_model::apply_sgr_operation(
 
 void Terminal_screen_model::set_current_style(const Terminal_text_style& style)
 {
+    m_current_style_id = intern_style(style);
+    m_current_style    = style;
+}
+
+Terminal_style_id Terminal_screen_model::intern_style(const Terminal_text_style& style)
+{
     const terminal_text_style_lookup_key_t key = terminal_text_style_lookup_key(style);
     const auto found = m_style_ids_by_value.find(key);
     if (found != m_style_ids_by_value.end()) {
-        m_current_style    = style;
-        m_current_style_id = found->second;
-        return;
+        return found->second;
     }
 
     if (m_styles.size() >= m_next_style_compaction_count) {
+        const Terminal_text_style previous_style = m_current_style;
         compact_styles(style);
-        return;
+        const Terminal_style_id result = m_current_style_id;
+        const auto previous = m_style_ids_by_value.find(
+            terminal_text_style_lookup_key(previous_style));
+        Q_ASSERT(previous != m_style_ids_by_value.end());
+        m_current_style    = previous_style;
+        m_current_style_id = previous->second;
+        return result;
     }
 
     if (m_styles.size() >= m_style_count_cap) {
@@ -1778,8 +1929,7 @@ void Terminal_screen_model::set_current_style(const Terminal_text_style& style)
     m_style_table_stats.peak_style_count = std::max(
         m_style_table_stats.peak_style_count,
         m_style_table_stats.current_style_count);
-    m_current_style    = style;
-    m_current_style_id = style_id;
+    return style_id;
 }
 
 void Terminal_screen_model::compact_styles(const Terminal_text_style& pending_style)
@@ -1813,6 +1963,7 @@ void Terminal_screen_model::compact_styles(const Terminal_text_style& pending_st
         };
 
     collect_style_id(k_default_terminal_style_id);
+    collect_style_id(m_current_style_id);
     collect_style_id(m_saved_cursor.style_id);
     collect_style_id(m_primary_backing.active_grid_state().saved_cursor.style_id);
     collect_style_id(m_alternate_grid.active_grid_state().saved_cursor.style_id);
@@ -4633,6 +4784,8 @@ void Terminal_screen_model::reset_grid()
     m_active_buffer_id              = Terminal_buffer_id::PRIMARY;
     m_active_alternate_mode         = 0;
     m_dec_1049_saved_primary_cursor = false;
+    m_character_protected            = false;
+    m_rectangular_attribute_extent   = false;
     m_tab_stops                     = default_tab_stops(m_config.grid_size.columns);
     restore_buffer_state(m_primary_backing.active_grid_state());
 }
@@ -5315,6 +5468,7 @@ void Terminal_screen_model::write_printable_ascii_cell_content(
     target_cell.occupied          = true;
     target_cell.style_id          = m_current_style_id;
     target_cell.hyperlink_id      = m_current_hyperlink_id;
+    target_cell.protected_cell    = m_character_protected;
 }
 
 void Terminal_screen_model::write_single_width_bmp_span(
@@ -5391,6 +5545,7 @@ void Terminal_screen_model::write_single_width_bmp_cell_content(
     target_cell.occupied          = true;
     target_cell.style_id          = m_current_style_id;
     target_cell.hyperlink_id      = m_current_hyperlink_id;
+    target_cell.protected_cell    = m_character_protected;
 }
 
 void Terminal_screen_model::put_spacing_scalar(QString text, int display_width)
@@ -5458,6 +5613,7 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
         else {
             const Terminal_style_id     style_id     = cell.style_id;
             const Terminal_hyperlink_id hyperlink_id = cell.hyperlink_id;
+            const bool protected_cell = cell.protected_cell;
             Terminal_screen_row& screen_row =
                 active_grid_rows()[static_cast<std::size_t>(target.row)];
             const bool selection_content_changed =
@@ -5476,7 +5632,8 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
                 display_width,
                 natural_display_width,
                 style_id,
-                hyperlink_id);
+                hyperlink_id,
+                protected_cell);
             set_cursor_after_cell(m_cursor, display_width);
             return;
         }
@@ -5488,7 +5645,8 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
         display_width,
         natural_display_width,
         cell.style_id,
-        cell.hyperlink_id);
+        cell.hyperlink_id,
+        cell.protected_cell);
     set_cursor_after_cell(target, display_width);
 }
 
@@ -5498,7 +5656,8 @@ void Terminal_screen_model::install_cell_span(
     int                        display_width,
     int                        natural_display_width,
     Terminal_style_id          style_id,
-    Terminal_hyperlink_id      hyperlink_id)
+    Terminal_hyperlink_id      hyperlink_id,
+    bool                       protected_cell)
 {
     mark_terminal_content_changed();
     Terminal_screen_row& screen_row =
@@ -5526,6 +5685,7 @@ void Terminal_screen_model::install_cell_span(
     cell.occupied          = true;
     cell.style_id          = style_id;
     cell.hyperlink_id      = hyperlink_id;
+    cell.protected_cell    = protected_cell;
 
     for (int width_offset = 1; width_offset < display_width; ++width_offset) {
         clear_cell_at({position.row, position.column + width_offset});
@@ -5538,6 +5698,7 @@ void Terminal_screen_model::install_cell_span(
         continuation.occupied          = true;
         continuation.style_id          = cell.style_id;
         continuation.hyperlink_id      = cell.hyperlink_id;
+        continuation.protected_cell    = cell.protected_cell;
     }
 
     screen_row.image_slice = std::move(image);
@@ -5557,7 +5718,8 @@ void Terminal_screen_model::place_cell_text(
         display_width,
         natural_display_width,
         m_current_style_id,
-        m_current_hyperlink_id);
+        m_current_hyperlink_id,
+        m_character_protected);
 }
 
 void Terminal_screen_model::clear_cell_span(terminal_grid_position_t position)
@@ -5933,6 +6095,232 @@ void Terminal_screen_model::erase_characters(int count)
         m_cursor.row,
         m_cursor.column,
         m_cursor.column + bounded_count - 1);
+}
+
+std::optional<Terminal_screen_model::rectangular_area_t>
+Terminal_screen_model::rectangular_area(int top, int left, int bottom, int right) const
+{
+    const int last_row = m_origin_mode ? m_scroll_bottom - m_scroll_top + 1
+                                       : m_config.grid_size.rows;
+    const int last_column = m_config.grid_size.columns;
+    if (top > bottom || left > right) {
+        return std::nullopt;
+    }
+
+    rectangular_area_t area;
+    area.top    = std::clamp(top,    1, last_row)    - 1 + (m_origin_mode ? m_scroll_top : 0);
+    area.left   = std::clamp(left,   1, last_column) - 1;
+    area.bottom = std::clamp(bottom, 1, last_row)    - 1 + (m_origin_mode ? m_scroll_top : 0);
+    area.right  = std::clamp(right,  1, last_column) - 1;
+    return area;
+}
+
+void Terminal_screen_model::copy_rectangular_area(
+    rectangular_area_t source,
+    int                destination_top,
+    int                destination_left)
+{
+    const int last_row = m_origin_mode ? m_scroll_bottom - m_scroll_top + 1
+                                       : m_config.grid_size.rows;
+    const int target_top = std::clamp(destination_top, 1, last_row) - 1 +
+        (m_origin_mode ? m_scroll_top : 0);
+    const int target_left = std::clamp(destination_left, 1, m_config.grid_size.columns) - 1;
+    const int copy_rows = std::min(source.bottom - source.top + 1,
+        (m_origin_mode ? m_scroll_bottom : m_config.grid_size.rows - 1) - target_top + 1);
+    const int copy_columns = std::min(source.right - source.left + 1,
+        m_config.grid_size.columns - target_left);
+
+    // Capture before writing so overlapping copies behave as a single move.
+    std::vector<std::vector<Cell>> source_cells;
+    source_cells.reserve(static_cast<std::size_t>(copy_rows));
+    for (int offset = 0; offset < copy_rows; ++offset) {
+        const auto& cells = active_grid_rows()[static_cast<std::size_t>(source.top + offset)].cells;
+        source_cells.emplace_back(
+            cells.begin() + source.left,
+            cells.begin() + source.left + copy_columns);
+    }
+
+    for (int offset = 0; offset < copy_rows; ++offset) {
+        const int row_number = target_top + offset;
+        Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
+        const std::vector<Cell> before_cells = row.cells;
+        const int end_column = target_left + copy_columns;
+        const int first_damage = cell_base_column_in_row(row, target_left);
+        const Cell& last_cell = row.cells[static_cast<std::size_t>(end_column - 1)];
+        const int last_damage = std::min(m_config.grid_size.columns,
+            end_column - 1 + std::max(1, last_cell.display_width));
+        row.image_slice = image_slice_without_cells(row, first_damage, last_damage);
+        for (int column = target_left; column < end_column; ++column) {
+            clear_cell_at_content(row, column);
+        }
+        std::copy(source_cells[static_cast<std::size_t>(offset)].begin(),
+                  source_cells[static_cast<std::size_t>(offset)].end(),
+                  row.cells.begin() + target_left);
+        repair_wide_spans_in_row(row.cells, m_config.grid_size.columns);
+        if (end_column == m_config.grid_size.columns) {
+            row.soft_wrap_columns = 0;
+        }
+        advance_row_content_generation_if_changed(row, before_cells);
+        mark_dirty(row_number);
+    }
+    mark_terminal_content_changed();
+}
+
+void Terminal_screen_model::fill_rectangular_area(
+    rectangular_area_t area,
+    QChar              character)
+{
+    Cell replacement;
+    replacement.text          = QString(character);
+    replacement.text_category = Terminal_render_cell_text::category_for_text(
+        QStringView(replacement.text));
+    replacement.occupied      = true;
+    replacement.style_id      = m_current_style_id;
+    replacement.hyperlink_id  = m_current_hyperlink_id;
+    replacement.protected_cell = m_character_protected;
+
+    for (int row_number = area.top; row_number <= area.bottom; ++row_number) {
+        Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
+        const std::vector<Cell> before_cells = row.cells;
+        const int first_damage = cell_base_column_in_row(row, area.left);
+        const Cell& last_cell = row.cells[static_cast<std::size_t>(area.right)];
+        const int last_damage = std::min(m_config.grid_size.columns,
+            area.right + std::max(1, last_cell.display_width));
+        row.image_slice = image_slice_without_cells(row, first_damage, last_damage);
+        for (int column = area.left; column <= area.right; ++column) {
+            clear_cell_at_content(row, column);
+            row.cells[static_cast<std::size_t>(column)] = replacement;
+        }
+        if (area.right == m_config.grid_size.columns - 1) {
+            row.soft_wrap_columns = 0;
+        }
+        advance_row_content_generation_if_changed(row, before_cells);
+        mark_dirty(row_number);
+    }
+    mark_terminal_content_changed();
+}
+
+void Terminal_screen_model::erase_rectangular_area(
+    rectangular_area_t area,
+    bool               selective)
+{
+    for (int row_number = area.top; row_number <= area.bottom; ++row_number) {
+        Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
+        const std::vector<Cell> before_cells = row.cells;
+        std::vector<std::optional<Cell>> replacements(
+            static_cast<std::size_t>(area.right - area.left + 1));
+        for (int column = area.left; column <= area.right; ++column) {
+            int base = column;
+            if (before_cells[static_cast<std::size_t>(column)].wide_continuation) {
+                for (int candidate = column - 1; candidate >= 0; --candidate) {
+                    if (!before_cells[static_cast<std::size_t>(candidate)].wide_continuation) {
+                        base = candidate;
+                        break;
+                    }
+                }
+            }
+            const Cell& previous = before_cells[static_cast<std::size_t>(column)];
+            if (selective && previous.protected_cell) {
+                continue;
+            }
+            Cell replacement;
+            if (selective) {
+                replacement.occupied = previous.style_id != k_default_terminal_style_id;
+                replacement.style_id = previous.style_id;
+            }
+            replacements[static_cast<std::size_t>(column - area.left)] = replacement;
+            const int end_column = std::min(m_config.grid_size.columns,
+                base + std::max(1,
+                    before_cells[static_cast<std::size_t>(base)].display_width));
+            row.image_slice = image_slice_without_cells(row, base, end_column);
+        }
+        for (int column = area.left; column <= area.right; ++column) {
+            if (replacements[static_cast<std::size_t>(column - area.left)].has_value()) {
+                clear_cell_at_content(row, column);
+            }
+        }
+        for (int column = area.left; column <= area.right; ++column) {
+            const auto& replacement = replacements[
+                static_cast<std::size_t>(column - area.left)];
+            if (replacement.has_value()) {
+                row.cells[static_cast<std::size_t>(column)] = *replacement;
+            }
+        }
+        if (area.right == m_config.grid_size.columns - 1) {
+            row.soft_wrap_columns = 0;
+        }
+        advance_row_content_generation_if_changed(row, before_cells);
+        mark_dirty(row_number);
+    }
+    mark_terminal_content_changed();
+}
+
+void Terminal_screen_model::change_rectangular_attributes(
+    rectangular_area_t      area,
+    std::span<const int>    attributes,
+    bool                    reverse)
+{
+    constexpr std::uint16_t bold = terminal_style_attribute_mask(Terminal_style_attribute::BOLD);
+    constexpr std::uint16_t underline = terminal_style_attribute_mask(
+        Terminal_style_attribute::UNDERLINE);
+    constexpr std::uint16_t blink = terminal_style_attribute_mask(Terminal_style_attribute::BLINK);
+    constexpr std::uint16_t inverse = terminal_style_attribute_mask(
+        Terminal_style_attribute::INVERSE);
+    constexpr std::uint16_t visual_mask = bold | underline | blink | inverse;
+
+    for (int row_number = area.top; row_number <= area.bottom; ++row_number) {
+        Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
+        const int first_column = m_rectangular_attribute_extent || row_number == area.top
+            ? area.left : 0;
+        const int last_column = m_rectangular_attribute_extent || row_number == area.bottom
+            ? area.right : m_config.grid_size.columns - 1;
+        std::vector<bool> visited(static_cast<std::size_t>(m_config.grid_size.columns), false);
+        for (int column = first_column; column <= last_column; ++column) {
+            const int base = cell_base_column_in_row(row, column);
+            if (visited[static_cast<std::size_t>(base)]) {
+                continue;
+            }
+            const int end_column = std::min(m_config.grid_size.columns,
+                base + std::max(1, row.cells[static_cast<std::size_t>(base)].display_width));
+            Terminal_text_style style = m_styles[
+                static_cast<std::size_t>(row.cells[static_cast<std::size_t>(base)].style_id)];
+            for (const int attribute : attributes) {
+                std::uint16_t mask = 0U;
+                switch (attribute) {
+                    case 0:  mask = visual_mask; break;
+                    case 1:  mask = bold;        break;
+                    case 4:  mask = underline;   break;
+                    case 5:  mask = blink;       break;
+                    case 7:  mask = inverse;     break;
+                    case 22: if (!reverse) { style.attributes &= ~bold; }      break;
+                    case 24: if (!reverse) { style.attributes &= ~underline; } break;
+                    case 25: if (!reverse) { style.attributes &= ~blink; }     break;
+                    case 27: if (!reverse) { style.attributes &= ~inverse; }   break;
+                    default: break;
+                }
+                if (reverse) {
+                    style.attributes ^= mask;
+                }
+                else if (attribute == 0) {
+                    style.attributes &= ~visual_mask;
+                }
+                else {
+                    style.attributes |= mask;
+                }
+            }
+            const Terminal_style_id style_id = intern_style(style);
+            for (int target = base; target < end_column; ++target) {
+                Cell& cell = row.cells[static_cast<std::size_t>(target)];
+                cell.style_id = style_id;
+                if (style_id != k_default_terminal_style_id) {
+                    cell.occupied = true;
+                }
+                visited[static_cast<std::size_t>(target)] = true;
+            }
+        }
+        mark_dirty(row_number);
+    }
+    mark_terminal_content_changed();
 }
 
 void Terminal_screen_model::clear_wide_continuation_boundary(

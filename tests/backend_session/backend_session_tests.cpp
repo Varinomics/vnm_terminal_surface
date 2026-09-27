@@ -14580,7 +14580,7 @@ bool test_backend_output_replies_use_write_path()
     if (backend->writes.size() == 6U) {
         ok &= check(backend->writes[0] == QByteArrayLiteral("\x1b[1;2R"),
             "DSR reply reports cursor after preceding output");
-        ok &= check(backend->writes[1] == QByteArrayLiteral("\x1b[?61;4;22c"),
+        ok &= check(backend->writes[1] == QByteArrayLiteral("\x1b[?61;4;22;28c"),
             "DA1 reply advertising sixel graphics and ANSI color is emitted through backend write");
         ok &= check(backend->writes[2] == QByteArrayLiteral("\x1b[>0;0;0c"),
             "DA2 reply is emitted through backend write");

@@ -87,6 +87,19 @@ forbidden_use: no manual text, figures, or examples copied in as fixtures or gol
 inventory_ref: none
 notes: read at https://vt100.net/dec/ek-vt520-rm.pdf; palette RGB values are product-owned color-scheme policy
 
+## dec-vt420-rectangular-areas
+
+oracle_id: dec-vt420-rectangular-areas
+oracle_type: external-standard
+status: approved
+license_posture: published DEC manual; behavior specification only, no import
+pin_or_version: VT420 Programmer Reference Manual, EK-VT420-RM.002, second edition, February 1992, chapter 9
+checked_in_output_allowed: yes
+allowed_use: independently authored tests of DECCRA, DECFRA, DECERA, DECSERA, DECSACE, DECCARA and DECRARA coordinates, defaults, protection and visual attributes
+forbidden_use: no manual text, figures, or examples copied in as fixtures or goldens
+inventory_ref: none
+notes: read at https://vt100.net/mirror/mds-199909/cd3/term/vt420rm2.pdf; the screen model exposes one active page and clamps DEC page selectors to that page
+
 ## xterm-409-reference
 
 oracle_id: xterm-409-reference

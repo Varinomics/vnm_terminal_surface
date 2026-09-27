@@ -4982,8 +4982,8 @@ bool test_replies_and_cursor_save_restore()
         dsr_reply.wire_bytes == QByteArrayLiteral("\x1b[2;3R"),
         "DSR cursor reply");
     ok &= check(da1_reply.kind == term::Terminal_reply_kind::DA1 &&
-        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;22c"),
-        "DA1 reply advertises ANSI color without sixel when no cell pixel size is known");
+        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;22;28c"),
+        "DA1 reply advertises ANSI color and rectangles without sixel when no cell pixel size is known");
     ok &= check(da2_reply.kind == term::Terminal_reply_kind::DA2 &&
         da2_reply.wire_bytes == QByteArrayLiteral("\x1b[>0;0;0c"),
         "DA2 reply");
@@ -5457,8 +5457,8 @@ bool test_sixel_capability_replies()
 
     check_replies(
         model.ingest(QByteArrayLiteral("\x1b[c")),
-        {QByteArrayLiteral("\x1b[?61;4;22c")},
-        "DA1 advertises sixel graphics and ANSI color with a cell pixel size");
+        {QByteArrayLiteral("\x1b[?61;4;22;28c")},
+        "DA1 advertises sixel graphics, ANSI color and rectangles with a cell pixel size");
 
     term::Terminal_screen_model_result result = model.ingest(QByteArrayLiteral(
         "\x1b[?1;1;0S\x1b[?1;2;0S\x1b[?1;3;256S\x1b[?1;3;16S\x1b[?1;4;0S"));
@@ -5547,7 +5547,7 @@ bool test_sixel_capability_replies()
         unknown_cell_model.ingest(QByteArrayLiteral(
             "\x1b[c\x1b[?1;1;0S\x1b[?2;1;0S\x1b[?2;7;0S\x1b[?3;1;0S")),
         {
-            QByteArrayLiteral("\x1b[?61;22c"),
+            QByteArrayLiteral("\x1b[?61;22;28c"),
             QByteArrayLiteral("\x1b[?1;3S"),
             QByteArrayLiteral("\x1b[?2;3S"),
             QByteArrayLiteral("\x1b[?2;2S"),
@@ -5751,6 +5751,133 @@ bool test_cmd_wrapped_output_resize_trace()
     return ok;
 }
 
+bool test_dec_rectangular_editing()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(4, 6);
+    model.ingest(QByteArrayLiteral(
+        "ABCDEF\x1b[2;1HGHIJKL\x1b[3;1HMNOPQR\x1b[4;2H"));
+    const term::terminal_grid_position_t cursor = model.cursor_position();
+
+    auto result = model.ingest(QByteArrayLiteral("\x1b[1;2;2;3;1;2;4;1$v"));
+    ok &= check(diagnostic_count(result) == 0, "DECCRA accepts eight parameters");
+    ok &= check(model.row_text(1) == QStringLiteral("GHIBCL") &&
+            model.row_text(2) == QStringLiteral("MNOHIR"),
+        "DECCRA copies a two-row rectangle without disturbing adjacent cells");
+    ok &= check(model.cursor_position() == cursor,
+        "DECCRA leaves the active cursor unchanged");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;4;1;1;3;1$v"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("ABABCD"),
+        "overlapping DECCRA reads the entire source before writing");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;1H\x1b[32m"
+        "\x1b]8;;https://rect.example\x1b\\R\x1b]8;;\x1b\\\x1b[0m"));
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;1;1;4;6;1$v"));
+    const auto copy_snapshot = model.render_snapshot(request_for_model(model, 115U));
+    const auto& source_cell = cell_at(copy_snapshot, 0, 0);
+    const auto& copied_cell = cell_at(copy_snapshot, 3, 5);
+    ok &= check(diagnostic_count(result) == 0 &&
+            copied_cell.text == source_cell.text &&
+            copied_cell.hyperlink_id == source_cell.hyperlink_id &&
+            copied_cell.hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            copied_cell.style_id == source_cell.style_id,
+        "DECCRA carries source character, visual style and hyperlink identity");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[35;2;2;3;4$x"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(1) == QStringLiteral("G###CL") &&
+            model.row_text(2) == QStringLiteral("M###IR"),
+        "DECFRA fills an inclusive rectangle with its decimal character");
+    result = model.ingest(QByteArrayLiteral("\x1b[2;2;3;4$z"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(1) == QStringLiteral("G   CL") &&
+            model.row_text(2) == QStringLiteral("M   IR"),
+        "DECERA erases the selected cells while preserving the remainder");
+    ok &= check(model.cursor_position() == cursor,
+        "fill and erase rectangles do not move the cursor");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[3;3;2;4$z"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(1) == QStringLiteral("G   CL"),
+        "a reversed rectangle is ignored");
+    result = model.ingest(QByteArrayLiteral("\x1b[65;1;1;1;1$x"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0).startsWith(QStringLiteral("A")),
+        "DECFRA writes the requested printable character");
+
+    model = make_model(4, 6);
+    model.ingest(QByteArrayLiteral("\x1b[2;3r\x1b[?6h"));
+    result = model.ingest(QByteArrayLiteral("\x1b[70;1;1;2;2$x"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0).isEmpty() &&
+            model.row_text(1) == QStringLiteral("FF") &&
+            model.row_text(2) == QStringLiteral("FF") &&
+            model.row_text(3).isEmpty(),
+        "DECOM makes rectangle row coordinates relative to the scroll region");
+
+    model = make_model(1, 6);
+    model.ingest(QByteArrayLiteral("\x1b[31m\x1b[1\"qP\x1b[0\"qU"));
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;2${"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("P"),
+        "DECSERA keeps DECSCA-protected cells and erases unprotected cells");
+    const auto selective_snapshot = model.render_snapshot(request_for_model(model, 116U));
+    const auto& erased_style = selective_snapshot.styles[
+        static_cast<std::size_t>(cell_at(selective_snapshot, 0, 1).style_id)];
+    ok &= check(erased_style.foreground.kind ==
+            term::Terminal_color_ref_kind::PALETTE_INDEX &&
+            erased_style.foreground.palette_index == 1U,
+        "DECSERA retains the visual attributes of an erased cell");
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;1$z"));
+    ok &= check(diagnostic_count(result) == 0 && model.row_text(0).isEmpty(),
+        "DECERA also erases protected cells");
+
+    model = make_model(2, 5);
+    model.ingest(QByteArrayLiteral("\x1b[31mABCD\x1b[2;1HEFGH"));
+    result = model.ingest(QByteArrayLiteral("\x1b[1;2;2;3;1$r"));
+    const auto stream_snapshot = model.render_snapshot(request_for_model(model, 111U));
+    const auto& first_style = stream_snapshot.styles[
+        static_cast<std::size_t>(cell_at(stream_snapshot, 0, 0).style_id)];
+    const auto& second_style = stream_snapshot.styles[
+        static_cast<std::size_t>(cell_at(stream_snapshot, 0, 1).style_id)];
+    const auto& last_style = stream_snapshot.styles[
+        static_cast<std::size_t>(cell_at(stream_snapshot, 1, 3).style_id)];
+    const auto bold = term::terminal_style_attribute_mask(
+        term::Terminal_style_attribute::BOLD);
+    ok &= check(diagnostic_count(result) == 0 &&
+            (first_style.attributes & bold) == 0U &&
+            (second_style.attributes & bold) != 0U &&
+            (last_style.attributes & bold) == 0U &&
+            second_style.foreground.kind == term::Terminal_color_ref_kind::PALETTE_INDEX,
+        "DECCARA default stream extent changes visual attributes and keeps color");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[2*x\x1b[1;2;2;3;1$t"));
+    const auto rectangle_snapshot = model.render_snapshot(request_for_model(model, 112U));
+    const auto& rectangle_style = rectangle_snapshot.styles[
+        static_cast<std::size_t>(cell_at(rectangle_snapshot, 0, 1).style_id)];
+    const auto& outside_style = rectangle_snapshot.styles[
+        static_cast<std::size_t>(cell_at(rectangle_snapshot, 0, 3).style_id)];
+    ok &= check(diagnostic_count(result) == 0 &&
+            (rectangle_style.attributes & bold) == 0U &&
+            (outside_style.attributes & bold) != 0U,
+        "DECSACE rectangle extent restricts DECRARA to selected columns");
+    ok &= check(snapshot_valid(model, 113U),
+        "rectangle attribute edits keep the render snapshot valid");
+
+    model = make_model(2, 5);
+    model.ingest(QByteArrayLiteral("A") + bytes_from_hex("e7958c") +
+        QByteArrayLiteral("B"));
+    result = model.ingest(QByteArrayLiteral("\x1b[1;2;1;3;1;2;1;1$v"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(1).startsWith(QString::fromUtf8(bytes_from_hex("e7958c"))) &&
+            snapshot_valid(model, 114U),
+        "DECCRA preserves a complete wide glyph and valid continuation geometry");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -5759,6 +5886,7 @@ int main()
     ok &= test_row_movement_severs_soft_wrap_neighbors();
     ok &= test_resize_wrap_boundaries_cursor_and_history();
     ok &= test_cmd_wrapped_output_resize_trace();
+    ok &= test_dec_rectangular_editing();
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();

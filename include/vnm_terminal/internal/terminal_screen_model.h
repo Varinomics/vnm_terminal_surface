@@ -1170,6 +1170,23 @@ private:
         std::vector<Parser_action>&    generated_actions,
         ingest_publication_t*          publication);
 
+    struct rectangular_area_t
+    {
+        int top = 0;
+        int left = 0;
+        int bottom = 0;
+        int right = 0;
+    };
+
+    std::optional<rectangular_area_t> rectangular_area(
+        int top, int left, int bottom, int right) const;
+    void copy_rectangular_area(
+        rectangular_area_t source, int destination_top, int destination_left);
+    void fill_rectangular_area(rectangular_area_t area, QChar character);
+    void erase_rectangular_area(rectangular_area_t area, bool selective);
+    void change_rectangular_attributes(
+        rectangular_area_t area, std::span<const int> attributes, bool reverse);
+
     Parser_action graphics_attribute_reply(
         int                            item,
         int                            action,
@@ -1184,6 +1201,9 @@ private:
         const Terminal_sgr_operation&  operation);
 
     void set_current_style(
+        const Terminal_text_style&     style);
+
+    Terminal_style_id intern_style(
         const Terminal_text_style&     style);
 
     void compact_styles(
@@ -1263,7 +1283,8 @@ private:
         int                            display_width,
         int                            natural_display_width,
         Terminal_style_id              style_id,
-        Terminal_hyperlink_id          hyperlink_id);
+        Terminal_hyperlink_id          hyperlink_id,
+        bool                           protected_cell);
 
     void place_cell_text(
         terminal_grid_position_t       position,
@@ -1806,6 +1827,8 @@ private:
     int                             m_scroll_top = 0;
     int                             m_scroll_bottom = 0;
     bool                            m_origin_mode = false;
+    bool                            m_character_protected = false;
+    bool                            m_rectangular_attribute_extent = false;
     bool                            m_dec_1049_saved_primary_cursor = false;
     bool                            m_pending_wrap = false;
     bool                            m_viewport_changed = false;

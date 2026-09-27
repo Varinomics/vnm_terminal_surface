@@ -910,15 +910,31 @@ id: csi-decsca
 family: CSI
 sequence: DECSCA
 feature: protected cell attribute
-status: ignored
-action_category: ignored-with-diagnostic
-behavior: no protected-cell model state is stored
+status: supported
+action_category: screen-state-mutation
+behavior: parameter 1 makes subsequent written cells protected; parameters 0 and 2 make them erasable; DECSERA preserves protected cells while DECERA erases them
 host_policy: none
 payload_limit: none
-recovery: command ignored and parser continues
+recovery: unsupported parameter is ignored with a diagnostic and parser continues
 reply: no-reply
-diagnostic: ignored DECSCA diagnostic
-oracle: product-decision-vnm-terminal
+diagnostic: unsupported parameter diagnostic
+oracle: dec-vt420-rectangular-areas
+
+## csi-dec-rectangular-editing
+
+id: csi-dec-rectangular-editing
+family: CSI
+sequence: DECCRA, DECFRA, DECERA, DECSERA, DECSACE, DECCARA, DECRARA
+feature: rectangular cell editing
+status: supported
+action_category: screen-mutation
+behavior: copy preserves source cell text and visual attributes with overlap snapshot; fill uses its decimal character and current SGR/protection; ordinary erase clears characters and attributes; selective erase preserves DECSCA-protected cells and surviving visual attributes; DECSACE selects stream or rectangle extent for per-cell visual attribute changes
+host_policy: none
+payload_limit: bounded by active grid size
+recovery: invalid reversed coordinates are ignored; out-of-page coordinates are clipped; malformed parameters are discarded with a diagnostic
+reply: no-reply
+diagnostic: malformed parameter diagnostic
+oracle: dec-vt420-rectangular-areas
 
 ## bracketed-paste-generated-input
 
@@ -976,7 +992,7 @@ sequence: DA1
 feature: terminal identity reply
 status: supported
 action_category: terminal-reply
-behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 22 c, conformance class 61 with attribute 22, ANSI color text (SGR 30-37 and 40-47, with 39 and 49 restoring the default colors), and attribute 4, sixel graphics, while a cell pixel size (csi-window-op-16) lets images be placed; without one the reply is CSI ? 61 ; 22 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
+behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 22 ; 28 c, conformance class 61 with attribute 22 for ANSI color text and attribute 28 for rectangular editing; attribute 4 advertises sixel graphics while a cell pixel size lets images be placed; without one the reply is CSI ? 61 ; 22 ; 28 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
 host_policy: backend write queue capacity applies
 payload_limit: none
 recovery: malformed query ignored with diagnostic
