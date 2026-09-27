@@ -284,6 +284,7 @@ const std::set<std::string>& required_sequence_ids()
         "csi-scroll-down",
         "csi-xtsmgraphics",
         "csi-decsca",
+        "csi-dec-rectangular-editing",
         "bracketed-paste-generated-input",
         "mouse-sgr-1006-generated-input",
         "focus-generated-input",
@@ -605,10 +606,12 @@ void validate_matrix_records(
 
     const auto decsca = matrix.find("csi-decsca");
     if (decsca != matrix.end()) {
-        require(value_of(decsca->second, "status") == "ignored", errors,
-            "DECSCA must be ignored");
-        require(contains_text(value_of(decsca->second, "behavior"), "no protected-cell"),
-            errors, "DECSCA must not create protected-cell state");
+        require(value_of(decsca->second, "status") == "supported", errors,
+            "DECSCA must be supported for selective rectangular erase");
+        require(contains_text(value_of(decsca->second, "behavior"), "protected"),
+            errors, "DECSCA must define protected-cell state");
+        require(contains_text(value_of(decsca->second, "behavior"), "DECSERA"),
+            errors, "DECSCA must specify selective rectangular erase behavior");
     }
 
     const auto mouse1005 = matrix.find("dec-private-1005");

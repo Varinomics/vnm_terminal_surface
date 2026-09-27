@@ -172,6 +172,7 @@ struct terminal_retained_history_cell_state_for_testing_t
     bool                                 occupied = false;
     Terminal_style_id                    style_id = k_default_terminal_style_id;
     Terminal_hyperlink_id                hyperlink_id = k_no_terminal_hyperlink_id;
+    bool                                 protected_cell = false;
 };
 
 struct Terminal_retained_line_lookup_result
@@ -1208,7 +1209,8 @@ private:
         const Terminal_text_style&     style);
 
     void compact_styles(
-        const Terminal_text_style&     pending_style);
+        const Terminal_text_style&     pending_style,
+        bool                           preserve_current);
 
     void validate_live_style_ids() const;
 

@@ -1887,28 +1887,17 @@ void Terminal_screen_model::apply_sgr_operation(
 
 void Terminal_screen_model::set_current_style(const Terminal_text_style& style)
 {
-    m_current_style_id = intern_style(style);
-    m_current_style    = style;
-}
-
-Terminal_style_id Terminal_screen_model::intern_style(const Terminal_text_style& style)
-{
     const terminal_text_style_lookup_key_t key = terminal_text_style_lookup_key(style);
     const auto found = m_style_ids_by_value.find(key);
     if (found != m_style_ids_by_value.end()) {
-        return found->second;
+        m_current_style    = style;
+        m_current_style_id = found->second;
+        return;
     }
 
     if (m_styles.size() >= m_next_style_compaction_count) {
-        const Terminal_text_style previous_style = m_current_style;
-        compact_styles(style);
-        const Terminal_style_id result = m_current_style_id;
-        const auto previous = m_style_ids_by_value.find(
-            terminal_text_style_lookup_key(previous_style));
-        Q_ASSERT(previous != m_style_ids_by_value.end());
-        m_current_style    = previous_style;
-        m_current_style_id = previous->second;
-        return result;
+        compact_styles(style, false);
+        return;
     }
 
     if (m_styles.size() >= m_style_count_cap) {
@@ -1929,10 +1918,40 @@ Terminal_style_id Terminal_screen_model::intern_style(const Terminal_text_style&
     m_style_table_stats.peak_style_count = std::max(
         m_style_table_stats.peak_style_count,
         m_style_table_stats.current_style_count);
-    return style_id;
+    m_current_style    = style;
+    m_current_style_id = style_id;
 }
 
-void Terminal_screen_model::compact_styles(const Terminal_text_style& pending_style)
+Terminal_style_id Terminal_screen_model::intern_style(const Terminal_text_style& style)
+{
+    const auto found = m_style_ids_by_value.find(terminal_text_style_lookup_key(style));
+    if (found != m_style_ids_by_value.end()) {
+        return found->second;
+    }
+
+    const Terminal_text_style previous_style = m_current_style;
+    const Terminal_style_id previous_id = m_current_style_id;
+    if (m_styles.size() >= m_next_style_compaction_count) {
+        compact_styles(style, true);
+        const Terminal_style_id result = m_current_style_id;
+        const auto previous = m_style_ids_by_value.find(
+            terminal_text_style_lookup_key(previous_style));
+        Q_ASSERT(previous != m_style_ids_by_value.end());
+        m_current_style    = previous_style;
+        m_current_style_id = previous->second;
+        return result;
+    }
+
+    set_current_style(style);
+    const Terminal_style_id result = m_current_style_id;
+    m_current_style    = previous_style;
+    m_current_style_id = previous_id;
+    return result;
+}
+
+void Terminal_screen_model::compact_styles(
+    const Terminal_text_style& pending_style,
+    bool preserve_current)
 {
     const std::size_t old_style_count = m_styles.size();
     std::vector<std::uint8_t> referenced(old_style_count, 0U);
@@ -1963,7 +1982,9 @@ void Terminal_screen_model::compact_styles(const Terminal_text_style& pending_st
         };
 
     collect_style_id(k_default_terminal_style_id);
-    collect_style_id(m_current_style_id);
+    if (preserve_current) {
+        collect_style_id(m_current_style_id);
+    }
     collect_style_id(m_saved_cursor.style_id);
     collect_style_id(m_primary_backing.active_grid_state().saved_cursor.style_id);
     collect_style_id(m_alternate_grid.active_grid_state().saved_cursor.style_id);
@@ -3365,6 +3386,7 @@ Terminal_screen_model::retained_history_row_cells_for_testing(
         state.occupied = cell.occupied;
         state.style_id = cell.style_id;
         state.hyperlink_id = cell.hyperlink_id;
+        state.protected_cell = cell.protected_cell;
         cells.push_back(std::move(state));
     }
     return cells;

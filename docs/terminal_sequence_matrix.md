@@ -911,7 +911,7 @@ family: CSI
 sequence: DECSCA
 feature: protected cell attribute
 status: supported
-action_category: screen-state-mutation
+action_category: mode-mutation
 behavior: parameter 1 makes subsequent written cells protected; parameters 0 and 2 make them erasable; DECSERA preserves protected cells while DECERA erases them
 host_policy: none
 payload_limit: none

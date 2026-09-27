@@ -5225,11 +5225,11 @@ bool test_replies_and_cursor_save_restore()
         term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
         "CSI >18 t is an unsupported private lowercase t query");
 
-    result = model.ingest(QByteArrayLiteral("\x1b[18$t"));
+    result = model.ingest(QByteArrayLiteral("\x1b[18#t"));
     check_rejected_csi_t_query(
         result,
         term::Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
-        "CSI 18 $ t is an unsupported intermediate lowercase t query");
+        "CSI 18 # t is an unsupported intermediate lowercase t query");
 
     result = model.ingest(QByteArrayLiteral("\x1b[t"));
     check_rejected_csi_t_query(
@@ -5784,6 +5784,7 @@ bool test_dec_rectangular_editing()
             copied_cell.hyperlink_id != term::k_no_terminal_hyperlink_id &&
             copied_cell.style_id == source_cell.style_id,
         "DECCRA carries source character, visual style and hyperlink identity");
+    const term::terminal_grid_position_t fill_cursor = model.cursor_position();
 
     result = model.ingest(QByteArrayLiteral("\x1b[35;2;2;3;4$x"));
     ok &= check(diagnostic_count(result) == 0 &&
@@ -5795,7 +5796,7 @@ bool test_dec_rectangular_editing()
             model.row_text(1) == QStringLiteral("G   CL") &&
             model.row_text(2) == QStringLiteral("M   IR"),
         "DECERA erases the selected cells while preserving the remainder");
-    ok &= check(model.cursor_position() == cursor,
+    ok &= check(model.cursor_position() == fill_cursor,
         "fill and erase rectangles do not move the cursor");
 
     result = model.ingest(QByteArrayLiteral("\x1b[3;3;2;4$z"));
@@ -5874,6 +5875,38 @@ bool test_dec_rectangular_editing()
             model.row_text(1).startsWith(QString::fromUtf8(bytes_from_hex("e7958c"))) &&
             snapshot_valid(model, 114U),
         "DECCRA preserves a complete wide glyph and valid continuation geometry");
+
+    model = make_model(2, 6, 8);
+    model.ingest(QByteArrayLiteral("\x1b[1\"qP") + bytes_from_hex("e7958c") +
+        QByteArrayLiteral("\x1b[32;1;5;1;5$x\x1b[0\"q\x1b[2;1HNEXT\x1b[2;1H\n"));
+    const auto retained = model.retained_history_row_cells_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(model.scrollback_size() == 1 && retained.has_value() &&
+            retained->size() == 6U &&
+            (*retained)[0].protected_cell &&
+            (*retained)[1].protected_cell &&
+            (*retained)[2].protected_cell &&
+            (*retained)[4].protected_cell &&
+            (*retained)[4].text == QStringLiteral(" "),
+        "DECSCA protection survives live history encoding, including wide and blank cells");
+    model.resize({2, 8});
+    const auto retained_after_resize = model.retained_history_row_cells_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(retained_after_resize.has_value() &&
+            (*retained_after_resize)[1].protected_cell &&
+            (*retained_after_resize)[2].protected_cell &&
+            (*retained_after_resize)[4].protected_cell,
+        "protected history decodes after grid reflow");
+
+    model = make_model(2, 5);
+    model.ingest(QByteArrayLiteral("\x1b[1\"q") + bytes_from_hex("e7958c") +
+        QByteArrayLiteral("\x1b[0\"q"));
+    model.resize({2, 7});
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;2${"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0).startsWith(QString::fromUtf8(bytes_from_hex("e7958c"))) &&
+            snapshot_valid(model, 117U),
+        "protected wide glyph remains selective-erase safe after active-grid reflow");
 
     return ok;
 }
