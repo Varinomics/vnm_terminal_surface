@@ -4120,7 +4120,10 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
         for (std::size_t index = first; index <= last; ++index) {
             const Terminal_screen_row& source = state.rows[index];
             int count = (int)source.cells.size();
-            while (count > 0 && !source.cells[(std::size_t)count - 1U].occupied) {
+            while (count > 0 &&
+                !source.cells[(std::size_t)count - 1U].occupied &&
+                !source.cells[(std::size_t)count - 1U].protected_cell)
+            {
                 --count;
             }
             // Preserve written cells beyond an earlier wide-glyph wrap gap.
@@ -4204,6 +4207,7 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
 
                 for (int part = 1; part < natural_width; ++part) {
                     Cell continuation;
+                    continuation.protected_cell = source_cell.protected_cell;
                     if (part < physical_width &&
                         source_column + part < static_cast<int>(source.cells.size()) &&
                         source.cells[static_cast<std::size_t>(source_column + part)]
@@ -9556,6 +9560,7 @@ Terminal_history_row_record Terminal_screen_model::history_row_record_from_retai
             cell.occupied,
             cell.style_id,
             cell.hyperlink_id,
+            cell.protected_cell,
         });
     }
 
@@ -9586,6 +9591,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
         restored_cell.occupied = cell.occupied;
         restored_cell.style_id = cell.style_id;
         restored_cell.hyperlink_id = cell.hyperlink_id;
+        restored_cell.protected_cell = cell.protected_cell;
         restored_cell.natural_display_width = cell.wide_continuation
             ? 0
             : std::max(1, cell.display_width);

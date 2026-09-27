@@ -785,6 +785,7 @@ private:
         Terminal_style_id              style_id          = k_default_terminal_style_id;
         Terminal_hyperlink_id          hyperlink_id      = k_no_terminal_hyperlink_id;
         int                            natural_display_width = 1;
+        bool                           protected_cell    = false;
     };
 
     struct Terminal_screen_row

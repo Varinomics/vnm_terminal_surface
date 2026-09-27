@@ -175,7 +175,8 @@ bool cells_equal(
         left.wide_continuation == right.wide_continuation &&
         left.occupied          == right.occupied          &&
         left.style_id          == right.style_id          &&
-        left.hyperlink_id      == right.hyperlink_id;
+        left.hyperlink_id      == right.hyperlink_id      &&
+        left.protected_cell    == right.protected_cell;
 }
 
 bool origin_spans_equal(
@@ -1792,7 +1793,7 @@ bool test_header_and_handle_validation_failures()
         "decode rejects the previous payload layout instead of defaulting absent provenance");
 
     std::vector<std::byte> bad_flags = payload;
-    write_le_u32(bad_flags, k_header_flags_offset, 0x80U);
+    write_le_u32(bad_flags, k_header_flags_offset, 0x100U);
     const term::Terminal_history_row_record_decode_result flags_failure =
         decode_mutated_payload(read, bad_flags);
     ok &= check(flags_failure.status ==
@@ -2323,6 +2324,97 @@ bool test_row_record_oversize_hard_fails_before_publication()
     return ok;
 }
 
+bool test_protection_sidecar_round_trip_and_version_isolation()
+{
+    bool ok = true;
+    term::Terminal_history_ring ring({65536U, 65536U});
+
+    term::Terminal_history_row_record prefix = make_base_record(
+        519U,
+        3U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        10);
+    for (const QChar character : QStringLiteral("abcdefghij")) {
+        prefix.cells.push_back(make_cell(QString(character), 1, true));
+    }
+    term::Terminal_history_row_record plain = prefix;
+    prefix.cells[0].protected_cell = true;
+    prefix.cells[8].protected_cell = true;
+    prefix.cells[9].protected_cell = true;
+
+    term::Terminal_history_row_record_append_result plain_append;
+    const auto plain_decoded = append_and_decode(
+        ring, plain, make_identity(19U, 519U), plain_append);
+    term::Terminal_history_row_record_append_result prefix_append;
+    const auto prefix_decoded = append_and_decode(
+        ring, prefix, make_identity(19U, 520U), prefix_append);
+    ok &= check(plain_decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+            prefix_decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+            records_equal(prefix_decoded.record, prefix),
+        "protected prefix ASCII cells round-trip independently of cell encoding");
+    ok &= check(prefix_append.payload_kind ==
+            term::Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII &&
+            prefix_append.commit.record_bytes == plain_append.commit.record_bytes + 6U,
+        "protected ASCII cells add only the versioned two-byte bitmap section");
+
+    const auto read = ring.read_record(prefix_append.commit.byte_sequence);
+    const std::vector<std::byte> payload = payload_bytes(ring, prefix_append);
+    ok &= check((read_le_u32(payload, k_header_flags_offset) & 0x80U) != 0U,
+        "protected cells set the optional protection-section presence flag");
+
+    std::vector<std::byte> future_version = payload;
+    write_le_u16(future_version, k_header_bytes, 2U);
+    const auto future_decoded = decode_mutated_payload(read, future_version);
+    ok &= check(future_decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+            std::none_of(future_decoded.record.cells.begin(),
+                future_decoded.record.cells.end(),
+                [](const term::Terminal_history_row_cell& cell) {
+                    return cell.protected_cell;
+                }),
+        "unknown protection-section versions leave common row data readable");
+
+    std::vector<std::byte> invalid_length = payload;
+    write_le_u16(invalid_length, k_header_bytes + 2U, 3U);
+    ok &= check(decode_mutated_payload(read, invalid_length).status ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "known protection-section version rejects a bitmap of the wrong length");
+
+    std::vector<std::byte> invalid_padding = payload;
+    invalid_padding[k_header_bytes + 5U] |= std::byte{0x80U};
+    ok &= check(decode_mutated_payload(read, invalid_padding).status ==
+            term::Terminal_history_row_record_codec_status::INVALID_PAYLOAD,
+        "protection bitmap rejects bits beyond the row width");
+
+    std::vector<std::byte> missing_bitmap(payload.begin(), payload.begin() + 105);
+    refresh_payload_size_fields(missing_bitmap);
+    ok &= check(decode_mutated_payload(read, missing_bitmap).status ==
+            term::Terminal_history_row_record_codec_status::TRUNCATED_RECORD,
+        "protection bitmap truncation is rejected before reading cell data");
+
+    term::Terminal_history_row_record generic = make_base_record(
+        521U,
+        4U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        3);
+    generic.cells.resize(3U);
+    generic.cells[1] = make_cell(QStringLiteral("界"), 2, true);
+    generic.cells[2] = make_wide_continuation(
+        term::k_default_terminal_style_id,
+        term::k_no_terminal_hyperlink_id);
+    generic.cells[1].protected_cell = true;
+    generic.cells[2].protected_cell = true;
+    term::Terminal_history_row_record_append_result generic_append;
+    const auto generic_decoded = append_and_decode(
+        ring, generic, make_identity(19U, 521U), generic_append);
+    ok &= check(generic_decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+            records_equal(generic_decoded.record, generic) &&
+            generic_append.payload_kind ==
+                term::Terminal_history_row_record_payload_kind::GENERIC_COMPACT,
+        "protected wide cells survive generic compact history encoding");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -2346,5 +2438,6 @@ int main()
     ok &= test_image_free_records_encode_byte_identically();
     ok &= test_image_section_round_trips();
     ok &= test_image_section_rejects_malformed_sections();
+    ok &= test_protection_sidecar_round_trip_and_version_isolation();
     return ok ? 0 : 1;
 }

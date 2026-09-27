@@ -31,11 +31,15 @@ constexpr std::uint32_t k_row_record_flag_content_origin_spans = 0x20U;
 // A row that shows an image carries it in a presence-flagged section, so the
 // record version and every image-free row stay as they were.
 constexpr std::uint32_t k_row_record_flag_image_section = 0x40U;
+// Cell protection belongs to an independently versioned, optional section.
+// Unprotected rows retain their exact encoded representation.
+constexpr std::uint32_t k_row_record_flag_protection_section = 0x80U;
 constexpr std::uint32_t k_row_record_known_flags_mask =
     k_payload_kind_mask |
     k_row_record_flag_ambiguous_content_stamp |
     k_row_record_flag_content_origin_spans |
-    k_row_record_flag_image_section;
+    k_row_record_flag_image_section |
+    k_row_record_flag_protection_section;
 constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
 constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
 constexpr std::size_t k_encoded_style_bytes = 16U;
@@ -45,6 +49,10 @@ constexpr std::size_t k_content_origin_span_count_bytes = 4U;
 // (4 + 4) and revision (8); the pixel rows follow, packed at width x 4 bytes.
 constexpr std::size_t k_image_section_fixed_bytes = 24U;
 constexpr std::size_t k_image_section_pixel_bytes = 4U;
+constexpr std::uint16_t k_protection_section_version = 1U;
+constexpr std::size_t k_protection_section_header_bytes = 4U;
+
+std::size_t protected_cell_bitmap_bytes(std::size_t cell_count);
 
 constexpr std::uint8_t k_opcode_default_blank = 0x00U;
 constexpr std::uint8_t k_opcode_wide_continuation = 0x01U;
@@ -83,6 +91,7 @@ struct Encoded_record_parts
     std::size_t                   payload_bytes = 0U;
     std::uint32_t                 payload_kind = k_payload_kind_generic_compact;
     std::size_t                   prefix_plain_ascii_bytes = 0U;
+    bool                          protection_section = false;
 };
 
 struct row_record_header_t
@@ -962,6 +971,79 @@ Terminal_history_row_record_codec_status read_image_section(
     return Terminal_history_row_record_codec_status::OK;
 }
 
+bool write_protection_section(
+    Byte_writer&                       writer,
+    const Terminal_history_row_record& record)
+{
+    const std::size_t bitmap_bytes = protected_cell_bitmap_bytes(record.cells.size());
+    if (!writer.write_u16(k_protection_section_version) ||
+        !writer.write_u16(static_cast<std::uint16_t>(bitmap_bytes)))
+    {
+        return false;
+    }
+
+    for (std::size_t first = 0U; first < record.cells.size(); first += 8U) {
+        std::uint8_t bits = 0U;
+        for (std::size_t bit = 0U; bit < 8U && first + bit < record.cells.size(); ++bit) {
+            if (record.cells[first + bit].protected_cell) {
+                bits |= static_cast<std::uint8_t>(1U << bit);
+            }
+        }
+        if (!writer.write_u8(bits)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Terminal_history_row_record_codec_status read_protection_section(
+    Byte_reader&                reader,
+    const row_record_header_t& header,
+    std::vector<bool>&         protected_cells)
+{
+    if ((header.flags & k_row_record_flag_protection_section) == 0U) {
+        return Terminal_history_row_record_codec_status::OK;
+    }
+
+    std::uint16_t version = 0U;
+    std::uint16_t bitmap_bytes = 0U;
+    if (!reader.read_u16(version) || !reader.read_u16(bitmap_bytes)) {
+        return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+    }
+    if (version != k_protection_section_version) {
+        return reader.skip(bitmap_bytes)
+            ? Terminal_history_row_record_codec_status::OK
+            : Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+    }
+    if (bitmap_bytes != protected_cell_bitmap_bytes(header.cell_count)) {
+        return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+
+    protected_cells.resize(header.cell_count, false);
+    bool any_protected = false;
+    for (std::size_t byte_index = 0U; byte_index < bitmap_bytes; ++byte_index) {
+        std::uint8_t bits = 0U;
+        if (!reader.read_u8(bits)) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+        const std::size_t first = byte_index * 8U;
+        for (std::size_t bit = 0U; bit < 8U; ++bit) {
+            const bool marked = (bits & (1U << bit)) != 0U;
+            if (first + bit >= protected_cells.size()) {
+                if (marked) {
+                    return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+                }
+                continue;
+            }
+            protected_cells[first + bit] = marked;
+            any_protected |= marked;
+        }
+    }
+    return any_protected
+        ? Terminal_history_row_record_codec_status::OK
+        : Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+}
+
 bool write_table_length(Byte_writer& writer, std::uint32_t byte_count)
 {
     const std::uint8_t width_code = shortest_width_code(byte_count);
@@ -1312,6 +1394,19 @@ Terminal_history_row_record_codec_status validate_and_measure_content_origin_spa
     return Terminal_history_row_record_codec_status::OK;
 }
 
+std::size_t protected_cell_bitmap_bytes(std::size_t cell_count)
+{
+    return (cell_count + 7U) / 8U;
+}
+
+std::size_t protection_section_bytes(const Terminal_history_row_record& record)
+{
+    return std::any_of(record.cells.begin(), record.cells.end(),
+        [](const Terminal_history_row_cell& cell) { return cell.protected_cell; })
+        ? k_protection_section_header_bytes + protected_cell_bitmap_bytes(record.cells.size())
+        : 0U;
+}
+
 bool try_prepare_prefix_plain_ascii_stream(
     const Terminal_history_row_record& record,
     Encoded_record_parts&              parts,
@@ -1421,8 +1516,11 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
     if (image_status != Terminal_history_row_record_codec_status::OK) {
         return image_status;
     }
+    const std::size_t protection_bytes = protection_section_bytes(record);
+    parts.protection_section = protection_bytes != 0U;
     if (!checked_add(payload_bytes, content_origin_span_bytes) ||
-        !checked_add(payload_bytes, image_section_bytes))
+        !checked_add(payload_bytes, image_section_bytes) ||
+        !checked_add(payload_bytes, protection_bytes))
     {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
@@ -1438,7 +1536,8 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
 
     payload_bytes = k_row_record_header_bytes;
     if (!checked_add(payload_bytes, content_origin_span_bytes) ||
-        !checked_add(payload_bytes, image_section_bytes))
+        !checked_add(payload_bytes, image_section_bytes) ||
+        !checked_add(payload_bytes, protection_bytes))
     {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
@@ -1754,6 +1853,9 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     if (record.image_slice != nullptr) {
         header.flags |= k_row_record_flag_image_section;
     }
+    if (parts.protection_section) {
+        header.flags |= k_row_record_flag_protection_section;
+    }
     header.epoch = identity.epoch;
     header.byte_sequence = byte_sequence;
     header.row_sequence = identity.row_sequence;
@@ -1782,6 +1884,9 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     // The section precedes the styles: it cannot go last, because a prefix
     // plain-ASCII row takes every remaining byte as its cell stream.
     if (!write_image_section(writer, record)) {
+        return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
+    }
+    if (parts.protection_section && !write_protection_section(writer, record)) {
         return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
     }
 
@@ -1936,9 +2041,33 @@ Terminal_history_row_record_codec_status validate_payload_counts(
         }
     }
 
+    std::size_t protection_section_bytes = 0U;
+    if ((header.flags & k_row_record_flag_protection_section) != 0U) {
+        const std::size_t protection_offset = k_row_record_header_bytes +
+            content_origin_span_table_bytes + image_section_table_bytes;
+        Byte_reader protection_header_reader(payload.subspan(protection_offset));
+        std::uint16_t version = 0U;
+        std::uint16_t bitmap_bytes = 0U;
+        if (!protection_header_reader.read_u16(version) ||
+            !protection_header_reader.read_u16(bitmap_bytes))
+        {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+        if (version == k_protection_section_version &&
+            bitmap_bytes != protected_cell_bitmap_bytes(header.cell_count))
+        {
+            return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+        }
+        protection_section_bytes = k_protection_section_header_bytes + bitmap_bytes;
+        if (protection_section_bytes > payload.size() - protection_offset) {
+            return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
+        }
+    }
+
     std::size_t minimum_payload_bytes = k_row_record_header_bytes;
     if (!checked_add(minimum_payload_bytes, content_origin_span_table_bytes) ||
-        !checked_add(minimum_payload_bytes, image_section_table_bytes))
+        !checked_add(minimum_payload_bytes, image_section_table_bytes) ||
+        !checked_add(minimum_payload_bytes, protection_section_bytes))
     {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
@@ -2556,6 +2685,12 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
         return result;
     }
 
+    std::vector<bool> protected_cells;
+    result.status = read_protection_section(reader, header, protected_cells);
+    if (result.status != Terminal_history_row_record_codec_status::OK) {
+        return result;
+    }
+
     {
         VNM_TERMINAL_PROFILE_SCOPE(
             "Terminal_history_row_record_codec::decode_payload::materialize_styles");
@@ -2584,6 +2719,10 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
         if (result.status != Terminal_history_row_record_codec_status::OK) {
             return result;
         }
+    }
+
+    for (std::size_t index = 0U; index < protected_cells.size(); ++index) {
+        record.cells[index].protected_cell = protected_cells[index];
     }
 
     if (reader.offset() != payload_view.payload.size()) {
