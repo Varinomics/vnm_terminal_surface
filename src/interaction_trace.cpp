@@ -252,6 +252,16 @@ Interaction_trace_scope::~Interaction_trace_scope()
     s_current_correlation_id = m_previous_id;
 }
 
+void write_selection_trace(bool enabled, const QString& message)
+{
+    record_interaction_trace("selection", "state", message);
+    if (enabled) {
+        diagnostics::write(
+            diagnostics::Level::INFO,
+            QStringLiteral("[vnm-terminal-selection] ") + message);
+    }
+}
+
 void record_interaction_trace(
     const char*    category,
     const char*    event,

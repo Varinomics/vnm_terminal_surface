@@ -37,6 +37,7 @@ void record_interaction_trace(
     const char*   event,
     const QString& details = {},
     std::uint64_t correlation_id = 0U);
+void write_selection_trace(bool enabled, const QString& message);
 QString interaction_trace_byte_summary(QByteArrayView bytes);
 QString interaction_trace_key_summary(const QKeyEvent& event);
 

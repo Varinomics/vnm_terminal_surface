@@ -644,16 +644,6 @@ bool selection_trace_requested(bool stderr_enabled)
     return stderr_enabled || interaction_trace_enabled();
 }
 
-void write_selection_trace(bool enabled, const QString& message)
-{
-    record_interaction_trace("selection", "state", message);
-    if (!enabled) {
-        return;
-    }
-
-    std::fprintf(stderr, "[vnm-terminal-selection] %s\n", qPrintable(message));
-}
-
 QString selection_trace_bool(bool value)
 {
     return value ? QStringLiteral("true") : QStringLiteral("false");

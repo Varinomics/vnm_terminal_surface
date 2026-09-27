@@ -934,16 +934,6 @@ bool selection_source_matches_snapshot(
         term::viewport_mappings_match(source.viewport_mapping, snapshot.viewport);
 }
 
-void write_selection_trace(bool enabled, const QString& message)
-{
-    term::record_interaction_trace("selection", "state", message);
-    if (!enabled) {
-        return;
-    }
-
-    std::fprintf(stderr, "[vnm-terminal-selection] %s\n", qPrintable(message));
-}
-
 QString selection_trace_bool(bool value)
 {
     return value ? QStringLiteral("true") : QStringLiteral("false");
@@ -1152,7 +1142,7 @@ void trace_surface_mouse_decision(
     message += QStringLiteral(" drag=") +
         selection_trace_drag_state(drag_active, drag_moved, drag_cancelled);
     message += QStringLiteral(" accepted=") + selection_trace_bool(accepted);
-    write_selection_trace(trace_enabled, message);
+    term::write_selection_trace(trace_enabled, message);
 }
 
 term::Terminal_selection_range selection_range_for_drag(
@@ -4748,7 +4738,7 @@ QString VNM_TerminalSurface::selected_text()
 
     if (m_private->session == nullptr) {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface selected-text reason=no-session"));
+            term::write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface selected-text reason=no-session"));
         }
         return {};
     }
@@ -4756,7 +4746,7 @@ QString VNM_TerminalSurface::selected_text()
     drain_backend_callback_events_to_current_epoch();
     const term::Terminal_selection_result result = m_private->session->selected_text();
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-        write_selection_trace(m_selection_trace_enabled,
+        term::write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface selected-text result=%1 size=%2")
                 .arg(static_cast<int>(result.code))
                 .arg(result.text.size()));
@@ -4772,7 +4762,7 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
     Input_frontier_scope input_frontier(*this, true, false);
     if (m_private->session == nullptr) {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface copy-selected-text reason=no-session"));
+            term::write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface copy-selected-text reason=no-session"));
         }
         return false;
     }
@@ -4790,7 +4780,7 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
             result.text == QStringLiteral(" ")))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled,
+            term::write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral("surface copy-selected-text result=%1 size=%2")
                     .arg(static_cast<int>(result.code))
                     .arg(result.text.size()));
@@ -4800,7 +4790,7 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
 
     const bool clipboard_write_persisted = set_terminal_clipboard_text(result.text);
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-        write_selection_trace(m_selection_trace_enabled,
+        term::write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface copy-selected-text result=%1 size=%2 clipboard=%3")
                 .arg(static_cast<int>(result.code))
                 .arg(result.text.size())
@@ -5930,7 +5920,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled,
+            term::write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-press source-mismatch reason=%1 anchor=source{none} current=%2 %3")
                     .arg(selection_trace_source_snapshot_mismatch_reason(
@@ -5968,7 +5958,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     event->accept();
     sync_from_session();
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-        write_selection_trace(m_selection_trace_enabled,
+        term::write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface mouse-press source anchor=%1 current=%2 %3")
                 .arg(selection_trace_source_identity(
                     m_private->selection_drag_press_provenance->source))
@@ -6177,7 +6167,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     const std::optional<term::terminal_selection_source_identity_t> source =
         m_private->session->published_selection_source_identity();
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-        write_selection_trace(m_selection_trace_enabled,
+        term::write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface mouse-move source anchor=%1 current=%2 %3")
                 .arg(selection_trace_source_identity(
                     m_private->selection_drag_press_provenance->source))
@@ -6189,7 +6179,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled,
+            term::write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-move source-mismatch snapshot_reason=%1 anchor_reason=%2")
                     .arg(selection_trace_source_snapshot_mismatch_reason(
@@ -6243,7 +6233,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             !proof.reconciled_proven_range.has_value()))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled,
+            term::write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-move gesture-proof status=%1 original=%2 current=%3")
                     .arg(QString::fromLatin1(
@@ -6407,7 +6397,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         const std::optional<term::terminal_selection_source_identity_t> source =
             m_private->session->published_selection_source_identity();
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled,
+            term::write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral("surface mouse-release source anchor=%1 current=%2 %3")
                     .arg(selection_trace_source_identity(
                         m_private->selection_drag_press_provenance->source))
@@ -6419,7 +6409,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
             !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
         {
             if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-                write_selection_trace(m_selection_trace_enabled,
+                term::write_selection_trace(m_selection_trace_enabled,
                     QStringLiteral(
                         "surface mouse-release source-mismatch snapshot_reason=%1 anchor_reason=%2")
                         .arg(selection_trace_source_snapshot_mismatch_reason(
@@ -6471,7 +6461,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                     !proof.reconciled_proven_range.has_value()))
             {
                 if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-                    write_selection_trace(m_selection_trace_enabled,
+                    term::write_selection_trace(m_selection_trace_enabled,
                         QStringLiteral(
                             "surface mouse-release gesture-proof status=%1 original=%2 current=%3")
                             .arg(QString::fromLatin1(
@@ -8437,7 +8427,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
 
     if (m_private->session == nullptr) {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface backend-drain reason=no-session"));
+            term::write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface backend-drain reason=no-session"));
         }
         (void)process_backend_callback_events_recorded(nullptr, budget, true);
         return;
@@ -8451,7 +8441,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
     if (trace_drain) {
         const std::optional<term::terminal_selection_source_identity_t> before_source =
             session->published_selection_source_identity();
-        write_selection_trace(m_selection_trace_enabled,
+        term::write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface backend-drain begin %1 source=%2")
                 .arg(selection_trace_snapshot_identity(m_private->render_snapshot))
                 .arg(selection_trace_source_identity(before_source)));
@@ -8466,7 +8456,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
             m_private->session != nullptr
                 ? m_private->session->published_selection_source_identity()
                 : std::optional<term::terminal_selection_source_identity_t>{};
-        write_selection_trace(m_selection_trace_enabled,
+        term::write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface backend-drain end %1 source=%2")
                 .arg(selection_trace_snapshot_identity(m_private->render_snapshot))
                 .arg(selection_trace_source_identity(after_source)));
