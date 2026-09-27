@@ -928,10 +928,10 @@ sequence: DECCRA, DECFRA, DECERA, DECSERA, DECSACE, DECCARA, DECRARA
 feature: rectangular cell editing
 status: supported
 action_category: screen-mutation
-behavior: copy preserves source cell text and visual attributes with overlap snapshot; fill uses its decimal character and current SGR/protection; ordinary erase clears characters and attributes; selective erase preserves DECSCA-protected cells and surviving visual attributes; DECSACE selects stream or rectangle extent for per-cell visual attribute changes
+behavior: copy preserves source cell text and visual attributes with overlap snapshot; fill maps permitted decimal characters 32-126 and 160-255 directly to U+0020-U+00FF and applies current SGR/protection because ISO 2022 character-set designation is not modeled; ordinary erase clears characters and attributes; selective erase preserves DECSCA-protected cells and surviving visual attributes; DECSACE selects stream or rectangle extent for per-cell visual attribute changes
 host_policy: none
 payload_limit: bounded by active grid size
-recovery: invalid reversed coordinates are ignored; out-of-page coordinates are clipped; malformed parameters are discarded with a diagnostic
+recovery: invalid reversed coordinates are ignored; out-of-page coordinates are clipped; source and destination pages clamp to the sole active page; malformed parameters are discarded with a diagnostic
 reply: no-reply
 diagnostic: malformed parameter diagnostic
 oracle: dec-vt420-rectangular-areas
