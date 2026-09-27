@@ -74,6 +74,19 @@ forbidden_use: no manual text, figures, or examples copied in as fixtures or gol
 inventory_ref: none
 notes: read at https://vt100.net/docs/vt3xx-gp/chapter14.html and chapter2.html; where the manual is silent the sixel matrix row records the product decision
 
+## dec-vt520-ansi-color
+
+oracle_id: dec-vt520-ansi-color
+oracle_type: external-standard
+status: approved
+license_posture: published DEC manual; behavior specification only, no import
+pin_or_version: VT520/VT525 Programmer Information, EK-VT520-RM, SGR Table 5-15
+checked_in_output_allowed: yes
+allowed_use: ANSI color SGR 30-37 and 40-47, default color resets 39 and 49, and DA1 extension 22; fixtures and expected results are independently authored from the specification
+forbidden_use: no manual text, figures, or examples copied in as fixtures or goldens
+inventory_ref: none
+notes: read at https://vt100.net/dec/ek-vt520-rm.pdf; palette RGB values are product-owned color-scheme policy
+
 ## xterm-409-reference
 
 oracle_id: xterm-409-reference

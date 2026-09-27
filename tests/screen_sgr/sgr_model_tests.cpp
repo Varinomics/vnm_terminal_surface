@@ -3,6 +3,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -306,6 +307,44 @@ bool test_partial_attribute_resets()
         "28 clears invisible");
     ok &= check(!has_attribute(style_h, term::Terminal_style_attribute::STRIKE),
         "29 clears strike");
+    return ok;
+}
+
+// Oracle dec-vt520-ansi-color defines DA1 attribute 22 as ANSI color text.
+// These authored sequences use the product-owned Classic palette.
+bool test_ansi_color_palette()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model();
+
+    QByteArray output;
+    for (int color = 0; color < 8; ++color) {
+        output += QByteArrayLiteral("\x1b[") + QByteArray::number(30 + color) + ';' +
+            QByteArray::number(40 + color) + "mX";
+    }
+    output += QByteArrayLiteral("\x1b[49mY");
+    const term::Terminal_screen_model_result result = model.ingest(output);
+    ok &= check(diagnostic_count(result) == 0, "all eight ANSI color pairs are accepted");
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(3U);
+    const std::array<quint32, 8> expected = {
+        0xff000000U, 0xffcd0000U, 0xff00cd00U, 0xffcdcd00U,
+        0xff0000eeU, 0xffcd00cdU, 0xff00cdcdU, 0xffe5e5e5U,
+    };
+    for (int color = 0; color < 8; ++color) {
+        ok &= check_cell_colors(
+            snapshot,
+            cell_at(snapshot, 0, color),
+            expected[static_cast<std::size_t>(color)],
+            expected[static_cast<std::size_t>(color)],
+            "ANSI foreground and background preserve their palette index");
+    }
+    ok &= check_cell_colors(
+        snapshot,
+        cell_at(snapshot, 0, 8),
+        expected[7],
+        k_default_background_rgba,
+        "49 restores default background while preserving ANSI foreground");
     return ok;
 }
 
@@ -751,6 +790,7 @@ int main()
     bool ok = true;
     ok &= test_nested_sgr_and_resets();
     ok &= test_partial_attribute_resets();
+    ok &= test_ansi_color_palette();
     ok &= test_color_modes();
     ok &= test_style_persistence_and_style_ids();
     ok &= test_style_table_compaction_and_capacity_policy();

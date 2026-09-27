@@ -1466,12 +1466,12 @@ void Terminal_screen_model::apply_control_sequence(
                                 sequence.private_marker.isEmpty() &&
                                 mode == 0)
                             {
-                                // Class 61 with attribute 4, sixel graphics (ctlseqs), claimed
-                                // only while a cell pixel size lets images be placed.
+                                // ANSI color (22) is always available; sixel (4) needs
+                                // a cell pixel size so decoded images can be placed.
                                 generated_actions.push_back(make_da1_reply_action(
                                     m_config.cell_pixel_size.has_value()
-                                        ? QByteArrayLiteral("\x1b[?61;4c")
-                                        : QByteArrayLiteral("\x1b[?61c")));
+                                        ? QByteArrayLiteral("\x1b[?61;4;22c")
+                                        : QByteArrayLiteral("\x1b[?61;22c")));
                                 return;
                             }
                             if (sequence.intermediates.isEmpty() &&

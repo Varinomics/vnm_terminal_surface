@@ -976,7 +976,7 @@ sequence: DA1
 feature: terminal identity reply
 status: supported
 action_category: terminal-reply
-behavior: emits typed DA1 reply action CSI ? 61 ; 4 c, conformance class 61 with attribute 4, sixel graphics (xterm ctlseqs), while a cell pixel size (csi-window-op-16) lets images be placed, and CSI ? 61 c without one
+behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 22 c, conformance class 61 with attribute 22, ANSI color text (SGR 30-37 and 40-47, with 39 and 49 restoring the default colors), and attribute 4, sixel graphics, while a cell pixel size (csi-window-op-16) lets images be placed; without one the reply is CSI ? 61 ; 22 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
 host_policy: backend write queue capacity applies
 payload_limit: none
 recovery: malformed query ignored with diagnostic
