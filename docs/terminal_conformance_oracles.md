@@ -113,6 +113,19 @@ forbidden_use: no manual text, figures, or examples copied in as fixtures or gol
 inventory_ref: none
 notes: read at https://vt100.net/mirror/mds-199909/cd3/term/vt420rm2.pdf; recursion and expansion limits are product-owned safety policy
 
+## dec-vt420-horizontal-scrolling
+
+oracle_id: dec-vt420-horizontal-scrolling
+oracle_type: external-standard
+status: approved
+license_posture: published DEC manual; behavior specification only, no import
+pin_or_version: VT420 Programmer Reference Manual, EK-VT420-RM-002, chapters 6, 8, 10, and 12
+checked_in_output_allowed: yes
+allowed_use: DA1 extension 21, DECVSSM, DECSLRM, DECIC, DECDC, DECBI, DECFI, and rectangular scrolling behavior; independently authored fixtures and expected results
+forbidden_use: no manual text, figures, or examples copied in as fixtures or goldens
+inventory_ref: none
+notes: read at https://vt100.net/mirror/mds-199909/cd3/term/vt420rm2.pdf; published pages 133-135, 149-152, 177-178, and 229-231
+
 ## xterm-409-reference
 
 oracle_id: xterm-409-reference

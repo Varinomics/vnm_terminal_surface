@@ -1318,7 +1318,8 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
         if (has_no_intermediates &&
             (final_byte == 'D' || final_byte == 'E' ||
              final_byte == 'M' || final_byte == '7' ||
-             final_byte == '8' || final_byte == '=' ||
+             final_byte == '8' || final_byte == '6' ||
+             final_byte == '9' || final_byte == '=' ||
              final_byte == '>'))
         {
             actions.push_back(make_escape_dispatch_action(

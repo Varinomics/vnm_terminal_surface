@@ -18,6 +18,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -4982,8 +4983,8 @@ bool test_replies_and_cursor_save_restore()
         dsr_reply.wire_bytes == QByteArrayLiteral("\x1b[2;3R"),
         "DSR cursor reply");
     ok &= check(da1_reply.kind == term::Terminal_reply_kind::DA1 &&
-        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;22;28;32c"),
-        "DA1 advertises ANSI color, rectangles and macros without sixel when cell size is unknown");
+        da1_reply.wire_bytes == QByteArrayLiteral("\x1b[?61;21;22;28;32c"),
+        "DA1 advertises horizontal scrolling, ANSI color, rectangles and macros without sixel when cell size is unknown");
     ok &= check(da2_reply.kind == term::Terminal_reply_kind::DA2 &&
         da2_reply.wire_bytes == QByteArrayLiteral("\x1b[>0;0;0c"),
         "DA2 reply");
@@ -5457,8 +5458,8 @@ bool test_sixel_capability_replies()
 
     check_replies(
         model.ingest(QByteArrayLiteral("\x1b[c")),
-        {QByteArrayLiteral("\x1b[?61;4;22;28;32c")},
-        "DA1 advertises sixel, ANSI color, rectangles and macros with a cell pixel size");
+        {QByteArrayLiteral("\x1b[?61;4;21;22;28;32c")},
+        "DA1 advertises sixel, horizontal scrolling, ANSI color, rectangles and macros with a cell pixel size");
 
     term::Terminal_screen_model_result result = model.ingest(QByteArrayLiteral(
         "\x1b[?1;1;0S\x1b[?1;2;0S\x1b[?1;3;256S\x1b[?1;3;16S\x1b[?1;4;0S"));
@@ -5547,7 +5548,7 @@ bool test_sixel_capability_replies()
         unknown_cell_model.ingest(QByteArrayLiteral(
             "\x1b[c\x1b[?1;1;0S\x1b[?2;1;0S\x1b[?2;7;0S\x1b[?3;1;0S")),
         {
-            QByteArrayLiteral("\x1b[?61;22;28;32c"),
+            QByteArrayLiteral("\x1b[?61;21;22;28;32c"),
             QByteArrayLiteral("\x1b[?1;3S"),
             QByteArrayLiteral("\x1b[?2;3S"),
             QByteArrayLiteral("\x1b[?2;2S"),
@@ -5716,6 +5717,204 @@ bool test_resize_wrap_boundaries_cursor_and_history()
     const auto snapshot = wide.render_snapshot(request_for_model(wide, 110U));
     ok &= check(term::validate_render_snapshot(snapshot).status == term::Terminal_render_snapshot_status::OK,
         "reflow preserves valid wide-cell geometry");
+    return ok;
+}
+
+// VT420 DECVSSM and DECSLRM define a rectangular scrolling region. Whole-row
+// history cannot receive a partially scrolled row, and outside columns stay.
+bool test_horizontal_margins_and_rectangular_scroll()
+{
+    bool ok = true;
+    auto model = make_model(4, 8);
+    model.ingest(QByteArrayLiteral(
+        "abcdefgh\x1b[2;1Hijklmnop\x1b[3;1Hqrstuvwx\x1b[4;1HyzABCDEF"));
+
+    auto result = model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;6s\x1b[S"));
+    ok &= check(diagnostic_count(result) == 0,
+        "DECVSSM, DECSLRM and SU are recognized");
+    ok &= check(model.row_text(0) == QStringLiteral("ajklmngh") &&
+            model.row_text(1) == QStringLiteral("irstuvop") &&
+            model.row_text(2) == QStringLiteral("qzABCDwx") &&
+            model.row_text(3) == QStringLiteral("y     EF"),
+        "SU shifts only the selected columns and blanks their exposed row");
+    ok &= check(model.scrollback_size() == 0,
+        "rectangular top-row scroll does not append a partial row to history");
+    ok &= check(snapshot_valid(model, 150U),
+        "rectangular SU retains a valid render snapshot");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[T"));
+    ok &= check(diagnostic_count(result) == 0,
+        "rectangular SD is recognized");
+    ok &= check(model.row_text(0) == QStringLiteral("a     gh") &&
+            model.row_text(1) == QStringLiteral("ijklmnop") &&
+            model.row_text(2) == QStringLiteral("qrstuvwx") &&
+            model.row_text(3) == QStringLiteral("yzABCDEF"),
+        "SD preserves outside columns and moves only the selected rectangle");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[?69l\x1b[S"));
+    ok &= check(diagnostic_count(result) == 0 && model.scrollback_size() == 1,
+        "disabling DECVSSM restores full-width scrolling and history");
+
+    auto wrapped = make_model(2, 8);
+    wrapped.ingest(QByteArrayLiteral(
+        "abcdefgh\x1b[2;1Hijklmnop\x1b[?69h\x1b[2;6s"
+        "\x1b[2;6HXZ"));
+    const std::string wrapped_rows = wrapped.row_text(0).toStdString() + " / " +
+        wrapped.row_text(1).toStdString();
+    ok &= check(wrapped.row_text(0) == QStringLiteral("ajklmXgh") &&
+            wrapped.row_text(1) == QStringLiteral("iZ    op") &&
+            wrapped.scrollback_size() == 0,
+        "wrapping at the bottom scrolls only the margin rectangle without history: " +
+            wrapped_rows);
+    return ok;
+}
+
+bool test_horizontal_margin_editing_and_cursor()
+{
+    bool ok = true;
+    auto model = make_model(3, 8);
+    model.ingest(QByteArrayLiteral(
+        "abcdefgh\x1b[2;1Hijklmnop\x1b[3;1Hqrstuvwx"
+        "\x1b[?69h\x1b[2;6s\x1b[2;3H"));
+    auto result = model.ingest(QByteArrayLiteral("\x1b[1'}"));
+    ok &= check(diagnostic_count(result) == 0,
+        "DECIC column insertion is recognized");
+    ok &= check(model.row_text(0) == QStringLiteral("ab cdegh") &&
+            model.row_text(1) == QStringLiteral("ij klmop") &&
+            model.row_text(2) == QStringLiteral("qr stuwx"),
+        "DECIC inserts in each row of the scrolling region without moving outer columns");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[1'~"));
+    ok &= check(diagnostic_count(result) == 0,
+        "DECDC column deletion is recognized");
+    ok &= check(model.row_text(0) == QStringLiteral("abcde gh") &&
+            model.row_text(1) == QStringLiteral("ijklm op") &&
+            model.row_text(2) == QStringLiteral("qrstu wx"),
+        "DECDC shifts each selected row left and blanks at the right margin");
+
+    model.ingest(QByteArrayLiteral("\x1b[1@"));
+    ok &= check(model.row_text(0) == QStringLiteral("abcde gh") &&
+            model.row_text(1) == QStringLiteral("ij klmop") &&
+            model.row_text(2) == QStringLiteral("qrstu wx"),
+        "ICH confines its shift to the right margin on the cursor row");
+    model.ingest(QByteArrayLiteral("\x1b[1P"));
+    ok &= check(model.row_text(1) == QStringLiteral("ijklm op"),
+        "DCH restores the cursor row without changing outside columns");
+
+    auto outside_vertical = make_model(4, 8);
+    outside_vertical.ingest(QByteArrayLiteral(
+        "abcdefgh\x1b[2;3r\x1b[1;2H\x1b[1@"));
+    ok &= check(outside_vertical.row_text(0) == QStringLiteral("abcdefgh"),
+        "ICH leaves a cursor row outside vertical scroll margins unchanged");
+    outside_vertical.ingest(QByteArrayLiteral("\x1b[1P"));
+    ok &= check(outside_vertical.row_text(0) == QStringLiteral("abcdefgh"),
+        "DCH leaves a cursor row outside vertical scroll margins unchanged");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;2H\x1b[D"));
+    ok &= check(model.cursor_position().column == 0,
+        "CUB may cross the left margin when DECOM is reset");
+    model.ingest(QByteArrayLiteral("\x1b[1;6H\x1b[3C"));
+    ok &= check(model.cursor_position().column == 7,
+        "CUF may cross the right margin when DECOM is reset");
+
+    model.ingest(QByteArrayLiteral("\x1b[?6h\x1b[1;1H"));
+    ok &= check(model.cursor_position().row == 0 &&
+            model.cursor_position().column == 1,
+        "DECOM makes CUP column one relative to the left margin");
+    model.ingest(QByteArrayLiteral("\x1b[1;99H"));
+    ok &= check(model.cursor_position().column == 5,
+        "DECOM clamps CUP to the right margin");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;1H\x1b" "6"));
+    ok &= check(model.cursor_position().column == 1 &&
+            model.row_text(0) == QStringLiteral("a bcdegh"),
+        "DECBI at the left margin shifts the selected columns right");
+    model.ingest(QByteArrayLiteral("\x1b[1;5H\x1b" "9"));
+    ok &= check(model.cursor_position().column == 5 &&
+            model.row_text(0) == QStringLiteral("abcde gh"),
+        "DECFI at the right margin shifts the selected columns left");
+    ok &= check(snapshot_valid(model, 151U),
+        "column editing retains a valid render snapshot");
+    return ok;
+}
+
+bool test_horizontal_margin_wrap_and_reset()
+{
+    bool ok = true;
+    auto model = make_model(3, 8);
+    auto result = model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;5s\x1b[?6hABCDZ"));
+    ok &= check(diagnostic_count(result) == 0,
+        "horizontal-margin text and origin mode are recognized");
+    ok &= check(model.row_text(0) == QStringLiteral(" ABCD") &&
+            model.row_text(1) == QStringLiteral(" Z") &&
+            model.cursor_position().column == 2,
+        "text wraps from the right margin to the left margin on the next row");
+    model.ingest(QByteArrayLiteral("\x1b[s\x1b[1;1H!"));
+    ok &= check(model.cursor_position().column == 1,
+        "CSI s resets margins while mode 69 is enabled and homes at the DECOM origin");
+    model.ingest(QByteArrayLiteral("\x1b[?69l\x1b[?6l\x1b[2;4H\x1b[s\x1b[3;7H\x1b[u"));
+    ok &= check(model.cursor_position().row == 1 &&
+            model.cursor_position().column == 3,
+        "CSI s and CSI u retain cursor save and restore when mode 69 is disabled");
+    result = model.ingest(QByteArrayLiteral("\x1b[?69$p"));
+    const auto mode_replies = replies_in(result);
+    ok &= check(mode_replies.size() == 1U &&
+            reply_at(mode_replies, 0U).wire_bytes == QByteArrayLiteral("\x1b[?69;2$y"),
+        "DECRQM reports horizontal margin mode reset");
+
+    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[3;6s\x1b[?6h"));
+    result = model.ingest(QByteArrayLiteral("\x1b[?69$p"));
+    const auto set_replies = replies_in(result);
+    ok &= check(set_replies.size() == 1U &&
+            reply_at(set_replies, 0U).wire_bytes == QByteArrayLiteral("\x1b[?69;1$y"),
+        "DECRQM reports horizontal margin mode set");
+    model.resize({3, 10});
+    model.ingest(QByteArrayLiteral("\x1b[1;1H"));
+    ok &= check(model.cursor_position().column == 0 &&
+            snapshot_valid(model, 152U),
+        "resize restores full-width horizontal margins while keeping mode 69 active");
+
+    model.ingest(QByteArrayLiteral("\x1b[2;6s\x1b[?1049h\x1b[3;7s\x1b[?69l\x1b[?1049l"));
+    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[?6h\x1b[1;1H"));
+    ok &= check(model.cursor_position().column == 0,
+        "resetting mode 69 on the alternate screen restores the primary margins too");
+    return ok;
+}
+
+bool test_horizontal_margin_wide_cell_boundary()
+{
+    bool ok = true;
+    auto model = make_model(2, 8);
+    model.ingest(QByteArray("\xe7\x95\x8c\x1b[2;2HA\x1b[?69h\x1b[2;5s\x1b[S"));
+    ok &= check(snapshot_valid(model, 153U),
+        "rectangular scrolling repairs a wide glyph crossed by the left margin");
+    const QString wide_row = snapshot_row_text(
+        model.render_snapshot(request_for_model(model, 154U)), 0);
+    ok &= check(wide_row.startsWith(QStringLiteral(" A")),
+        "moving an inner cell preserves it and clears the damaged outer wide glyph: " +
+            wide_row.toStdString() + " / model=" + model.row_text(0).toStdString() +
+            " / source=" + model.row_text(1).toStdString());
+
+    auto combining = make_model(2, 8);
+    combining.ingest(QByteArrayLiteral(
+        "abcdefgh\x1b[?69h\x1b[2;5s\x1b[1;2H\xcc\x81"));
+    ok &= check(combining.row_text(0) == QStringLiteral("abcdefgh"),
+        "combining text at the left margin does not modify the outside cell");
+
+    for (const QByteArray& edit : {
+        QByteArrayLiteral("\x1b[1'}"),
+        QByteArrayLiteral("\x1b[1'~")})
+    {
+        auto columns = make_model(2, 8);
+        columns.ingest(QByteArray("ab\xe7\x95\x8c" "efgh\x1b[2;1H"
+            "ab\xe7\x95\x8c" "efgh\x1b[?69h\x1b[2;7s\x1b[1;4H") + edit);
+        const auto snapshot = columns.render_snapshot(request_for_model(columns, 155U));
+        ok &= check(term::validate_render_snapshot(snapshot).status ==
+                term::Terminal_render_snapshot_status::OK &&
+                !snapshot_row_text(snapshot, 0).contains(QString::fromUtf8("\xe7\x95\x8c")) &&
+                snapshot_row_text(snapshot, 0).endsWith(QChar(u'h')),
+            "DEC column editing clears a wide glyph split at its edit boundary");
+    }
     return ok;
 }
 
@@ -5916,6 +6115,10 @@ bool test_dec_rectangular_editing()
 int main()
 {
     bool ok = true;
+    ok &= test_horizontal_margins_and_rectangular_scroll();
+    ok &= test_horizontal_margin_editing_and_cursor();
+    ok &= test_horizontal_margin_wrap_and_reset();
+    ok &= test_horizontal_margin_wide_cell_boundary();
     ok &= test_row_movement_severs_soft_wrap_neighbors();
     ok &= test_resize_wrap_boundaries_cursor_and_history();
     ok &= test_cmd_wrapped_output_resize_trace();

@@ -968,6 +968,8 @@ private:
         terminal_grid_position_t       cursor;
         int                            scroll_top     = 0;
         int                            scroll_bottom  = 0;
+        int                            scroll_left    = 0;
+        int                            scroll_right   = 0;
         bool                           origin_mode    = false;
         bool                           pending_wrap   = false;
     };
@@ -1375,6 +1377,17 @@ private:
         int                            top_parameter,
         int                            bottom_parameter);
 
+    void set_horizontal_margins(
+        int                            left_parameter,
+        int                            right_parameter);
+
+    void set_horizontal_margin_mode(bool enabled);
+
+    int active_left_margin() const;
+    int active_right_margin() const;
+    int cursor_right_margin() const;
+    int cursor_left_margin() const;
+
     void set_origin_mode(
         bool                           enabled);
 
@@ -1426,7 +1439,15 @@ private:
             nullptr);
     void scroll_up_region(int top, int bottom, bool append_scrollback, int count = 1);
     void scroll_down_region(int top, int bottom, int count = 1);
+    void replace_row_segment(int target_row, const Terminal_screen_row* source_row);
+    void shift_columns(int first_column, int count, bool insert);
+    void repair_horizontal_margin_boundaries(
+        Terminal_screen_row& row,
+        int                  left,
+        int                  end_column);
     void reverse_index();
+    void back_index();
+    void forward_index();
     void arm_primary_repaint_recovery_resize_guard();
     void cancel_primary_repaint_recovery_resize_guard();
     void advance_primary_repaint_recovery_resize_guard();
@@ -1518,7 +1539,8 @@ private:
     std::shared_ptr<const Terminal_image_slice> image_slice_shifted(
         const Terminal_screen_row&     row,
         int                            from_column,
-        int                            shift);
+        int                            shift,
+        int                            end_column);
 
     void backspace();
     void horizontal_tab();
@@ -1829,6 +1851,9 @@ private:
                                         k_terminal_hyperlink_prune_threshold;
     int                             m_scroll_top = 0;
     int                             m_scroll_bottom = 0;
+    int                             m_scroll_left = 0;
+    int                             m_scroll_right = 0;
+    bool                            m_horizontal_margin_mode = false;
     bool                            m_origin_mode = false;
     bool                            m_character_protected = false;
     bool                            m_rectangular_attribute_extent = false;

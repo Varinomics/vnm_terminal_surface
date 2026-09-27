@@ -912,8 +912,8 @@ sequence: SU / CSI Ps S
 feature: scroll region up
 status: supported
 action_category: screen-mutation
-behavior: scrolls the active scroll region up and blanks vacated bottom rows
-host_policy: top-anchored primary regions append scrolled rows to host scrollback
+behavior: scrolls the active scroll region up and blanks vacated bottom rows; DECSLRM confines this to the selected columns while DECVSSM is enabled
+host_policy: only top-anchored, full-width primary regions append scrolled rows to host scrollback
 payload_limit: none
 recovery: malformed sequence ignored with diagnostic
 reply: no-reply
@@ -928,13 +928,77 @@ sequence: SD / CSI Ps T single-parameter form; XTHIMOUSE-shaped multi-parameter 
 feature: scroll region down
 status: supported
 action_category: screen-mutation
-behavior: single-parameter CSI Ps T scrolls the active scroll region down and blanks vacated top rows; XTHIMOUSE-shaped multi-parameter CSI T mutates no screen state
+behavior: single-parameter CSI Ps T scrolls the active scroll region down and blanks vacated top rows, within the selected columns while DECVSSM is enabled; XTHIMOUSE-shaped multi-parameter CSI T mutates no screen state
 host_policy: does not append host scrollback
 payload_limit: none
 recovery: malformed or unsupported CSI T form ignored with diagnostic
 reply: no-reply
 diagnostic: malformed sequence diagnostic; unsupported diagnostic for XTHIMOUSE-shaped multi-parameter CSI T
 oracle: xterm-409-reference
+
+## dec-horizontal-margin-mode
+
+id: dec-horizontal-margin-mode
+family: CSI
+sequence: DECVSSM / CSI ? 69 h and CSI ? 69 l
+feature: horizontal scrolling margins
+status: supported
+action_category: mode-mutation
+behavior: set enables DECSLRM and rectangular scrolling; reset disables it and restores both page borders as horizontal margins in each screen buffer
+host_policy: partial-width scrolls do not append row fragments to host scrollback
+payload_limit: none
+recovery: malformed sequence ignored with diagnostic
+reply: DECRQM reports set or reset mode state
+diagnostic: malformed sequence diagnostic
+oracle: dec-vt420-horizontal-scrolling
+
+## dec-horizontal-margins
+
+id: dec-horizontal-margins
+family: CSI
+sequence: DECSLRM / CSI Pl ; Pr s
+feature: left and right scrolling margins
+status: supported
+action_category: screen-mutation
+behavior: while mode 69 is set, a valid pair of margins at least two columns wide confines scrolling and column edits; the cursor homes, and DECOM makes cursor addressing relative to their left border; with mode 69 reset, parameterless CSI s saves the cursor; if moving Sixel pixels and stationary outside-margin pixels would exceed the decoded-image cap in one row slice, the stationary pixels remain and the moving pixels are dropped
+host_policy: grid resize restores page-border margins
+payload_limit: none
+recovery: invalid margin pair leaves the current margins unchanged
+reply: no-reply
+diagnostic: malformed parameter syntax diagnostic; invalid margin pair has no diagnostic
+oracle: dec-vt420-horizontal-scrolling
+
+## dec-horizontal-column-editing
+
+id: dec-horizontal-column-editing
+family: CSI
+sequence: DECIC / CSI Pn ' } and DECDC / CSI Pn ' ~
+feature: insert and delete columns
+status: supported
+action_category: screen-mutation
+behavior: inserts or deletes columns from the cursor through the right margin on every row of the scrolling region, preserving cells and image pixels outside the region; has no effect when the cursor lies outside the region; if a shifted image would exceed the decoded-image cap, stationary pixels remain and moving pixels are dropped
+host_policy: column edits do not append scrollback
+payload_limit: none
+recovery: malformed sequence ignored with diagnostic
+reply: no-reply
+diagnostic: malformed sequence diagnostic
+oracle: dec-vt420-horizontal-scrolling
+
+## dec-horizontal-index
+
+id: dec-horizontal-index
+family: ESC
+sequence: DECBI / ESC 6 and DECFI / ESC 9
+feature: horizontal index
+status: supported
+action_category: screen-mutation
+behavior: moves the cursor one column backward or forward; at an internal left or right margin, shifts the selected scrolling rectangle by one column and blanks the exposed edge
+host_policy: horizontal shifts do not append scrollback
+payload_limit: none
+recovery: unsupported ESC controls continue through normal recovery
+reply: no-reply
+diagnostic: no diagnostic
+oracle: dec-vt420-horizontal-scrolling
 
 ## csi-xtsmgraphics
 
@@ -1040,7 +1104,7 @@ sequence: DA1
 feature: terminal identity reply
 status: supported
 action_category: terminal-reply
-behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 22 ; 28 ; 32 c, conformance class 61 with attribute 22 for ANSI color text, attribute 28 for rectangular editing, and attribute 32 for stored DEC macros; attribute 4 advertises sixel graphics while a cell pixel size lets images be placed; without one the reply is CSI ? 61 ; 22 ; 28 ; 32 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
+behavior: emits typed DA1 reply action CSI ? 61 ; 4 ; 21 ; 22 ; 28 ; 32 c, conformance class 61 with attribute 21 for DEC horizontal scrolling, 22 for ANSI color text (SGR 30-37 and 40-47, with 39 and 49 restoring default colors), 28 for rectangular editing, and 32 for stored DEC macros; attribute 4 advertises sixel graphics while a cell pixel size (csi-window-op-16) lets images be placed; without one the reply is CSI ? 61 ; 21 ; 22 ; 28 ; 32 c; partial C1 support, host-gated OSC 52 writes, and unsupported DEC features are not advertised
 host_policy: backend write queue capacity applies
 payload_limit: none
 recovery: malformed query ignored with diagnostic

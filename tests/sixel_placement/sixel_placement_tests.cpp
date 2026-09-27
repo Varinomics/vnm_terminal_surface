@@ -1411,7 +1411,7 @@ bool test_encoder_session_end_to_end()
         model.ingest(QByteArray("\x1b[c\x1b[?2;1;0S\x1b[16t"));
     const std::vector<term::Terminal_reply> replies = replies_in(query_result);
     ok &= check(diagnostics_in(query_result).empty() && replies.size() == 3U &&
-            replies[0].wire_bytes == QByteArray("\x1b[?61;4;22;28;32c") &&
+            replies[0].wire_bytes == QByteArray("\x1b[?61;4;21;22;28;32c") &&
             replies[1].wire_bytes == QByteArray("\x1b[?2;0;400;80S") &&
             replies[2].wire_bytes == QByteArray("\x1b[6;20;10t"),
         "the encoder learns of sixel graphics, a 400 x 80 geometry and a 10 x 20 cell");
@@ -1961,9 +1961,80 @@ bool test_indivisible_steps_are_bounded_in_units()
     return ok;
 }
 
+bool test_horizontal_margins_preserve_outside_sixel_cells()
+{
+    bool ok = true;
+    auto model = make_model(3, 8);
+    const QByteArray image = sixel("9;1", solid_rows(10, 1));
+    model.ingest(
+        cursor_to(0, 0) + image +
+        cursor_to(0, 2) + image +
+        cursor_to(1, 3) + image);
+
+    const auto drawn_at = [&](int row, int column) {
+        const auto slice = slice_at(model, row);
+        if (slice == nullptr) {
+            return false;
+        }
+        const int pixel_x = (column - slice->first_column) * k_cell.width;
+        return pixel_x >= 0 && pixel_x < slice->pixels.width() &&
+            slice->pixels.pixelColor(pixel_x, 0).alpha() != 0;
+    };
+    ok &= check(drawn_at(0, 0) && drawn_at(0, 2) && drawn_at(1, 3),
+        "Sixel setup draws both a stationary outer cell and moving inner cells");
+
+    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;6s\x1b[S"));
+    ok &= check(drawn_at(0, 0) && drawn_at(0, 3) && !drawn_at(0, 2),
+        "rectangular SU merges the stationary outer image with the moved inner image");
+    ok &= check(slice_at(model, 1) == nullptr && model.scrollback_size() == 0,
+        "rectangular SU blanks the vacated image cell without partial-row history");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;3H\x1b['}"));
+    ok &= check(drawn_at(0, 0) && drawn_at(0, 4) && !drawn_at(0, 3),
+        "DECIC moves the image inside the right margin without moving the outer image");
+    model.ingest(QByteArrayLiteral("\x1b[1;3H\x1b['~"));
+    ok &= check(drawn_at(0, 0) && drawn_at(0, 3),
+        "DECDC returns the moved image cell while retaining the outer image");
+    return ok;
+}
+
+bool test_horizontal_scroll_over_cap_keeps_stationary_image()
+{
+    bool ok = true;
+    const term::terminal_cell_pixel_size_t cell{10, 40};
+    auto model = make_model(3, 160, cell, 100, 1024U * 1024U);
+    const QByteArray image = sixel("1;0", "\"1;1;10;40");
+    model.ingest(cursor_to(0, 0) + image + cursor_to(1, 159) + image);
+    const auto stationary = slice_at(model, 0);
+    const auto moving = slice_at(model, 1);
+    ok &= check(stationary != nullptr && moving != nullptr,
+        "both separate image rows fit under the decoded-image cap");
+
+    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;160s\x1b[S"));
+    ok &= check(slice_at(model, 0) == stationary && slice_at(model, 1) == nullptr,
+        "an over-cap rectangular scroll preserves the stationary outside image");
+
+    auto shifted = make_model(3, 160, cell, 100, 1024U * 1024U);
+    const QByteArray drawn_image = sixel("9;1", solid_rows(10, 6));
+    shifted.ingest(cursor_to(0, 0) + drawn_image +
+        cursor_to(0, 90) + drawn_image);
+    const auto before_shift = slice_at(shifted, 0);
+    ok &= check(before_shift != nullptr && before_shift->pixels.width() == 910,
+        "two drawn cells fit in a single image just below the decoded-image cap");
+    shifted.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;160s\x1b[1;91H\x1b['}"));
+    const auto after_shift = slice_at(shifted, 0);
+    ok &= check(after_shift != nullptr &&
+            after_shift->pixels.pixelColor(0, 0).alpha() != 0 &&
+            after_shift->pixels.pixelColor(900, 0).alpha() == 0,
+        "an over-cap column shift keeps the stationary pixel and drops the moving pixel");
+    return ok;
+}
+
 int main()
 {
     bool ok = true;
+    ok &= test_horizontal_margins_preserve_outside_sixel_cells();
+    ok &= test_horizontal_scroll_over_cap_keeps_stationary_image();
     ok &= test_slices_equal_raster_bands();
     ok &= test_images_clip_at_the_right_margin();
     ok &= test_cursor_follows_the_final_sixel_row();

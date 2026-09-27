@@ -1097,6 +1097,14 @@ void Terminal_screen_model::apply_control_sequence(
             reverse_index();
             return;
         }
+        if (sequence.final_bytes == QByteArrayLiteral("6")) {
+            back_index();
+            return;
+        }
+        if (sequence.final_bytes == QByteArrayLiteral("9")) {
+            forward_index();
+            return;
+        }
         if (sequence.final_bytes == QByteArrayLiteral("7")) {
             save_cursor();
             return;
@@ -1326,6 +1334,18 @@ void Terminal_screen_model::apply_control_sequence(
         return;
     }
 
+    if (sequence.private_marker.isEmpty() &&
+        sequence.intermediates == QByteArrayLiteral("'") &&
+        (final_byte == '}' || final_byte == '~'))
+    {
+        int count = 1;
+        if (!single_count(count)) {
+            return;
+        }
+        shift_columns(m_cursor.column, count, final_byte == '}');
+        return;
+    }
+
     switch (final_byte) {
         case 'A':
         case 'B':
@@ -1390,7 +1410,14 @@ void Terminal_screen_model::apply_control_sequence(
                                 return;
                             }
 
-                            set_cursor_position(m_cursor.row, std::max(column, 1) - 1);
+                            set_cursor_position(
+                                m_cursor.row,
+                                m_origin_mode && m_horizontal_margin_mode
+                                    ? std::clamp(
+                                        m_scroll_left + std::max(column, 1) - 1,
+                                        m_scroll_left,
+                                        m_scroll_right)
+                                    : std::max(column, 1) - 1);
                             return;
         }
         case 'J':
@@ -1579,7 +1606,30 @@ void Terminal_screen_model::apply_control_sequence(
                             return;
         }
         case 's':
-            if (has_no_prefix && sequence.payload.isEmpty()) {
+            if (!has_no_prefix) {
+                malformed();
+                return;
+            }
+            if (m_horizontal_margin_mode) {
+                if (!parse_simple_parameters()) {
+                    return;
+                }
+                if (parameter_count() > 2U) {
+                    malformed();
+                    return;
+                }
+                int left = 1;
+                int right = m_config.grid_size.columns;
+                if (!parameter_value(0U, 1, left) ||
+                    !parameter_value(1U, m_config.grid_size.columns, right))
+                {
+                    malformed();
+                    return;
+                }
+                set_horizontal_margins(left, right);
+                return;
+            }
+            if (sequence.payload.isEmpty()) {
                 save_cursor();
                 return;
             }
@@ -1607,12 +1657,13 @@ void Terminal_screen_model::apply_control_sequence(
                                 sequence.private_marker.isEmpty() &&
                                 mode == 0)
                             {
-                                // ANSI color (22), rectangular editing (28), and stored
-                                // macros (32) are available. Sixel (4) needs a cell pixel size.
+                                // Horizontal scrolling (21), ANSI color (22), rectangular
+                                // editing (28), and stored macros (32) are available.
+                                // Sixel (4) needs a cell pixel size for image placement.
                                 generated_actions.push_back(make_da1_reply_action(
                                     m_config.cell_pixel_size.has_value()
-                                        ? QByteArrayLiteral("\x1b[?61;4;22;28;32c")
-                                        : QByteArrayLiteral("\x1b[?61;22;28;32c")));
+                                        ? QByteArrayLiteral("\x1b[?61;4;21;22;28;32c")
+                                        : QByteArrayLiteral("\x1b[?61;21;22;28;32c")));
                                 return;
                             }
                             if (sequence.intermediates.isEmpty() &&
@@ -1642,7 +1693,9 @@ void Terminal_screen_model::apply_control_sequence(
                                     : m_cursor.row + 1;
                                 generated_actions.push_back(make_dsr_cursor_position_reply_action(
                                     report_row,
-                                    m_cursor.column + 1));
+                                    m_origin_mode && m_horizontal_margin_mode
+                                        ? m_cursor.column - m_scroll_left + 1
+                                        : m_cursor.column + 1));
                                 return;
                             }
 
@@ -3532,6 +3585,8 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
     resize_rows(state.rows, m_config.grid_size);
     state.scroll_top    = 0;
     state.scroll_bottom = m_config.grid_size.rows - 1;
+    state.scroll_left   = 0;
+    state.scroll_right  = m_config.grid_size.columns - 1;
     return state;
 }
 
@@ -4007,6 +4062,8 @@ void Terminal_screen_model::restore_buffer_state(const screen_buffer_state_t& st
     m_cursor            = state.cursor;
     m_scroll_top        = state.scroll_top;
     m_scroll_bottom     = state.scroll_bottom;
+    m_scroll_left       = state.scroll_left;
+    m_scroll_right      = state.scroll_right;
     m_origin_mode       = state.origin_mode;
     m_modes.origin_mode = m_origin_mode;
     m_pending_wrap      = state.pending_wrap;
@@ -4024,6 +4081,8 @@ void Terminal_screen_model::save_active_buffer_state()
     state.cursor       = m_cursor;
     state.scroll_top   = m_scroll_top;
     state.scroll_bottom = m_scroll_bottom;
+    state.scroll_left  = m_scroll_left;
+    state.scroll_right = m_scroll_right;
     state.origin_mode  = m_origin_mode;
     state.pending_wrap = m_pending_wrap;
 }
@@ -4441,6 +4500,8 @@ void Terminal_screen_model::resize_buffer_state(
     }
     state.scroll_top    = 0;
     state.scroll_bottom = grid_size.rows - 1;
+    state.scroll_left   = 0;
+    state.scroll_right  = grid_size.columns - 1;
     state.origin_mode   = false;
 }
 
@@ -5152,6 +5213,9 @@ void Terminal_screen_model::reset_scroll_region()
 {
     m_scroll_top        = 0;
     m_scroll_bottom     = m_config.grid_size.rows - 1;
+    m_scroll_left       = 0;
+    m_scroll_right      = m_config.grid_size.columns - 1;
+    m_horizontal_margin_mode = false;
     m_origin_mode       = false;
     m_modes.origin_mode = false;
 }
@@ -5243,7 +5307,8 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
             m_pending_wrap = false;
         }
 
-        const int available_columns = m_config.grid_size.columns - m_cursor.column;
+        const int right_margin = cursor_right_margin();
+        const int available_columns = right_margin + 1 - m_cursor.column;
         if (available_columns <= 0) {
             return;
         }
@@ -5258,7 +5323,7 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
             screen_row.image_slice = image_slice_without_cells(
                 screen_row,
                 m_cursor.column,
-                m_config.grid_size.columns);
+                right_margin + 1);
             bool selection_content_changed = false;
             if (available_columns > 1) {
                 selection_content_changed =
@@ -5278,16 +5343,16 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                 selection_content_changed ||
                 printable_ascii_cell_changes_selection_content(
                     screen_row,
-                    m_config.grid_size.columns - 1,
+                    right_margin,
                     text[text.size() - 1]);
             write_printable_ascii_cell_content(
                 screen_row,
-                m_config.grid_size.columns - 1,
+                right_margin,
                 text[text.size() - 1]);
             advance_row_content_generation_with_change_flag(
                 screen_row,
                 selection_content_changed);
-            m_cursor.column = m_config.grid_size.columns - 1;
+            m_cursor.column = right_margin;
             m_pending_wrap = false;
             mark_cursor_dirty();
             return;
@@ -5302,7 +5367,7 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
             m_cursor.column,
             text.sliced(offset, span_length));
         if (span_length >= available_columns) {
-            m_cursor.column = m_config.grid_size.columns - 1;
+            m_cursor.column = right_margin;
             m_pending_wrap = m_modes.autowrap;
         }
         else {
@@ -5342,7 +5407,8 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
             m_pending_wrap = false;
         }
 
-        const int available_columns = m_config.grid_size.columns - m_cursor.column;
+        const int right_margin = cursor_right_margin();
+        const int available_columns = right_margin + 1 - m_cursor.column;
         if (available_columns <= 0) {
             return;
         }
@@ -5357,7 +5423,7 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
             screen_row.image_slice = image_slice_without_cells(
                 screen_row,
                 m_cursor.column,
-                m_config.grid_size.columns);
+                right_margin + 1);
             bool selection_content_changed = false;
             if (available_columns > 1) {
                 selection_content_changed =
@@ -5377,17 +5443,17 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
                 selection_content_changed ||
                 single_width_bmp_cell_changes_selection_content(
                     screen_row,
-                    m_config.grid_size.columns - 1,
+                    right_margin,
                     text[text.size() - 1]);
             const QString margin_text(text[text.size() - 1]);
             write_single_width_bmp_cell_content(
                 screen_row,
-                m_config.grid_size.columns - 1,
+                right_margin,
                 margin_text);
             advance_row_content_generation_with_change_flag(
                 screen_row,
                 selection_content_changed);
-            m_cursor.column = m_config.grid_size.columns - 1;
+            m_cursor.column = right_margin;
             m_pending_wrap = false;
             mark_cursor_dirty();
             return;
@@ -5402,7 +5468,7 @@ void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
             m_cursor.column,
             text.sliced(offset, span_length));
         if (span_length >= available_columns) {
-            m_cursor.column = m_config.grid_size.columns - 1;
+            m_cursor.column = right_margin;
             m_pending_wrap = m_modes.autowrap;
         }
         else {
@@ -5578,7 +5644,7 @@ void Terminal_screen_model::write_single_width_bmp_cell_content(
 void Terminal_screen_model::put_spacing_scalar(QString text, int display_width)
 {
     const int natural_display_width = display_width;
-    if (display_width > m_config.grid_size.columns) {
+    if (display_width > active_right_margin() - active_left_margin() + 1) {
         display_width = 1;
     }
 
@@ -5587,7 +5653,7 @@ void Terminal_screen_model::put_spacing_scalar(QString text, int display_width)
         m_pending_wrap = false;
     }
 
-    if (display_width > m_config.grid_size.columns - m_cursor.column) {
+    if (display_width > cursor_right_margin() + 1 - m_cursor.column) {
         if (m_modes.autowrap) {
             wrap_line();
         }
@@ -5610,10 +5676,12 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
     if (!m_pending_wrap) {
         const bool current_margin_cell_is_target =
             !m_modes.autowrap                                 &&
-            m_cursor.column == m_config.grid_size.columns - 1 &&
+            m_cursor.column == cursor_right_margin()           &&
             active_grid_rows()[m_cursor.row].cells[m_cursor.column].occupied;
 
-        if (!current_margin_cell_is_target && m_cursor.column == 0) {
+        if (!current_margin_cell_is_target &&
+            m_cursor.column == cursor_left_margin())
+        {
             return;
         }
 
@@ -5623,6 +5691,9 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
     }
 
     target = cell_base_position(target);
+    if (target.column < cursor_left_margin()) {
+        return;
+    }
     Cell& cell = active_grid_rows()[target.row].cells[target.column];
     if (!cell.occupied) {
         return;
@@ -5633,7 +5704,7 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
     if (natural_display_width <= 0) { natural_display_width = 1; }
     int display_width = natural_display_width;
     if (display_width > m_config.grid_size.columns) { display_width = 1; }
-    if (display_width > m_config.grid_size.columns - target.column) {
+    if (display_width > cursor_right_margin() + 1 - target.column) {
         if (!m_modes.autowrap) {
             display_width = 1;
         }
@@ -6366,6 +6437,10 @@ void Terminal_screen_model::finalize_row_cell_mutation(
     Terminal_screen_row&     screen_row,
     const std::vector<Cell>& before_cells)
 {
+    repair_horizontal_margin_boundaries(
+        screen_row,
+        active_left_margin(),
+        active_right_margin() + 1);
     repair_wide_spans_in_row(screen_row.cells, m_config.grid_size.columns);
 
     m_pending_wrap = false;
@@ -6375,23 +6450,30 @@ void Terminal_screen_model::finalize_row_cell_mutation(
 
 void Terminal_screen_model::insert_cells(int count)
 {
+    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
+        m_cursor.column < active_left_margin() ||
+        m_cursor.column > active_right_margin())
+    {
+        return;
+    }
     mark_terminal_content_changed();
-    count = std::clamp(count, 1, m_config.grid_size.columns - m_cursor.column);
+    const int end_column = cursor_right_margin() + 1;
+    count = std::clamp(count, 1, end_column - m_cursor.column);
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
     std::vector<Cell>& row = screen_row.cells;
     const std::vector<Cell> before_cells = row;
     // Computed before any cell changes, so a failed allocation leaves the row
     // whole.
     std::shared_ptr<const Terminal_image_slice> image =
-        image_slice_shifted(screen_row, m_cursor.column, count);
+        image_slice_shifted(screen_row, m_cursor.column, count, end_column);
 
     clear_wide_continuation_boundary(row, m_cursor.column);
-    clear_wide_continuation_boundary(row, m_config.grid_size.columns - count);
+    clear_wide_continuation_boundary(row, end_column - count);
 
     std::move_backward(
         row.begin() + m_cursor.column,
-        row.begin() + m_config.grid_size.columns - count,
-        row.end());
+        row.begin() + end_column - count,
+        row.begin() + end_column);
 
     const Cell replacement = erased_cell();
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
@@ -6404,15 +6486,22 @@ void Terminal_screen_model::insert_cells(int count)
 
 void Terminal_screen_model::delete_cells(int count)
 {
+    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
+        m_cursor.column < active_left_margin() ||
+        m_cursor.column > active_right_margin())
+    {
+        return;
+    }
     mark_terminal_content_changed();
-    count = std::clamp(count, 1, m_config.grid_size.columns - m_cursor.column);
+    const int end_column = cursor_right_margin() + 1;
+    count = std::clamp(count, 1, end_column - m_cursor.column);
     Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
     std::vector<Cell>& row = screen_row.cells;
     const std::vector<Cell> before_cells = row;
     // Computed before any cell changes, so a failed allocation leaves the row
     // whole.
     std::shared_ptr<const Terminal_image_slice> image =
-        image_slice_shifted(screen_row, m_cursor.column, -count);
+        image_slice_shifted(screen_row, m_cursor.column, -count, end_column);
 
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
         erase_cell_at({m_cursor.row, column});
@@ -6421,12 +6510,12 @@ void Terminal_screen_model::delete_cells(int count)
 
     std::move(
         row.begin() + m_cursor.column + count,
-        row.end(),
+        row.begin() + end_column,
         row.begin() + m_cursor.column);
 
     const Cell replacement = erased_cell();
-    for (int column = m_config.grid_size.columns - count;
-        column < m_config.grid_size.columns;
+    for (int column = end_column - count;
+        column < end_column;
         ++column)
     {
         row[static_cast<std::size_t>(column)] = replacement;
@@ -6445,13 +6534,34 @@ void Terminal_screen_model::break_soft_wrap_before(int row)
 
 void Terminal_screen_model::insert_lines(int count)
 {
-    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom) {
+    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
+        m_cursor.column < active_left_margin() ||
+        m_cursor.column > active_right_margin())
+    {
         return;
     }
 
     break_soft_wrap_before(m_cursor.row);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, m_scroll_bottom - m_cursor.row + 1);
+    if (active_left_margin() != 0 ||
+        active_right_margin() != m_config.grid_size.columns - 1)
+    {
+        const std::vector<Terminal_screen_row> before_rows(
+            active_grid_rows().begin() + m_cursor.row,
+            active_grid_rows().begin() + m_scroll_bottom + 1);
+        for (int row = m_cursor.row; row <= m_scroll_bottom; ++row) {
+            const int source = row - count;
+            replace_row_segment(
+                row,
+                source >= m_cursor.row
+                    ? &before_rows[static_cast<std::size_t>(source - m_cursor.row)]
+                    : nullptr);
+        }
+        break_soft_wrap_before(m_scroll_bottom + 1);
+        m_pending_wrap = false;
+        return;
+    }
     std::move_backward(
         active_grid_rows().begin() + m_cursor.row,
         active_grid_rows().begin() + m_scroll_bottom - count + 1,
@@ -6468,7 +6578,10 @@ void Terminal_screen_model::insert_lines(int count)
 
 void Terminal_screen_model::delete_lines(int count)
 {
-    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom) {
+    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
+        m_cursor.column < active_left_margin() ||
+        m_cursor.column > active_right_margin())
+    {
         return;
     }
 
@@ -6476,6 +6589,23 @@ void Terminal_screen_model::delete_lines(int count)
     mark_terminal_content_changed();
     count = std::clamp(count, 1, m_scroll_bottom - m_cursor.row + 1);
     break_soft_wrap_before(m_scroll_bottom + 1);
+    if (active_left_margin() != 0 ||
+        active_right_margin() != m_config.grid_size.columns - 1)
+    {
+        const std::vector<Terminal_screen_row> before_rows(
+            active_grid_rows().begin() + m_cursor.row,
+            active_grid_rows().begin() + m_scroll_bottom + 1);
+        for (int row = m_cursor.row; row <= m_scroll_bottom; ++row) {
+            const int source = row + count;
+            replace_row_segment(
+                row,
+                source <= m_scroll_bottom
+                    ? &before_rows[static_cast<std::size_t>(source - m_cursor.row)]
+                    : nullptr);
+        }
+        m_pending_wrap = false;
+        return;
+    }
     std::move(
         active_grid_rows().begin() + m_cursor.row + count,
         active_grid_rows().begin() + m_scroll_bottom + 1,
@@ -6512,9 +6642,10 @@ void Terminal_screen_model::set_cursor_after_cell(
 {
     mark_cursor_dirty();
 
-    if (display_width >= m_config.grid_size.columns - position.column) {
+    const int right_margin = cursor_right_margin();
+    if (display_width >= right_margin + 1 - position.column) {
         m_cursor.row    = position.row;
-        m_cursor.column = m_config.grid_size.columns - 1;
+        m_cursor.column = right_margin;
         m_pending_wrap  = m_modes.autowrap;
         mark_cursor_dirty();
         return;
@@ -6554,7 +6685,14 @@ void Terminal_screen_model::set_cursor_address(int row_parameter, int column_par
             (requested_row != 0 || requested_column != 0) ? target_row : -1;
     }
 
-    set_cursor_position(target_row, requested_column);
+    int target_column = requested_column;
+    if (m_origin_mode && m_horizontal_margin_mode) {
+        target_column = std::clamp(
+            m_scroll_left + requested_column,
+            m_scroll_left,
+            m_scroll_right);
+    }
+    set_cursor_position(target_row, target_column);
 }
 
 void Terminal_screen_model::move_cursor_relative(int row_delta, int column_delta)
@@ -6567,7 +6705,86 @@ void Terminal_screen_model::move_cursor_relative(int row_delta, int column_delta
         target_row = std::clamp(target_row, m_scroll_top, m_scroll_bottom);
     }
 
-    set_cursor_position(target_row, m_cursor.column + column_delta);
+    int target_column = m_cursor.column + column_delta;
+    if (column_delta != 0 &&
+        m_origin_mode &&
+        m_horizontal_margin_mode &&
+        m_cursor.column >= m_scroll_left &&
+        m_cursor.column <= m_scroll_right)
+    {
+        target_column = std::clamp(target_column, m_scroll_left, m_scroll_right);
+    }
+    set_cursor_position(target_row, target_column);
+}
+
+int Terminal_screen_model::active_left_margin() const
+{
+    return m_horizontal_margin_mode ? m_scroll_left : 0;
+}
+
+int Terminal_screen_model::active_right_margin() const
+{
+    return m_horizontal_margin_mode ? m_scroll_right : m_config.grid_size.columns - 1;
+}
+
+int Terminal_screen_model::cursor_left_margin() const
+{
+    return m_cursor.column >= active_left_margin() &&
+            m_cursor.column <= active_right_margin()
+        ? active_left_margin()
+        : 0;
+}
+
+int Terminal_screen_model::cursor_right_margin() const
+{
+    return m_cursor.column >= active_left_margin() &&
+            m_cursor.column <= active_right_margin()
+        ? active_right_margin()
+        : m_config.grid_size.columns - 1;
+}
+
+void Terminal_screen_model::set_horizontal_margins(int left_parameter, int right_parameter)
+{
+    const int left = std::clamp(
+        std::max(left_parameter, 1) - 1,
+        0,
+        m_config.grid_size.columns - 1);
+    const int right = std::clamp(
+        (right_parameter <= 0 ? m_config.grid_size.columns : right_parameter) - 1,
+        0,
+        m_config.grid_size.columns - 1);
+    if (left >= right) {
+        return;
+    }
+
+    if (left != m_scroll_left || right != m_scroll_right) {
+        cancel_primary_repaint_recovery_candidate();
+    }
+    m_scroll_left  = left;
+    m_scroll_right = right;
+    set_cursor_address(1, 1);
+}
+
+void Terminal_screen_model::set_horizontal_margin_mode(bool enabled)
+{
+    if (m_horizontal_margin_mode == enabled) {
+        return;
+    }
+    cancel_primary_repaint_recovery_candidate();
+    m_horizontal_margin_mode = enabled;
+    if (!enabled) {
+        m_scroll_left  = 0;
+        m_scroll_right = m_config.grid_size.columns - 1;
+        for (screen_buffer_state_t* state : {
+            &m_primary_backing.active_grid_state(),
+            &m_alternate_grid.active_grid_state()})
+        {
+            state->scroll_left  = 0;
+            state->scroll_right = m_config.grid_size.columns - 1;
+        }
+    }
+    m_pending_wrap = false;
+    mark_mode_state_changed();
 }
 
 void Terminal_screen_model::set_scroll_region(int top_parameter, int bottom_parameter)
@@ -6720,6 +6937,9 @@ void Terminal_screen_model::apply_dec_private_mode(
             // This follows the xterm DECNKM polarity used by modern TUI software.
             set_application_keypad_mode(enabled);
             return;
+        case 69:
+            set_horizontal_margin_mode(enabled);
+            return;
         case 80:
             // DECSDM set places sixel images at the page home without
             // scrolling, the polarity of xterm and OpenConsole.
@@ -6825,6 +7045,8 @@ int Terminal_screen_model::dec_private_mode_status(int mode) const
             return m_modes.autowrap ? 1 : 2;
         case 66:
             return m_application_keypad ? 1 : 2;
+        case 69:
+            return m_horizontal_margin_mode ? 1 : 2;
         case 80:
             return m_sixel_display_mode ? 1 : 2;
         case 1070:
@@ -7056,12 +7278,163 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
     return appended_handle;
 }
 
+void Terminal_screen_model::replace_row_segment(
+    int                        target_row,
+    const Terminal_screen_row* source_row)
+{
+    const int left  = active_left_margin();
+    const int right = active_right_margin() + 1;
+    Terminal_screen_row& target = active_grid_rows()[static_cast<std::size_t>(target_row)];
+    const std::vector<Cell> before_cells = target.cells;
+
+    // A row may hold an image in the moving segment and another outside it.
+    // Cut both at cell boundaries before combining them into the single slice
+    // used by the renderer.
+    std::shared_ptr<const Terminal_image_slice> image =
+        image_slice_without_cells(target, left, right);
+    if (source_row != nullptr && source_row->image_slice != nullptr) {
+        Terminal_screen_row source_image;
+        source_image.image_slice = source_row->image_slice;
+        source_image.image_slice = image_slice_without_cells(source_image, 0, left);
+        source_image.image_slice = image_slice_without_cells(
+            source_image,
+            right,
+            m_config.grid_size.columns);
+        if (source_image.image_slice != nullptr) {
+            const Terminal_image_slice& patch = *source_image.image_slice;
+            if (image == nullptr) {
+                image = source_image.image_slice;
+            }
+            else {
+                const composite_layout_t layout = composite_image_layout(
+                    *image,
+                    patch.pixels,
+                    patch.first_column,
+                    patch.cell_pixel_size);
+                // A combined row may exceed the decoded-image cap although
+                // both original rows fit. Keep the stationary image outside
+                // the margins in that case; the moving image is discarded.
+                if (layout.bytes <= static_cast<std::int64_t>(sixel_raster_limit_bytes())) {
+                    image = make_image_slice(
+                        composite_image_band(*image, patch.pixels, layout),
+                        layout.first_column,
+                        patch.cell_pixel_size);
+                }
+            }
+        }
+    }
+
+    if (source_row != nullptr) {
+        std::copy(
+            source_row->cells.begin() + left,
+            source_row->cells.begin() + right,
+            target.cells.begin() + left);
+    }
+    else {
+        std::fill(target.cells.begin() + left, target.cells.begin() + right, erased_cell());
+    }
+    repair_horizontal_margin_boundaries(target, left, right);
+    repair_wide_spans_in_row(target.cells, m_config.grid_size.columns);
+    target.image_slice = std::move(image);
+    target.soft_wrap_columns = 0;
+    advance_row_content_generation_if_changed(target, before_cells);
+    mark_dirty(target_row);
+}
+
+void Terminal_screen_model::shift_columns(int first_column, int count, bool insert)
+{
+    const int left  = active_left_margin();
+    const int right = active_right_margin();
+    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
+        first_column < left || first_column > right)
+    {
+        return;
+    }
+
+    count = std::clamp(count, 1, right - first_column + 1);
+    const int end_column = right + 1;
+    mark_terminal_content_changed();
+    m_pending_wrap = false;
+    for (int row_index = m_scroll_top; row_index <= m_scroll_bottom; ++row_index) {
+        Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row_index)];
+        std::vector<Cell>& cells = screen_row.cells;
+        const std::vector<Cell> before_cells = cells;
+        std::shared_ptr<const Terminal_image_slice> image = image_slice_shifted(
+            screen_row,
+            first_column,
+            insert ? count : -count,
+            end_column);
+        const auto clear_split_source_span = [&](int boundary) {
+            if (boundary <= 0 || boundary >= m_config.grid_size.columns) {
+                return;
+            }
+            const int base = cell_base_column_in_row(screen_row, boundary);
+            if (base == boundary) {
+                return;
+            }
+            const int end = std::min(
+                m_config.grid_size.columns,
+                base + std::max(1, cells[static_cast<std::size_t>(base)].display_width));
+            std::fill(cells.begin() + base, cells.begin() + end, Cell{});
+        };
+        clear_split_source_span(first_column);
+        clear_split_source_span(insert ? end_column - count : first_column + count);
+        if (insert) {
+            std::move_backward(
+                cells.begin() + first_column,
+                cells.begin() + end_column - count,
+                cells.begin() + end_column);
+            std::fill(
+                cells.begin() + first_column,
+                cells.begin() + first_column + count,
+                Cell{});
+        }
+        else {
+            std::move(
+                cells.begin() + first_column + count,
+                cells.begin() + end_column,
+                cells.begin() + first_column);
+            std::fill(
+                cells.begin() + end_column - count,
+                cells.begin() + end_column,
+                Cell{});
+        }
+        repair_horizontal_margin_boundaries(screen_row, left, end_column);
+        repair_wide_spans_in_row(cells, m_config.grid_size.columns);
+        screen_row.image_slice = std::move(image);
+        screen_row.soft_wrap_columns = 0;
+        advance_row_content_generation_if_changed(screen_row, before_cells);
+        mark_dirty(row_index);
+    }
+    break_soft_wrap_before(m_scroll_top);
+    break_soft_wrap_before(m_scroll_bottom + 1);
+}
+
 void Terminal_screen_model::scroll_up_region(
     int    top,
     int    bottom,
     bool   append_scrollback,
     int    count)
 {
+    if (active_left_margin() != 0 ||
+        active_right_margin() != m_config.grid_size.columns - 1)
+    {
+        mark_terminal_content_changed();
+        count = std::clamp(count, 1, bottom - top + 1);
+        const std::vector<Terminal_screen_row> before_rows(
+            active_grid_rows().begin() + top,
+            active_grid_rows().begin() + bottom + 1);
+        for (int row = top; row <= bottom; ++row) {
+            const int source = row + count;
+            replace_row_segment(
+                row,
+                source <= bottom ? &before_rows[static_cast<std::size_t>(source - top)] : nullptr);
+        }
+        break_soft_wrap_before(top);
+        break_soft_wrap_before(bottom + 1);
+        return;
+    }
+
     break_soft_wrap_before(top);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, bottom - top + 1);
@@ -7110,6 +7483,25 @@ void Terminal_screen_model::scroll_up_region(
 
 void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
 {
+    if (active_left_margin() != 0 ||
+        active_right_margin() != m_config.grid_size.columns - 1)
+    {
+        mark_terminal_content_changed();
+        count = std::clamp(count, 1, bottom - top + 1);
+        const std::vector<Terminal_screen_row> before_rows(
+            active_grid_rows().begin() + top,
+            active_grid_rows().begin() + bottom + 1);
+        for (int row = top; row <= bottom; ++row) {
+            const int source = row - count;
+            replace_row_segment(
+                row,
+                source >= top ? &before_rows[static_cast<std::size_t>(source - top)] : nullptr);
+        }
+        break_soft_wrap_before(top);
+        break_soft_wrap_before(bottom + 1);
+        return;
+    }
+
     break_soft_wrap_before(top);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, bottom - top + 1);
@@ -7130,7 +7522,10 @@ void Terminal_screen_model::reverse_index()
     mark_cursor_dirty();
     m_pending_wrap = false;
 
-    if (m_cursor.row == m_scroll_top) {
+    if (m_cursor.row == m_scroll_top &&
+        m_cursor.column >= active_left_margin() &&
+        m_cursor.column <= active_right_margin())
+    {
         scroll_down_region(m_scroll_top, m_scroll_bottom);
         mark_cursor_dirty();
         return;
@@ -7140,6 +7535,32 @@ void Terminal_screen_model::reverse_index()
         --m_cursor.row;
     }
     mark_cursor_dirty();
+}
+
+void Terminal_screen_model::back_index()
+{
+    if (m_cursor.column == active_left_margin() &&
+        m_cursor.column > 0 &&
+        m_cursor.row >= m_scroll_top &&
+        m_cursor.row <= m_scroll_bottom)
+    {
+        shift_columns(active_left_margin(), 1, true);
+        return;
+    }
+    move_cursor_relative(0, -1);
+}
+
+void Terminal_screen_model::forward_index()
+{
+    if (m_cursor.column == active_right_margin() &&
+        m_cursor.column < m_config.grid_size.columns - 1 &&
+        m_cursor.row >= m_scroll_top &&
+        m_cursor.row <= m_scroll_bottom)
+    {
+        shift_columns(active_left_margin(), 1, false);
+        return;
+    }
+    move_cursor_relative(0, 1);
 }
 
 void Terminal_screen_model::arm_primary_repaint_recovery_resize_guard()
@@ -7655,7 +8076,7 @@ bool Terminal_screen_model::row_has_visible_text(const Terminal_screen_row& row)
 void Terminal_screen_model::carriage_return()
 {
     mark_cursor_dirty();
-    m_cursor.column = 0;
+    m_cursor.column = cursor_left_margin();
     m_pending_wrap  = false;
     mark_cursor_dirty();
 }
@@ -7677,8 +8098,13 @@ void Terminal_screen_model::wrap_line()
         next_row     <  m_config.grid_size.rows &&
         active_grid_rows()[(std::size_t)next_row].image_slice != nullptr;
     Terminal_screen_row& row = active_grid_rows()[(std::size_t)m_cursor.row];
-    int soft_wrap_columns    = m_pending_wrap ? m_config.grid_size.columns : m_cursor.column;
-    if (row.image_slice != nullptr || wraps_onto_image_row) {
+    int soft_wrap_columns    = m_pending_wrap ? cursor_right_margin() + 1 : m_cursor.column;
+    if (row.image_slice != nullptr || wraps_onto_image_row ||
+        (m_cursor.column >= active_left_margin() &&
+         m_cursor.column <= active_right_margin() &&
+         (active_left_margin() != 0 ||
+          active_right_margin() != m_config.grid_size.columns - 1)))
+    {
         soft_wrap_columns = 0;
     }
     row.soft_wrap_columns = soft_wrap_columns;
@@ -7691,7 +8117,10 @@ void Terminal_screen_model::advance_row()
     mark_cursor_dirty();
     m_pending_wrap = false;
 
-    if (m_cursor.row == m_scroll_bottom) {
+    if (m_cursor.row == m_scroll_bottom &&
+        m_cursor.column >= active_left_margin() &&
+        m_cursor.column <= active_right_margin())
+    {
         scroll_active_region_up();
         mark_cursor_dirty();
         return;
@@ -7716,7 +8145,9 @@ void Terminal_screen_model::scroll_active_region_up()
         m_scroll_top,
         m_scroll_bottom,
         m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
-            m_scroll_top == 0);
+            m_scroll_top == 0 &&
+            active_left_margin() == 0 &&
+            active_right_margin() == m_config.grid_size.columns - 1);
 }
 
 // The decoded-size cap is the retained history's largest record.
@@ -8293,7 +8724,8 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_w
 std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_shifted(
     const Terminal_screen_row& row,
     int                        from_column,
-    int                        shift)
+    int                        shift,
+    int                        end_column)
 {
     if (row.image_slice == nullptr) {
         return nullptr;
@@ -8312,16 +8744,16 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_s
         int offset = 0;
     };
 
-    // Columns left of from_column stay; columns from it on move, less those
-    // DCH deletes and those that would land at or past the right margin.
-    const int columns = m_config.grid_size.columns;
+    // Columns outside [from_column, end_column) stay; columns inside move,
+    // less those deleted or pushed past the right margin.
     const column_segment_t segments[] = {
         {slice.first_column, std::min(slice_end_column, from_column), 0},
         {
             std::max(slice.first_column, from_column + std::max(0, -shift)),
-            std::min({slice_end_column, columns, columns - shift}),
+            std::min({slice_end_column, end_column, end_column - shift}),
             shift,
         },
+        {std::max(slice.first_column, end_column), slice_end_column, 0},
     };
 
     const int cell_width   = slice.cell_pixel_size.width;
@@ -8344,6 +8776,14 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_s
             const int target_first_x = (segment.first + segment.offset - first_column) * cell_width;
             end_x = std::max(end_x, target_first_x + source_end_x - source_first_x);
         }
+    }
+
+    if (std::int64_t{end_x} * slice.pixels.height() * 4 >
+        static_cast<std::int64_t>(sixel_raster_limit_bytes()))
+    {
+        // The old slice fits the cap. Keep its stationary columns if the
+        // shifted union would exceed it, as rectangular scrolling does.
+        return image_slice_without_cells(row, from_column, end_column);
     }
 
     QImage pixels(end_x, slice.pixels.height(), QImage::Format_RGBA8888_Premultiplied);
@@ -8376,7 +8816,7 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_s
 void Terminal_screen_model::backspace()
 {
     mark_cursor_dirty();
-    if (m_cursor.column > 0) {
+    if (m_cursor.column > cursor_left_margin()) {
         --m_cursor.column;
     }
     m_pending_wrap = false;
@@ -8385,8 +8825,9 @@ void Terminal_screen_model::backspace()
 
 void Terminal_screen_model::horizontal_tab()
 {
-    int target = m_config.grid_size.columns - 1;
-    for (int column = m_cursor.column + 1; column < m_config.grid_size.columns; ++column) {
+    const int right_margin = cursor_right_margin();
+    int target = right_margin;
+    for (int column = m_cursor.column + 1; column <= right_margin; ++column) {
         if (m_tab_stops[static_cast<std::size_t>(column)]) {
             target = column;
             break;
@@ -8549,6 +8990,31 @@ void Terminal_screen_model::mark_all_dirty()
     for (int row = 0; row < m_config.grid_size.rows; ++row) {
         mark_dirty(row);
     }
+}
+
+void Terminal_screen_model::repair_horizontal_margin_boundaries(
+    Terminal_screen_row& row,
+    int                  left,
+    int                  end_column)
+{
+    const auto clear_split_span = [&](int boundary) {
+        if (boundary <= 0 || boundary >= m_config.grid_size.columns) {
+            return;
+        }
+        const int base = cell_base_column_in_row(row, boundary - 1);
+        const Cell& base_cell = row.cells[static_cast<std::size_t>(base)];
+        const int span_end = base + std::max(1, base_cell.display_width);
+        if (span_end <= boundary) {
+            return;
+        }
+        for (int column = base; column < boundary;
+             ++column)
+        {
+            row.cells[static_cast<std::size_t>(column)] = Cell{};
+        }
+    };
+    clear_split_span(left);
+    clear_split_span(end_column);
 }
 
 void Terminal_screen_model::repair_wide_spans_in_row(
