@@ -708,6 +708,9 @@ public:
     Q_INVOKABLE QByteArray explicit_hyperlink_at(qreal x, qreal y) const;
     Q_INVOKABLE QString selected_text();
     Q_INVOKABLE void    clear_selection();
+    // Cancels the current pointer gesture on the GUI thread without sending a
+    // mouse release to the terminal child or completing a local click.
+    void cancel_pointer_gesture();
     Q_INVOKABLE void    set_search_query(QString query);
     Q_INVOKABLE void    clear_search();
     Q_INVOKABLE bool    search_next();
@@ -899,6 +902,7 @@ private:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void mouseUngrabEvent() override;
     void hoverMoveEvent(QHoverEvent* event) override;
     void hoverLeaveEvent(QHoverEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;

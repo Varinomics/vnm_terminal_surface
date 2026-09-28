@@ -4826,6 +4826,49 @@ void VNM_TerminalSurface::clear_selection_within_input_event()
     m_private->clear_selection_with_sync(*this);
 }
 
+void VNM_TerminalSurface::cancel_pointer_gesture()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    const bool pending_press = std::any_of(
+        m_private->pending_published_mouse_reports.begin(),
+        m_private->pending_published_mouse_reports.end(),
+        [](const auto& report) {
+            return report.kind == term::Terminal_mouse_event_kind::PRESS;
+        });
+    if (m_private->mouse_reporting_pressed_buttons == Qt::NoButton &&
+        !m_private->hyperlink_activation_gesture_active             &&
+        !m_private->selection_drag_active                           &&
+        !pending_press)
+    {
+        return;
+    }
+
+    m_private->clear_pending_published_mouse_reports();
+    m_private->clear_mouse_reporting_state();
+    m_private->clear_hyperlink_activation_state();
+
+    if (!m_private->selection_drag_active) {
+        return;
+    }
+
+    const bool moved = m_private->selection_drag_moved;
+    record_surface_selection_drag_transcript(
+        m_private->transcript_recorder,
+        QStringLiteral("cancel"),
+        m_private->selection_anchor,
+        std::nullopt,
+        std::nullopt,
+        moved);
+    m_private->clear_selection_drag_state();
+    if (moved) {
+        m_private->detach_selection_visual_attachment_with_sync(*this);
+    }
+    else {
+        m_private->clear_selection_with_sync(*this);
+    }
+}
+
 void VNM_TerminalSurface::set_search_query(QString query)
 {
     Input_frontier_scope input_frontier(*this);
@@ -6282,6 +6325,12 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     event->accept();
     sync_from_session();
     trace_decision(QStringLiteral("selection-range-set"));
+}
+
+void VNM_TerminalSurface::mouseUngrabEvent()
+{
+    cancel_pointer_gesture();
+    QQuickItem::mouseUngrabEvent();
 }
 
 void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
