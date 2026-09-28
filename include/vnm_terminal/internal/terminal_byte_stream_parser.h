@@ -50,6 +50,9 @@ public:
     bool macro_work_advanced() const { return m_macro_work_advanced; }
     bool macro_work_deferred() const { return m_macro_work_deferred; }
     bool parse_boundary_reached() const { return m_parser_boundary_reached; }
+    // A UTF-8 scalar started in replayed macro text or a string payload may
+    // finish in the next host span. Session scanners must share this carry.
+    std::optional<Terminal_utf8_scan_state> pending_utf8_scan_state() const;
     void begin_macro_expansion_scope()
     {
         m_macro_expansion_bytes = 0U;

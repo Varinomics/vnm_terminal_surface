@@ -6329,7 +6329,11 @@ void Terminal_session::clear_text_area_resize_tail_epoch()
 void Terminal_session::reset_text_area_resize_scanner()
 {
     m_text_area_resize_scanner = {};
-    reset_utf8_scan_state(m_text_area_resize_scanner.utf8_state);
+    if (m_screen_model.has_value()) {
+        if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
+            m_text_area_resize_scanner.utf8_state = *carry;
+        }
+    }
 }
 
 void Terminal_session::begin_text_area_resize_candidate(unsigned char introducer)
@@ -6954,6 +6958,11 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
     std::size_t    available_bytes)
 {
     Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
+    if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN) {
+        if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
+            m_text_area_resize_scanner.utf8_state = *carry;
+        }
+    }
     const bool capability_known =
         m_config.text_area_resize_arbitration.has_value() &&
         m_config.text_area_resize_arbitration->version ==
@@ -7081,6 +7090,23 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
                     keep_scan_state_through(candidate_start - left);
                     return left + (bytes.size() - candidate_start);
                 }
+                // A macro in the parsed prefix may have started a UTF-8
+                // scalar. In that case the apparent C1 introducer starts by
+                // completing the scalar, so scan the untouched tail again.
+                if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
+                    Terminal_utf8_scan_state state = *carry;
+                    if (utf8_scan_consumes_byte(
+                            static_cast<unsigned char>(bytes[candidate_start]), state))
+                    {
+                        const qsizetype tail_left = ingest_backend_output_run(
+                            sequence,
+                            bytes.sliced(candidate_start),
+                            *carry,
+                            true);
+                        reset_text_area_resize_scanner();
+                        return m_backend_output_stopped ? tail_left : 0;
+                    }
+                }
             }
             reset_text_area_resize_scanner();
             std::memcpy(
@@ -7100,7 +7126,8 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
             keep_scan_state_through(bytes.size() - left);
             return left;
         }
-        m_text_area_resize_scanner.utf8_state = scan_utf8_state;
+        m_text_area_resize_scanner.utf8_state =
+            m_screen_model->pending_utf8_scan_state().value_or(scan_utf8_state);
         if (bytes.empty()) {
             complete_processing_backend_output_side_effects();
         }
@@ -7161,7 +7188,9 @@ qsizetype Terminal_session::ingest_backend_output_run(
                         return stopped_after(sync_reset.start, left);
                     }
                     remaining = remaining.sliced(sync_reset.start);
-                    reset_utf8_scan_state(remaining_utf8_scan_state);
+                    remaining_utf8_scan_state =
+                        m_screen_model->pending_utf8_scan_state().value_or(
+                            Terminal_utf8_scan_state{});
                     continue;
                 }
 
@@ -7211,7 +7240,9 @@ qsizetype Terminal_session::ingest_backend_output_run(
                 return stopped_after(sync_set.start, left);
             }
             remaining = remaining.sliced(sync_set.start);
-            reset_utf8_scan_state(remaining_utf8_scan_state);
+            remaining_utf8_scan_state =
+                m_screen_model->pending_utf8_scan_state().value_or(
+                    Terminal_utf8_scan_state{});
             continue;
         }
 

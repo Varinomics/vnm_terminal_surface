@@ -15980,6 +15980,177 @@ bool test_resumed_macro_sixel_budget_stops_before_synchronized_segment()
     return ok;
 }
 
+bool test_macro_utf8_carry_precedes_host_control_scanners()
+{
+    bool ok = true;
+    for (const bool arbitrate_resize : {false, true}) {
+        for (const bool split_callbacks : {false, true}) {
+            term::Terminal_session_config config = arbitrate_resize
+                ? text_area_resize_arbitration_config()
+                : term::Terminal_session_config{};
+            config.backend_event_notifier = [] {};
+            std::unique_ptr<term::Terminal_session> session;
+            Scripted_backend* backend = make_session(session, config);
+            (void)session->start(launch_config_with_grid(4, 80));
+            session->process_backend_callback_events();
+
+            ok &= check(backend->emit_output(QByteArrayLiteral("\x1bP1;0;1!zD8\x1b\\")),
+                "UTF-8 carry macro definition queues");
+            session->process_backend_callback_events();
+            const QByteArray invocation = QByteArrayLiteral("\x1b[1*z");
+            const QByteArray suffix = arbitrate_resize
+                ? QByteArrayLiteral("\x9b") + QByteArrayLiteral("8;10;20tTAIL")
+                : QByteArrayLiteral("\x9b?25;2026hZ");
+            if (split_callbacks) {
+                ok &= check(backend->emit_output(invocation),
+                    "split UTF-8 carry macro invocation queues");
+                session->process_backend_callback_events();
+                ok &= check(backend->emit_output(suffix),
+                    "split UTF-8 continuation and suffix queue");
+            }
+            else {
+                ok &= check(backend->emit_output(invocation + suffix),
+                    "same-window UTF-8 carry macro and continuation queue");
+            }
+            const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+            session->process_backend_callback_events();
+            const auto snapshot = session->latest_render_snapshot();
+            const QString expected = arbitrate_resize
+                ? QStringLiteral("\u061B8;10;20tTAIL")
+                : QStringLiteral("\u061B?25;2026hZ");
+            ok &= check(snapshot.has_value() && snapshot_row_text(*snapshot, 0) == expected &&
+                    !session->synchronized_output_hold_active() &&
+                    session->backend_callbacks_settled(epoch) &&
+                    !session->has_pending_backend_callback_events(),
+                arbitrate_resize
+                    ? "macro UTF-8 continuation prints before resize scanner in both window shapes"
+                    : "macro UTF-8 continuation prints before sync scanner in both window shapes");
+            if (arbitrate_resize) {
+                ok &= check(arbitration_requests(*session).empty() &&
+                        term::grid_sizes_match(
+                            session->grid_size(), term::terminal_grid_size_t{4, 80}),
+                    "macro UTF-8 continuation does not arm a text-area resize");
+            }
+        }
+    }
+
+    for (const bool arbitrate_resize : {false, true}) {
+        term::Terminal_session_config config = arbitrate_resize
+            ? text_area_resize_arbitration_config()
+            : term::Terminal_session_config{};
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        (void)session->start(launch_config_with_grid(4, 80));
+        session->process_backend_callback_events();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1bP1;0;1!zD8\x1b\\")),
+            "incomplete-tail macro definition queues");
+        session->process_backend_callback_events();
+        const QByteArray prefix = QByteArrayLiteral("\x1b[1*z\x9b") +
+            (arbitrate_resize ? QByteArrayLiteral("8;10") : QByteArrayLiteral("?2026"));
+        ok &= check(backend->emit_output(prefix),
+            "macro invocation and apparent incomplete C1 sequence queue");
+        session->process_backend_callback_events();
+        const QByteArray suffix = arbitrate_resize
+            ? QByteArrayLiteral(";20tTAIL")
+            : QByteArrayLiteral("hZ");
+        ok &= check(backend->emit_output(suffix),
+            "apparent C1 sequence tail queues");
+        const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+        session->process_backend_callback_events();
+        const auto snapshot = session->latest_render_snapshot();
+        const QString expected = arbitrate_resize
+            ? QStringLiteral("\u061B8;10;20tTAIL")
+            : QStringLiteral("\u061B?2026hZ");
+        ok &= check(snapshot.has_value() && snapshot_row_text(*snapshot, 0) == expected &&
+                !session->synchronized_output_hold_active() &&
+                session->backend_callbacks_settled(epoch),
+            "macro UTF-8 continuation is not buffered as an incomplete C1 sequence");
+        if (arbitrate_resize) {
+            ok &= check(arbitration_requests(*session).empty(),
+                "incomplete apparent C1 resize never reaches arbitration");
+        }
+    }
+
+    for (const bool split_callbacks : {false, true}) {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        (void)session->start(launch_config_with_grid(4, 80));
+        session->process_backend_callback_events();
+        const QByteArray body = QByteArrayLiteral("\x1b]2;\xd8");
+        const QByteArray definition = QByteArrayLiteral("\x1bP1;0;1!z") +
+            body.toHex() + QByteArrayLiteral("\x1b\\");
+        ok &= check(backend->emit_output(definition),
+            "OSC UTF-8 carry macro definition queues");
+        session->process_backend_callback_events();
+        const QByteArray invocation = QByteArrayLiteral("\x1b[1*z");
+        const QByteArray suffix = QByteArrayLiteral("\x9b?25;2026hleaked\aZ");
+        if (split_callbacks) {
+            ok &= check(backend->emit_output(invocation),
+                "split OSC UTF-8 carry macro invocation queues");
+            session->process_backend_callback_events();
+            ok &= check(backend->emit_output(suffix),
+                "split OSC UTF-8 continuation queues");
+        }
+        else {
+            ok &= check(backend->emit_output(invocation + suffix),
+                "same-window OSC UTF-8 carry and continuation queue");
+        }
+        const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+        session->process_backend_callback_events();
+        const auto title = first_notification(
+            *session, term::Terminal_session_notification_kind::TITLE_CHANGED);
+        const auto snapshot = session->latest_render_snapshot();
+        ok &= check(title.has_value() &&
+                title->message == QStringLiteral("\u061B?25;2026hleaked") &&
+                snapshot.has_value() && snapshot_row_text(*snapshot, 0) == QStringLiteral("Z") &&
+                !session->synchronized_output_hold_active() &&
+                session->backend_callbacks_settled(epoch),
+            "macro OSC UTF-8 continuation stays in the title across host window shapes");
+    }
+
+    {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        (void)session->start(launch_config_with_grid(4, 80));
+        session->process_backend_callback_events();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x9b?2026h")),
+            "standalone C1 sync entry queues");
+        session->process_backend_callback_events();
+        ok &= check(session->synchronized_output_hold_active(),
+            "standalone C1 CSI still enters synchronized output");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x9b?2026lVISIBLE")),
+            "standalone C1 sync release queues");
+        session->process_backend_callback_events();
+        const auto snapshot = session->latest_render_snapshot();
+        ok &= check(!session->synchronized_output_hold_active() && snapshot.has_value() &&
+                snapshot_row_text(*snapshot, 0) == QStringLiteral("VISIBLE"),
+            "standalone C1 CSI still releases synchronized output");
+    }
+    {
+        term::Terminal_session_config config = text_area_resize_arbitration_config();
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        (void)session->start(launch_config_with_grid(4, 80));
+        session->process_backend_callback_events();
+        ok &= check(backend->emit_output(
+                QByteArrayLiteral("\x9b") + QByteArrayLiteral("8;10;20t")),
+            "standalone C1 text-area resize queues");
+        session->process_backend_callback_events();
+        const auto requests = arbitration_requests(*session);
+        ok &= check(requests.size() == 1U && requests.front().request.has_value() &&
+                term::grid_sizes_match(requests.front().request->requested_grid_size,
+                    term::terminal_grid_size_t{10, 20}),
+            "standalone C1 CSI still reaches text-area resize arbitration");
+    }
+    return ok;
+}
+
 bool test_passthrough_macro_stop_preserves_synchronized_release()
 {
     bool ok = true;
@@ -22331,6 +22502,7 @@ int main()
     ok &= test_macro_replay_yields_at_a_deadline_step();
     ok &= test_sixel_budget_stop_before_synchronized_segment();
     ok &= test_resumed_macro_sixel_budget_stops_before_synchronized_segment();
+    ok &= test_macro_utf8_carry_precedes_host_control_scanners();
     ok &= test_passthrough_macro_stop_preserves_synchronized_release();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_paused_window_stays_inside_its_command();
