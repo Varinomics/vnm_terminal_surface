@@ -6146,6 +6146,28 @@ bool test_dec_rectangular_editing()
     ok &= check(snapshot_valid(model, 113U),
         "rectangle attribute edits keep the render snapshot valid");
 
+    model = make_model(2, 8);
+    model.ingest(QByteArrayLiteral(
+        "ABCDEFGH\x1b[2;1Habcdefgh\x1b[?69h\x1b[3;6s\x1b[?6h"));
+    // VT420 DECSACE 1 selects the stream between its endpoints. DECCARA
+    // does not confine that stream to the page's horizontal margins.
+    result = model.ingest(QByteArrayLiteral("\x1b[1*x\x1b[1;2;2;2;1$r"));
+    const auto margin_stream_snapshot = model.render_snapshot(request_for_model(model, 113U));
+    bool margin_stream_extent = true;
+    for (int row = 0; row < 2; ++row) {
+        for (int column = 0; column < 8; ++column) {
+            const auto& style = margin_stream_snapshot.styles[
+                static_cast<std::size_t>(cell_at(margin_stream_snapshot, row, column).style_id)];
+            const bool expected_bold = row == 0 ? column >= 3 : column <= 3;
+            margin_stream_extent &= ((style.attributes & bold) != 0U) == expected_bold;
+        }
+    }
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("ABCDEFGH") &&
+            model.row_text(1) == QStringLiteral("abcdefgh") &&
+            margin_stream_extent,
+        "DECSACE stream crosses both DECLRMM margins after DECOM-relative endpoints");
+
     model = make_model(2, 5);
     model.ingest(QByteArrayLiteral("A") + bytes_from_hex("e7958c") +
         QByteArrayLiteral("B"));
@@ -6294,6 +6316,7 @@ bool test_dec_rectangular_editing_boundaries()
 
 bool test_dec_selective_rectangle_preserves_protected_soft_wrap()
 {
+    bool ok = true;
     auto model = make_model(2, 4);
     model.ingest(QByteArrayLiteral("\x1b[1\"qABCDEF\x1b[0\"q"));
     const auto result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;4${"));
@@ -6301,8 +6324,40 @@ bool test_dec_selective_rectangle_preserves_protected_soft_wrap()
         model.row_text(0) == QStringLiteral("ABCD") &&
         model.row_text(1) == QStringLiteral("EF");
     model.resize({2, 8});
-    return check(cells_survive && model.row_text(0) == QStringLiteral("ABCDEF"),
+    ok &= check(cells_survive && model.row_text(0) == QStringLiteral("ABCDEF"),
         "DECSERA preserves a protected row's soft wrap when no cell is erased");
+
+    const QByteArray wide = bytes_from_hex("e7958c");
+    model = make_model(2, 4);
+    model.ingest(QByteArrayLiteral("\x1b[1\"qABC") + wide +
+        QByteArrayLiteral("\x1b[0\"q"));
+    const std::uint64_t protected_generation = primary_retained_line_generation(model, 0);
+    const auto protected_result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;4${"));
+    const bool protected_content_unchanged = diagnostic_count(protected_result) == 0 &&
+        model.row_text(0) == QStringLiteral("ABC") &&
+        model.row_text(1) == QString::fromUtf8(wide) &&
+        primary_retained_line_generation(model, 0) == protected_generation;
+    ok &= check(protected_content_unchanged,
+        "DECSERA leaves early-wrapped protected cell content and generation unchanged");
+    model.resize({2, 8});
+    ok &= check(model.row_text(0) == QStringLiteral("ABC") + QString::fromUtf8(wide),
+        "DECSERA preserves an early wide-glyph soft wrap when its last cell is unchanged");
+
+    model = make_model(2, 4);
+    model.ingest(QByteArrayLiteral("\x1b[1\"qABC\x1b[0\"qX") + wide);
+    const std::uint64_t erasable_generation = primary_retained_line_generation(model, 0);
+    const auto erasable_result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;4${"));
+    const bool last_cell_erased = diagnostic_count(erasable_result) == 0 &&
+        model.row_text(0) == QStringLiteral("ABC") &&
+        model.row_text(1) == QString::fromUtf8(wide) &&
+        primary_retained_line_generation(model, 0) > erasable_generation;
+    ok &= check(last_cell_erased,
+        "DECSERA removes a real last-column cell and advances its content generation");
+    model.resize({2, 8});
+    ok &= check(model.row_text(0) == QStringLiteral("ABC") &&
+            model.row_text(1) == QString::fromUtf8(wide),
+        "DECSERA breaks the soft wrap when the last column's content is erased");
+    return ok;
 }
 
 bool test_rectangular_attribute_styled_blank_selection()

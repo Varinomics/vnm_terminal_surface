@@ -1169,8 +1169,8 @@ bool test_text_writes_and_erases_clear_image_cells()
         }
     }
 
-    // A transparent image column can retain protected text while drawn
-    // columns on either side require separate image-damage ranges.
+    // A transparent image column can retain protected text. Selective erase
+    // clears drawn pixels on both sides while deriving the row image once.
     const QByteArray gapped_data =
         "#1;2;100;0;0!10~!10?#2;2;0;100;0!10~#3;2;0;0;100!10~";
     const term::Screen_sixel_image_mutation gapped_image =
@@ -1195,7 +1195,7 @@ bool test_text_writes_and_erases_clear_image_cells()
                 after_gap_erase->pixels == expected &&
                 after_gap_erase->revision == before_gap_erase->revision + 1U &&
                 protected_gap.row_text(0) == QStringLiteral(" P"),
-            "DECSERA clears disjoint image columns once around protected text");
+            "DECSERA clears both drawn image sides once around protected text");
     }
 
     const std::vector<std::pair<const char*, QByteArray>> clearing_edits = {

@@ -6359,7 +6359,7 @@ void Terminal_screen_model::erase_rectangular_area(
             }
         }
         if (area.right == m_config.grid_size.columns - 1 &&
-            replacements.back().has_value())
+            !cells_have_same_selection_content(before_cells.back(), row.cells.back()))
         {
             row.soft_wrap_columns = 0;
         }
