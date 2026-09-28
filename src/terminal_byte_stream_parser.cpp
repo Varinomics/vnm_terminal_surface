@@ -971,24 +971,20 @@ bool parse_sgr_parameter_groups(
     return finish_group();
 }
 
-std::optional<Terminal_utf8_scan_state>
-Terminal_byte_stream_parser::pending_utf8_scan_state() const
+Terminal_utf8_scan_state
+Terminal_byte_stream_parser::utf8_scan_state_at_frontier() const
 {
-    if (m_string_family != Parser_sequence_family::NONE &&
-        m_string_utf8_scan_state.continuation_remaining > 0)
-    {
+    if (m_string_family != Parser_sequence_family::NONE) {
         return m_string_utf8_scan_state;
     }
 
     Terminal_utf8_scan_state state;
     for (const char character : m_pending_prefix) {
         if (!utf8_scan_consumes_byte(static_cast<unsigned char>(character), state)) {
-            return std::nullopt;
+            return {};
         }
     }
-    return state.continuation_remaining > 0
-        ? std::optional<Terminal_utf8_scan_state>(state)
-        : std::nullopt;
+    return state;
 }
 
 std::vector<Parser_action> Terminal_byte_stream_parser::ingest(

@@ -16207,6 +16207,109 @@ bool test_budgeted_macro_utf8_carry_precedes_released_tail_resize_scanner()
     return ok;
 }
 
+bool test_completed_macro_utf8_scalar_precedes_real_c1_resize()
+{
+    bool ok = true;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    (void)session->start(launch_config_with_grid(4, 81));
+    session->process_backend_callback_events();
+
+    const QByteArray body = QByteArray(4095, 'Q') + QByteArrayLiteral("\xd8\x9bQ");
+    const QByteArray definition = QByteArrayLiteral("\x1bP1;0;1!z") +
+        body.toHex() + QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(definition),
+        "completed-scalar macro definition queues");
+    session->process_backend_callback_events();
+
+    const QByteArray output = QByteArrayLiteral("\x1b[1*z\x9b") +
+        QByteArrayLiteral("8;10;20tTAIL");
+    ok &= check(backend->emit_output(output),
+        "budgeted macro and real C1 resize queue");
+    const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+    (void)session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    ok &= check(session->has_pending_backend_callback_events() &&
+            !session->backend_callbacks_settled(epoch),
+        "macro replay yields at its 4096-byte budget before the C1 resize");
+
+    int steps = 0;
+    while (!session->pending_text_area_resize_arbitration().has_value() &&
+           session->has_pending_backend_callback_events() && steps < 100)
+    {
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        ++steps;
+    }
+    const auto requests = arbitration_requests(*session);
+    ok &= check(steps < 100 && requests.size() == 1U &&
+            requests.front().request.has_value() &&
+            term::grid_sizes_match(requests.front().request->requested_grid_size,
+                term::terminal_grid_size_t{10, 20}),
+        "C1 CSI after the completed macro scalar requests a 10x20 resize");
+    if (requests.size() != 1U || !requests.front().request.has_value()) {
+        return false;
+    }
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+            requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+            {},
+        }).code == term::Terminal_session_result_code::ACCEPTED,
+        "completed-scalar C1 resize request settles");
+    steps = 0;
+    while (session->has_pending_backend_callback_events() && steps < 100) {
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        ++steps;
+    }
+    const auto snapshot = session->latest_render_snapshot();
+    ok &= check(steps < 100 && session->backend_callbacks_settled(epoch) &&
+            !session->has_pending_backend_callback_events() && snapshot.has_value() &&
+            snapshot_contains_text(*snapshot, QStringLiteral("\u061BQTAIL")) &&
+            arbitration_requests(*session).size() == 1U,
+        "completed scalar and settled resize tail preserve text and callback accounting");
+    return ok;
+}
+
+bool test_macro_expansion_invalidates_predicted_c1_resize()
+{
+    bool ok = true;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    (void)session->start(launch_config_with_grid(4, 80));
+    session->process_backend_callback_events();
+
+    const QByteArray first_body = QByteArrayLiteral("\x1b[2*");
+    const QByteArray first_definition = QByteArrayLiteral("\x1bP1;0;1!z") +
+        first_body.toHex() + QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(first_definition),
+        "partial-invocation macro definition queues");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1bP2;0;1!zD8\x1b\\")),
+        "UTF-8 lead macro definition queues");
+    session->process_backend_callback_events();
+
+    const QByteArray output = QByteArrayLiteral("\x1b[1*zz\x9b") +
+        QByteArrayLiteral("8;10;20tTAIL");
+    ok &= check(backend->emit_output(output),
+        "macro completion and apparent C1 resize queue");
+    const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+    session->process_backend_callback_events();
+    const auto snapshot = session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            snapshot_row_text(*snapshot, 0) == QStringLiteral("\u061B8;10;20tTAIL") &&
+            arbitration_requests(*session).empty() &&
+            !session->pending_text_area_resize_arbitration().has_value() &&
+            term::grid_sizes_match(session->grid_size(), term::terminal_grid_size_t{4, 80}) &&
+            session->backend_callbacks_settled(epoch),
+        "macro-generated UTF-8 lead reclassifies the predicted C1 as text");
+    return ok;
+}
+
 bool test_passthrough_macro_stop_preserves_synchronized_release()
 {
     bool ok = true;
@@ -22560,6 +22663,8 @@ int main()
     ok &= test_resumed_macro_sixel_budget_stops_before_synchronized_segment();
     ok &= test_macro_utf8_carry_precedes_host_control_scanners();
     ok &= test_budgeted_macro_utf8_carry_precedes_released_tail_resize_scanner();
+    ok &= test_completed_macro_utf8_scalar_precedes_real_c1_resize();
+    ok &= test_macro_expansion_invalidates_predicted_c1_resize();
     ok &= test_passthrough_macro_stop_preserves_synchronized_release();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_paused_window_stays_inside_its_command();

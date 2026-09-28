@@ -6326,21 +6326,20 @@ void Terminal_session::clear_text_area_resize_tail_epoch()
     m_text_area_resize_tail = {};
 }
 
-void Terminal_session::refresh_text_area_resize_scanner_utf8_carry()
+void Terminal_session::refresh_text_area_resize_scanner_utf8_state()
 {
     if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN &&
         m_screen_model.has_value())
     {
-        if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
-            m_text_area_resize_scanner.utf8_state = *carry;
-        }
+        m_text_area_resize_scanner.utf8_state =
+            m_screen_model->utf8_scan_state_at_frontier();
     }
 }
 
 void Terminal_session::reset_text_area_resize_scanner()
 {
     m_text_area_resize_scanner = {};
-    refresh_text_area_resize_scanner_utf8_carry();
+    refresh_text_area_resize_scanner_utf8_state();
 }
 
 void Terminal_session::begin_text_area_resize_candidate(unsigned char introducer)
@@ -6469,7 +6468,7 @@ bool Terminal_session::scan_backend_output_span(
     Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
     consumed_bytes = 0U;
     // Pending macro replay may have advanced the parser before a released tail.
-    refresh_text_area_resize_scanner_utf8_carry();
+    refresh_text_area_resize_scanner_utf8_state();
 
     const bool capability_known =
         m_config.text_area_resize_arbitration.has_value() &&
@@ -6493,19 +6492,14 @@ bool Terminal_session::scan_backend_output_span(
                 may_complete_backend_output_callback);
             if (m_backend_output_stopped) {
                 const qsizetype stop = end - left;
-                Terminal_utf8_scan_state utf8_state = plain_seed;
-                for (qsizetype offset = plain_begin; offset < stop; ++offset) {
-                    (void)utf8_scan_consumes_byte(
-                        static_cast<unsigned char>(bytes[offset]),
-                        utf8_state);
-                }
-                m_text_area_resize_scanner.state      = Text_area_resize_scan_state::PLAIN;
-                m_text_area_resize_scanner.utf8_state = utf8_state;
+                m_text_area_resize_scanner.state = Text_area_resize_scan_state::PLAIN;
+                refresh_text_area_resize_scanner_utf8_state();
                 plain_begin = stop;
                 return false;
             }
         }
         plain_begin = end;
+        refresh_text_area_resize_scanner_utf8_state();
         plain_seed  = m_text_area_resize_scanner.utf8_state;
         return true;
     };
@@ -6569,6 +6563,11 @@ bool Terminal_session::scan_backend_output_span(
                 if (!flush_plain(offset)) {
                     consumed_bytes = static_cast<std::size_t>(plain_begin);
                     return false;
+                }
+                // The plain prefix may replay a macro and change this byte's role.
+                if (utf8_scan_consumes_byte(byte, scanner.utf8_state)) {
+                    ++offset;
+                    continue;
                 }
                 begin_text_area_resize_candidate(byte);
                 ++offset;
@@ -6967,7 +6966,7 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
     std::size_t    available_bytes)
 {
     Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
-    refresh_text_area_resize_scanner_utf8_carry();
+    refresh_text_area_resize_scanner_utf8_state();
     const bool capability_known =
         m_config.text_area_resize_arbitration.has_value() &&
         m_config.text_area_resize_arbitration->version ==
@@ -6983,33 +6982,6 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
         bool candidate_embedded_c0 = false;
         bool parameters_empty       = true;
         bool private_parameters     = false;
-
-        // Where the model stopped, the scan state is the one after the bytes
-        // it took. It stops only inside sixel data, where a scan that is
-        // not plain would turn plain with a fresh decoding state at the next
-        // byte anyway.
-        const auto keep_scan_state_through = [&](qsizetype consumed) {
-            Terminal_utf8_scan_state state = utf8_seed;
-            Text_area_resize_scan_state kind = Text_area_resize_scan_state::PLAIN;
-            for (qsizetype offset = 0; offset < consumed; ++offset) {
-                const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
-                if (kind == Text_area_resize_scan_state::PLAIN &&
-                    utf8_scan_consumes_byte(byte, state))
-                {
-                    continue;
-                }
-                if (byte == 0x1bU || byte == 0x9bU) {
-                    kind = Text_area_resize_scan_state::ESCAPE;
-                    reset_utf8_scan_state(state);
-                    continue;
-                }
-                kind = Text_area_resize_scan_state::PLAIN;
-            }
-            if (kind != Text_area_resize_scan_state::PLAIN) {
-                reset_utf8_scan_state(state);
-            }
-            m_text_area_resize_scanner.utf8_state = state;
-        };
 
         for (qsizetype offset = 0; offset < bytes.size(); ++offset) {
             const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
@@ -7092,25 +7064,25 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
                     utf8_seed,
                     false);
                 if (m_backend_output_stopped) {
-                    keep_scan_state_through(candidate_start - left);
+                    refresh_text_area_resize_scanner_utf8_state();
                     return left + (bytes.size() - candidate_start);
                 }
                 // A macro in the parsed prefix may have started a UTF-8
                 // scalar. In that case the apparent C1 introducer starts by
                 // completing the scalar, so scan the untouched tail again.
-                if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
-                    Terminal_utf8_scan_state state = *carry;
-                    if (utf8_scan_consumes_byte(
-                            static_cast<unsigned char>(bytes[candidate_start]), state))
-                    {
-                        const qsizetype tail_left = ingest_backend_output_run(
-                            sequence,
-                            bytes.sliced(candidate_start),
-                            *carry,
-                            true);
-                        reset_text_area_resize_scanner();
-                        return m_backend_output_stopped ? tail_left : 0;
-                    }
+                const Terminal_utf8_scan_state parser_seed =
+                    m_screen_model->utf8_scan_state_at_frontier();
+                Terminal_utf8_scan_state state = parser_seed;
+                if (utf8_scan_consumes_byte(
+                        static_cast<unsigned char>(bytes[candidate_start]), state))
+                {
+                    const qsizetype tail_left = ingest_backend_output_run(
+                        sequence,
+                        bytes.sliced(candidate_start),
+                        parser_seed,
+                        true);
+                    reset_text_area_resize_scanner();
+                    return m_backend_output_stopped ? tail_left : 0;
                 }
             }
             reset_text_area_resize_scanner();
@@ -7128,11 +7100,11 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
 
         const qsizetype left = ingest_backend_output_run(sequence, bytes, utf8_seed, true);
         if (m_backend_output_stopped) {
-            keep_scan_state_through(bytes.size() - left);
+            refresh_text_area_resize_scanner_utf8_state();
             return left;
         }
         m_text_area_resize_scanner.utf8_state =
-            m_screen_model->pending_utf8_scan_state().value_or(scan_utf8_state);
+            m_screen_model->utf8_scan_state_at_frontier();
         if (bytes.empty()) {
             complete_processing_backend_output_side_effects();
         }
@@ -7194,8 +7166,7 @@ qsizetype Terminal_session::ingest_backend_output_run(
                     }
                     remaining = remaining.sliced(sync_reset.start);
                     remaining_utf8_scan_state =
-                        m_screen_model->pending_utf8_scan_state().value_or(
-                            Terminal_utf8_scan_state{});
+                        m_screen_model->utf8_scan_state_at_frontier();
                     continue;
                 }
 
@@ -7246,8 +7217,7 @@ qsizetype Terminal_session::ingest_backend_output_run(
             }
             remaining = remaining.sliced(sync_set.start);
             remaining_utf8_scan_state =
-                m_screen_model->pending_utf8_scan_state().value_or(
-                    Terminal_utf8_scan_state{});
+                m_screen_model->utf8_scan_state_at_frontier();
             continue;
         }
 

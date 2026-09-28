@@ -751,7 +751,7 @@ private:
         Terminal_text_area_resize_arbitration_event event);
     void observe_text_area_resize_arbitration_storage();
 
-    void refresh_text_area_resize_scanner_utf8_carry();
+    void refresh_text_area_resize_scanner_utf8_state();
     void reset_text_area_resize_scanner();
     void begin_text_area_resize_candidate(unsigned char introducer);
     bool append_text_area_resize_candidate_byte(unsigned char byte);

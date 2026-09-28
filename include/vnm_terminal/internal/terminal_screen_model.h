@@ -642,9 +642,9 @@ public:
     {
         return m_sixel_placement.has_value() || m_parser.macro_work_pending();
     }
-    std::optional<Terminal_utf8_scan_state> pending_utf8_scan_state() const
+    Terminal_utf8_scan_state utf8_scan_state_at_frontier() const
     {
-        return m_parser.pending_utf8_scan_state();
+        return m_parser.utf8_scan_state_at_frontier();
     }
 
     // A placement waits either unstarted, with the screen as it was, or
