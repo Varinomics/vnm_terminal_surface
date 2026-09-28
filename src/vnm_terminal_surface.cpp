@@ -2584,6 +2584,8 @@ struct VNM_TerminalSurface::Private
         std::uint64_t                   session_generation = 0U;
         term::Terminal_mouse_event_kind kind =
             term::Terminal_mouse_event_kind::PRESS;
+        term::Terminal_mouse_button     button =
+            term::Terminal_mouse_button::NONE;
         QByteArray                      bytes;
         term::terminal_grid_position_t  position;
         std::uint64_t                   admission_id = 0U;
@@ -2639,6 +2641,7 @@ struct VNM_TerminalSurface::Private
 
     Pending_published_mouse_report pending_published_mouse_report(
         term::Terminal_mouse_event_kind               kind,
+        term::Terminal_mouse_button                   button,
         const Published_mouse_report_write_result&    encoded)
     {
         Q_ASSERT(session != nullptr);
@@ -2648,6 +2651,7 @@ struct VNM_TerminalSurface::Private
             session.get(),
             session_generation,
             kind,
+            button,
             encoded.bytes,
             *encoded.position,
             ++next_mouse_report_admission_id,
@@ -2671,7 +2675,11 @@ struct VNM_TerminalSurface::Private
                 return candidate.admission_id == report.admission_id;
             });
         if (queued == pending_published_mouse_reports.end()) {
-            // A reentrant newer input already resolved this report.
+            // Reentrant input or cancellation retired this report. A removed
+            // press must not restore a canceled held-button gesture.
+            if (report.kind == term::Terminal_mouse_event_kind::PRESS) {
+                return std::nullopt;
+            }
             return Published_mouse_report_attempt{
                 Published_mouse_report_attempt_status::WRITTEN, std::nullopt, report.position};
         }
@@ -2682,8 +2690,16 @@ struct VNM_TerminalSurface::Private
                 Published_mouse_report_attempt_status::CALLBACKS_PENDING, std::nullopt, report.position};
         }
         auto attempt = try_write_pending_published_mouse_report(report);
-        if (attempt.status != Published_mouse_report_attempt_status::CALLBACKS_PENDING) {
+        const bool still_front =
+            !pending_published_mouse_reports.empty() &&
+            pending_published_mouse_reports.front().admission_id == report.admission_id;
+        if (attempt.status != Published_mouse_report_attempt_status::CALLBACKS_PENDING &&
+            still_front)
+        {
             pending_published_mouse_reports.pop_front();
+        }
+        if (report.kind == term::Terminal_mouse_event_kind::PRESS && !still_front) {
+            return std::nullopt;
         }
         return attempt;
     }
@@ -2790,6 +2806,11 @@ struct VNM_TerminalSurface::Private
                 return false;
             }
 
+            if (pending_published_mouse_reports.empty() ||
+                pending_published_mouse_reports.front().admission_id != report.admission_id)
+            {
+                continue;
+            }
             pending_published_mouse_reports.pop_front();
             if (attempt.status == Published_mouse_report_attempt_status::WRITTEN) {
                 surface.sync_from_session();
@@ -2851,6 +2872,32 @@ struct VNM_TerminalSurface::Private
             handle_pending_published_mouse_report_invalidated(report);
         }
         pending_published_mouse_reports.clear();
+    }
+
+    void cancel_pending_published_mouse_presses()
+    {
+        std::vector<term::Terminal_mouse_button> canceled_buttons;
+        std::deque<Pending_published_mouse_report> retained;
+        for (Pending_published_mouse_report& report : pending_published_mouse_reports) {
+            const bool press_pending =
+                report.kind == term::Terminal_mouse_event_kind::PRESS;
+            const bool matches_pending_press =
+                std::find(canceled_buttons.begin(), canceled_buttons.end(),
+                    report.button) != canceled_buttons.end();
+            if (press_pending) {
+                if (!matches_pending_press) {
+                    canceled_buttons.push_back(report.button);
+                }
+                continue;
+            }
+            if (report.kind == term::Terminal_mouse_event_kind::RELEASE &&
+                matches_pending_press)
+            {
+                continue;
+            }
+            retained.push_back(std::move(report));
+        }
+        pending_published_mouse_reports = std::move(retained);
     }
 
     void clear_selection_drag_state()
@@ -4844,7 +4891,7 @@ void VNM_TerminalSurface::cancel_pointer_gesture()
         return;
     }
 
-    m_private->clear_pending_published_mouse_reports();
+    m_private->cancel_pending_published_mouse_presses();
     m_private->clear_mouse_reporting_state();
     m_private->clear_hyperlink_activation_state();
 
@@ -5842,6 +5889,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         if (encoded.encoded) {
             report = m_private->pending_published_mouse_report(
                 term::Terminal_mouse_event_kind::PRESS,
+                button,
                 encoded);
         }
 
@@ -6695,6 +6743,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
     if (encoded.encoded) {
         report = m_private->pending_published_mouse_report(
             term::Terminal_mouse_event_kind::RELEASE,
+            button,
             encoded);
     }
 
