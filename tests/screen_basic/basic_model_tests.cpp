@@ -2106,6 +2106,40 @@ bool test_dec_stored_macros()
         "macro expands before later bytes in the same write");
 
     model = make_model(3, 20);
+    result = model.ingest(define(1, 0, 0, QByteArray::fromHex("c2a0c3bf")) +
+        invoke(1) + 'X');
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QString::fromUtf8("\xc2\xa0\xc3\xbfX"),
+        "literal macro accepts GR bytes including A0 and BF");
+
+    model = make_model(3, 20);
+    model.ingest(define(1, 0, 0, QByteArrayLiteral("O")));
+    QByteArray rejected_c1(1, static_cast<char>(0x9f));
+    result = model.ingest(define(1, 0, 0, rejected_c1) + invoke(1));
+    ok &= check(model.row_text(0) == QStringLiteral("O"),
+        "literal macro rejects C1 bytes and preserves its previous definition");
+    result = model.ingest(define(1, 0, 0, QByteArray::fromHex("e282ac")) + invoke(1));
+    ok &= check(model.row_text(0) == QStringLiteral("OO"),
+        "a UTF-8 character containing C1 continuation bytes rejects the definition");
+
+    model = make_model(3, 20);
+    QByteArray formatting = QByteArrayLiteral("A");
+    for (unsigned int byte = 0x08U; byte <= 0x0dU; ++byte) {
+        formatting.append(static_cast<char>(byte));
+    }
+    result = model.ingest(define(1, 0, 0, formatting + 'B') + invoke(1));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("AB"),
+        "literal macro strips formatting bytes 08 through 0D before storage");
+
+    model = make_model(3, 20);
+    result = model.ingest(define(1, 0, 0, QByteArray(1, static_cast<char>(0xff))) +
+        invoke(1) + 'X');
+    ok &= check(diagnostic_count(result) == 1 &&
+            model.row_text(0) == QStringLiteral("\ufffdX"),
+        "literal macro accepts FF, then ordinary UTF-8 parsing replaces it");
+
+    model = make_model(3, 20);
     const QByteArray styled_text = QByteArrayLiteral("\x1b[31mA");
     result = model.ingest(define(2, 0, 1, styled_text.toHex()) + invoke(2) + 'B');
     ok &= check(diagnostic_count(result) == 0 &&
@@ -2128,6 +2162,12 @@ bool test_dec_stored_macros()
     ok &= check(diagnostic_count(result) == 0 &&
             model.row_text(0) == QStringLiteral("AAAB"),
         "hex macro repeat expands the specified byte sequence");
+
+    model = make_model(3, 20);
+    result = model.ingest(define(3, 0, 1, QByteArrayLiteral("!6144;;41")) + invoke(3));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("A"),
+        "empty hex repetition consumes no stored bytes and later hex data remains");
 
     model = make_model(3, 20);
     const QByteArray null_macro_input =

@@ -15863,6 +15863,98 @@ bool test_macro_replay_yields_at_a_deadline_step()
     return ok;
 }
 
+bool test_sixel_budget_stop_before_synchronized_segment()
+{
+    bool ok = true;
+    for (const bool from_macro : {false, true}) {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        session->set_cell_pixel_size({10, 20});
+        (void)session->start(launch_config_with_grid(4, 80));
+        session->process_backend_callback_events();
+        session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+
+        const QByteArray image_start = QByteArrayLiteral("\x1bPq#1~");
+        if (from_macro) {
+            const QByteArray definition = QByteArrayLiteral("\x1bP1;0;1!z") +
+                image_start.toHex() + QByteArrayLiteral("\x1b\\");
+            ok &= check(backend->emit_output(definition),
+                "sixel sync-boundary macro definition queues");
+            session->process_backend_callback_events();
+        }
+        const QByteArray output =
+            (from_macro ? QByteArrayLiteral("\x1b[1*z") : image_start) +
+            QByteArrayLiteral("\x1b[?2026hPRE\x1b[?2026lAFTER");
+        ok &= check(backend->emit_output(output),
+            "sixel sync-boundary output queues");
+        const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        int steps = 0;
+        while (session->has_pending_backend_callback_events() && steps < 100) {
+            (void)session->process_backend_callback_events_for(
+                std::chrono::steady_clock::duration::zero());
+            ++steps;
+        }
+        const auto snapshot = session->latest_render_snapshot();
+        ok &= check(steps > 0 && steps < 100 &&
+                session->backend_callbacks_settled(epoch) &&
+                !session->has_pending_backend_callback_events() &&
+                snapshot.has_value() &&
+                snapshot_contains_text(*snapshot, QStringLiteral("PREAFTER")),
+            from_macro
+                ? "macro sixel budget stop preserves the following sync segment and callback"
+                : "host sixel budget stop preserves the following sync segment and callback");
+    }
+    return ok;
+}
+
+bool test_passthrough_macro_stop_preserves_synchronized_release()
+{
+    bool ok = true;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    (void)session->start(launch_config_with_grid(4, 80));
+    session->process_backend_callback_events();
+
+    const QByteArray definition = QByteArrayLiteral("\x1bP1;0;0!z") +
+        QByteArray(6000, 'Q') + QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(definition),
+        "passthrough macro definition queues");
+    session->process_backend_callback_events();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "passthrough fixture enters synchronized output");
+    session->process_backend_callback_events();
+
+    QByteArray output = QByteArrayLiteral("\x1b[");
+    output.append(QByteArray(4094, '\0'));
+    output += QByteArrayLiteral("1*z\x1b[?2026lAFTER");
+    ok &= check(backend->emit_output(output),
+        "oversized CSI macro invocation and sync release queue");
+    const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+    int steps = 0;
+    while (session->has_pending_backend_callback_events() && steps < 100) {
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        ++steps;
+    }
+    const auto snapshot = session->latest_render_snapshot();
+    ok &= check(steps > 1 && steps < 100 &&
+            session->backend_callbacks_settled(epoch) &&
+            !session->has_pending_backend_callback_events() &&
+            !session->synchronized_output_hold_active() &&
+            snapshot.has_value() &&
+            snapshot_contains_text(*snapshot, QStringLiteral("AFTER")),
+        "passthrough DECINVM stop resumes its macro before the held release");
+    return ok;
+}
+
 // Rows [first, first + count) of a snapshot either all carry an image or none
 // do: a published snapshot never shows part of an image.
 bool snapshot_image_rows_whole(
@@ -22168,6 +22260,8 @@ int main()
     ok &= test_macro_replay_resumes_after_last_host_byte();
     ok &= test_macro_expansion_limit_spans_one_output_command();
     ok &= test_macro_replay_yields_at_a_deadline_step();
+    ok &= test_sixel_budget_stop_before_synchronized_segment();
+    ok &= test_passthrough_macro_stop_preserves_synchronized_release();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_paused_window_stays_inside_its_command();
     ok &= test_settle_with_a_reply_before_a_heavy_image_stays_asynchronous();

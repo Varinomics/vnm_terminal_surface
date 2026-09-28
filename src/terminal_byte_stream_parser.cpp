@@ -1442,6 +1442,9 @@ void Terminal_byte_stream_parser::continue_sixel_string(
             &m_string_utf8_scan_state);
         offset += taken;
         if (offset == bytes.size()) {
+            // The next source may begin with a separately rewritten sequence.
+            // Yield at this byte even when no source bytes remain in this call.
+            m_sixel_work_deferred = budget_spent();
             return;
         }
         if (taken > 0 && budget_spent()) {

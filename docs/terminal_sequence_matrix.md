@@ -128,7 +128,7 @@ sequence: DCS Pid ; Pdt ; Pen ! z data ST
 feature: DEC stored macro definition
 status: supported
 action_category: parser-state-mutation
-behavior: IDs 0-63; Pdt 0 or omitted replaces that ID and 1 clears all definitions before storing the new one; Pen 0 or omitted stores graphic bytes, and 1 decodes hex pairs with optional ! Pn ; hex-pairs ; repeats; omitted Pid and repeat count are zero and one respectively; invalid parameters or malformed data leave the previous store unchanged; replayed bytes enter the ordinary parser and host-request path; definitions are session-local, survive DECSTR, and are cleared by RIS even though broader RIS screen behavior remains unsupported
+behavior: IDs 0-63; Pdt 0 or omitted replaces that ID and 1 clears all definitions before storing the new one; Pen 0 or omitted stores literal bytes 0x20-0x7E and 0xA0-0xFF, rejecting other bytes except formatting bytes 0x08-0x0D, which are stripped before storage; a UTF-8 character with a continuation byte in 0x80-0x9F therefore rejects the definition; Pen 1 decodes hex pairs with optional ! Pn ; hex-pairs ; repeats; omitted Pid and repeat count are zero and one respectively; invalid parameters or malformed data leave the previous store unchanged; replayed bytes enter the ordinary parser and host-request path, but do not pass through session-level synchronized-output entry handling or text-area resize arbitration; definitions are session-local, survive DECSTR, and are cleared by RIS even though broader RIS screen behavior remains unsupported
 host_policy: replayed host requests use their normal policy
 payload_limit: 1048576 raw DCS bytes; 6144 decoded stored bytes across all macro IDs
 recovery: incomplete definitions wait for ST; CAN and SUB cancel, and another ESC abandons a definition unless it forms ST
@@ -144,9 +144,9 @@ sequence: CSI Pid * z
 feature: DEC stored macro invocation
 status: supported
 action_category: parser-input-expansion
-behavior: substitutes the stored bytes before later host bytes in the same write; missing IDs are ignored; nested invocations are supported, active-ID recursion is rejected, and total expanded bytes in one backend output command are capped at 1048576; deadline drains replay at most 4096 macro bytes per step; effects persist after replay
+behavior: substitutes the stored bytes before later host bytes in the same write; missing IDs are ignored; nested invocations are supported, active-ID recursion is rejected, and total expanded bytes in one admitted backend-output operation, including any released held tail, are capped at 1048576; deadline drains replay at most 4096 macro bytes per step; effects persist after replay
 host_policy: replayed host requests use their normal policy
-payload_limit: 1048576 expanded bytes per backend output command
+payload_limit: 1048576 expanded bytes per admitted backend-output operation
 recovery: invalid ID or recursion emits a diagnostic and later input continues
 reply: no-reply
 diagnostic: malformed ID, recursive invocation, or expansion limit diagnostic
@@ -816,7 +816,7 @@ sequence: DECSET/DECRST ?2026
 feature: synchronized output
 status: supported
 action_category: mode-mutation
-behavior: coalesces snapshot publication only; parser and screen still mutate
+behavior: coalesces snapshot publication only; parser and screen still mutate; direct host bytes receive session entry-boundary publication and policy capture, while a macro-replayed DECSET enters synchronized mode in the model without that session entry-boundary handling
 host_policy: render invalidation throttling policy applies
 payload_limit: none
 recovery: timeout or DECRST exits synchronized output with diagnostic if stale

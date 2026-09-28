@@ -6500,7 +6500,7 @@ bool Terminal_session::scan_backend_output_span(
     const auto ingest_passthrough_byte = [this, sequence](
         unsigned char byte,
         bool          decline_request,
-        bool          may_complete_backend_output_callback)
+        bool          may_complete_backend_output_callback) -> qsizetype
     {
         const char encoded = static_cast<char>(byte);
         const QByteArrayView one_byte(&encoded, 1);
@@ -6512,14 +6512,14 @@ bool Terminal_session::scan_backend_output_span(
             Text_area_resize_policy_scope declined(
                 *m_screen_model,
                 m_config.text_area_resize_policy);
-            ingest_backend_output_run(
+            return ingest_backend_output_run(
                 sequence,
                 one_byte,
                 utf8_seed,
                 may_complete_backend_output_callback);
         }
         else {
-            ingest_backend_output_run(
+            return ingest_backend_output_run(
                 sequence,
                 one_byte,
                 utf8_seed,
@@ -6527,10 +6527,9 @@ bool Terminal_session::scan_backend_output_span(
         }
     };
 
-    // A candidate the model stops in ends the scan as a plain span does. The
-    // model stops in one only after its ESC, inside sixel data or once an
-    // image has ended, so what it left are the input bytes from end - left
-    // on, where end follows the candidate's last byte.
+    // A candidate the model stops in ends the scan as a plain span does.
+    // What it left are the input bytes from end - left on, where end follows
+    // the candidate's last byte. A passthrough CSI can stop on DECINVM too.
     const auto stop_in_candidate = [this, &consumed_bytes](qsizetype end, qsizetype left) {
         Q_ASSERT(left <= end);
         reset_text_area_resize_scanner();
@@ -6596,10 +6595,14 @@ bool Terminal_session::scan_backend_output_span(
                 scanner.state != Text_area_resize_scan_state::PASSTHROUGH_ESCAPE &&
                 scanner.state != Text_area_resize_scan_state::PASSTHROUGH_INTERMEDIATES &&
                 scanned_text_area_resize_request(byte, requested_grid_size);
-            ingest_passthrough_byte(
+            const qsizetype left = ingest_passthrough_byte(
                 byte,
                 scanner.decline_passthrough_request && recognized_request,
                 !tail_already_owned && offset + 1 == bytes.size());
+            if (m_backend_output_stopped) {
+                stop_in_candidate(offset + 1, left);
+                return false;
+            }
 
             if (scanner.state == Text_area_resize_scan_state::PASSTHROUGH_ESCAPE) {
                 if (byte == '[') {

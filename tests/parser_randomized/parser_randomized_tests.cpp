@@ -67,6 +67,7 @@ struct Test_case
     int                               expected_diagnostic_count = -1;
     int                               expected_reply_count = -1;
     bool                              compare_actions = false;
+    bool                              use_macro_replay_allowance = false;
     bool                              exhaustive_byte_chunks = true;
     bool                              has_large_payload_limit_boundaries = false;
     std::size_t                       large_payload_introducer_size = 0U;
@@ -1428,9 +1429,16 @@ bool run_with_budget(
         int steps = 0;
         do {
             term::Sixel_work_budget budget(step_units());
+            std::size_t macro_replay_bytes_remaining =
+                test_case.use_macro_replay_allowance
+                    ? 1U + static_cast<std::size_t>(rng.bounded(7))
+                    : 0U;
+            std::size_t* allowance = test_case.use_macro_replay_allowance
+                ? &macro_replay_bytes_remaining
+                : nullptr;
             result = model.sixel_placement_pending()
-                ? model.ingest({}, nullptr, &budget)
-                : model.ingest(chunk, nullptr, &budget);
+                ? model.ingest({}, nullptr, &budget, allowance)
+                : model.ingest(chunk, nullptr, &budget, allowance);
             collect(result);
             chunk = chunk.sliced(result.consumed_bytes);
             ++steps;
@@ -2529,8 +2537,8 @@ void append_dcs_cases(std::vector<Test_case>& cases)
         "generated_sixel_c1_image", c1_image, {}, 0xd4a2687f1e05b93cULL));
 
     // DECDMAC is buffered through ST, and an invoked macro is fed back into
-    // the same parser before later host bytes. This compares every chunking
-    // plan and Sixel budget against one unsplit model run.
+    // the same parser before later host bytes. Replay allowances cut inside
+    // UTF-8, CSI and Sixel data under every chunking plan and Sixel budget.
     {
         const QByteArray inner = QByteArrayLiteral("\x1b[1*zY");
         const QByteArray image = QByteArrayLiteral("\x1bPq#1~\x1b\\");
@@ -2538,11 +2546,12 @@ void append_dcs_cases(std::vector<Test_case>& cases)
         test_case.name = "generated_dec_macro_nested_sixel_budget_resume";
         test_case.config = {term::terminal_grid_size_t{3, 12}, 4, 4};
         test_case.config.cell_pixel_size = term::terminal_cell_pixel_size_t{10, 20};
-        test_case.bytes = QByteArrayLiteral("A\x1bP1;0;0!zX\x1b\\") +
+        test_case.bytes = QByteArrayLiteral("A\x1bP1;0;1!zc3a9\x1b\\") +
             QByteArrayLiteral("\x1bP2;0;1!z") + inner.toHex() + QByteArrayLiteral("\x1b\\") +
             QByteArrayLiteral("\x1bP3;0;1!z") + image.toHex() + QByteArrayLiteral("\x1b\\") +
             QByteArrayLiteral("\x1b[2*z\x1b[3*zB");
         test_case.chunk_seed = 0x23a4701c9158d4e6ULL;
+        test_case.use_macro_replay_allowance = true;
         test_case.expected_reply_count = 0;
         set_expected_diagnostics(test_case, {});
         cases.push_back(std::move(test_case));
