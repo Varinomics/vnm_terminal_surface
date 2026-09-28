@@ -1092,8 +1092,8 @@ void Terminal_screen_model::apply_control_sequence(
             return;
         }
         if (sequence.final_bytes == QByteArrayLiteral("E")) {
-            carriage_return();
             line_feed();
+            carriage_return();
             return;
         }
         if (sequence.final_bytes == QByteArrayLiteral("M")) {
@@ -8125,6 +8125,7 @@ void Terminal_screen_model::wrap_line()
     Terminal_screen_row& row = active_grid_rows()[(std::size_t)m_cursor.row];
     int soft_wrap_columns    = m_pending_wrap ? cursor_right_margin() + 1 : m_cursor.column;
     if (row.image_slice != nullptr || wraps_onto_image_row ||
+        cursor_left_margin() != 0 ||
         (m_cursor.column >= active_left_margin() &&
          m_cursor.column <= active_right_margin() &&
          (active_left_margin() != 0 ||
@@ -8133,8 +8134,8 @@ void Terminal_screen_model::wrap_line()
         soft_wrap_columns = 0;
     }
     row.soft_wrap_columns = soft_wrap_columns;
-    carriage_return();
     advance_row();
+    carriage_return();
 }
 
 void Terminal_screen_model::advance_row()
@@ -8781,8 +8782,8 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_w
 
 // ICH and DCH move a row's cells from from_column on by `shift` columns, to
 // the right when positive, and the image moves with them (S1). Image columns
-// the shift pushes past the right margin, or that DCH deletes, are lost; so
-// are moving columns already past the margin, as no cell carries them in.
+// pushed past the right margin, or deleted by DCH, are lost. Columns outside
+// the edited range stay on their row, including those past a narrowed grid.
 // Like image_slice_without_cells, this computes the row's new image, null when
 // none is left, and leaves the row alone.
 std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_shifted(

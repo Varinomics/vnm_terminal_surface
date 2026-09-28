@@ -5842,6 +5842,42 @@ bool test_horizontal_margin_editing_and_cursor()
 bool test_horizontal_margin_wrap_and_reset()
 {
     bool ok = true;
+    for (const int left : {0, 3}) {
+        const QByteArray margins = QByteArrayLiteral("\x1b[?69h\x1b[") +
+            QByteArray::number(left + 1) + QByteArrayLiteral(";6s");
+        const QByteArray rows = QByteArrayLiteral(
+            "aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc");
+        auto next_line_at_bottom = make_model(3, 10);
+        next_line_at_bottom.ingest(rows + margins +
+            QByteArrayLiteral("\x1b[3;8H\x1b" "E" "X"));
+        const QString expected_nel = left == 0
+            ? QStringLiteral("Xccccccccc") : QStringLiteral("cccXcccccc");
+        ok &= check(next_line_at_bottom.row_text(0) == QStringLiteral("aaaaaaaaaa") &&
+                next_line_at_bottom.row_text(1) == QStringLiteral("bbbbbbbbbb") &&
+                next_line_at_bottom.row_text(2) == expected_nel &&
+                next_line_at_bottom.scrollback_size() == 0,
+            "NEL from right of the margin on its bottom row leaves the rectangle alone");
+
+        auto wrap_at_bottom = make_model(3, 10);
+        wrap_at_bottom.ingest(rows + margins + QByteArrayLiteral("\x1b[3;8HXYZW"));
+        const QString expected_wrap = left == 0
+            ? QStringLiteral("WccccccXYZ") : QStringLiteral("cccWcccXYZ");
+        ok &= check(wrap_at_bottom.row_text(0) == QStringLiteral("aaaaaaaaaa") &&
+                wrap_at_bottom.row_text(1) == QStringLiteral("bbbbbbbbbb") &&
+                wrap_at_bottom.row_text(2) == expected_wrap &&
+                wrap_at_bottom.scrollback_size() == 0,
+            "autowrap from right of the margin on its bottom row leaves the rectangle alone");
+    }
+
+    auto outside_wrap_reflow = make_model(3, 10);
+    outside_wrap_reflow.ingest(QByteArrayLiteral(
+        "\x1b[?69h\x1b[4;6s\x1b[2;1Habc\x1b[1;8HXYZW"));
+    outside_wrap_reflow.ingest(QByteArrayLiteral("\x1b[?69l"));
+    outside_wrap_reflow.resize({3, 20});
+    ok &= check(!outside_wrap_reflow.row_text(0).contains(QStringLiteral("abc")) &&
+            outside_wrap_reflow.row_text(1).contains(QStringLiteral("abcW")),
+        "a wrap into an interior left margin does not splice unrelated cells into reflow");
+
     auto outside_left = make_model(3, 10);
     outside_left.ingest(QByteArrayLiteral(
         "\x1b[?69h\x1b[4;6s\x1b[1;1HABCDEFGHIJ"));

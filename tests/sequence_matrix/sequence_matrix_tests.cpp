@@ -287,6 +287,7 @@ const std::set<std::string>& required_sequence_ids()
         "csi-scroll-down",
         "dec-horizontal-margin-mode",
         "dec-horizontal-margins",
+        "csi-insert-delete-character",
         "dec-horizontal-column-editing",
         "dec-horizontal-index",
         "csi-xtsmgraphics",

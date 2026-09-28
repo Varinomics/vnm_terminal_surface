@@ -2050,6 +2050,41 @@ bool test_rectangular_scroll_keeps_off_grid_image_columns_on_their_row()
     return ok;
 }
 
+bool test_character_edits_keep_off_grid_image_columns_stationary()
+{
+    bool ok = true;
+    const auto drawn_at = [](const term::Terminal_screen_model& model, int column) {
+        const auto slice = slice_at(model, 0);
+        if (slice == nullptr) {
+            return false;
+        }
+        const int pixel_x = (column - slice->first_column) * k_cell.width;
+        return pixel_x >= 0 && pixel_x < slice->pixels.width() &&
+            slice->pixels.pixelColor(pixel_x, 0).alpha() != 0;
+    };
+
+    auto inserted = make_model(3, 20);
+    inserted.ingest(cursor_to(0, 12) + sixel("9;1", solid_rows(80, 1)));
+    inserted.resize({3, 10});
+    ok &= check(drawn_at(inserted, 12) && drawn_at(inserted, 19),
+        "narrowing retains the image wholly past the visible grid");
+    inserted.ingest(cursor_to(0, 0) + QByteArrayLiteral("\x1b[@"));
+    inserted.resize({3, 20});
+    ok &= check(drawn_at(inserted, 12) && drawn_at(inserted, 19),
+        "ICH leaves an image wholly past the narrowed grid stationary");
+
+    auto deleted = make_model(3, 20);
+    deleted.ingest(cursor_to(0, 5) + sixel("9;1", solid_rows(100, 1)));
+    deleted.resize({3, 10});
+    deleted.ingest(cursor_to(0, 3) + QByteArrayLiteral("\x1b[2P"));
+    deleted.resize({3, 20});
+    ok &= check(drawn_at(deleted, 3) && drawn_at(deleted, 7) &&
+            !drawn_at(deleted, 8) && !drawn_at(deleted, 9) &&
+            drawn_at(deleted, 10) && drawn_at(deleted, 14),
+        "DCH shifts visible image columns but keeps the off-grid tail stationary");
+    return ok;
+}
+
 bool test_budgeted_rectangular_sixel_scroll_moves_one_region_per_step()
 {
     constexpr int rows = 20;
@@ -2126,6 +2161,7 @@ int main()
     bool ok = true;
     ok &= test_horizontal_margins_preserve_outside_sixel_cells();
     ok &= test_rectangular_scroll_keeps_off_grid_image_columns_on_their_row();
+    ok &= test_character_edits_keep_off_grid_image_columns_stationary();
     ok &= test_budgeted_rectangular_sixel_scroll_moves_one_region_per_step();
     ok &= test_sixel_placement_respects_horizontal_margins();
     ok &= test_horizontal_scroll_over_cap_keeps_stationary_image();
