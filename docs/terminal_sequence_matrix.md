@@ -816,7 +816,7 @@ sequence: DECSET/DECRST ?2026
 feature: synchronized output
 status: supported
 action_category: mode-mutation
-behavior: coalesces snapshot publication only; parser and screen still mutate; direct host bytes receive session entry-boundary publication and policy capture, while a macro-replayed DECSET enters synchronized mode in the model without that session entry-boundary handling
+behavior: coalesces snapshot publication only; parser and screen still mutate; canonical direct-host DECSET ?2026 boundaries recognized by the session receive entry-boundary publication and policy capture, while a macro-replayed DECSET or a parser-valid variant bypassing the session boundary enters synchronized mode in the model without that session entry-boundary handling
 host_policy: render invalidation throttling policy applies
 payload_limit: none
 recovery: timeout or DECRST exits synchronized output with diagnostic if stale

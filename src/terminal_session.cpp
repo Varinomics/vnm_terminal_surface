@@ -6096,7 +6096,7 @@ bool Terminal_session::advance_pending_parser_work(std::uint64_t sequence)
         flush_deferred_backend_content_snapshot();
     }
     (void)ingest_backend_output_segment(sequence, QByteArrayView{}, false);
-    return !m_screen_model->parser_work_pending();
+    return !m_backend_output_stopped && !m_screen_model->parser_work_pending();
 }
 
 bool Terminal_session::text_area_resize_arbitration_armable() const
@@ -7139,9 +7139,9 @@ qsizetype Terminal_session::ingest_backend_output_run(
     QByteArrayView           remaining(bytes);
     Terminal_utf8_scan_state remaining_utf8_scan_state = utf8_seed;
     // When the model stops in a segment, the run stops too. What it left is
-    // the end of that segment and everything after it in remaining, which
-    // are the run's last bytes: a rewritten synchronized-output sequence
-    // holds no sixel data, so the model never stops in one.
+    // the end of that segment and everything after it in remaining. Pending
+    // parser work yields the step before a rewritten synchronized-output
+    // sequence is entered.
     const auto stopped_after = [&](qsizetype segment_size, qsizetype left) {
         return left + (remaining.size() - segment_size);
     };

@@ -816,8 +816,8 @@ private:
         QByteArrayView             bytes,
         bool                       completes_backend_output_callback = false);
 
-    // Continues the sixel placement the head operation's last step left
-    // waiting; true once none waits.
+    // Continues pending sixel placement or stored-macro replay from the head
+    // operation; true once the work has completed without stopping this step.
     bool advance_pending_parser_work(std::uint64_t sequence);
 
     void defer_backend_content_snapshot(

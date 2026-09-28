@@ -15911,6 +15911,75 @@ bool test_sixel_budget_stop_before_synchronized_segment()
     return ok;
 }
 
+bool test_resumed_macro_sixel_budget_stops_before_synchronized_segment()
+{
+    bool ok = true;
+    for (const bool production_budget : {false, true}) {
+        term::Terminal_session_config config;
+        config.backend_event_notifier = [] {};
+        if (production_budget) {
+            config.synchronized_output_scroll_policy =
+                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+        }
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        session->set_cell_pixel_size({10, 20});
+        (void)session->start(launch_config_with_grid(4, 80));
+        session->process_backend_callback_events();
+        if (!production_budget) {
+            session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+        }
+
+        const QByteArray body = production_budget
+            ? QByteArray(4100, 'Q') + QByteArrayLiteral("\x1bPq\"1;1;1448;1448#")
+            : QByteArrayLiteral("\x1bPq#1~~");
+        const QByteArray definition = QByteArrayLiteral("\x1bP1;0;1!z") +
+            body.toHex() + QByteArrayLiteral("\x1b\\");
+        ok &= check(backend->emit_output(definition),
+            "resumed Sixel macro definition queues");
+        session->process_backend_callback_events();
+        if (production_budget) {
+            ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+                "production-budget fixture enters synchronized output");
+            session->process_backend_callback_events();
+            ok &= check(session->synchronized_output_hold_active(),
+                "production-budget fixture holds output before the macro");
+        }
+
+        const QByteArray output = QByteArrayLiteral("\x1b[1*z") +
+            (production_budget
+                ? QByteArrayLiteral("\x1b[?2026lAFTER")
+                : QByteArrayLiteral("\x1b[?2026hPRE\x1b[?2026lAFTER"));
+        ok &= check(backend->emit_output(output),
+            "resumed macro and synchronized-output boundary queue");
+        const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        ok &= check(!session->backend_callbacks_settled(epoch) &&
+                session->has_pending_backend_callback_events(),
+            "macro replay leaves the source and callback pending after its first step");
+
+        int steps = 1;
+        while (session->has_pending_backend_callback_events() && steps < 100) {
+            (void)session->process_backend_callback_events_for(
+                std::chrono::steady_clock::duration::zero());
+            ++steps;
+        }
+        const auto snapshot = session->latest_render_snapshot();
+        ok &= check(steps > 1 && steps < 100 &&
+                session->backend_callbacks_settled(epoch) &&
+                !session->has_pending_backend_callback_events() &&
+                !session->synchronized_output_hold_active() &&
+                snapshot.has_value() &&
+                snapshot_contains_text(*snapshot,
+                    production_budget ? QStringLiteral("AFTER") : QStringLiteral("PREAFTER")),
+            production_budget
+                ? "production-budget resumed macro preserves the sync release and callback"
+                : "unit-budget resumed macro preserves the sync entry and callback");
+    }
+    return ok;
+}
+
 bool test_passthrough_macro_stop_preserves_synchronized_release()
 {
     bool ok = true;
@@ -22261,6 +22330,7 @@ int main()
     ok &= test_macro_expansion_limit_spans_one_output_command();
     ok &= test_macro_replay_yields_at_a_deadline_step();
     ok &= test_sixel_budget_stop_before_synchronized_segment();
+    ok &= test_resumed_macro_sixel_budget_stops_before_synchronized_segment();
     ok &= test_passthrough_macro_stop_preserves_synchronized_release();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_paused_window_stays_inside_its_command();
