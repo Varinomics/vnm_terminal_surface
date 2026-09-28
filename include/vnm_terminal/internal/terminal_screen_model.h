@@ -955,10 +955,11 @@ private:
     {
         terminal_grid_position_t       position;
         Terminal_text_style            style;
-        Terminal_style_id              style_id     = k_default_terminal_style_id;
-        bool                           pending_wrap = false;
-        bool                           origin_mode  = false;
-        bool                           valid        = false;
+        Terminal_style_id              style_id            = k_default_terminal_style_id;
+        bool                           pending_wrap        = false;
+        bool                           origin_mode         = false;
+        bool                           character_protected = false;
+        bool                           valid               = false;
     };
 
     struct screen_buffer_state_t
@@ -1536,6 +1537,9 @@ private:
         const Terminal_screen_row&     row,
         int                            first_column,
         int                            end_column);
+    std::shared_ptr<const Terminal_image_slice> image_slice_without_cells(
+        const Terminal_screen_row&               row,
+        std::span<const std::pair<int, int>>     column_ranges);
 
     std::shared_ptr<const Terminal_image_slice> image_slice_shifted(
         const Terminal_screen_row&     row,

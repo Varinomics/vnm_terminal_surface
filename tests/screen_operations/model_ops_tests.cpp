@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <new>
@@ -6129,17 +6130,113 @@ bool test_dec_rectangular_editing()
             (*retained_after_resize)[1].protected_cell &&
             (*retained_after_resize)[2].protected_cell &&
             (*retained_after_resize)[4].protected_cell,
-        "protected history decodes after grid reflow");
+        "retained history protection is unchanged by active-grid resize");
 
-    model = make_model(2, 5);
+    model = make_model(3, 3);
+    model.ingest(QByteArrayLiteral("\x1b[1\"qA") + bytes_from_hex("e7958c") +
+        QByteArrayLiteral("BC\x1b[0\"q"));
+    model.resize({3, 7});
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;5${"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("A") +
+                QString::fromUtf8(bytes_from_hex("e7958c")) + QStringLiteral("BC") &&
+            snapshot_valid(model, 117U),
+        "protected soft-wrapped text survives flatten-and-rewrap selective erase");
+
+    model = make_model(2, 1);
     model.ingest(QByteArrayLiteral("\x1b[1\"q") + bytes_from_hex("e7958c") +
         QByteArrayLiteral("\x1b[0\"q"));
-    model.resize({2, 7});
+    model.resize({2, 3});
     result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;2${"));
+    const auto clipped_snapshot = model.render_snapshot(request_for_model(model, 118U));
     ok &= check(diagnostic_count(result) == 0 &&
-            model.row_text(0).startsWith(QString::fromUtf8(bytes_from_hex("e7958c"))) &&
-            snapshot_valid(model, 117U),
-        "protected wide glyph remains selective-erase safe after active-grid reflow");
+            model.row_text(0) == QString::fromUtf8(bytes_from_hex("e7958c")) &&
+            cell_at(clipped_snapshot, 0, 1).wide_continuation &&
+            snapshot_valid(model, 119U),
+        "clipped protected wide glyph synthesizes a protected continuation during reflow");
+
+    return ok;
+}
+
+bool test_dec_rectangular_editing_boundaries()
+{
+    bool ok = true;
+    const QByteArray wide = bytes_from_hex("e7958c");
+
+    for (int source_column : {2, 3}) {
+        term::Terminal_screen_model model = make_model(2, 6);
+        model.ingest(QByteArrayLiteral("A") + wide + QByteArrayLiteral("BCD\x1b[2;1Huvwxyz"));
+        const QByteArray copy = QByteArrayLiteral("\x1b[1;") +
+            QByteArray::number(source_column) + QByteArrayLiteral(";1;") +
+            QByteArray::number(source_column) + QByteArrayLiteral(";1;2;2;1$v");
+        const auto result = model.ingest(copy);
+        ok &= check(diagnostic_count(result) == 0 &&
+                model.row_text(1) == QStringLiteral("u wxyz") &&
+                snapshot_valid(model, 118U + static_cast<std::uint64_t>(source_column)),
+            "DECCRA clips a split source wide glyph without changing cells outside the destination");
+
+        bool scrolled = true;
+        try {
+            model.ingest(QByteArrayLiteral("\x1b[2;1H\n\n"));
+        }
+        catch (const std::exception&) {
+            scrolled = false;
+        }
+        ok &= check(scrolled && model.scrollback_size() == 2,
+            "DECCRA split-wide destination encodes into retained history");
+    }
+
+    for (int character : {160, 173, 255}) {
+        term::Terminal_screen_model model = make_model(2, 4);
+        const QByteArray fill = QByteArrayLiteral("\x1b[") + QByteArray::number(character) +
+            QByteArrayLiteral(";1;1;1;1$x");
+        const auto result = model.ingest(fill);
+        ok &= check(diagnostic_count(result) == 0 &&
+                model.row_text(0) == (character == 173
+                    ? QString{} : QString(QChar(static_cast<ushort>(character)))) &&
+                snapshot_valid(model, 123U),
+            "DECFRA accepts only single-column fill characters");
+
+        bool scrolled = true;
+        try {
+            model.ingest(QByteArrayLiteral("\x1b[2;1H\n"));
+        }
+        catch (const std::exception&) {
+            scrolled = false;
+        }
+        ok &= check(scrolled && model.scrollback_size() == 1,
+            "DECFRA output encodes into retained history");
+    }
+
+    term::Terminal_screen_model model = make_model(2, 8);
+    model.ingest(QByteArrayLiteral("abcdefgh\x1b[?69h\x1b[3;6s\x1b[?6h"));
+    auto result = model.ingest(QByteArrayLiteral("\x1b[88;1;1;1;1$x"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("abXdefgh"),
+        "DECOM and DECLRMM make rectangle columns relative to the left margin");
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;1;1;1;2;1$v"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("abXXefgh"),
+        "DECCRA destination column is relative to the left margin");
+    result = model.ingest(QByteArrayLiteral("\x1b[89;1;99;1;99$x"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("abXXeYgh"),
+        "origin-relative rectangle columns clamp at the right margin");
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;1;1;1;99;1$v"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("abXXeXgh"),
+        "origin-relative DECCRA destination clamps at the right margin");
+    result = model.ingest(QByteArrayLiteral("\x1b[?6l\x1b[90;1;1;1;1$x"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("ZbXXeXgh"),
+        "DECLRMM alone leaves rectangle columns page-relative");
+
+    model = make_model(1, 4);
+    model.ingest(QByteArrayLiteral("\x1b[1\"q\x1b" "7\x1b[0\"q\x1b" "8P"));
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;1${"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.row_text(0) == QStringLiteral("P"),
+        "DECRC restores the DECSCA selective-erase attribute saved by DECSC");
 
     return ok;
 }
@@ -6158,10 +6255,12 @@ bool test_rectangular_attribute_styled_blank_selection()
         const auto result = model.ingest(sequence);
         const auto after = model.selection_line_leases(
             term::Terminal_buffer_id::PRIMARY, range);
+        const auto snapshot = model.render_snapshot(request_for_model(model, 124U));
+        const term::Terminal_render_cell* styled_blank = cell_at_or_null(snapshot, 0, 1);
         ok &= check(diagnostic_count(result) == 0 &&
-                model.row_text(0) == QStringLiteral("A B") &&
-                model.selected_text(range).text == QStringLiteral("A B"),
-            "rectangular attributes keep an interior styled blank in copied text");
+                styled_blank != nullptr &&
+                styled_blank->text == QStringLiteral(" "),
+            "rectangular attributes materialize an occupied styled blank");
         ok &= check(before.size() == 1U && after.size() == 1U &&
                 after.front().history_handle.content_generation ==
                     before.front().history_handle.content_generation + 1U &&
@@ -6189,6 +6288,7 @@ int main()
     ok &= test_resize_wrap_boundaries_cursor_and_history();
     ok &= test_cmd_wrapped_output_resize_trace();
     ok &= test_dec_rectangular_editing();
+    ok &= test_dec_rectangular_editing_boundaries();
     ok &= test_rectangular_attribute_styled_blank_selection();
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();

@@ -1308,6 +1308,9 @@ void Terminal_screen_model::apply_control_sequence(
             {
                 return;
             }
+            if (width_for_codepoint(static_cast<std::uint32_t>(character)).cells != 1) {
+                return;
+            }
             fill_rectangular_area(*area, QChar(static_cast<ushort>(character)));
             return;
         }
@@ -6189,16 +6192,19 @@ Terminal_screen_model::rectangular_area(int top, int left, int bottom, int right
 {
     const int last_row = m_origin_mode ? m_scroll_bottom - m_scroll_top + 1
                                        : m_config.grid_size.rows;
-    const int last_column = m_config.grid_size.columns;
+    const bool margin_relative_columns = m_origin_mode && m_horizontal_margin_mode;
+    const int  column_origin           = margin_relative_columns ? m_scroll_left : 0;
+    const int  last_column             = margin_relative_columns
+        ? m_scroll_right - m_scroll_left + 1 : m_config.grid_size.columns;
     if (top > bottom || left > right) {
         return std::nullopt;
     }
 
     rectangular_area_t area;
     area.top    = std::clamp(top,    1, last_row)    - 1 + (m_origin_mode ? m_scroll_top : 0);
-    area.left   = std::clamp(left,   1, last_column) - 1;
+    area.left   = std::clamp(left,   1, last_column) - 1 + column_origin;
     area.bottom = std::clamp(bottom, 1, last_row)    - 1 + (m_origin_mode ? m_scroll_top : 0);
-    area.right  = std::clamp(right,  1, last_column) - 1;
+    area.right  = std::clamp(right,  1, last_column) - 1 + column_origin;
     return area;
 }
 
@@ -6211,11 +6217,17 @@ void Terminal_screen_model::copy_rectangular_area(
                                        : m_config.grid_size.rows;
     const int target_top = std::clamp(destination_top, 1, last_row) - 1 +
         (m_origin_mode ? m_scroll_top : 0);
-    const int target_left = std::clamp(destination_left, 1, m_config.grid_size.columns) - 1;
+    const bool margin_relative_columns = m_origin_mode && m_horizontal_margin_mode;
+    const int  column_origin           = margin_relative_columns ? m_scroll_left : 0;
+    const int  last_column             = margin_relative_columns
+        ? m_scroll_right - m_scroll_left + 1 : m_config.grid_size.columns;
+    const int target_left =
+        std::clamp(destination_left, 1, last_column) - 1 + column_origin;
     const int copy_rows = std::min(source.bottom - source.top + 1,
         (m_origin_mode ? m_scroll_bottom : m_config.grid_size.rows - 1) - target_top + 1);
     const int copy_columns = std::min(source.right - source.left + 1,
-        m_config.grid_size.columns - target_left);
+        (margin_relative_columns ? m_scroll_right : m_config.grid_size.columns - 1) -
+            target_left + 1);
 
     // Capture before writing so overlapping copies behave as a single move.
     std::vector<std::vector<Cell>> source_cells;
@@ -6243,6 +6255,7 @@ void Terminal_screen_model::copy_rectangular_area(
         std::copy(source_cells[static_cast<std::size_t>(offset)].begin(),
                   source_cells[static_cast<std::size_t>(offset)].end(),
                   row.cells.begin() + target_left);
+        repair_horizontal_margin_boundaries(row, target_left, end_column);
         repair_wide_spans_in_row(row.cells, m_config.grid_size.columns);
         if (end_column == m_config.grid_size.columns) {
             row.soft_wrap_columns = 0;
@@ -6296,6 +6309,7 @@ void Terminal_screen_model::erase_rectangular_area(
         const std::vector<Cell> before_cells = row.cells;
         std::vector<std::optional<Cell>> replacements(
             static_cast<std::size_t>(area.right - area.left + 1));
+        std::vector<std::pair<int, int>> image_damage;
         for (int column = area.left; column <= area.right; ++column) {
             int base = column;
             if (before_cells[static_cast<std::size_t>(column)].wide_continuation) {
@@ -6319,8 +6333,16 @@ void Terminal_screen_model::erase_rectangular_area(
             const int end_column = std::min(m_config.grid_size.columns,
                 base + std::max(1,
                     before_cells[static_cast<std::size_t>(base)].display_width));
-            row.image_slice = image_slice_without_cells(row, base, end_column);
+            if (row.image_slice != nullptr) {
+                if (!image_damage.empty() && base <= image_damage.back().second) {
+                    image_damage.back().second = std::max(image_damage.back().second, end_column);
+                }
+                else {
+                    image_damage.emplace_back(base, end_column);
+                }
+            }
         }
+        row.image_slice = image_slice_without_cells(row, image_damage);
         for (int column = area.left; column <= area.right; ++column) {
             if (replacements[static_cast<std::size_t>(column - area.left)].has_value()) {
                 clear_cell_at_content(row, column);
@@ -7111,12 +7133,13 @@ bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
 
 void Terminal_screen_model::save_cursor()
 {
-    m_saved_cursor.position     = m_cursor;
-    m_saved_cursor.style        = m_current_style;
-    m_saved_cursor.style_id     = m_current_style_id;
-    m_saved_cursor.pending_wrap = m_pending_wrap;
-    m_saved_cursor.origin_mode  = m_origin_mode;
-    m_saved_cursor.valid        = true;
+    m_saved_cursor.position            = m_cursor;
+    m_saved_cursor.style               = m_current_style;
+    m_saved_cursor.style_id            = m_current_style_id;
+    m_saved_cursor.pending_wrap        = m_pending_wrap;
+    m_saved_cursor.origin_mode         = m_origin_mode;
+    m_saved_cursor.character_protected = m_character_protected;
+    m_saved_cursor.valid               = true;
 }
 
 void Terminal_screen_model::restore_cursor()
@@ -7127,16 +7150,17 @@ void Terminal_screen_model::restore_cursor()
 
     mark_cursor_dirty();
     const bool previous_origin_mode = m_origin_mode;
-    m_cursor.row        = std::clamp(m_saved_cursor.position.row, 0, m_config.grid_size.rows - 1);
-    m_cursor.column     = std::clamp(
+    m_cursor.row          = std::clamp(m_saved_cursor.position.row, 0, m_config.grid_size.rows - 1);
+    m_cursor.column       = std::clamp(
         m_saved_cursor.position.column,
         0,
         m_config.grid_size.columns - 1);
-    m_current_style     = m_saved_cursor.style;
-    m_current_style_id  = m_saved_cursor.style_id;
-    m_pending_wrap      = m_saved_cursor.pending_wrap;
-    m_origin_mode       = m_saved_cursor.origin_mode;
-    m_modes.origin_mode = m_origin_mode;
+    m_current_style       = m_saved_cursor.style;
+    m_current_style_id    = m_saved_cursor.style_id;
+    m_pending_wrap        = m_saved_cursor.pending_wrap;
+    m_origin_mode         = m_saved_cursor.origin_mode;
+    m_character_protected = m_saved_cursor.character_protected;
+    m_modes.origin_mode   = m_origin_mode;
     if (m_origin_mode != previous_origin_mode) {
         mark_mode_state_changed();
     }
@@ -8695,6 +8719,14 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_w
     int                        first_column,
     int                        end_column)
 {
+    const std::array<std::pair<int, int>, 1> column_ranges{{{first_column, end_column}}};
+    return image_slice_without_cells(row, column_ranges);
+}
+
+std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_without_cells(
+    const Terminal_screen_row&           row,
+    std::span<const std::pair<int, int>> column_ranges)
+{
     if (row.image_slice == nullptr) {
         return nullptr;
     }
@@ -8702,11 +8734,21 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_w
     const int                        slice_first_column = row.image_slice->first_column;
     const terminal_cell_pixel_size_t slice_cell         = row.image_slice->cell_pixel_size;
     const QImage&                    slice_pixels       = row.image_slice->pixels;
-    const int x_first = std::max(0, (first_column - slice_first_column) * slice_cell.width);
-    const int x_end   = std::min(
-        slice_pixels.width(),
-        (end_column - slice_first_column) * slice_cell.width);
-    if (x_first >= x_end || !image_block_has_drawn_pixel(slice_pixels, x_first, x_end)) {
+    const auto pixel_range = [&](const std::pair<int, int>& columns) {
+        return std::pair{
+            std::max(0, (columns.first - slice_first_column) * slice_cell.width),
+            std::min(slice_pixels.width(),
+                (columns.second - slice_first_column) * slice_cell.width),
+        };
+    };
+    const bool has_drawn_damage = std::any_of(
+        column_ranges.begin(), column_ranges.end(),
+        [&](const std::pair<int, int>& columns) {
+            const auto [x_first, x_end] = pixel_range(columns);
+            return x_first < x_end &&
+                image_block_has_drawn_pixel(slice_pixels, x_first, x_end);
+        });
+    if (!has_drawn_damage) {
         return row.image_slice;
     }
 
@@ -8715,9 +8757,15 @@ std::shared_ptr<const Terminal_image_slice> Terminal_screen_model::image_slice_w
     if (pixels.isNull()) {
         throw std::bad_alloc();
     }
-    for (int y = 0; y < pixels.height(); ++y) {
-        auto* line = reinterpret_cast<std::uint32_t*>(pixels.scanLine(y));
-        std::fill(line + x_first, line + x_end, 0U);
+    for (const std::pair<int, int>& columns : column_ranges) {
+        const auto [x_first, x_end] = pixel_range(columns);
+        if (x_first >= x_end) {
+            continue;
+        }
+        for (int y = 0; y < pixels.height(); ++y) {
+            auto* line = reinterpret_cast<std::uint32_t*>(pixels.scanLine(y));
+            std::fill(line + x_first, line + x_end, 0U);
+        }
     }
 
     return image_block_has_drawn_pixel(pixels, 0, pixels.width())

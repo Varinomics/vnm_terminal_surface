@@ -1120,6 +1120,7 @@ bool test_text_writes_and_erases_clear_image_cells()
         QByteArray  edit;
         int         first_cell;
         int         end_cell;
+        bool        one_image_revision = false;
     };
 
     const std::vector<Edit_case> cases = {
@@ -1134,11 +1135,11 @@ bool test_text_writes_and_erases_clear_image_cells()
         {"ECH clears the image under the erased cells",
             cursor_to(0, 4) + "\x1b[3X", 4, 7},
         {"DECERA clears the image under rectangular cells",
-            "\x1b[1;3;1;4$z", 2, 4},
+            "\x1b[1;3;1;4$z", 2, 4, true},
         {"DECFRA clears the image under filled cells",
             "\x1b[88;1;5;1;6$x", 4, 6},
         {"DECSERA clears the image under erasable cells",
-            "\x1b[1;7;1;8${", 6, 8},
+            "\x1b[1;7;1;8${", 6, 8, true},
         {"DECCRA clears the image at copied destination cells",
             "\x1b[1;1;1;2;1;1;9;1$v", 8, 10},
         {"ED 0 clears the image from the cursor on",
@@ -1162,6 +1163,10 @@ bool test_text_writes_and_erases_clear_image_cells()
             edit_case.name);
         ok &= check(slice != nullptr && slice->revision > revision_before,
             "an edited row image is a new slice with a new revision");
+        if (edit_case.one_image_revision) {
+            ok &= check(slice != nullptr && slice->revision == revision_before + 1U,
+                "rectangular erase derives the row image once");
+        }
     }
 
     const std::vector<std::pair<const char*, QByteArray>> clearing_edits = {
