@@ -1230,7 +1230,6 @@ private:
         terminal_grid_size_t           grid_size,
         bool                           guard_primary_repaint_recovery);
 
-    void reset_scroll_region();
     void reset_tab_stops();
 
     void put_scalar(
@@ -1491,6 +1490,7 @@ private:
         int                        aspect                  = 1;
         int                        width                   = 0;
         int                        height                  = 0;
+        int                        end_column              = 0;
         bool                       display_mode            = false;
         bool                       started                 = false;
         bool                       bands_done              = false;
@@ -1520,6 +1520,7 @@ private:
         int                            band_top,
         int                            row,
         int                            first_column,
+        int                            end_column,
         terminal_cell_pixel_size_t     cell);
 
     std::shared_ptr<const Terminal_image_slice> make_image_slice(

@@ -5209,17 +5209,6 @@ void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)
     }
 }
 
-void Terminal_screen_model::reset_scroll_region()
-{
-    m_scroll_top        = 0;
-    m_scroll_bottom     = m_config.grid_size.rows - 1;
-    m_scroll_left       = 0;
-    m_scroll_right      = m_config.grid_size.columns - 1;
-    m_horizontal_margin_mode = false;
-    m_origin_mode       = false;
-    m_modes.origin_mode = false;
-}
-
 void Terminal_screen_model::reset_tab_stops()
 {
     m_tab_stops = default_tab_stops(m_config.grid_size.columns);
@@ -6441,7 +6430,7 @@ void Terminal_screen_model::finalize_row_cell_mutation(
 {
     repair_horizontal_margin_boundaries(
         screen_row,
-        active_left_margin(),
+        m_cursor.column,
         active_right_margin() + 1);
     repair_wide_spans_in_row(screen_row.cells, m_config.grid_size.columns);
 
@@ -6509,6 +6498,7 @@ void Terminal_screen_model::delete_cells(int count)
         erase_cell_at({m_cursor.row, column});
     }
     clear_wide_continuation_boundary(row, m_cursor.column + count);
+    clear_wide_continuation_boundary(row, end_column);
 
     std::move(
         row.begin() + m_cursor.column + count,
@@ -7381,6 +7371,9 @@ void Terminal_screen_model::shift_columns(int first_column, int count, bool inse
         };
         clear_split_source_span(first_column);
         clear_split_source_span(insert ? end_column - count : first_column + count);
+        if (!insert) {
+            clear_split_source_span(end_column);
+        }
         if (insert) {
             std::move_backward(
                 cells.begin() + first_column,
@@ -7401,7 +7394,7 @@ void Terminal_screen_model::shift_columns(int first_column, int count, bool inse
                 cells.begin() + end_column,
                 Cell{});
         }
-        repair_horizontal_margin_boundaries(screen_row, left, end_column);
+        repair_horizontal_margin_boundaries(screen_row, first_column, end_column);
         repair_wide_spans_in_row(cells, m_config.grid_size.columns);
         screen_row.image_slice = std::move(image);
         screen_row.soft_wrap_columns = 0;
@@ -8176,9 +8169,13 @@ void Terminal_screen_model::place_sixel_image(
         return;
     }
 
-    // With DECSDM reset the image starts at the cursor. As in OpenConsole, an
-    // image that would start below the bottom margin is dropped whole.
-    if (!m_sixel_display_mode && m_cursor.row > m_scroll_bottom) {
+    // With DECSDM reset the image starts at the cursor. OpenConsole drops an
+    // image whose origin is outside the scrolling rectangle.
+    if (!m_sixel_display_mode &&
+        (m_cursor.row > m_scroll_bottom ||
+         m_cursor.column < active_left_margin() ||
+         m_cursor.column > active_right_margin()))
+    {
         return;
     }
 
@@ -8198,6 +8195,8 @@ void Terminal_screen_model::place_sixel_image(
     placement.cell           = cell;
     placement.display_mode   = m_sixel_display_mode;
     placement.origin         = m_sixel_display_mode ? terminal_grid_position_t{0, 0} : m_cursor;
+    placement.end_column     = m_sixel_display_mode
+        ? m_config.grid_size.columns : active_right_margin() + 1;
     placement.decoded_aspect = image.pixel_aspect_ratio;
     placement.aspect         = static_cast<int>(std::clamp<std::int64_t>(
         aspect_rows * cell.height / 6,
@@ -8284,7 +8283,7 @@ std::uint64_t Terminal_screen_model::sixel_band_cost(
 {
     const std::int64_t band_width = std::min<std::int64_t>(
         placement.width,
-        static_cast<std::int64_t>(m_config.grid_size.columns - placement.origin.column) *
+        static_cast<std::int64_t>(placement.end_column - placement.origin.column) *
             placement.cell.width);
     const std::int64_t band_height = std::min<std::int64_t>(
         placement.cell.height,
@@ -8310,7 +8309,7 @@ std::uint64_t Terminal_screen_model::sixel_composite_cost(
 
     const std::int64_t band_width = std::min<std::int64_t>(
         placement.width,
-        static_cast<std::int64_t>(m_config.grid_size.columns - placement.origin.column) *
+        static_cast<std::int64_t>(placement.end_column - placement.origin.column) *
             placement.cell.width);
     const std::int64_t band_columns =
         (band_width + placement.cell.width - 1) / placement.cell.width;
@@ -8341,7 +8340,14 @@ std::uint64_t Terminal_screen_model::sixel_scroll_cost() const
             static_cast<std::uint64_t>(m_config.cell_pixel_size->width) *
             static_cast<std::uint64_t>(m_config.cell_pixel_size->height)
         : 0U;
-    return k_sixel_scroll_step_units + region_rows * k_sixel_scroll_row_units + row_image_pixels;
+    const bool rectangular = active_left_margin() != 0 ||
+        active_right_margin() != m_config.grid_size.columns - 1;
+    // A rectangular row may copy its stationary image, split the source
+    // image twice, then composite the two parts into one slice.
+    const std::uint64_t image_copy_pixels = rectangular
+        ? 4U * region_rows * row_image_pixels : row_image_pixels;
+    return k_sixel_scroll_step_units + region_rows * k_sixel_scroll_row_units +
+        image_copy_pixels;
 }
 
 bool Terminal_screen_model::advance_sixel_placement(std::vector<Parser_action>& generated_actions)
@@ -8408,6 +8414,7 @@ bool Terminal_screen_model::advance_sixel_placement(std::vector<Parser_action>& 
                 band * cell.height,
                 static_cast<int>(row),
                 placement.origin.column,
+                placement.end_column,
                 cell));
         ++placement.next_band;
     }
@@ -8469,13 +8476,14 @@ std::size_t Terminal_screen_model::place_image_band(
     int                        band_top,
     int                        row,
     int                        first_column,
+    int                        end_column,
     terminal_cell_pixel_size_t cell)
 {
     // Clip at the right margin, and copy the band out of the decoder's raster,
     // which may be a view keeping a larger capacity buffer alive.
     const int band_width = static_cast<int>(std::min<std::int64_t>(
         raster.width(),
-        static_cast<std::int64_t>(m_config.grid_size.columns - first_column) * cell.width));
+        static_cast<std::int64_t>(end_column - first_column) * cell.width));
     const int band_height = std::min(cell.height, raster.height() - band_top);
 
     // The band is laid out as the slice it may become, so its columns come

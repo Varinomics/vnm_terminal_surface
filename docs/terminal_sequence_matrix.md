@@ -960,7 +960,7 @@ sequence: DECSLRM / CSI Pl ; Pr s
 feature: left and right scrolling margins
 status: supported
 action_category: screen-mutation
-behavior: while mode 69 is set, a valid pair of margins at least two columns wide confines scrolling and column edits; the cursor homes, and DECOM makes cursor addressing relative to their left border; with mode 69 reset, parameterless CSI s saves the cursor; if moving Sixel pixels and stationary outside-margin pixels would exceed the decoded-image cap in one row slice, the stationary pixels remain and the moving pixels are dropped
+behavior: while mode 69 is set, a valid pair of margins at least two columns wide confines scrolling and column edits; the cursor homes, and DECOM makes cursor addressing relative to their left border; with mode 69 reset, parameterless CSI s saves the cursor; with DECSDM reset, a Sixel image whose origin is inside the horizontal margins clips at the right margin and scrolls only the margin rectangle, while an image whose origin is outside them is discarded; if moving Sixel pixels and stationary outside-margin pixels would exceed the decoded-image cap in one row slice, the stationary pixels remain and the moving pixels are dropped
 host_policy: grid resize restores page-border margins
 payload_limit: none
 recovery: invalid margin pair leaves the current margins unchanged

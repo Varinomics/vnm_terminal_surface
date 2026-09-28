@@ -5869,10 +5869,15 @@ bool test_horizontal_margin_wrap_and_reset()
             reply_at(set_replies, 0U).wire_bytes == QByteArrayLiteral("\x1b[?69;1$y"),
         "DECRQM reports horizontal margin mode set");
     model.resize({3, 10});
-    model.ingest(QByteArrayLiteral("\x1b[1;1H"));
+    result = model.ingest(QByteArrayLiteral("\x1b[?69$p"));
+    const auto resized_replies = replies_in(result);
+    ok &= check(resized_replies.size() == 1U &&
+            reply_at(resized_replies, 0U).wire_bytes == QByteArrayLiteral("\x1b[?69;1$y"),
+        "resize keeps horizontal margin mode set");
+    model.ingest(QByteArrayLiteral("\x1b[?6h\x1b[1;1H"));
     ok &= check(model.cursor_position().column == 0 &&
             snapshot_valid(model, 152U),
-        "resize restores full-width horizontal margins while keeping mode 69 active");
+        "resize restores full-width margins for DECOM addressing");
 
     model.ingest(QByteArrayLiteral("\x1b[2;6s\x1b[?1049h\x1b[3;7s\x1b[?69l\x1b[?1049l"));
     model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[?6h\x1b[1;1H"));
@@ -5914,6 +5919,35 @@ bool test_horizontal_margin_wide_cell_boundary()
                 !snapshot_row_text(snapshot, 0).contains(QString::fromUtf8("\xe7\x95\x8c")) &&
                 snapshot_row_text(snapshot, 0).endsWith(QChar(u'h')),
             "DEC column editing clears a wide glyph split at its edit boundary");
+    }
+
+    const std::array<QByteArray, 3> right_boundary_deletes{
+        QByteArrayLiteral("\x1b[P"),
+        QByteArrayLiteral("\x1b['~"),
+        QByteArrayLiteral("\x1b" "9")};
+    for (std::size_t edit_index = 0; edit_index < right_boundary_deletes.size(); ++edit_index) {
+        auto columns = make_model(2, 8);
+        columns.ingest(QByteArray("abcde\xe7\x95\x8c" "h\x1b[?69h\x1b[2;6s"
+            "\x1b[1;") + QByteArray::number(edit_index == 2U ? 6 : 2) +
+            QByteArrayLiteral("H") + right_boundary_deletes[edit_index]);
+        ok &= check(snapshot_valid(columns, 156U) &&
+                !columns.row_text(0).contains(QString::fromUtf8("\xe7\x95\x8c")) &&
+                columns.row_text(0).endsWith(QChar(u'h')),
+            "deleting at a right-margin wide glyph preserves complete cells and outside text");
+    }
+
+    for (const QByteArray& edit : {
+        QByteArrayLiteral("\x1b[@"),
+        QByteArrayLiteral("\x1b[P"),
+        QByteArrayLiteral("\x1b['}"),
+        QByteArrayLiteral("\x1b['~")})
+    {
+        auto columns = make_model(2, 8);
+        columns.ingest(QByteArray("a\xe7\x95\x8c" "cdefg\x1b[?69h\x1b[3;7s"
+            "\x1b[1;5H") + edit);
+        ok &= check(snapshot_valid(columns, 157U) &&
+                columns.row_text(0).startsWith(QString::fromUtf8("a\xe7\x95\x8c")),
+            "an interior column edit preserves a wide glyph across the untouched left margin");
     }
     return ok;
 }

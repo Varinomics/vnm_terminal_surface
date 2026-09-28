@@ -1998,6 +1998,28 @@ bool test_horizontal_margins_preserve_outside_sixel_cells()
     return ok;
 }
 
+bool test_sixel_placement_respects_horizontal_margins()
+{
+    bool ok = true;
+    const QByteArray image = sixel("9;1", solid_rows(200, 10));
+    auto inside = make_model(4, 30);
+    inside.ingest(QByteArrayLiteral("\x1b[?69h\x1b[1;10s") + cursor_to(3, 0) + image);
+    for (int row = 1; row <= 3; ++row) {
+        const auto slice = slice_at(inside, row);
+        ok &= check(slice != nullptr && slice->first_column == 0 &&
+                slice->pixels.width() == 10 * k_cell.width,
+            "a Sixel band inside horizontal margins is clipped before rectangular scrolling");
+    }
+
+    auto outside = make_model(4, 30);
+    outside.ingest(QByteArrayLiteral("\x1b[?69h\x1b[6;15s\x1b[1;6HHELLO") +
+        cursor_to(3, 0) + image);
+    ok &= check(outside.row_text(0).mid(5, 5) == QStringLiteral("HELLO") &&
+            slice_at(outside, 0) == nullptr && slice_at(outside, 3) == nullptr,
+        "a Sixel origin outside horizontal margins does not scroll unrelated text");
+    return ok;
+}
+
 bool test_horizontal_scroll_over_cap_keeps_stationary_image()
 {
     bool ok = true;
@@ -2034,6 +2056,7 @@ int main()
 {
     bool ok = true;
     ok &= test_horizontal_margins_preserve_outside_sixel_cells();
+    ok &= test_sixel_placement_respects_horizontal_margins();
     ok &= test_horizontal_scroll_over_cap_keeps_stationary_image();
     ok &= test_slices_equal_raster_bands();
     ok &= test_images_clip_at_the_right_margin();
