@@ -6358,7 +6358,9 @@ void Terminal_screen_model::erase_rectangular_area(
                 row.cells[static_cast<std::size_t>(column)] = *replacement;
             }
         }
-        if (area.right == m_config.grid_size.columns - 1) {
+        if (area.right == m_config.grid_size.columns - 1 &&
+            replacements.back().has_value())
+        {
             row.soft_wrap_columns = 0;
         }
         advance_row_content_generation_if_changed(row, before_cells);

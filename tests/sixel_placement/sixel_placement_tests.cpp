@@ -1169,6 +1169,35 @@ bool test_text_writes_and_erases_clear_image_cells()
         }
     }
 
+    // A transparent image column can retain protected text while drawn
+    // columns on either side require separate image-damage ranges.
+    const QByteArray gapped_data =
+        "#1;2;100;0;0!10~!10?#2;2;0;100;0!10~#3;2;0;0;100!10~";
+    const term::Screen_sixel_image_mutation gapped_image =
+        decoded_image("9;1", gapped_data);
+    ok &= check(gapped_image.raster.width() == 40,
+        "the transparent-center reference image spans four cells");
+    if (gapped_image.raster.width() == 40) {
+        term::Terminal_screen_model protected_gap = make_model(4, 20);
+        protected_gap.ingest(QByteArrayLiteral(
+            "\x1b[1\"q\x1b[1;2HP\x1b[0\"q\x1b[1;1H"));
+        protected_gap.ingest(sixel("9;1", gapped_data));
+        const auto before_gap_erase = slice_at(protected_gap, 0);
+        ok &= check(before_gap_erase != nullptr &&
+                before_gap_erase->pixels == gapped_image.raster &&
+                protected_gap.row_text(0) == QStringLiteral(" P"),
+            "Sixel placement preserves protected text in an undrawn column");
+        protected_gap.ingest(QByteArrayLiteral("\x1b[1;1;1;3${"));
+        const auto after_gap_erase = slice_at(protected_gap, 0);
+        const QImage expected = raster_without_cells(
+            raster_without_cells(gapped_image.raster, 0, 1), 2, 3);
+        ok &= check(before_gap_erase != nullptr && after_gap_erase != nullptr &&
+                after_gap_erase->pixels == expected &&
+                after_gap_erase->revision == before_gap_erase->revision + 1U &&
+                protected_gap.row_text(0) == QStringLiteral(" P"),
+            "DECSERA clears disjoint image columns once around protected text");
+    }
+
     const std::vector<std::pair<const char*, QByteArray>> clearing_edits = {
         {"EL 2 drops the row image", cursor_to(0, 5) + "\x1b[2K"},
         {"ED 2 drops the screen's images", cursor_to(0, 5) + "\x1b[2J"},

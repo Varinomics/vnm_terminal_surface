@@ -6238,7 +6238,26 @@ bool test_dec_rectangular_editing_boundaries()
             model.row_text(0) == QStringLiteral("P"),
         "DECRC restores the DECSCA selective-erase attribute saved by DECSC");
 
+    model = make_model(1, 4);
+    model.ingest(QByteArrayLiteral("\x1b" "7\x1b[1\"q\x1b" "8P"));
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;1${"));
+    ok &= check(diagnostic_count(result) == 0 && model.row_text(0).isEmpty(),
+        "DECRC restores erasable character state saved before DECSCA protection");
+
     return ok;
+}
+
+bool test_dec_selective_rectangle_preserves_protected_soft_wrap()
+{
+    auto model = make_model(2, 4);
+    model.ingest(QByteArrayLiteral("\x1b[1\"qABCDEF\x1b[0\"q"));
+    const auto result = model.ingest(QByteArrayLiteral("\x1b[1;1;1;4${"));
+    const bool cells_survive = diagnostic_count(result) == 0 &&
+        model.row_text(0) == QStringLiteral("ABCD") &&
+        model.row_text(1) == QStringLiteral("EF");
+    model.resize({2, 8});
+    return check(cells_survive && model.row_text(0) == QStringLiteral("ABCDEF"),
+        "DECSERA preserves a protected row's soft wrap when no cell is erased");
 }
 
 bool test_rectangular_attribute_styled_blank_selection()
@@ -6289,6 +6308,7 @@ int main()
     ok &= test_cmd_wrapped_output_resize_trace();
     ok &= test_dec_rectangular_editing();
     ok &= test_dec_rectangular_editing_boundaries();
+    ok &= test_dec_selective_rectangle_preserves_protected_soft_wrap();
     ok &= test_rectangular_attribute_styled_blank_selection();
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();
