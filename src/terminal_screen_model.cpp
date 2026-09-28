@@ -6368,6 +6368,7 @@ void Terminal_screen_model::change_rectangular_attributes(
 
     for (int row_number = area.top; row_number <= area.bottom; ++row_number) {
         Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
+        const std::vector<Cell> before_cells = row.cells;
         const int first_column = m_rectangular_attribute_extent || row_number == area.top
             ? area.left : 0;
         const int last_column = m_rectangular_attribute_extent || row_number == area.bottom
@@ -6416,6 +6417,7 @@ void Terminal_screen_model::change_rectangular_attributes(
                 visited[static_cast<std::size_t>(target)] = true;
             }
         }
+        advance_row_content_generation_if_changed(row, before_cells);
         mark_dirty(row_number);
     }
     mark_terminal_content_changed();
@@ -10418,7 +10420,8 @@ QString Terminal_screen_model::row_text_from_cells(
             continue;
         }
 
-        text += cell.occupied ? cell.text : QStringLiteral(" ");
+        text += cell.occupied && !cell.text.isEmpty()
+            ? cell.text : QStringLiteral(" ");
     }
 
     if (bounded_end_column == column_count) {

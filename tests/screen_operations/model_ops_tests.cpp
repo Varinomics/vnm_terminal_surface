@@ -6110,6 +6110,38 @@ bool test_dec_rectangular_editing()
     return ok;
 }
 
+bool test_rectangular_attribute_styled_blank_selection()
+{
+    bool ok = true;
+    const auto check_attribute_edit = [&](const QByteArray& sequence) {
+        term::Terminal_screen_model model = make_model(1, 5);
+        model.ingest(QByteArrayLiteral("A\x1b[1;3HB"));
+        const term::Terminal_selection_range range = {
+            {0, 0}, {0, 3}, term::Terminal_selection_mode::NORMAL,
+        };
+        const auto before = model.selection_line_leases(
+            term::Terminal_buffer_id::PRIMARY, range);
+        const auto result = model.ingest(sequence);
+        const auto after = model.selection_line_leases(
+            term::Terminal_buffer_id::PRIMARY, range);
+        ok &= check(diagnostic_count(result) == 0 &&
+                model.row_text(0) == QStringLiteral("A B") &&
+                model.selected_text(range).text == QStringLiteral("A B"),
+            "rectangular attributes keep an interior styled blank in copied text");
+        ok &= check(before.size() == 1U && after.size() == 1U &&
+                after.front().history_handle.content_generation ==
+                    before.front().history_handle.content_generation + 1U &&
+                model.retained_line_lookup(
+                    term::Terminal_buffer_id::PRIMARY,
+                    before.front().history_handle).resolution_status ==
+                    term::Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH,
+            "rectangular attributes invalidate the prior selection lease when styling a blank");
+    };
+    check_attribute_edit(QByteArrayLiteral("\x1b[1;2;1;2;1$r"));
+    check_attribute_edit(QByteArrayLiteral("\x1b[1;2;1;2;1$t"));
+    return ok;
+}
+
 }
 
 int main()
@@ -6123,6 +6155,7 @@ int main()
     ok &= test_resize_wrap_boundaries_cursor_and_history();
     ok &= test_cmd_wrapped_output_resize_trace();
     ok &= test_dec_rectangular_editing();
+    ok &= test_rectangular_attribute_styled_blank_selection();
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();
