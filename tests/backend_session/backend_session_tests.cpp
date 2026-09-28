@@ -15757,6 +15757,112 @@ QByteArray budget_filling_sixel_image()
     return QByteArrayLiteral("\x1bPq\"1;1;1448;1448#1~\x1b\\");
 }
 
+bool test_macro_replay_resumes_after_last_host_byte()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    session->set_cell_pixel_size({10, 20});
+    (void)session->start(launch_config_with_grid(4, 20));
+    session->process_backend_callback_events();
+    session->set_sixel_work_step_units_for_testing([] { return std::uint64_t{1U}; });
+
+    const QByteArray image = QByteArrayLiteral("\x1bPq#1~\x1b\\");
+    const QByteArray body = image + QByteArrayLiteral("\x1b[2;1HAFTER\x1b[c");
+    const QByteArray definition = QByteArrayLiteral("\x1bP1;0;1!z") + body.toHex() +
+        QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(definition), "macro definition queues");
+    session->process_backend_callback_events();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1*z")),
+        "last-byte macro invocation queues");
+    const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+    (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    ok &= check(!session->backend_callbacks_settled(epoch) &&
+            session->has_pending_backend_callback_events(),
+        "the callback remains open while budgeted macro replay is deferred");
+    int steps = 0;
+    while (session->has_pending_backend_callback_events() && steps < 100) {
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        ++steps;
+    }
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(steps > 0 && steps < 100 && session->backend_callbacks_settled(epoch) &&
+            snapshot.has_value() && snapshot_contains_text(*snapshot, QStringLiteral("AFTER")) &&
+            term::render_snapshot_row_image(*snapshot, 0) != nullptr &&
+            backend->writes == std::vector<QByteArray>{
+                QByteArrayLiteral("\x1b[?61;4;21;22;28;32c")},
+        "empty drain steps finish the macro image, text and reply before settling the callback");
+    return ok;
+}
+
+bool test_macro_expansion_limit_spans_one_output_command()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    (void)session->start(launch_config_with_grid(4, 20));
+    session->process_backend_callback_events();
+
+    const QByteArray invoke_inner = QByteArrayLiteral("\x1b[2*z");
+    QByteArray outer;
+    outer.reserve(2600);
+    for (int index = 0; index < 510; ++index) {
+        outer += invoke_inner;
+    }
+    outer += QByteArrayLiteral("\x1b]52;c;YQ==\x1b\\");
+    const QByteArray definitions =
+        QByteArrayLiteral("\x1bP2;0;1!z") + QByteArray(2048, '\0').toHex() +
+        QByteArrayLiteral("\x1b\\\x1bP1;0;1!z") + outer.toHex() +
+        QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(definitions), "nested macro definitions queue");
+    session->process_backend_callback_events();
+
+    const QByteArray invocation = QByteArrayLiteral("\x1b[1*z");
+    ok &= check(backend->emit_output(invocation + QByteArrayLiteral("\x1b[?2026h") +
+            invocation + QByteArrayLiteral("\x1b[?2026l")),
+        "two invocations queue in one output command");
+    session->process_backend_callback_events();
+    ok &= check(notification_count(*session,
+            term::Terminal_session_notification_kind::HOST_REQUEST) == 1U,
+        "the expanded-byte limit applies across session model ingests of one output command");
+    return ok;
+}
+
+bool test_macro_replay_yields_at_a_deadline_step()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    (void)session->start(launch_config_with_grid(4, 80));
+    session->process_backend_callback_events();
+    const QByteArray definition = QByteArrayLiteral("\x1bP1;0;0!z") +
+        QByteArray(6000, 'Q') + QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(definition), "large macro definition queues");
+    session->process_backend_callback_events();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1*z")),
+        "large macro invocation queues");
+    const std::uint64_t epoch = session->backend_callback_enqueue_epoch();
+    (void)session->process_backend_callback_events_for(std::chrono::steady_clock::duration::zero());
+    ok &= check(!session->backend_callbacks_settled(epoch) &&
+            session->has_pending_backend_callback_events(),
+        "one deadline step leaves replay bytes for a later step");
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(session->backend_callbacks_settled(epoch) && snapshot.has_value() &&
+            snapshot_contains_text(*snapshot, QStringLiteral("QQQQ")),
+        "the remaining replay bytes finish without new host output");
+    return ok;
+}
+
 // Rows [first, first + count) of a snapshot either all carry an image or none
 // do: a published snapshot never shows part of an image.
 bool snapshot_image_rows_whole(
@@ -22059,6 +22165,9 @@ int main()
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
     ok &= test_budgeted_backend_callback_drain_resumes_sixel_work();
+    ok &= test_macro_replay_resumes_after_last_host_byte();
+    ok &= test_macro_expansion_limit_spans_one_output_command();
+    ok &= test_macro_replay_yields_at_a_deadline_step();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_paused_window_stays_inside_its_command();
     ok &= test_settle_with_a_reply_before_a_heavy_image_stays_asynchronous();

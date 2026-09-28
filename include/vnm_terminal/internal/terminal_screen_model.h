@@ -376,11 +376,11 @@ struct Terminal_screen_model_result
     bool                       alternate_scroll_mode_changed = false;
     int                        scrollback_rows               = 0;
     int                        evicted_scrollback_rows       = 0;
-    // How much of an ingest's bytes it parsed, and whether sixel work its
-    // budget could not pay for waits: the caller hands the rest over again
-    // in a later step, or, while a placement waits, calls with no bytes.
+    // How much of an ingest's bytes it parsed, and whether sixel placement
+    // or macro replay waits: the caller hands the rest over again in a later
+    // step, or resumes pending work with no bytes.
     qsizetype                  consumed_bytes                = 0;
-    bool                       sixel_work_pending            = false;
+    bool                       parser_work_pending           = false;
 };
 
 struct terminal_screen_model_resize_transition_t
@@ -633,7 +633,15 @@ public:
         QByteArrayView bytes,
         const terminal_screen_model_resize_transition_sink_t*
             resize_transition_sink = nullptr,
-        Sixel_work_budget* sixel_work_budget = nullptr);
+        Sixel_work_budget* sixel_work_budget = nullptr,
+        std::size_t* macro_replay_bytes_remaining = nullptr);
+
+    void begin_macro_expansion_scope() { m_parser.begin_macro_expansion_scope(); }
+    void end_macro_expansion_scope()   { m_parser.end_macro_expansion_scope(); }
+    bool parser_work_pending() const
+    {
+        return m_sixel_placement.has_value() || m_parser.macro_work_pending();
+    }
 
     // A placement waits either unstarted, with the screen as it was, or
     // started, partly placed: then nothing may be published until it ends,

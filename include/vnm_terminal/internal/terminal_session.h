@@ -818,7 +818,7 @@ private:
 
     // Continues the sixel placement the head operation's last step left
     // waiting; true once none waits.
-    bool advance_pending_sixel_placement(std::uint64_t sequence);
+    bool advance_pending_parser_work(std::uint64_t sequence);
 
     void defer_backend_content_snapshot(
         std::uint64_t                          sequence,
@@ -1179,6 +1179,7 @@ private:
     // The sixel work budget of the drain step in progress; none when the
     // drain has no deadline.
     Sixel_work_budget*                                     m_sixel_work_budget = nullptr;
+    std::size_t*                                           m_macro_replay_bytes_remaining = nullptr;
     std::function<std::uint64_t()>                         m_sixel_work_step_units_for_testing;
     // Whether the model stopped in the output being ingested, and how many of
     // its bytes it left; see ingest_backend_output_bytes.

@@ -41,13 +41,21 @@ public:
     std::vector<Parser_action> ingest(
         QByteArrayView       bytes,
         qsizetype&           offset,
-        Sixel_work_budget*   budget = nullptr);
+        Sixel_work_budget*   budget = nullptr,
+        std::size_t*         macro_replay_bytes_remaining = nullptr);
 
     // Whether the last ingest stopped because its budget ran out.
     bool sixel_work_deferred() const { return m_sixel_work_deferred; }
     bool macro_work_pending() const { return !m_macro_frames.empty(); }
     bool macro_work_advanced() const { return m_macro_work_advanced; }
+    bool macro_work_deferred() const { return m_macro_work_deferred; }
     bool parse_boundary_reached() const { return m_parser_boundary_reached; }
+    void begin_macro_expansion_scope()
+    {
+        m_macro_expansion_bytes = 0U;
+        m_macro_expansion_scope_active = true;
+    }
+    void end_macro_expansion_scope() { m_macro_expansion_scope_active = false; }
 
     // The decoded size a sixel image may reach; its owner keeps it equal to
     // the retained history's largest record.
@@ -174,8 +182,10 @@ private:
     std::deque<Macro_frame>    m_macro_frames;
     std::size_t                m_macro_storage_bytes           = 0U;
     std::size_t                m_macro_expansion_bytes         = 0U;
+    bool                       m_macro_expansion_scope_active   = false;
     bool                       m_macro_boundary_reached        = false;
     bool                       m_macro_work_advanced           = false;
+    bool                       m_macro_work_deferred           = false;
     bool                       m_parser_boundary_reached       = false;
     std::uint64_t              m_next_host_request_id          = 1U;
 };

@@ -144,9 +144,9 @@ sequence: CSI Pid * z
 feature: DEC stored macro invocation
 status: supported
 action_category: parser-input-expansion
-behavior: substitutes the stored bytes before later host bytes in the same write; missing IDs are ignored; nested invocations are supported, active-ID recursion is rejected, and total expanded bytes in one host ingest are capped at 1048576; effects persist after replay
+behavior: substitutes the stored bytes before later host bytes in the same write; missing IDs are ignored; nested invocations are supported, active-ID recursion is rejected, and total expanded bytes in one backend output command are capped at 1048576; deadline drains replay at most 4096 macro bytes per step; effects persist after replay
 host_policy: replayed host requests use their normal policy
-payload_limit: 1048576 expanded bytes per host ingest
+payload_limit: 1048576 expanded bytes per backend output command
 recovery: invalid ID or recursion emits a diagnostic and later input continues
 reply: no-reply
 diagnostic: malformed ID, recursive invocation, or expansion limit diagnostic

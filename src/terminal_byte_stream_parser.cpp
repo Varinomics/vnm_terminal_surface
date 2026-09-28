@@ -9,6 +9,7 @@
 #include <QByteArray>
 #include <QChar>
 #include <QLatin1StringView>
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <optional>
@@ -973,13 +974,15 @@ bool parse_sgr_parameter_groups(
 std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
     QByteArrayView       bytes,
     qsizetype&           offset,
-    Sixel_work_budget*   budget)
+    Sixel_work_budget*   budget,
+    std::size_t*         macro_replay_bytes_remaining)
 {
     m_sixel_work_budget   = budget;
     m_sixel_work_deferred = false;
     m_macro_work_advanced = false;
+    m_macro_work_deferred = false;
     m_parser_boundary_reached = false;
-    if (offset == 0 && m_macro_frames.empty()) {
+    if (!m_macro_expansion_scope_active && offset == 0 && m_macro_frames.empty()) {
         m_macro_expansion_bytes = 0U;
     }
     std::vector<Parser_action> actions;
@@ -1015,8 +1018,26 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
             continue;
         }
 
-        m_macro_work_advanced = ingest_source(frame.bytes, frame.offset) > 0 ||
+        if (macro_replay_bytes_remaining != nullptr &&
+            *macro_replay_bytes_remaining == 0U)
+        {
+            m_macro_work_deferred = true;
+            break;
+        }
+
+        const qsizetype offset_before = frame.offset;
+        const qsizetype source_end = macro_replay_bytes_remaining == nullptr
+            ? frame.bytes.size()
+            : frame.offset + static_cast<qsizetype>(std::min(
+                static_cast<std::size_t>(frame.bytes.size() - frame.offset),
+                *macro_replay_bytes_remaining));
+        m_macro_work_advanced = ingest_source(
+            QByteArrayView(frame.bytes).first(source_end), frame.offset) > 0 ||
             m_macro_work_advanced;
+        if (macro_replay_bytes_remaining != nullptr) {
+            *macro_replay_bytes_remaining -=
+                static_cast<std::size_t>(frame.offset - offset_before);
+        }
         if (&frame == &m_macro_frames.back() && frame.offset == frame.bytes.size()) {
             m_macro_frames.pop_back();
             m_macro_work_advanced = true;
@@ -1025,6 +1046,11 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest(
             m_sixel_work_budget = nullptr;
             return actions;
         }
+    }
+
+    if (m_macro_work_deferred) {
+        m_sixel_work_budget = nullptr;
+        return actions;
     }
 
     ingest_source(bytes, offset);
@@ -1868,8 +1894,10 @@ bool Terminal_byte_stream_parser::define_macro(QByteArrayView payload)
                 }
                 const std::size_t remaining =
                     k_macro_storage_limit_bytes - static_cast<std::size_t>(decoded.size());
-                if (!repeated.isEmpty() &&
-                    static_cast<std::size_t>(count) >
+                if (repeated.isEmpty()) {
+                    continue;
+                }
+                if (static_cast<std::size_t>(count) >
                         remaining / static_cast<std::size_t>(repeated.size()))
                 {
                     return true;

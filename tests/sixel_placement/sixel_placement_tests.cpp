@@ -1731,7 +1731,7 @@ bool test_spent_budget_ends_the_ingest_at_an_image_end()
     term::Terminal_screen_model model = make_model(20, 160);
     term::Sixel_work_budget budget(2000000U);
     const term::Terminal_screen_model_result result = model.ingest(bytes, nullptr, &budget);
-    ok &= check(result.sixel_work_pending &&
+    ok &= check(result.parser_work_pending &&
             result.consumed_bytes == bytes.size() - 2 * image.size(),
         "a dropped image that spends the budget ends the call at its end");
 
@@ -1763,7 +1763,7 @@ bool test_composites_are_paid_for()
     }
     term::Sixel_work_budget budget(200000U);
     const term::Terminal_screen_model_result result = model.ingest(overlays, nullptr, &budget);
-    ok &= check(result.sixel_work_pending && result.consumed_bytes < overlays.size() / 10,
+    ok &= check(result.parser_work_pending && result.consumed_bytes < overlays.size() / 10,
         "the composites over the wide image spend the budget within a few overlays");
     return ok;
 }

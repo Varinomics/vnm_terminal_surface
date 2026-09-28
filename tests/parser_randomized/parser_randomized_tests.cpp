@@ -1435,7 +1435,7 @@ bool run_with_budget(
             chunk = chunk.sliced(result.consumed_bytes);
             ++steps;
         }
-        while ((result.sixel_work_pending || !chunk.empty()) && steps < 1000000);
+        while ((result.parser_work_pending || !chunk.empty()) && steps < 1000000);
         ok &= check(chunk.empty() && !model.sixel_placement_pending(),
             label + "/" + std::to_string(chunk_index) + ": the budgeted chunk is applied");
 

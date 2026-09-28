@@ -2213,10 +2213,13 @@ bool test_dec_stored_macros()
         "nested macro expansion preserves source order");
 
     model = make_model(3, 20);
+    model.set_cell_pixel_size({10, 20});
     const QByteArray sixel = QByteArrayLiteral("\x1bPq~\x1b\\");
-    result = model.ingest(define(10, 0, 1, sixel.toHex()) + invoke(10) + 'R');
-    ok &= check(diagnostic_count(result) == 1 &&
-            model.row_text(0) == QStringLiteral("R"),
+    result = model.ingest(define(10, 0, 1, sixel.toHex()) + invoke(10) +
+        QByteArrayLiteral("\x1b[2;1HR"));
+    ok &= check(diagnostic_count(result) == 0 &&
+            model.image_slice_for_testing(term::Terminal_buffer_id::PRIMARY, 0) != nullptr &&
+            model.row_text(1) == QStringLiteral("R"),
         "macro Sixel takes the ordinary image dispatch and resumes later input");
 
     model = make_model(3, 20);

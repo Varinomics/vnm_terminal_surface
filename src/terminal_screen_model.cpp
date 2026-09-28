@@ -701,7 +701,8 @@ Terminal_screen_model::Resize_transition_scope::~Resize_transition_scope()
 Terminal_screen_model_result Terminal_screen_model::ingest(
     QByteArrayView bytes,
     const terminal_screen_model_resize_transition_sink_t* resize_transition_sink,
-    Sixel_work_budget* sixel_work_budget)
+    Sixel_work_budget* sixel_work_budget,
+    std::size_t* macro_replay_bytes_remaining)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::ingest");
 
@@ -766,7 +767,8 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
             const qsizetype parsed_before = parsed;
             const bool budget_spent_before =
                 sixel_work_budget != nullptr && sixel_work_budget->exhausted();
-            parser_actions = m_parser.ingest(bytes, parsed, sixel_work_budget);
+            parser_actions = m_parser.ingest(
+                bytes, parsed, sixel_work_budget, macro_replay_bytes_remaining);
             // Every parse makes progress: it takes bytes, or it resolves input
             // it held before (a recovery at a held ESC emits its diagnostic).
             // Only a budget work earlier in the step already spent, such as a
@@ -841,6 +843,7 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         // image ends or allocations.
         deferred =
             m_parser.sixel_work_deferred() ||
+            m_parser.macro_work_deferred() ||
             m_sixel_placement.has_value()  ||
             (sixel_work_budget != nullptr &&
                 sixel_work_budget->exhausted() &&
@@ -876,7 +879,7 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         result = finalize_result(std::move(result), overrides);
     }
     result.consumed_bytes     = parsed;
-    result.sixel_work_pending = deferred;
+    result.parser_work_pending = deferred;
     return result;
 }
 

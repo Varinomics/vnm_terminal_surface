@@ -138,12 +138,13 @@ bool model_allows_render_snapshot(const Terminal_screen_model& model)
     return !model.mode_state().synchronized_output && !model.sixel_placement_started();
 }
 
-// Lends a drain step's sixel work budget to the session for the step, and
-// takes it back however the step ends.
-class Sixel_work_budget_scope final
+// Lends a drain step's work budget to the session for the step, and takes it
+// back however the step ends.
+template <typename Budget>
+class Step_budget_scope final
 {
 public:
-    Sixel_work_budget_scope(Sixel_work_budget*& slot, Sixel_work_budget* budget)
+    Step_budget_scope(Budget*& slot, Budget* budget)
     :
         m_slot(slot),
         m_previous(slot)
@@ -151,14 +152,14 @@ public:
         m_slot = budget;
     }
 
-    ~Sixel_work_budget_scope() { m_slot = m_previous; }
+    ~Step_budget_scope() { m_slot = m_previous; }
 
-    Sixel_work_budget_scope(const Sixel_work_budget_scope&)            = delete;
-    Sixel_work_budget_scope& operator=(const Sixel_work_budget_scope&) = delete;
+    Step_budget_scope(const Step_budget_scope&)            = delete;
+    Step_budget_scope& operator=(const Step_budget_scope&) = delete;
 
 private:
-    Sixel_work_budget*& m_slot;
-    Sixel_work_budget*  m_previous;
+    Budget*& m_slot;
+    Budget*  m_previous;
 };
 
 bool render_snapshot_can_advance_latest_content_snapshot(
@@ -4794,9 +4795,14 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
                         ? m_sixel_work_step_units_for_testing()
                         : k_sixel_work_units_per_drain_step);
             }
-            const Sixel_work_budget_scope budget_scope(
+            std::size_t macro_replay_bytes_remaining =
+                static_cast<std::size_t>(k_backend_output_drain_slice_bytes);
+            const Step_budget_scope<Sixel_work_budget> sixel_budget_scope(
                 m_sixel_work_budget,
                 step_budget.has_value() ? &*step_budget : nullptr);
+            const Step_budget_scope<std::size_t> macro_budget_scope(
+                m_macro_replay_bytes_remaining,
+                deadline.has_value() ? &macro_replay_bytes_remaining : nullptr);
             run_operation_step(deadline.has_value());
         }
 
@@ -4867,13 +4873,16 @@ void Terminal_session::run_operation_step(bool windowed)
         operation.admitted                    = true;
         m_backend_error_queued_during_command = false;
         record_result(admit_operation(operation));
+        if (m_screen_model.has_value()) {
+            m_screen_model->begin_macro_expansion_scope();
+        }
     }
 
     bool window_taken = false;
     while (operation.phase != Runner_operation_phase::RETIRED && !m_backend_output_stopped) {
         if (m_screen_model.has_value() &&
-            m_screen_model->sixel_placement_pending() &&
-            !advance_pending_sixel_placement(operation.command.sequence))
+            m_screen_model->parser_work_pending() &&
+            !advance_pending_parser_work(operation.command.sequence))
         {
             break;
         }
@@ -5041,7 +5050,10 @@ void Terminal_session::dispose_operation_replies()
 void Terminal_session::retire_operation()
 {
     Q_ASSERT(m_operation.has_value());
-    Q_ASSERT(m_screen_model.has_value() ? !m_screen_model->sixel_placement_pending() : true);
+    Q_ASSERT(m_screen_model.has_value() ? !m_screen_model->parser_work_pending() : true);
+    if (m_screen_model.has_value()) {
+        m_screen_model->end_macro_expansion_scope();
+    }
     const Runner_operation operation = std::move(*m_operation);
     m_operation.reset();
 
@@ -6069,20 +6081,22 @@ void Terminal_session::finish_released_tail(Runner_operation& operation)
     }
 }
 
-bool Terminal_session::advance_pending_sixel_placement(std::uint64_t sequence)
+bool Terminal_session::advance_pending_parser_work(std::uint64_t sequence)
 {
-    if (!m_screen_model->sixel_placement_pending()) {
+    if (!m_screen_model->parser_work_pending()) {
         return true;
     }
 
     // Until it starts, the screen is as the output before the image left it,
     // so a content snapshot the drain deferred is published first; once it
     // starts, publication is held until it ends.
-    if (!m_screen_model->sixel_placement_started()) {
+    if (m_screen_model->sixel_placement_pending() &&
+        !m_screen_model->sixel_placement_started())
+    {
         flush_deferred_backend_content_snapshot();
     }
     (void)ingest_backend_output_segment(sequence, QByteArrayView{}, false);
-    return !m_screen_model->sixel_placement_pending();
+    return !m_screen_model->parser_work_pending();
 }
 
 bool Terminal_session::text_area_resize_arbitration_armable() const
@@ -6803,7 +6817,7 @@ void Terminal_session::release_text_area_resize_arbitration(
     // model has work pending: none is pending when a hold arms, and a hold
     // takes bytes without applying them.
     Q_ASSERT(m_operation.has_value());
-    Q_ASSERT(!m_screen_model->sixel_placement_pending());
+    Q_ASSERT(!m_screen_model->parser_work_pending());
 
     Text_area_resize_arbitration_hold hold =
         std::move(*m_text_area_resize_arbitration);
@@ -8047,8 +8061,8 @@ qsizetype Terminal_session::ingest_backend_output_segment(
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::ingest_backend_output_segment");
 
-    // No bytes continue a waiting placement, and nothing else.
-    if (bytes.empty() && !m_screen_model->sixel_placement_pending()) {
+    // Empty steps continue pending parser work before the next host bytes.
+    if (bytes.empty() && !m_screen_model->parser_work_pending()) {
         return 0;
     }
 
@@ -8080,10 +8094,11 @@ qsizetype Terminal_session::ingest_backend_output_segment(
         ingest_result = m_screen_model->ingest(
             bytes,
             &resize_transition_sink,
-            m_sixel_work_budget);
+            m_sixel_work_budget,
+            m_macro_replay_bytes_remaining);
     }
     const qsizetype unconsumed_bytes = bytes.size() - ingest_result.consumed_bytes;
-    if (ingest_result.sixel_work_pending) {
+    if (ingest_result.parser_work_pending) {
         m_backend_output_stopped = true;
     }
     m_search_retained_reset_pending =
@@ -8118,7 +8133,7 @@ qsizetype Terminal_session::ingest_backend_output_segment(
         model_result_warrants_render_snapshot(ingest_result);
     const bool render_terminal_content_changed = ingest_result.terminal_content_changed;
     apply_trailing_changes(ingest_result, trailing_changes);
-    if (completes_backend_output_callback && !ingest_result.sixel_work_pending) {
+    if (completes_backend_output_callback && !ingest_result.parser_work_pending) {
         complete_processing_backend_output_side_effects();
     }
 
