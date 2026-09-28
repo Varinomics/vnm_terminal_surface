@@ -6326,14 +6326,21 @@ void Terminal_session::clear_text_area_resize_tail_epoch()
     m_text_area_resize_tail = {};
 }
 
-void Terminal_session::reset_text_area_resize_scanner()
+void Terminal_session::refresh_text_area_resize_scanner_utf8_carry()
 {
-    m_text_area_resize_scanner = {};
-    if (m_screen_model.has_value()) {
+    if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN &&
+        m_screen_model.has_value())
+    {
         if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
             m_text_area_resize_scanner.utf8_state = *carry;
         }
     }
+}
+
+void Terminal_session::reset_text_area_resize_scanner()
+{
+    m_text_area_resize_scanner = {};
+    refresh_text_area_resize_scanner_utf8_carry();
 }
 
 void Terminal_session::begin_text_area_resize_candidate(unsigned char introducer)
@@ -6461,6 +6468,8 @@ bool Terminal_session::scan_backend_output_span(
     Q_ASSERT(bytes.size() >= 0);
     Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
     consumed_bytes = 0U;
+    // Pending macro replay may have advanced the parser before a released tail.
+    refresh_text_area_resize_scanner_utf8_carry();
 
     const bool capability_known =
         m_config.text_area_resize_arbitration.has_value() &&
@@ -6958,11 +6967,7 @@ qsizetype Terminal_session::ingest_backend_output_bytes(
     std::size_t    available_bytes)
 {
     Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
-    if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN) {
-        if (const auto carry = m_screen_model->pending_utf8_scan_state()) {
-            m_text_area_resize_scanner.utf8_state = *carry;
-        }
-    }
+    refresh_text_area_resize_scanner_utf8_carry();
     const bool capability_known =
         m_config.text_area_resize_arbitration.has_value() &&
         m_config.text_area_resize_arbitration->version ==

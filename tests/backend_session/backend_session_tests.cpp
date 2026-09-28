@@ -16151,6 +16151,62 @@ bool test_macro_utf8_carry_precedes_host_control_scanners()
     return ok;
 }
 
+bool test_budgeted_macro_utf8_carry_precedes_released_tail_resize_scanner()
+{
+    bool ok = true;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    (void)session->start(launch_config_with_grid(4, 81));
+    session->process_backend_callback_events();
+
+    const QByteArray body = QByteArray(5999, 'Q') + QByteArrayLiteral("\xd8");
+    const QByteArray definition = QByteArrayLiteral("\x1bP1;0;1!z") +
+        body.toHex() + QByteArrayLiteral("\x1b\\");
+    ok &= check(backend->emit_output(definition),
+        "budgeted released-tail UTF-8 macro definition queues");
+    session->process_backend_callback_events();
+
+    const QByteArray tail = QByteArrayLiteral("\x1b[1*z\x9b") +
+        QByteArrayLiteral("8;10;20tTAIL");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;5;81t") + tail),
+        "resize request captures macro invocation and apparent C1 resize tail");
+    session->process_backend_callback_events();
+    const auto first_requests = arbitration_requests(*session);
+    if (!check(first_requests.size() == 1U && first_requests.front().request.has_value(),
+            "the original resize request reaches arbitration once"))
+    {
+        return false;
+    }
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+            first_requests.front().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+            {},
+        }).code == term::Terminal_session_result_code::ACCEPTED,
+        "rejecting the original request releases the held tail");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "the released macro replay still owns pending output");
+    int steps = 0;
+    while (session->has_pending_backend_callback_events() && steps < 100) {
+        (void)session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+        ++steps;
+    }
+    const auto snapshot = session->latest_render_snapshot();
+    ok &= check(steps > 0 && steps < 100 &&
+            !session->has_pending_backend_callback_events() &&
+            !session->pending_text_area_resize_arbitration().has_value() &&
+            term::grid_sizes_match(session->grid_size(), term::terminal_grid_size_t{4, 81}) &&
+            snapshot.has_value() &&
+            snapshot_contains_text(*snapshot, QStringLiteral("\u061B8;10;20tTAIL")),
+        "budgeted released tail prints the macro UTF-8 scalar and literal host suffix");
+    ok &= check(arbitration_requests(*session).size() == 1U,
+        "the apparent C1 resize in the released tail never reaches arbitration");
+    return ok;
+}
+
 bool test_passthrough_macro_stop_preserves_synchronized_release()
 {
     bool ok = true;
@@ -22503,6 +22559,7 @@ int main()
     ok &= test_sixel_budget_stop_before_synchronized_segment();
     ok &= test_resumed_macro_sixel_budget_stops_before_synchronized_segment();
     ok &= test_macro_utf8_carry_precedes_host_control_scanners();
+    ok &= test_budgeted_macro_utf8_carry_precedes_released_tail_resize_scanner();
     ok &= test_passthrough_macro_stop_preserves_synchronized_release();
     ok &= test_settled_tail_replays_heavy_sixel_work_across_drains();
     ok &= test_paused_window_stays_inside_its_command();
