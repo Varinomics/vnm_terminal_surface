@@ -9380,6 +9380,107 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
     return ok;
 }
 
+bool test_pointer_cancel_ends_held_surface_gestures(QGuiApplication& app)
+{
+    bool ok = true;
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("\x1b[?1000;1006hactive")};
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "pointer-cancel reporting surface starts");
+        const QPointF point = point_in_grid_cell(fixture.surface, 0, 1);
+        const std::size_t press_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+            "pointer-cancel fixture accepts a reporting press");
+        ok &= check_write_chunks_equal(backend_ptr->writes, press_index,
+            {sgr_mouse_report(0, 0, 1, 'M')},
+            "the held reporting press reached the PTY before cancellation");
+        const std::size_t held_writes = backend_ptr->writes.size();
+        fixture.surface.cancel_pointer_gesture();
+        ok &= check(backend_ptr->writes.size() == held_writes,
+            "semantic cancellation fabricated a PTY mouse release");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, point,
+            Qt::LeftButton, Qt::NoButton, Qt::NoModifier, false,
+            "late physical release after cancellation is ignored");
+        ok &= check(backend_ptr->writes.size() == held_writes,
+            "late release completed a retired reporting gesture");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+            "a fresh reporting press starts after cancellation");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, point,
+            Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+            "a fresh reporting release completes after cancellation");
+        ok &= check_write_chunks_equal(backend_ptr->writes, held_writes,
+            {sgr_mouse_report(0, 0, 1, 'M'), sgr_mouse_report(0, 0, 1, 'm')},
+            "only fresh physical input resumes reporting after cancellation");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta")};
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "pointer-cancel selection surface starts");
+        const QPointF first = point_in_grid_cell(fixture.surface, 0, 1);
+        const QPointF last  = point_in_grid_cell(fixture.surface, 0, 4);
+        QGuiApplication::clipboard()->setText(QStringLiteral("cancel-sentinel"), QClipboard::Clipboard);
+        const std::size_t write_count = backend_ptr->writes.size();
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, first,
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+            "pointer-cancel fixture starts a selection gesture");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, last,
+            Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
+            "pointer-cancel fixture extends the held selection");
+        fixture.surface.cancel_pointer_gesture();
+        const auto canceled = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(canceled && canceled->selection_spans.empty(),
+            "semantic cancellation left the held selection visible");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, last,
+            Qt::LeftButton, Qt::NoButton, Qt::NoModifier, false,
+            "late selection release after cancellation is ignored");
+        ok &= check(backend_ptr->writes.size() == write_count &&
+                QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+                    QStringLiteral("cancel-sentinel"),
+            "cancellation copied a selection or fabricated terminal input");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+        std::vector<QByteArray> activations;
+        observe_hyperlink_activation_requests(fixture.surface, activations);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {osc8_hyperlink_sequence(
+            QByteArrayLiteral("id=cancel"), QByteArrayLiteral("https://example.test/"),
+            QByteArrayLiteral("link"))};
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "pointer-cancel hyperlink surface starts");
+        const QPointF point = point_in_grid_cell(fixture.surface, 0, 1);
+        const std::size_t write_count = backend_ptr->writes.size();
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
+            Qt::LeftButton, Qt::LeftButton, Qt::ControlModifier, true,
+            "pointer-cancel fixture starts a hyperlink gesture");
+        fixture.surface.cancel_pointer_gesture();
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, point,
+            Qt::LeftButton, Qt::NoButton, Qt::ControlModifier, false,
+            "late hyperlink release after cancellation is ignored");
+        ok &= check(activations.empty() && backend_ptr->writes.size() == write_count,
+            "cancellation activated a link or fabricated terminal input");
+    }
+    return ok;
+}
+
 bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
 {
     bool ok = true;
@@ -20585,6 +20686,7 @@ int main(int argc, char** argv)
     ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
     ok &= test_transcript_timing_diagnostics_records_hot_paths();
     ok &= test_mouse_reporting_surface_events(app);
+    ok &= test_pointer_cancel_ends_held_surface_gestures(app);
     ok &= test_row_timestamp_tooltip_signal_contract(app);
     ok &= test_selection_drag_and_selected_text(app);
     ok &= test_selection_visual_detach_after_row_mutation(app);
