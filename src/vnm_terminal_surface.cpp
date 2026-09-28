@@ -2592,6 +2592,7 @@ struct VNM_TerminalSurface::Private
     };
 
     std::uint64_t next_mouse_report_admission_id = 0U;
+    std::uint64_t pointer_cancel_generation = 0U;
 
     bool pending_report_session_is_active(
         const Pending_published_mouse_report& report) const
@@ -2661,6 +2662,7 @@ struct VNM_TerminalSurface::Private
     std::optional<Published_mouse_report_attempt> admit_published_mouse_report(
         VNM_TerminalSurface& surface, const Pending_published_mouse_report& report)
     {
+        const std::uint64_t cancel_generation = pointer_cancel_generation;
         // Publish ordering before invoking host cancellation: the callback may
         // admit a newer paste or even deliver it through this queue reentrantly.
         pending_published_mouse_reports.push_back(report);
@@ -2677,7 +2679,9 @@ struct VNM_TerminalSurface::Private
         if (queued == pending_published_mouse_reports.end()) {
             // Reentrant input or cancellation retired this report. A removed
             // press must not restore a canceled held-button gesture.
-            if (report.kind == term::Terminal_mouse_event_kind::PRESS) {
+            if (report.kind == term::Terminal_mouse_event_kind::PRESS &&
+                pointer_cancel_generation != cancel_generation)
+            {
                 return std::nullopt;
             }
             return Published_mouse_report_attempt{
@@ -2698,7 +2702,9 @@ struct VNM_TerminalSurface::Private
         {
             pending_published_mouse_reports.pop_front();
         }
-        if (report.kind == term::Terminal_mouse_event_kind::PRESS && !still_front) {
+        if (report.kind == term::Terminal_mouse_event_kind::PRESS &&
+            !still_front && pointer_cancel_generation != cancel_generation)
+        {
             return std::nullopt;
         }
         return attempt;
@@ -4891,6 +4897,7 @@ void VNM_TerminalSurface::cancel_pointer_gesture()
         return;
     }
 
+    ++m_private->pointer_cancel_generation;
     m_private->cancel_pending_published_mouse_presses();
     m_private->clear_mouse_reporting_state();
     m_private->clear_hyperlink_activation_state();
