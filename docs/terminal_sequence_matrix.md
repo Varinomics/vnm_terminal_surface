@@ -880,7 +880,7 @@ sequence: ESC E
 feature: next line
 status: supported
 action_category: screen-mutation
-behavior: moves the cursor to column zero of the next row, scrolling the active region at the bottom margin
+behavior: moves the cursor to the applicable left margin of the next row, scrolling the active region at the bottom margin
 host_policy: top-anchored primary-region scrolling appends host scrollback
 payload_limit: none
 recovery: unsupported ESC controls continue through normal recovery

@@ -5842,6 +5842,27 @@ bool test_horizontal_margin_editing_and_cursor()
 bool test_horizontal_margin_wrap_and_reset()
 {
     bool ok = true;
+    auto outside_left = make_model(3, 10);
+    outside_left.ingest(QByteArrayLiteral(
+        "\x1b[?69h\x1b[4;6s\x1b[1;1HABCDEFGHIJ"));
+    ok &= check(outside_left.row_text(0) == QStringLiteral("ABCDEF") &&
+            outside_left.row_text(1) == QStringLiteral("   GHI") &&
+            outside_left.row_text(2) == QStringLiteral("   J"),
+        "writing left of the margin wraps at the independent right edge");
+
+    auto outside_right = make_model(3, 10);
+    outside_right.ingest(QByteArrayLiteral(
+        "\x1b[?69h\x1b[4;6s\x1b[3;8H\rX"));
+    ok &= check(outside_right.row_text(2) == QStringLiteral("   X") &&
+            outside_right.cursor_position().column == 4,
+        "CR from right of the margin returns to its independent left edge on the last row");
+
+    auto next_line = make_model(3, 10);
+    next_line.ingest(QByteArrayLiteral(
+        "\x1b[?69h\x1b[4;6s\x1b[1;8H\x1b" "E" "X"));
+    ok &= check(next_line.row_text(1) == QStringLiteral("   X"),
+        "NEL from right of the margin starts the next row at its left edge");
+
     auto model = make_model(3, 8);
     auto result = model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;5s\x1b[?6hABCDZ"));
     ok &= check(diagnostic_count(result) == 0,
@@ -5936,6 +5957,30 @@ bool test_horizontal_margin_wide_cell_boundary()
                 columns.row_text(0).endsWith(QChar(u'h')),
             "deleting at a right-margin wide glyph preserves complete cells and outside text");
     }
+
+    for (const QByteArray& edit : {
+        QByteArrayLiteral("\x1b[@"),
+        QByteArrayLiteral("\x1b['}"),
+        QByteArrayLiteral("\x1b" "6")})
+    {
+        auto columns = make_model(2, 8);
+        columns.ingest(QByteArray("abcde\xe7\x95\x8c" "h\x1b[?69h\x1b[2;6s"
+            "\x1b[1;2H") + edit);
+        ok &= check(snapshot_valid(columns, 158U) &&
+                !columns.row_text(0).contains(QString::fromUtf8("\xe7\x95\x8c")) &&
+                columns.row_text(0).endsWith(QChar(u'h')),
+            "inserting at a right-margin wide glyph preserves complete cells and outside text");
+    }
+
+    auto historical = make_model(2, 8, 8);
+    historical.ingest(QByteArray("abcde\xe7\x95\x8c" "h\x1b[?69h\x1b[2;6s"
+        "\x1b[1;2H\x1b[@\x1b[?69l\x1b[S"));
+    const auto retained = historical.retained_history_row_cells_for_testing(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(historical.scrollback_size() == 1 && retained.has_value() &&
+            retained->size() == 8U && (*retained)[7].text == QStringLiteral("h") &&
+            snapshot_valid(historical, 159U),
+        "a column-edited wide-glyph row stays valid after moving into history");
 
     for (const QByteArray& edit : {
         QByteArrayLiteral("\x1b[@"),

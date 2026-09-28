@@ -2032,6 +2032,41 @@ bool test_horizontal_margins_preserve_outside_sixel_cells()
     return ok;
 }
 
+bool test_rectangular_scroll_keeps_off_grid_image_columns_on_their_row()
+{
+    auto model = make_model(3, 12);
+    model.ingest(cursor_to(1, 7) + sixel("9;1", solid_rows(50, 1)));
+    const auto source = slice_at(model, 1);
+    bool ok = check(source != nullptr && source->pixels.width() == 50,
+        "the wide image reaches the right edge before narrowing");
+
+    model.resize({3, 8});
+    ok &= check(slice_at(model, 1) == source,
+        "narrowing retains the image columns past the new grid edge");
+    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;5s\x1b[S"));
+    model.resize({3, 12});
+    ok &= check(slice_at(model, 0) == nullptr && slice_at(model, 1) != nullptr,
+        "rectangular scroll does not move off-grid image columns into another row");
+    return ok;
+}
+
+bool test_budgeted_rectangular_sixel_scroll_moves_one_region_per_step()
+{
+    constexpr int rows = 20;
+    auto model = make_model(rows, 160);
+    const QByteArray bytes = QByteArrayLiteral("\x1b[?69h\x1b[2;80s") +
+        cursor_to(rows - 1, 1) + sixel("9;1", solid_rows(10, 4));
+    const std::vector<budgeted_call_t> calls = ingest_in_budgeted_calls(model, bytes, 1U);
+    const bool scrolled = std::any_of(calls.begin(), calls.end(),
+        [](const budgeted_call_t& call) { return call.rows_moved > 0U; });
+    const bool bounded = std::all_of(calls.begin(), calls.end(),
+        [](const budgeted_call_t& call) {
+            return call.rows_moved <= static_cast<std::uint64_t>(rows);
+        });
+    return check(scrolled && bounded && !model.sixel_placement_pending(),
+        "a budgeted rectangular Sixel scroll moves at most one region per step");
+}
+
 bool test_sixel_placement_respects_horizontal_margins()
 {
     bool ok = true;
@@ -2090,6 +2125,8 @@ int main()
 {
     bool ok = true;
     ok &= test_horizontal_margins_preserve_outside_sixel_cells();
+    ok &= test_rectangular_scroll_keeps_off_grid_image_columns_on_their_row();
+    ok &= test_budgeted_rectangular_sixel_scroll_moves_one_region_per_step();
     ok &= test_sixel_placement_respects_horizontal_margins();
     ok &= test_horizontal_scroll_over_cap_keeps_stationary_image();
     ok &= test_slices_equal_raster_bands();

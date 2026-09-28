@@ -6748,16 +6748,14 @@ int Terminal_screen_model::active_right_margin() const
 
 int Terminal_screen_model::cursor_left_margin() const
 {
-    return m_cursor.column >= active_left_margin() &&
-            m_cursor.column <= active_right_margin()
+    return m_cursor.column >= active_left_margin()
         ? active_left_margin()
         : 0;
 }
 
 int Terminal_screen_model::cursor_right_margin() const
 {
-    return m_cursor.column >= active_left_margin() &&
-            m_cursor.column <= active_right_margin()
+    return m_cursor.column <= active_right_margin()
         ? active_right_margin()
         : m_config.grid_size.columns - 1;
 }
@@ -7316,11 +7314,14 @@ void Terminal_screen_model::replace_row_segment(
     if (source_row != nullptr && source_row->image_slice != nullptr) {
         Terminal_screen_row source_image;
         source_image.image_slice = source_row->image_slice;
+        const Terminal_image_slice& source_slice = *source_image.image_slice;
+        const int source_end_column = source_slice.first_column +
+            (source_slice.pixels.width() - 1) / source_slice.cell_pixel_size.width + 1;
         source_image.image_slice = image_slice_without_cells(source_image, 0, left);
         source_image.image_slice = image_slice_without_cells(
             source_image,
             right,
-            m_config.grid_size.columns);
+            source_end_column);
         if (source_image.image_slice != nullptr) {
             const Terminal_image_slice& patch = *source_image.image_slice;
             if (image == nullptr) {
