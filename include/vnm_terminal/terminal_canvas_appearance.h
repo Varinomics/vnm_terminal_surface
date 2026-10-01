@@ -4,11 +4,13 @@
 
 #include <QStringList>
 #include <QStringView>
+#include <QVariantMap>
 
 namespace vnm_terminal {
 
 QStringList terminal_canvas_color_scheme_names();
 QString terminal_canvas_default_color_scheme_name();
+QVariantMap terminal_color_scheme_preview(QStringView scheme_name);
 bool terminal_canvas_color_scheme_available(const Terminal_canvas_frame& frame);
 
 // Resolves source color references through a local scheme without changing

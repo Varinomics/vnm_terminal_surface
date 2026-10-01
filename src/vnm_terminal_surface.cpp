@@ -1,4 +1,5 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
+#include "vnm_terminal/terminal_canvas_appearance.h"
 
 #include <vnm_msdf_text/qt/lcd_resolver.h>
 #include "vnm_terminal/internal/backend_contract.h"
@@ -3607,40 +3608,12 @@ void VNM_TerminalSurface::set_color_scheme(const QString& color_scheme)
 
 QStringList VNM_TerminalSurface::available_color_schemes() const
 {
-    const std::vector<term::Terminal_color_scheme>& schemes = term::builtin_color_schemes();
-    QStringList names;
-    names.reserve(static_cast<int>(schemes.size()));
-    for (const term::Terminal_color_scheme& scheme : schemes) {
-        names.push_back(scheme.name);
-    }
-    return names;
+    return vnm_terminal::terminal_canvas_color_scheme_names();
 }
 
 QVariantMap VNM_TerminalSurface::color_scheme_preview(const QString& color_scheme) const
 {
-    const term::Terminal_color_scheme* scheme = term::find_color_scheme(color_scheme);
-    if (scheme == nullptr) {
-        return {};
-    }
-
-    QVariantList ansi;
-    ansi.reserve(static_cast<int>(scheme->ansi_palette_rgba.size()));
-    for (quint32 rgba : scheme->ansi_palette_rgba) {
-        ansi.push_back(QColor::fromRgba(rgba));
-    }
-
-    QVariantMap preview;
-    preview.insert(QStringLiteral("name"),       scheme->name);
-    preview.insert(QStringLiteral("background"), QColor::fromRgba(scheme->background_rgba));
-    preview.insert(QStringLiteral("foreground"), QColor::fromRgba(scheme->foreground_rgba));
-    preview.insert(QStringLiteral("cursor"),     QColor::fromRgba(scheme->cursor_rgba));
-    const QColor selection_background = QColor::fromRgba(scheme->selection_rgba);
-    preview.insert(QStringLiteral("selection"), selection_background);
-    preview.insert(
-        QStringLiteral("selection_foreground"),
-        term::terminal_selection_foreground_for_background(selection_background));
-    preview.insert(QStringLiteral("ansi"),       ansi);
-    return preview;
+    return vnm_terminal::terminal_color_scheme_preview(color_scheme);
 }
 
 VNM_TerminalSurface::Cursor_style VNM_TerminalSurface::cursor_style() const

@@ -2,6 +2,11 @@
 
 #include "vnm_terminal/internal/terminal_color_scheme.h"
 
+#include "vnm_terminal/internal/qsg_terminal_render_frame.h"
+
+#include <QColor>
+#include <QVariantList>
+
 #include <algorithm>
 
 namespace vnm_terminal {
@@ -18,6 +23,33 @@ QStringList terminal_canvas_color_scheme_names()
 QString terminal_canvas_default_color_scheme_name()
 {
     return internal::default_color_scheme().name;
+}
+
+QVariantMap terminal_color_scheme_preview(QStringView scheme_name)
+{
+    const auto* scheme = internal::find_color_scheme(scheme_name);
+    if (scheme == nullptr) {
+        return {};
+    }
+
+    QVariantList ansi;
+    ansi.reserve(static_cast<int>(scheme->ansi_palette_rgba.size()));
+    for (quint32 rgba : scheme->ansi_palette_rgba) {
+        ansi.push_back(QColor::fromRgba(rgba));
+    }
+
+    QVariantMap preview;
+    preview.insert(QStringLiteral("name"),       scheme->name);
+    preview.insert(QStringLiteral("background"), QColor::fromRgba(scheme->background_rgba));
+    preview.insert(QStringLiteral("foreground"), QColor::fromRgba(scheme->foreground_rgba));
+    preview.insert(QStringLiteral("cursor"),     QColor::fromRgba(scheme->cursor_rgba));
+    const QColor selection_background = QColor::fromRgba(scheme->selection_rgba);
+    preview.insert(QStringLiteral("selection"), selection_background);
+    preview.insert(
+        QStringLiteral("selection_foreground"),
+        internal::terminal_selection_foreground_for_background(selection_background));
+    preview.insert(QStringLiteral("ansi"),       ansi);
+    return preview;
 }
 
 bool terminal_canvas_color_scheme_available(const Terminal_canvas_frame& frame)
