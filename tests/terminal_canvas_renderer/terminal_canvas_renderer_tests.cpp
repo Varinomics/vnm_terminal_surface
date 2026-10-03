@@ -120,7 +120,12 @@ bool pump_until_rendered(
         application.processEvents(QEventLoop::AllEvents, 50);
         QThread::msleep(20);
         rendered = window.grabWindow();
-        if (image_has_canvas_pixels(rendered)) {
+        const qreal dpr = window.devicePixelRatio();
+        if (rendered.width() == qRound(window.width() * dpr) &&
+            rendered.height() == qRound(window.height() * dpr) &&
+            canvas.rendered_frame_generation() == canvas.frame_generation() &&
+            image_has_canvas_pixels(rendered))
+        {
             return true;
         }
     }
