@@ -220,6 +220,7 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/unicode_width.h
     include/vnm_terminal/internal/unicode_width_tables.h
     include/vnm_terminal/internal/vnm_terminal_font.h
+    include/vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h
     include/vnm_terminal/internal/viewport_contract.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h

@@ -1,4 +1,6 @@
 #include "helpers/test_check.h"
+#include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h"
 #include "vnm_terminal/terminal_canvas_frame.h"
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
@@ -11,11 +13,13 @@
 #include <QPoint>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
+#include <QScopeGuard>
 #include <QThread>
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 
 namespace {
@@ -121,6 +125,89 @@ bool pump_until_rendered(
         }
     }
     return false;
+}
+
+bool recorder_distinguishes_failed_candidate(
+    QGuiApplication& application,
+    QQuickWindow& window,
+    VNM_TerminalCanvas& canvas)
+{
+    namespace renderer = vnm_terminal::internal;
+    const auto recorder = renderer::VNM_TerminalCanvas_render_bridge::qsg_atlas_recorder(canvas);
+    const auto observe = [&](std::uint64_t sequence, bool committed) {
+        const auto previous_render_count = recorder->snapshot().render_count;
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            canvas.update();
+            window.requestUpdate();
+            application.processEvents(QEventLoop::AllEvents, 50);
+            QThread::msleep(20);
+            (void)window.grabWindow();
+            const auto report = recorder->snapshot();
+            if (report.prepared_snapshot_sequence == sequence &&
+                report.prepared_generation_committed == committed &&
+                report.render_count > previous_render_count && (!committed || report.drew))
+            {
+                return report;
+            }
+        }
+        return recorder->snapshot();
+    };
+    bool ok = check(canvas.set_canvas_frame(make_frame(701U)), "recorder baseline frame is accepted");
+    const auto baseline = observe(701U, true);
+    ok &= check(baseline.render_snapshot_sequence == 701U && baseline.drew &&
+        baseline.render_canvas_frame_generation == canvas.frame_generation(),
+        "recorder identifies the committed canvas draw");
+    if (!ok) {
+        return false;
+    }
+    renderer::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(702U);
+    const auto clear_failure = qScopeGuard([] {
+        renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    });
+    ok &= check(canvas.set_canvas_frame(make_frame(702U)), "failed candidate frame is accepted by the model");
+    const auto failed = observe(702U, false);
+    std::fprintf(stderr,
+        "recorder retention: baseline count=%llu drew=%d snapshot=%llu canvas=%llu owner=%llu pub=%llu; "
+        "failed count=%llu drew=%d snapshot=%llu canvas=%llu owner=%llu pub=%llu "
+        "prepared=%llu committed=%d installed=%llu\n",
+        static_cast<unsigned long long>(baseline.render_count), int(baseline.drew),
+        static_cast<unsigned long long>(baseline.render_snapshot_sequence),
+        static_cast<unsigned long long>(baseline.render_canvas_frame_generation),
+        static_cast<unsigned long long>(baseline.render_ownership_generation),
+        static_cast<unsigned long long>(baseline.render_publication_generation),
+        static_cast<unsigned long long>(failed.render_count), int(failed.drew),
+        static_cast<unsigned long long>(failed.render_snapshot_sequence),
+        static_cast<unsigned long long>(failed.render_canvas_frame_generation),
+        static_cast<unsigned long long>(failed.render_ownership_generation),
+        static_cast<unsigned long long>(failed.render_publication_generation),
+        static_cast<unsigned long long>(failed.prepared_snapshot_sequence),
+        int(failed.prepared_generation_committed),
+        static_cast<unsigned long long>(canvas.frame_generation()));
+    ok &= check(failed.prepared_snapshot_sequence == 702U && !failed.prepared_generation_committed,
+        "recorder exposes the failed prepare separately from its retained draw");
+    const bool retained_draw =
+        failed.render_snapshot_sequence == baseline.render_snapshot_sequence &&
+        failed.render_canvas_frame_generation == baseline.render_canvas_frame_generation &&
+        failed.render_ownership_generation == baseline.render_ownership_generation &&
+        failed.render_publication_generation == baseline.render_publication_generation &&
+        failed.render_canvas_frame_generation != canvas.frame_generation();
+    // A failed prepare can retain the earlier draw or issue no draw at all.
+    // Neither outcome may be credited as presentation of the candidate.
+    ok &= check(failed.render_count > baseline.render_count && (!failed.drew || retained_draw),
+        "a failed candidate cannot be attributed as the rendered canvas identity");
+    renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    ok &= check(canvas.set_canvas_frame(make_frame(703U)), "recovered frame is accepted");
+    const auto recovered = observe(703U, true);
+    ok &= check(recovered.drew && recovered.prepared_generation_committed &&
+        recovered.render_snapshot_sequence == 703U &&
+        recovered.render_snapshot_sequence == recovered.prepared_snapshot_sequence &&
+        recovered.render_capture_sequence == recovered.prepared_capture_sequence &&
+        recovered.render_canvas_frame_generation == recovered.prepared_canvas_frame_generation &&
+        recovered.render_ownership_generation == recovered.prepared_ownership_generation &&
+        recovered.render_publication_generation == recovered.prepared_publication_generation &&
+        recovered.render_canvas_frame_generation == canvas.frame_generation(),
+        "recorder advances to the recovered committed frame");
+    return ok;
 }
 
 bool authoritative_grid_glyph_positions(
@@ -313,6 +400,7 @@ int main(int argc, char** argv)
     }
 
     if (!rendered.isNull()) {
+        ok &= recorder_distinguishes_failed_candidate(application, window, canvas);
         ok &= authoritative_grid_glyph_positions(application, window, canvas);
         ok &= row_images_follow_pixels_placement_and_lifecycle(application, window, canvas);
     }

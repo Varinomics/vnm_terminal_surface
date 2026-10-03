@@ -9,6 +9,10 @@
 class QQuickWindow;
 class QScreen;
 
+namespace vnm_terminal::internal {
+class VNM_TerminalCanvas_render_bridge;
+}
+
 class VNM_TerminalCanvas : public QQuickItem
 {
     Q_OBJECT
@@ -120,6 +124,8 @@ protected:
     void itemChange(ItemChange change, const ItemChangeData& value) override;
 
 private:
+    friend class vnm_terminal::internal::VNM_TerminalCanvas_render_bridge;
+
     void bind_window_signals(QQuickWindow* window);
     void bind_screen_signals(QScreen* screen);
     void refresh_render_state();

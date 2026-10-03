@@ -4,6 +4,7 @@
 #include "vnm_terminal/font_metrics.h"
 
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/render_snapshot.h"
@@ -390,6 +391,14 @@ struct VNM_TerminalCanvas::Private
     QMetaObject::Connection                                      screen_dpi_changed_connection;
     QMetaObject::Connection                                      screen_physical_dpi_changed_connection;
 };
+
+std::shared_ptr<const term::Qsg_atlas_recorder>
+term::VNM_TerminalCanvas_render_bridge::qsg_atlas_recorder(
+    const VNM_TerminalCanvas& canvas)
+{
+    Q_ASSERT(canvas.thread() == QThread::currentThread());
+    return canvas.m_private->recorder;
+}
 
 VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
 :
