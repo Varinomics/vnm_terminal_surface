@@ -371,6 +371,9 @@ struct VNM_TerminalCanvas::Private
     term::terminal_cell_metrics_t                               cell_metrics;
     std::shared_ptr<term::Qsg_atlas_recorder>                   recorder =
         std::make_shared<term::Qsg_atlas_recorder>();
+
+    std::shared_ptr<term::Hierarchical_profiler> render_profiler;
+
     QTimer*                                                     cursor_blink_timer   = nullptr;
     QTimer*                                                     render_status_timer  = nullptr;
     QString                                                     render_error;
@@ -398,6 +401,14 @@ term::VNM_TerminalCanvas_render_bridge::qsg_atlas_recorder(
 {
     Q_ASSERT(canvas.thread() == QThread::currentThread());
     return canvas.m_private->recorder;
+}
+
+void term::VNM_TerminalCanvas_render_bridge::set_render_profiler(
+    VNM_TerminalCanvas&                    canvas,
+    std::shared_ptr<Hierarchical_profiler> profiler)
+{
+    Q_ASSERT(canvas.thread() == QThread::currentThread());
+    canvas.m_private->render_profiler = std::move(profiler);
 }
 
 VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
@@ -730,7 +741,7 @@ QSGNode* VNM_TerminalCanvas::updatePaintNode(
         m_private->cell_metrics,
         boundingRect().size(),
         m_private->render_font,
-        {},
+        m_private->render_profiler,
         m_private->device_pixel_ratio,
         m_private->font_epoch,
         ++m_private->capture_sequence,

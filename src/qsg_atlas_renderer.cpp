@@ -303,6 +303,7 @@ struct Glyph_atlas_runtime_configuration
 
 struct Atlas_prepare_result
 {
+    std::optional<bool>           simple_text_cache_usable;
     bool                          msdf_text_build_pending = false;
     bool                          raw_font_rasterized = false;
     std::uint64_t                 raster_thread       = 0U;
@@ -6053,7 +6054,12 @@ private:
     {
         VNM_TERMINAL_PROFILE_SCOPE(
             "Qsg_atlas_render_node::append_simple_text_run");
-        if (!ensure_simple_text_cache(result)) {
+        // Captured font, metrics and pixel ratio are fixed for this attempt.
+        // A retry gets a fresh result instead of carrying this decision forward.
+        if (!result.simple_text_cache_usable.has_value()) {
+            result.simple_text_cache_usable = ensure_simple_text_cache(result);
+        }
+        if (!*result.simple_text_cache_usable) {
             return false;
         }
 
