@@ -2186,6 +2186,11 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
     Backend_callback_drain_policy      drain_policy,
     std::uint64_t                      interaction_trace_id)
 {
+    // Every mouse report, wherever it was encoded, is written here. Whatever
+    // follows a motion report may have changed the pointer state the child
+    // knows, such as a press that moved it to another cell.
+    m_last_mouse_motion_report.reset();
+
     const std::uint64_t sequence = next_sequence();
     if (!is_session_writable()) {
         return make_rejected_result(
@@ -2298,17 +2303,32 @@ Terminal_mouse_event_result Terminal_session::write_mouse_event_locked(
         return {};
     }
 
+    // A motion report that repeats the last user bytes written to the child
+    // tells it nothing: the pointer is in the same cell with the same buttons
+    // and modifiers. xterm likewise sends motion only when the cell changes. Qt
+    // Quick re-delivers a stationary hover after scene changes; writing each
+    // re-delivery would make an application that redraws on motion redraw
+    // indefinitely while the pointer rests, and every redraw would produce
+    // another frame.
+    const bool motion =
+        event.kind == Terminal_mouse_event_kind::MOVE ||
+        event.kind == Terminal_mouse_event_kind::DRAG;
+    if (motion && m_last_mouse_motion_report == bytes) {
+        return {true, make_accepted_result(next_sequence())};
+    }
+
     const User_write_viewport_policy viewport_policy =
         event.kind == Terminal_mouse_event_kind::MOVE
             ? User_write_viewport_policy::PRESERVE_VIEWPORT
             : User_write_viewport_policy::RETURN_TO_TAIL;
-    return {
-        true,
-        write_user_bytes_locked(
-            std::move(bytes),
-            viewport_policy,
-            drain_policy),
-    };
+    const Terminal_session_result result = write_user_bytes_locked(
+        bytes,
+        viewport_policy,
+        drain_policy);
+    if (motion && result.code == Terminal_session_result_code::ACCEPTED) {
+        m_last_mouse_motion_report = std::move(bytes);
+    }
+    return {true, result};
 }
 
 Terminal_ime_commit_result Terminal_session::write_ime_commit(

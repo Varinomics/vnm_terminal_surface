@@ -11040,6 +11040,141 @@ bool test_mouse_passive_motion_preserves_detached_viewport(QGuiApplication& app)
     return ok;
 }
 
+// Qt Quick re-delivers a stationary hover after scene changes. Under all-motion
+// tracking, motion is reported only when the reported cell changes: an identical
+// report would make an application that redraws on motion keep redrawing while
+// the pointer rests.
+bool test_all_motion_hover_reports_only_cell_changes(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1003;1006hpointer-fixture"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "stationary hover mouse surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr &&
+        snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::ANY &&
+        snapshot->modes.sgr_mouse_encoding,
+        "stationary hover fixture starts with all-motion mouse reporting");
+
+    constexpr int row         = 1;
+    constexpr int column      = 4;
+    constexpr int next_column = 5;
+    const QPointF resting_point = point_in_grid_cell(fixture.surface, row, column);
+    const std::size_t first_index = backend_ptr->writes.size();
+    ok &= send_hover_move(fixture.surface, resting_point, Qt::NoModifier, true,
+        "first all-motion hover is accepted");
+    ok &= send_hover_move(fixture.surface, resting_point, Qt::NoModifier, true,
+        "repeated stationary hover is accepted");
+    ok &= send_hover_move(
+        fixture.surface,
+        resting_point + QPointF(1.0, 0.0),
+        Qt::NoModifier,
+        true,
+        "hover within the same cell is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        first_index,
+        { sgr_mouse_report(35, row, column, 'M') },
+        "hover that stays in one cell writes one motion report");
+
+    const std::size_t move_index = backend_ptr->writes.size();
+    ok &= send_hover_move(
+        fixture.surface,
+        point_in_grid_cell(fixture.surface, row, next_column),
+        Qt::NoModifier,
+        true,
+        "hover into the next cell is accepted");
+    ok &= send_hover_move(fixture.surface, resting_point, Qt::NoModifier, true,
+        "hover back into the first cell is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        move_index,
+        {
+            sgr_mouse_report(35, row, next_column, 'M'),
+            sgr_mouse_report(35, row, column, 'M'),
+        },
+        "hover into another cell and back writes both motion reports");
+
+    return ok;
+}
+
+// A motion report is withheld only while it repeats the last input the child
+// received. A press in between moves the child's pointer state, so a drag that
+// encodes like an earlier one is new again.
+bool test_drag_after_new_press_reports_repeated_cell(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1002;1006hdrag-fixture"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "repeated drag mouse surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    constexpr int row           = 1;
+    constexpr int press_column  = 6;
+    constexpr int target_column = 3;
+    const QPointF press_point  = point_in_grid_cell(fixture.surface, row, press_column);
+    const QPointF target_point = point_in_grid_cell(fixture.surface, row, target_column);
+    const std::size_t first_index = backend_ptr->writes.size();
+    for (int gesture = 0; gesture < 2; ++gesture) {
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, press_point,
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+            "button-event press is accepted");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, target_point,
+            Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
+            "button-event drag is accepted");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, target_point,
+            Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+            "button-event release is accepted");
+        ok &= send_hover_move(fixture.surface, press_point, Qt::NoModifier, false,
+            "button-event hover back to the press cell is not reported");
+    }
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        first_index,
+        {
+            sgr_mouse_report(0,  row, press_column,  'M'),
+            sgr_mouse_report(32, row, target_column, 'M'),
+            sgr_mouse_report(0,  row, target_column, 'm'),
+            sgr_mouse_report(0,  row, press_column,  'M'),
+            sgr_mouse_report(32, row, target_column, 'M'),
+            sgr_mouse_report(0,  row, target_column, 'm'),
+        },
+        "a second gesture reports its drag into the same cell as the first");
+
+    return ok;
+}
+
 bool test_local_first_wheel_trace_records_ingress_before_route(QGuiApplication& app)
 {
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
@@ -20680,6 +20815,8 @@ int main(int argc, char** argv)
     ok &= test_reentrant_paste_captures_new_public_frontier(app);
     ok &= test_resize_policy_setters_keep_callback_frontier(app);
     ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
+    ok &= test_all_motion_hover_reports_only_cell_changes(app);
+    ok &= test_drag_after_new_press_reports_repeated_cell(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
     ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);

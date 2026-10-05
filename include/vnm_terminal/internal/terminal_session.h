@@ -1163,6 +1163,10 @@ private:
     std::optional<Terminal_screen_model_result>            m_render_snapshot_model_result;
     std::optional<Deferred_backend_content_snapshot>       m_deferred_backend_content_snapshot;
     std::optional<Terminal_backend_exit>                   m_exit_status;
+    // The motion report last written to the child, kept only while no other
+    // user bytes follow it. A motion event that encodes to the same report
+    // tells the child nothing new and is not written again.
+    std::optional<QByteArray>                              m_last_mouse_motion_report;
     Ime_preedit_state                                      m_ime_preedit;
     Terminal_process_state                     m_process_state =
         Terminal_process_state::NOT_STARTED;
