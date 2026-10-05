@@ -2186,9 +2186,11 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
     Backend_callback_drain_policy      drain_policy,
     std::uint64_t                      interaction_trace_id)
 {
-    // Every mouse report, wherever it was encoded, is written here. Whatever
-    // follows a motion report may have changed the pointer state the child
-    // knows, such as a press that moved it to another cell.
+    // Every mouse report, wherever it was encoded, is written here, so a press,
+    // release or wheel report after a motion report always clears it. Key and
+    // input-method bytes share this path and clear it too; that can only cause
+    // one extra motion report. Paste and submitted text do not pass through
+    // here and leave it, since they do not move the pointer.
     m_last_mouse_motion_report.reset();
 
     const std::uint64_t sequence = next_sequence();
@@ -2313,14 +2315,24 @@ Terminal_mouse_event_result Terminal_session::write_mouse_event_locked(
     const bool motion =
         event.kind == Terminal_mouse_event_kind::MOVE ||
         event.kind == Terminal_mouse_event_kind::DRAG;
-    if (motion && m_last_mouse_motion_report == bytes) {
-        return {true, make_accepted_result(next_sequence())};
-    }
-
     const User_write_viewport_policy viewport_policy =
         event.kind == Terminal_mouse_event_kind::MOVE
             ? User_write_viewport_policy::PRESERVE_VIEWPORT
             : User_write_viewport_policy::RETURN_TO_TAIL;
+    if (motion && m_last_mouse_motion_report == bytes) {
+        // Only the write is skipped. The event is still accepted user input,
+        // so a drag returns a detached viewport to the tail as a written one
+        // does.
+        const std::uint64_t sequence = next_sequence();
+        return {
+            true,
+            finalize_accepted_text_input_result(
+                make_accepted_result(sequence),
+                sequence,
+                viewport_policy),
+        };
+    }
+
     const Terminal_session_result result = write_user_bytes_locked(
         bytes,
         viewport_policy,

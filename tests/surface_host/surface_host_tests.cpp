@@ -11175,6 +11175,83 @@ bool test_drag_after_new_press_reports_repeated_cell(QGuiApplication& app)
     return ok;
 }
 
+// A drag returns a detached viewport to the live terminal even when its report
+// repeats the previous one and is therefore not written again.
+bool test_repeated_drag_after_local_scroll_returns_to_tail(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    fixture.surface.set_wheel_event_policy(
+        VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_FIRST);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1002;1006h") + numbered_scroll_lines(80),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "drag after local scroll mouse surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    constexpr int row           = 1;
+    constexpr int press_column  = 6;
+    constexpr int target_column = 3;
+    const QPointF press_point  = point_in_grid_cell(fixture.surface, row, press_column);
+    const QPointF target_point = point_in_grid_cell(fixture.surface, row, target_column);
+    const std::size_t first_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, press_point,
+        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+        "button-event press before local scroll is accepted");
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, target_point,
+        Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
+        "button-event drag before local scroll is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        first_index,
+        {
+            sgr_mouse_report(0,  row, press_column,  'M'),
+            sgr_mouse_report(32, row, target_column, 'M'),
+        },
+        "press and drag before local scroll write their reports");
+
+    const std::size_t scroll_index = backend_ptr->writes.size();
+    ok &= send_wheel_event(fixture.surface, Qt::NoModifier, target_point, 0, 120, true,
+        "local-first wheel during the drag is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> scrolled_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(scrolled_snapshot != nullptr &&
+        scrolled_snapshot->viewport.offset_from_tail > 0,
+        "local-first wheel during the drag detaches the viewport");
+    ok &= check(backend_ptr->writes.size() == scroll_index,
+        "local-first wheel during the drag writes nothing to the child");
+
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, target_point + QPointF(1.0, 0.0),
+        Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
+        "button-event drag within the same cell is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> returned_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(returned_snapshot != nullptr &&
+        returned_snapshot->viewport.offset_from_tail == 0,
+        "drag within the same cell returns the viewport to the live terminal");
+    ok &= check(backend_ptr->writes.size() == scroll_index,
+        "drag within the same cell writes no repeated report");
+
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, target_point,
+        Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+        "button-event release after local scroll is accepted");
+
+    return ok;
+}
+
 bool test_local_first_wheel_trace_records_ingress_before_route(QGuiApplication& app)
 {
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
@@ -20817,6 +20894,7 @@ int main(int argc, char** argv)
     ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
     ok &= test_all_motion_hover_reports_only_cell_changes(app);
     ok &= test_drag_after_new_press_reports_repeated_cell(app);
+    ok &= test_repeated_drag_after_local_scroll_returns_to_tail(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
     ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
