@@ -5044,9 +5044,10 @@ void Terminal_session::record_backend_output_entry(
 
 // Every reply the step generated goes through the terminal-reply write policy
 // in the order its query was parsed and reaches its final disposition here:
-// written, or rejected (queue limit, stopped backend, backend rejection) with
-// its error recorded; no retry. Nothing behind the operation has taken effect
-// yet.
+// written; refused by a backend whose child has exited, and dropped without an
+// error since nothing remains to read it; or rejected for any other reason
+// (queue limit, stopped session, backend rejection) with its error recorded.
+// There is no retry. Nothing behind the operation has taken effect yet.
 void Terminal_session::dispose_operation_replies()
 {
     std::vector<Operation_reply> replies = std::move(m_operation_replies);
@@ -5283,7 +5284,15 @@ Terminal_session_result Terminal_session::process_write_command(
             interaction_trace_id);
     }
     if (is_backend_rejection(backend_result)) {
-        record_backend_error(command.sequence, *backend_result.error);
+        // A reply the terminal generated has no reader once the child has
+        // exited, so its refusal is not a failure. Refused input keeps its
+        // error.
+        const bool unread_reply =
+            command.kind == Terminal_session_command_kind::TERMINAL_REPLY &&
+            backend_result.child_exited;
+        if (!unread_reply) {
+            record_backend_error(command.sequence, *backend_result.error);
+        }
         return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 

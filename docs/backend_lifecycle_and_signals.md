@@ -146,7 +146,12 @@ bounded write queue and drained by the writer thread. The queue is bounded by
 `native_backend_write_queue_can_accept`. A write whose bytes would exceed the
 limit, or that arrives when the backend is not writable (not running, stopping,
 or the writer has already failed), is rejected with `WRITE_FAILED`. An empty
-write is also rejected.
+write is also rejected. Once the wait thread has observed the child's exit, a
+rejection sets `child_exited`: no reader remains for the bytes. The wait thread
+stops input as soon as it observes the exit, before it reports the exit, so a
+write can be refused this way while the session still believes the child is
+running. No other rejection sets it, including a stop whose exit has not been
+observed and the POSIX wait's loss of its exit observation.
 
 The writer drains queued entries in order. The POSIX writer issues a
 non-blocking `write()` to the master and treats the write itself as the

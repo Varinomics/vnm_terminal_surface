@@ -3521,6 +3521,10 @@ bool test_fast_start_exit_loop(const QString& fixture_path)
             "quick-exit fixture emits one authored marker");
         ok &= check_no_backend_errors(capture,
             "quick-exit fixture produces no backend errors");
+        const term::Terminal_backend_result after_exit = backend->write(QByteArrayLiteral("after"));
+        ok &= check(after_exit.code == term::Terminal_backend_result_code::REJECTED &&
+                after_exit.child_exited,
+            "ConPTY write after the quick-exit fixture exits reports the exited child");
     }
 
     return ok;

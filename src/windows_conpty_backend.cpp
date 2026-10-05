@@ -1083,6 +1083,7 @@ public:
             m_output_paused      = false;
             m_paused_output_delivery_in_progress = false;
             m_exit_reported      = false;
+            m_child_exit_confirmed = false;
             m_reader_finished    = false;
             m_writer_failed      = false;
             m_startup_aborted    = false;
@@ -1198,6 +1199,11 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(m_mutex);
+        // The wait thread stops input once it observes the child's exit,
+        // before it reports the exit.
+        if (m_child_exit_confirmed) {
+            return backend_write_after_child_exit(QStringLiteral("ConPTY backend is not writable"));
+        }
         if (!m_running || m_stopping || m_writer_failed || !m_input_write) {
             return
                 backend_reject(
@@ -2201,6 +2207,7 @@ private:
         bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            m_child_exit_confirmed = true;
             m_stopping      = true;
             m_output_paused = false;
             clear_queued_writes_locked();
@@ -2457,6 +2464,8 @@ private:
     bool                               m_output_paused = false;
     bool                               m_paused_output_delivery_in_progress = false;
     bool                               m_exit_reported = false;
+    // Set only once the wait has observed the child's exit.
+    bool                               m_child_exit_confirmed = false;
     bool                               m_shutdown_started = false;
     bool                               m_reader_finished = false;
     bool                               m_writer_failed = false;

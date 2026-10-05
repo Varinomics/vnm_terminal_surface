@@ -179,6 +179,7 @@ public:
         }
         if (exit_during_start.has_value()) {
             running = false;
+            child_exit_confirmed = true;
             m_callbacks.process_exited(*exit_during_start);
         }
         return term::backend_accept();
@@ -187,6 +188,10 @@ public:
     term::Terminal_backend_result write(QByteArray bytes) override
     {
         write_attempts.push_back(bytes);
+        if (!running && child_exit_confirmed && !fail_write) {
+            return term::backend_write_after_child_exit(
+                QStringLiteral("scripted write after the child exited"));
+        }
         if (!running || fail_write) {
             return
                 term::backend_reject(
@@ -260,6 +265,7 @@ public:
         ++interrupt_count;
         if (exit_on_interrupt) {
             running = false;
+            child_exit_confirmed = true;
             m_callbacks.process_exited({term::Terminal_exit_reason::INTERRUPTED, 130});
         }
         return term::backend_accept();
@@ -283,6 +289,7 @@ public:
         }
         running = false;
         if (exit_on_terminate) {
+            child_exit_confirmed = true;
             m_callbacks.process_exited({term::Terminal_exit_reason::TERMINATED, 0});
         }
         return term::backend_accept();
@@ -333,6 +340,7 @@ public:
     void emit_exit(term::Terminal_backend_exit exit)
     {
         running = false;
+        child_exit_confirmed = true;
         m_callbacks.process_exited(exit);
     }
 
@@ -358,6 +366,7 @@ public:
     bool                       fail_write                       = false;
     bool                       fail_resize                      = false;
     bool                       running                          = false;
+    bool                       child_exit_confirmed             = false;
     bool                       exit_on_interrupt                = true;
     bool                       exit_on_terminate                = true;
     bool                       output_paused                    = false;
@@ -15228,6 +15237,98 @@ bool test_generated_reply_write_failure_reports_backend_error()
     return ok;
 }
 
+// A child can exit before the terminal answers the queries in its last output,
+// as a short-lived command under ConPTY 1.25 does with ConPTY's own startup
+// query. The backend then refuses the reply because its input is closed.
+// Nothing remains to read the reply, so the session drops it without a
+// backend error.
+bool test_generated_reply_after_child_exit_is_dropped()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "late-reply session starts");
+    session->process_backend_callback_events();
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[c")),
+        "the child's last output asks for device attributes");
+    backend->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    session->process_backend_callback_events();
+
+    ok &= check(backend->write_attempts.size() == 1U && backend->writes.empty(),
+        "the reply is attempted after the child exited and is refused");
+    ok &= check(notification_count(
+            *session, term::Terminal_session_notification_kind::BACKEND_ERROR) == 0U,
+        "a reply refused because the child exited records no backend error");
+    ok &= check(session->exit_status().has_value() &&
+            session->exit_status()->reason == term::Terminal_exit_reason::EXITED,
+        "the child's exit is still reported");
+    return ok;
+}
+
+// A backend can stop taking input without having observed the child's exit,
+// as the POSIX backend does when it loses its exit observation. A reply
+// refused then has not lost its reader for certain, so the refusal is
+// reported.
+bool test_generated_reply_refused_without_observed_exit_reports_backend_error()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "unobserved-exit session starts");
+    session->process_backend_callback_events();
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[c")),
+        "the child's output asks for device attributes");
+    backend->running = false;
+    session->process_backend_callback_events();
+
+    ok &= check(backend->write_attempts.size() == 1U && backend->writes.empty(),
+        "the reply is attempted after the backend stopped and is refused");
+    const std::optional<term::Terminal_session_notification> error = first_notification(
+        *session, term::Terminal_session_notification_kind::BACKEND_ERROR);
+    ok &= check(error.has_value() && error->backend_error.has_value() &&
+            error->backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED,
+        "a reply refused without an observed exit reports a backend error");
+    return ok;
+}
+
+// The backend can refuse input before the session learns of the exit. Input
+// the user sent in that window is still reported when it is refused.
+bool test_user_input_after_child_exit_still_reports_backend_error()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "late-input session starts");
+    session->process_backend_callback_events();
+
+    backend->running              = false;
+    backend->child_exit_confirmed = true;
+    const term::Terminal_session_result result =
+        session->write_user_bytes(QByteArrayLiteral("x"));
+    ok &= check(result.code != term::Terminal_session_result_code::ACCEPTED,
+        "user input refused because the child exited is rejected");
+    const std::optional<term::Terminal_session_notification> error = first_notification(
+        *session, term::Terminal_session_notification_kind::BACKEND_ERROR);
+    ok &= check(error.has_value() && error->backend_error.has_value() &&
+            error->backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED,
+        "user input refused because the child exited reports a backend error");
+    return ok;
+}
+
 bool test_generated_reply_epoch_settles_after_write_rejection()
 {
     bool ok = true;
@@ -22645,6 +22746,9 @@ int main()
     ok &= test_terminal_canvas_fixture_script_through_session();
     ok &= test_generated_replies_settle_with_output_callback_epoch();
     ok &= test_generated_reply_write_failure_reports_backend_error();
+    ok &= test_generated_reply_after_child_exit_is_dropped();
+    ok &= test_generated_reply_refused_without_observed_exit_reports_backend_error();
+    ok &= test_user_input_after_child_exit_still_reports_backend_error();
     ok &= test_generated_reply_epoch_settles_after_write_rejection();
     ok &= test_generated_reply_byte_enqueue_failure_reports_backend_error();
     ok &= test_generated_reply_command_enqueue_failure_reports_backend_error();

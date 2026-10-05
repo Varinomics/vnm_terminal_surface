@@ -426,9 +426,11 @@ bool test_launch_output(const QString& fixture_path)
         "list fixture reports clean exit");
     ok &= check_no_backend_errors(capture,
         "list fixture produces no backend errors");
-    ok &= check(backend->write(QByteArrayLiteral("after")).code ==
-        term::Terminal_backend_result_code::REJECTED,
+    const term::Terminal_backend_result after_exit = backend->write(QByteArrayLiteral("after"));
+    ok &= check(after_exit.code == term::Terminal_backend_result_code::REJECTED,
         "POSIX PTY write after list exit rejects");
+    ok &= check(after_exit.child_exited,
+        "POSIX PTY write after list exit reports the exited child");
 
     return ok;
 }

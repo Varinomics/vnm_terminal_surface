@@ -849,6 +849,7 @@ public:
             m_startup_aborted                    = false;
             m_child_reaped                       = false;
             m_child_exit_observed                = false;
+            m_child_exit_confirmed               = false;
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
             m_paused_output_limits =
@@ -904,6 +905,11 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(m_mutex);
+        // The wait thread stops input once it observes the child's exit,
+        // before it reports the exit.
+        if (m_child_exit_confirmed) {
+            return backend_write_after_child_exit(QStringLiteral("POSIX PTY backend is not writable"));
+        }
         if (!m_running || m_process_stopping || m_stopping || m_writer_failed || !m_master) {
             return
                 backend_reject(
@@ -1938,6 +1944,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_child_exit_observed = true;
+            m_child_exit_confirmed = true;
             m_process_stopping = true;
             m_output_paused    = false;
             m_post_exit_process_group_cleanup_pending = true;
@@ -2090,6 +2097,9 @@ private:
     std::shared_ptr<Posix_process_group_custody> m_child_group_custody =
         std::make_shared<Posix_process_group_custody>(-1);
     bool m_child_exit_observed = false;
+    // Set only once the wait has observed the child's exit, unlike
+    // m_child_exit_observed, which a lost observation sets as well.
+    bool m_child_exit_confirmed = false;
     std::mutex                          m_mutex;
     std::condition_variable             m_output_cv;
     std::condition_variable             m_write_cv;

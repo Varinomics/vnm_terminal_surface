@@ -145,6 +145,10 @@ struct Terminal_backend_result
     // A rejected stop may already have revoked native input and begun cleanup.
     // Only a noncommitting rejection allows the session to restore readiness.
     bool                                   stop_committed = false;
+    // A write refused because the backend has observed the child's exit: no
+    // reader remains for the bytes. Any other refusal, from a failed writer or
+    // a stop without a confirmed exit, is not this.
+    bool                                   child_exited = false;
 };
 
 struct Terminal_backend_resize_request
@@ -204,6 +208,14 @@ inline Terminal_backend_result backend_reject(
         Terminal_backend_result_code::REJECTED,
         Terminal_backend_error{code, std::move(message)},
     };
+}
+
+inline Terminal_backend_result backend_write_after_child_exit(QString message)
+{
+    Terminal_backend_result result = backend_reject(
+        Terminal_backend_error_code::WRITE_FAILED, std::move(message));
+    result.child_exited = true;
+    return result;
 }
 
 inline Terminal_backend_result backend_stop_error(QString message)

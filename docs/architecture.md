@@ -188,8 +188,11 @@ whatever of its own the releasing command has. A budgeted drain takes that
 source a 4 KiB window at a time. The operation owns everything its bytes
 cause: model work it leaves pending, which only its own next step continues,
 and every reply it generates, which reaches its final disposition through the
-terminal-reply write policy (written, or refused with its error recorded) at
-the end of the step that generated it, in query order. Nothing behind the
+terminal-reply write policy at the end of the step that generated it, in query
+order: written; refused by a backend whose child has exited, and dropped
+without an error, since nothing remains to read a reply the terminal produced
+itself; or refused for any other reason, with its error recorded. Input the
+user sends (keys, paste, text) is reported whenever it is refused. Nothing behind the
 operation starts until it retires: its source consumed, its model work ended,
 its replies disposed of; a callback's epoch completes then, or when a hold
 captures its bytes, which certifies only that the hold owns them. Output up to
