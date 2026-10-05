@@ -444,15 +444,40 @@ std::optional<QByteArray> conpty_observable_output_payload(
     return std::nullopt;
 }
 
-QByteArray fixture_output_payload(std::string_view label)
+QByteArray fixture_record_payload(
+    term::Terminal_canvas_fixture_record_kind kind,
+    std::string_view                          label)
 {
     for (const term::terminal_canvas_fixture_record_t& record :
         term::terminal_canvas_fixture_contract_script())
     {
-        if (record.kind  == term::Terminal_canvas_fixture_record_kind::OUTPUT &&
+        if (record.kind  == kind &&
             record.label == label)
         {
             return decode_hex(record.payload_hex);
+        }
+    }
+
+    return {};
+}
+
+// The first CSI report in a scripted reply that ends in final_byte, such as
+// the device attributes report ('c') or the cursor position report ('R').
+QByteArray scripted_csi_report(const QByteArray& reply, char final_byte)
+{
+    for (qsizetype start = reply.indexOf("\x1b[");
+         start >= 0;
+         start = reply.indexOf("\x1b[", start + 2))
+    {
+        qsizetype end = start + 2;
+        while (end < reply.size() &&
+               (reply[end] == '?' || reply[end] == ';' ||
+                (reply[end] >= '0' && reply[end] <= '9')))
+        {
+            ++end;
+        }
+        if (end < reply.size() && reply[end] == final_byte) {
+            return reply.mid(start, end - start + 1);
         }
     }
 
@@ -1422,6 +1447,35 @@ bool wait_for_shell_size_report(
     return check(false, message);
 }
 
+// After a resize, ConPTY 1.25 asks its host for the cursor the first time the
+// child reads its screen buffer, and takes the next cursor report it reads as
+// the answer, however late. The interactive scenario keeps output paused across
+// its resize, so the request is answered once the fixture's reply-handling
+// queries arrive: by then the fixture has moved its cursor and asks for it, so
+// the scripted report is the true answer to both. Earlier releases ask nothing.
+bool answer_conpty_cursor_request(
+    term::Terminal_backend& backend,
+    Backend_capture&        capture,
+    const QByteArray&       scripted_reply)
+{
+    const QByteArray queries = fixture_record_payload(
+        term::Terminal_canvas_fixture_record_kind::OUTPUT,
+        "reply-handling");
+    bool ok = check(capture.wait_for_output(queries.mid(queries.lastIndexOf('\x1b'))),
+        "interactive fixture sends its reply-handling queries");
+
+    const QByteArray cursor_request = QByteArrayLiteral("\x1b[6n");
+    if (count_occurrences(capture.output_snapshot(), cursor_request) >
+        count_occurrences(queries, cursor_request))
+    {
+        ok &= check(backend.write(scripted_csi_report(scripted_reply, 'R')).code ==
+                term::Terminal_backend_result_code::ACCEPTED,
+            "ConPTY backend accepts the host's answer to ConPTY's cursor request");
+    }
+
+    return ok;
+}
+
 bool test_interactive_canvas_fixture(const QString& fixture_path)
 {
     bool ok = true;
@@ -1456,6 +1510,20 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
         backend->start(config, capture.callbacks());
     ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY backend starts interactive fixture");
+
+    // This test is the fixture's terminal, and a terminal answers ConPTY's own
+    // queries as well as the child's, which ConPTY passes through. ConPTY asks
+    // for device attributes as it starts and takes the first DA1 report it
+    // reads as the answer. It need not wait for one (1.25 does not), so an
+    // unanswered request would take the child's scripted report instead.
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("\x1b[c")),
+        "ConPTY asks its host for device attributes");
+    const QByteArray scripted_reply = fixture_record_payload(
+        term::Terminal_canvas_fixture_record_kind::EXPECT_INPUT,
+        "reply-handling");
+    ok &= check(backend->write(scripted_csi_report(scripted_reply, 'c')).code ==
+            term::Terminal_backend_result_code::ACCEPTED,
+        "ConPTY backend accepts the host's device attributes");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("term>")),
         "interactive fixture prompt reaches backend output");
 
@@ -1469,8 +1537,11 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
         term::terminal_canvas_fixture_contract_script())
     {
         if (record.kind == term::Terminal_canvas_fixture_record_kind::EXPECT_INPUT) {
-            const term::Terminal_backend_result write_result =
-                backend->write(decode_hex(record.payload_hex));
+            const QByteArray input = decode_hex(record.payload_hex);
+            if (record.label == std::string_view("reply-handling")) {
+                ok &= answer_conpty_cursor_request(*backend, capture, input);
+            }
+            const term::Terminal_backend_result write_result = backend->write(input);
             ok &= check(write_result.code == term::Terminal_backend_result_code::ACCEPTED,
                 "ConPTY backend accepts scripted input write");
             if (write_result.code != term::Terminal_backend_result_code::ACCEPTED) {
@@ -1491,7 +1562,8 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
 
             ok &= check(wait_for_file(checkpoint_path),
                 "fixture produced post-resize output while backend output was paused");
-            const QByteArray enable_modes_payload = fixture_output_payload(
+            const QByteArray enable_modes_payload = fixture_record_payload(
+                term::Terminal_canvas_fixture_record_kind::OUTPUT,
                 term::k_terminal_canvas_fixture_enable_input_modes_label);
             ok &= check(!enable_modes_payload.isEmpty(),
                 "enable-input-modes payload is available");
