@@ -1504,6 +1504,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
             QStringLiteral("80"),
             QStringLiteral("--checkpoint-after-enable-input-modes"),
             checkpoint_path,
+            QStringLiteral("--wait-for-host-ready"),
         });
 
     const term::Terminal_backend_result start_result =
@@ -1514,14 +1515,20 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
     // This test is the fixture's terminal, and a terminal answers ConPTY's own
     // queries as well as the child's, which ConPTY passes through. ConPTY asks
     // for device attributes as it starts and takes the first DA1 report it
-    // reads as the answer. It need not wait for one (1.25 does not), so an
-    // unanswered request would take the child's scripted report instead.
+    // reads as its answer; left unanswered, 1.25 takes the child's scripted
+    // report instead. 1.24 passes a DA1 report to a child that already reads VT
+    // input, and lets the child start after at most 3 s without an answer, so
+    // the fixture enables VT input only after the ready character that follows
+    // the answer. By then ConPTY has taken the answer on either version.
     ok &= check(capture.wait_for_output(QByteArrayLiteral("\x1b[c")),
         "ConPTY asks its host for device attributes");
     const QByteArray scripted_reply = fixture_record_payload(
         term::Terminal_canvas_fixture_record_kind::EXPECT_INPUT,
         "reply-handling");
-    ok &= check(backend->write(scripted_csi_report(scripted_reply, 'c')).code ==
+    QByteArray host_answer = scripted_csi_report(scripted_reply, 'c');
+    ok &= check(!host_answer.isEmpty(), "the scripted reply carries a DA1 report");
+    host_answer += term::k_terminal_canvas_fixture_host_ready_input;
+    ok &= check(backend->write(host_answer).code ==
             term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY backend accepts the host's device attributes");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("term>")),

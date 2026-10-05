@@ -97,7 +97,7 @@ void print_usage()
         << "       vnm_terminal_canvas_fixture --interactive-scenario "
         << term::terminal_canvas_fixture_scenario_name()
         << " [--expect-initial-size <rows> <columns>]"
-        << " [--checkpoint-after-enable-input-modes <path>]\n"
+        << " [--checkpoint-after-enable-input-modes <path>] [--wait-for-host-ready]\n"
         << "       vnm_terminal_canvas_fixture --shell-like-smoke\n"
         << "       vnm_terminal_canvas_fixture --hold-open\n"
         << "       vnm_terminal_canvas_fixture --hold-open-pid\n"
@@ -703,11 +703,45 @@ bool wait_for_gate_file(const std::string& path)
     return false;
 }
 
+// Reads console input records, VT input still off, through the host's ready
+// character. ConPTY handles its input in order, so whatever the host wrote
+// before that character has been taken as host input by then.
+bool wait_for_host_ready()
+{
+#if defined(_WIN32)
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    for (;;) {
+        INPUT_RECORD record{};
+        DWORD        count = 0U;
+        if (input == INVALID_HANDLE_VALUE || !ReadConsoleInputW(input, &record, 1U, &count)) {
+            std::cerr << "failed to read host-ready input\n";
+            return false;
+        }
+
+        if (count == 1U && record.EventType == KEY_EVENT &&
+            record.Event.KeyEvent.bKeyDown &&
+            record.Event.KeyEvent.uChar.UnicodeChar ==
+                static_cast<wchar_t>(term::k_terminal_canvas_fixture_host_ready_input))
+        {
+            return true;
+        }
+    }
+#else
+    std::cerr << "--wait-for-host-ready requires a Windows console\n";
+    return false;
+#endif
+}
+
 int run_interactive_scenario(
     int                expected_initial_rows,
     int                expected_initial_columns,
-    const std::string& checkpoint_after_enable_input_modes)
+    const std::string& checkpoint_after_enable_input_modes,
+    bool               host_ready_gate)
 {
+    if (host_ready_gate && !wait_for_host_ready()) {
+        return 15;
+    }
+
     if (!configure_interactive_console()) {
         return 19;
     }
@@ -1822,6 +1856,7 @@ int main(int argc, char** argv)
         int expected_initial_rows    = 0;
         int expected_initial_columns = 0;
         std::string checkpoint_after_enable_input_modes;
+        bool host_ready_gate = false;
 
         int index = 3;
         while (index < argc) {
@@ -1855,6 +1890,12 @@ int main(int argc, char** argv)
                 continue;
             }
 
+            if (argument_equals(argv[index], "--wait-for-host-ready")) {
+                host_ready_gate = true;
+                ++index;
+                continue;
+            }
+
             {
                 print_usage();
                 return 2;
@@ -1865,7 +1906,8 @@ int main(int argc, char** argv)
             run_interactive_scenario(
                 expected_initial_rows,
                 expected_initial_columns,
-                checkpoint_after_enable_input_modes);
+                checkpoint_after_enable_input_modes,
+                host_ready_gate);
     }
 
     if (argc == 2 && argument_equals(argv[1], "--hold-open")) {

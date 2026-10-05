@@ -86,6 +86,12 @@ inline std::string_view terminal_canvas_fixture_scenario_name()
 inline constexpr std::string_view k_terminal_canvas_fixture_enable_input_modes_label =
     "enable-input-modes";
 
+// With --wait-for-host-ready, the Windows interactive scenario reads console
+// input records through this character before it enables VT input. A ConPTY
+// host sends it after its answer to ConPTY's own startup query, so ConPTY has
+// taken that answer as host input before the child reads VT input.
+inline constexpr char k_terminal_canvas_fixture_host_ready_input = '#';
+
 inline constexpr terminal_canvas_fixture_shell_like_smoke_contract_t
 terminal_canvas_fixture_shell_like_smoke_contract()
 {
