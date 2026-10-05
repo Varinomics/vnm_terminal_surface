@@ -1961,7 +1961,11 @@ int run_escape_input_reader(
     }
 }
 
-int run_escape_vt_input_reader(const QString& observation_path)
+// A VT-input reader. By default it reads console bytes, converted to UTF-8 by
+// the console. With utf16_reads it reads UTF-16 with ReadConsoleW and converts
+// the text itself, so it observes the units ConPTY produced for the reader
+// rather than the console's conversion of them.
+int run_escape_vt_input_reader(const QString& observation_path, bool utf16_reads = false)
 {
     HANDLE input      = GetStdHandle(STD_INPUT_HANDLE);
     DWORD  input_mode = 0U;
@@ -1988,16 +1992,35 @@ int run_escape_vt_input_reader(const QString& observation_path)
     const QByteArray completion_sentinel = decode_hex("1b5b32343b367e");
     const qsizetype sentinel_size = barrier_sentinel.size();
     QByteArray pending;
+    // A leading surrogate whose trailing unit has not been read yet.
+    QString pending_utf16;
     std::size_t ack_count = 0U;
     std::cout << "escape-vt-input-reader-ready\n" << std::flush;
     for (;;) {
-        char  bytes[64];
-        DWORD count = 0U;
-        if (!ReadFile(input, bytes, sizeof(bytes), &count, nullptr)) {
-            return 1;
-        }
+        if (utf16_reads) {
+            wchar_t units[64];
+            DWORD   count = 0U;
+            if (!ReadConsoleW(input, units, static_cast<DWORD>(std::size(units)), &count, nullptr)) {
+                return 1;
+            }
 
-        pending.append(bytes, static_cast<qsizetype>(count));
+            pending_utf16 += QString::fromWCharArray(units, static_cast<qsizetype>(count));
+            qsizetype complete = pending_utf16.size();
+            if (complete > 0 && pending_utf16.at(complete - 1).isHighSurrogate()) {
+                --complete;
+            }
+            pending += pending_utf16.left(complete).toUtf8();
+            pending_utf16.remove(0, complete);
+        }
+        else {
+            char  bytes[64];
+            DWORD count = 0U;
+            if (!ReadFile(input, bytes, sizeof(bytes), &count, nullptr)) {
+                return 1;
+            }
+
+            pending.append(bytes, static_cast<qsizetype>(count));
+        }
         const qsizetype barrier_offset = pending.indexOf(barrier_sentinel);
         const qsizetype completion_offset = pending.indexOf(completion_sentinel);
         const bool completion = completion_offset >= 0 &&
@@ -2091,18 +2114,31 @@ QByteArray native_key_frame(
         QByteArray::number(key_down) + ';' + QByteArray::number(state) + ";1_";
 }
 
+// A VK_PACKET stroke carries its UTF-16 unit on key-up as well, as ConPTY's
+// own records for typed text do; other keys release with none.
+int packet_key_up_unicode(int virtual_key, int unicode)
+{
+    return virtual_key == VK_PACKET ? unicode : 0;
+}
+
 QByteArray native_key_stroke_bytes(
     int virtual_key, int scan_code, int unicode, int state)
 {
     return native_key_frame(virtual_key, scan_code, unicode, 1, state) +
-        native_key_frame(virtual_key, scan_code, 0, 0, state);
+        native_key_frame(
+            virtual_key, scan_code, packet_key_up_unicode(virtual_key, unicode), 0, state);
 }
 
 QByteArray native_key_stroke_records(
-    int virtual_key, int scan_code, int unicode, int state, int key_up_unicode = 0)
+    int                virtual_key,
+    int                scan_code,
+    int                unicode,
+    int                state,
+    std::optional<int> key_up_unicode = std::nullopt)
 {
     return native_key_record('D', virtual_key, scan_code, 1, unicode, state) +
-        native_key_record('U', virtual_key, scan_code, 1, key_up_unicode, state);
+        native_key_record('U', virtual_key, scan_code, 1,
+            key_up_unicode.value_or(packet_key_up_unicode(virtual_key, unicode)), state);
 }
 
 QByteArray packet_key_stroke_records(const QByteArray& text)
@@ -2357,14 +2393,15 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
             return false;
         }
 
-        const QByteArray child_ready_marker =
-            reader_mode == QStringLiteral("--escape-vt-input-reader")
-                ? QByteArrayLiteral("escape-vt-input-reader-ready")
-                : QByteArrayLiteral("escape-input-reader-ready");
+        const bool vt_reader =
+            reader_mode == QStringLiteral("--escape-vt-input-reader") ||
+            reader_mode == QStringLiteral("--escape-vt-utf16-input-reader");
+        const QByteArray child_ready_marker = vt_reader
+            ? QByteArrayLiteral("escape-vt-input-reader-ready")
+            : QByteArrayLiteral("escape-input-reader-ready");
         const bool child_ready = capture.wait_for_output(child_ready_marker);
         case_ok &= check(child_ready,
             "Escape transport reader reaches its ready marker");
-        const bool vt_reader = reader_mode == QStringLiteral("--escape-vt-input-reader");
         const QByteArray ack_prefix = vt_reader
             ? QByteArrayLiteral("escape-vt-input-reader-ack[")
             : QByteArrayLiteral("escape-input-reader-ack[");
@@ -2655,6 +2692,17 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
                 down_record_count == 2,
             "native reader reconstructs a supplementary character from ordered surrogates");
     }
+    // ConPTY converts the records into text for a VT-input reader. 1.25 forgets
+    // a pending leading surrogate at a key-up that carries no character
+    // (microsoft/terminal#19817). The reader reads UTF-16: a byte reader would
+    // also see the console's own UTF-8 conversion, which splits the pair on
+    // 1.24 whatever the records are.
+    ok &= run_case(
+        QStringLiteral("--escape-vt-utf16-input-reader"),
+        "supplementary text reaches a VT-input reader whole",
+        {{{supplementary_input}, supplementary.toUtf8()}},
+        Escape_input_delivery::PACED,
+        0U);
     ok &= run_case(
         QStringLiteral("--escape-input-reader"),
         "packet text does not multiply UTF-16 units by event.count",
@@ -6088,6 +6136,9 @@ int main(int argc, char** argv)
     }
     if (argc == 3 && std::string_view(argv[1]) == "--escape-vt-input-reader") {
         return run_escape_vt_input_reader(QString::fromLocal8Bit(argv[2]));
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--escape-vt-utf16-input-reader") {
+        return run_escape_vt_input_reader(QString::fromLocal8Bit(argv[2]), true);
     }
     if (argc == 2 && std::string_view(argv[1]) == "--escape-input-transport") {
         bool ok = test_escape_transport_after_native_shift_return(

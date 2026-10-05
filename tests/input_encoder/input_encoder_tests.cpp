@@ -108,11 +108,14 @@ QByteArray win32_input_event(
     return bytes;
 }
 
+// A VK_PACKET stroke carries its UTF-16 unit on key-up as well, as ConPTY's
+// own records for typed text do; other keys release with none.
 QByteArray win32_key_stroke(
     int virtual_key, int scan_code, int unicode_character, int control_key_state)
 {
+    const int key_up_character = virtual_key == VK_PACKET ? unicode_character : 0;
     return win32_input_event(virtual_key, scan_code, unicode_character, 1, control_key_state) +
-        win32_input_event(virtual_key, scan_code, 0, 0, control_key_state);
+        win32_input_event(virtual_key, scan_code, key_up_character, 0, control_key_state);
 }
 
 QByteArray packet_key_strokes(const QByteArray& bytes)
