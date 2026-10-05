@@ -831,6 +831,32 @@ set_tests_properties(vnm_terminal_canvas_renderer PROPERTIES
     TIMEOUT 60
 )
 
+add_executable(vnm_terminal_renderer_surface_format
+    terminal_renderer_surface_format/terminal_renderer_surface_format_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_renderer_surface_format PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface_renderer
+)
+
+set_target_properties(vnm_terminal_renderer_surface_format PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_renderer_surface_format
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_renderer_surface_format>"
+)
+
+set_tests_properties(vnm_terminal_renderer_surface_format PROPERTIES
+    LABELS "renderer;host"
+    TIMEOUT 30
+)
+
 set(vnm_terminal_renderer_inventory_file
     "${CMAKE_CURRENT_BINARY_DIR}/renderer_target_inventory_$<CONFIG>.txt")
 file(GENERATE
@@ -2436,6 +2462,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_canvas_export
     vnm_terminal_canvas_contract
     vnm_terminal_canvas_renderer
+    vnm_terminal_renderer_surface_format
     vnm_terminal_render_frame
     vnm_terminal_qsg_atlas
     vnm_terminal_shaping_contract

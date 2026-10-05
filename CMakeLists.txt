@@ -224,6 +224,7 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/viewport_contract.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
+    include/vnm_terminal/terminal_renderer_surface_format.h
     include/vnm_terminal/vnm_terminal_canvas.h
     src/qsg_atlas_font_bytes.cpp
     src/qsg_atlas_renderer.cpp
@@ -231,6 +232,7 @@ set(vnm_terminal_surface_renderer_sources
     src/qt_grid_metrics_provider.cpp
     src/font_metrics.cpp
     src/metrics_contract.cpp
+    src/terminal_renderer_surface_format.cpp
     src/unicode_width_tables.cpp
     src/vnm_terminal_font.cpp
     src/vnm_terminal_canvas.cpp
@@ -541,6 +543,7 @@ endif()
 install(FILES
     include/vnm_terminal/terminal_canvas_appearance.h
     include/vnm_terminal/terminal_canvas_frame.h
+    include/vnm_terminal/terminal_renderer_surface_format.h
     include/vnm_terminal/vnm_terminal_canvas.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
 )

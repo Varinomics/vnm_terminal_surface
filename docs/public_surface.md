@@ -621,6 +621,12 @@ At a high level:
 
 A host constructs a `QQuickWindow`, creates `VNM_TerminalSurface`, sizes it from
 window geometry, and starts a process after the item is attached to a window.
+Before that first window, once its `QGuiApplication` exists, the host calls
+`vnm_terminal::apply_terminal_renderer_minimum_surface_format()` from
+`vnm_terminal/terminal_renderer_surface_format.h`. It requests the OpenGL
+version the glyph atlas needs, desktop OpenGL 3.3 or OpenGL ES 3.0, and keeps a
+higher requested version and every other format option. A `VNM_TerminalCanvas`
+host has the same requirement.
 The host owns surrounding application behavior such as command-line parsing,
 window chrome, titlebar policy, clipboard policy decisions, hyperlink target
 validation and external dispatch, and packaging.
@@ -634,8 +640,9 @@ Headers under `include/vnm_terminal/internal/` are implementation detail, not
 consumer API. They are never installed: the package smoke test
 (`tests/package_smoke`) hard-fails if any `vnm_terminal/internal` header reaches
 the install tree. Every build installs the bounded immutable canvas contract
-(`vnm_terminal/terminal_canvas_frame.h`) and the backend-free Qt Quick canvas
-(`vnm_terminal/vnm_terminal_canvas.h`) through
+(`vnm_terminal/terminal_canvas_frame.h`), the backend-free Qt Quick canvas
+(`vnm_terminal/vnm_terminal_canvas.h`) and the renderer's graphics minimum
+(`vnm_terminal/terminal_renderer_surface_format.h`) through
 `vnm_terminal_surface::vnm_terminal_surface_renderer`. A full build additionally
 installs `vnm_terminal/backend_output_capture.h`,
 `vnm_terminal/font_metrics.h`, `vnm_terminal/terminal_canvas_export.h`,
