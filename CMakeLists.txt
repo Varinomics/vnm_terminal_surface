@@ -224,6 +224,9 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/viewport_contract.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/terminal_canvas_frame.h
+    include/vnm_terminal/terminal_touch_selection.h
+    include/vnm_terminal/terminal_touch_selection_codec.h
+    include/vnm_terminal/internal/terminal_touch_controller.h
     include/vnm_terminal/terminal_renderer_surface_format.h
     include/vnm_terminal/vnm_terminal_canvas.h
     src/qsg_atlas_font_bytes.cpp
@@ -236,6 +239,7 @@ set(vnm_terminal_surface_renderer_sources
     src/unicode_width_tables.cpp
     src/vnm_terminal_font.cpp
     src/vnm_terminal_canvas.cpp
+    src/terminal_touch_controller.cpp
 )
 
 add_library(vnm_terminal_surface_renderer STATIC
@@ -377,6 +381,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_repaint_recovery.cpp
     src/terminal_resize_controller.cpp
     src/terminal_session.cpp
+    src/terminal_session_touch_selection.cpp
     src/sixel_decoder.cpp
     src/terminal_byte_stream_parser.cpp
     src/terminal_canvas_export.cpp
@@ -543,6 +548,8 @@ endif()
 install(FILES
     include/vnm_terminal/terminal_canvas_appearance.h
     include/vnm_terminal/terminal_canvas_frame.h
+    include/vnm_terminal/terminal_touch_selection.h
+    include/vnm_terminal/terminal_touch_selection_codec.h
     include/vnm_terminal/terminal_renderer_surface_format.h
     include/vnm_terminal/vnm_terminal_canvas.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"

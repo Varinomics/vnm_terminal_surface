@@ -378,6 +378,7 @@ struct Terminal_render_frame
     std::vector<Terminal_render_decoration>        decorations;
     std::vector<Terminal_render_cursor_primitive>  cursors;
     std::vector<Terminal_render_rect>              overlay_rects;
+    std::vector<Terminal_render_rect>              touch_handle_rects;
     std::vector<Terminal_render_image_quad>        image_quads;
     std::vector<Terminal_render_dirty_row_range>   dirty_row_ranges;
     std::vector<Terminal_render_row_descriptor>    row_descriptors;

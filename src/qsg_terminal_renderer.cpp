@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
+#include "vnm_terminal/internal/terminal_touch_controller.h"
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
@@ -1757,6 +1758,10 @@ void build_terminal_render_frame_descriptors(
             layers.selection_key,
             frame.selection_rects,
             append_frame_key_render_rect);
+        append_frame_key_vector(
+            layers.selection_key,
+            frame.touch_handle_rects,
+            append_frame_key_render_rect);
         append_frame_key_string(layers.ime_preedit_key, ime_preedit.text);
         append_frame_key_int(layers.ime_preedit_key, ime_preedit.cursor_position);
         append_frame_key_bool(layers.ime_preedit_key, ime_preedit.active);
@@ -2619,6 +2624,37 @@ Terminal_render_frame build_terminal_render_frame(
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::cursor");
+
+        if (snapshot->touch_selection &&
+            snapshot->touch_selection->record_version == k_terminal_canvas_selection_version &&
+            snapshot->touch_selection->touch_handles_visible)
+        {
+            for (const auto endpoint : {snapshot->touch_selection->start, snapshot->touch_selection->end}) {
+                if (!endpoint.visible) {
+                    continue;
+                }
+                const QRectF handle = terminal_touch_handle_rect(
+                    endpoint, cell_metrics,
+                    QSizeF(snapshot->grid_size.columns * cell_metrics.width,
+                        snapshot->grid_size.rows * cell_metrics.height));
+                constexpr int k_handle_bands = 16;
+                for (int layer = 0; layer < 2; ++layer) {
+                    const QRectF circle = layer == 0 ? handle : handle.adjusted(2.0, 2.0, -2.0, -2.0);
+                    const qreal radius = circle.width() / 2.0;
+                    const qreal band_height = circle.height() / k_handle_bands;
+                    for (int band = 0; band < k_handle_bands; ++band) {
+                        const qreal y = -radius + (band + 0.5) * band_height;
+                        const qreal half_width = std::sqrt(std::max(0.0, radius * radius - y * y));
+                        frame.touch_handle_rects.push_back({
+                            QRectF(circle.center().x() - half_width,
+                                circle.top() + band * band_height, 2.0 * half_width, band_height),
+                            layer == 0 ? options.selection_background : options.selection_foreground,
+                            true,
+                        });
+                    }
+                }
+            }
+        }
 
         if (cursor_visible) {
             const QRectF rendered_cursor_rect =

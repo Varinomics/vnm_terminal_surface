@@ -8,9 +8,11 @@
 
 class QQuickWindow;
 class QScreen;
+class QTouchEvent;
 
 namespace vnm_terminal::internal {
 class VNM_TerminalCanvas_render_bridge;
+class Terminal_touch_controller;
 }
 
 class VNM_TerminalCanvas : public QQuickItem
@@ -52,6 +54,10 @@ class VNM_TerminalCanvas : public QQuickItem
     Q_PROPERTY(qulonglong renderedPublicationGeneration
         READ rendered_publication_generation NOTIFY render_status_changed)
     Q_PROPERTY(QString renderError READ render_error NOTIFY render_error_changed)
+    Q_PROPERTY(bool touchSelectionEnabled READ touch_selection_enabled
+        WRITE set_touch_selection_enabled NOTIFY touch_selection_enabled_changed)
+    Q_PROPERTY(QRectF touchViewport READ touch_viewport
+        WRITE set_touch_viewport NOTIFY touch_viewport_changed)
 
 public:
     explicit VNM_TerminalCanvas(QQuickItem* parent = nullptr);
@@ -98,6 +104,19 @@ public:
     qulonglong rendered_publication_generation() const;
     QString render_error() const;
 
+    bool touch_selection_enabled() const;
+    void set_touch_selection_enabled(bool enabled);
+    QRectF touch_viewport() const;
+    void set_touch_viewport(QRectF viewport);
+    Q_INVOKABLE qulonglong request_touch_selection_copy(qulonglong generation);
+    Q_INVOKABLE bool touch_selection_active() const;
+    Q_INVOKABLE void activate_terminal_tap();
+    Q_INVOKABLE bool dismiss_touch_selection(qulonglong generation = 0U);
+    Q_INVOKABLE void request_touch_padding_menu(QPointF position);
+    void cancel_touch_gesture();
+    void complete_touch_selection_request(
+        const vnm_terminal::Terminal_touch_selection_result& result);
+
     // The item copies and validates the immutable frame on its owning thread.
     // A rejected base frame leaves the last accepted canvas installed. Invalid
     // image records become image-local INVALID status while text is installed.
@@ -117,11 +136,23 @@ signals:
     void render_status_changed();
     void render_error_changed();
     void cursor_blink_phase_changed(bool visible);
+    void touch_selection_enabled_changed();
+    void touch_viewport_changed();
+    void terminal_tapped();
+    void touch_selection_requested(const vnm_terminal::Terminal_touch_selection_request& request);
+    void touch_selection_completed(const vnm_terminal::Terminal_touch_selection_result& result);
+    void touch_context_menu_requested(
+        vnm_terminal::Terminal_touch_menu menu, QRectF anchor, qulonglong selection_generation);
+    void touch_context_menu_dismissed();
+    void touch_selection_notice(QString reason);
 
 protected:
+    virtual bool touch_paste_available() const { return true; }
     QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override;
     void releaseResources() override;
     void itemChange(ItemChange change, const ItemChangeData& value) override;
+    void touchEvent(QTouchEvent* event) override;
+    void touchUngrabEvent() override;
 
 private:
     friend class vnm_terminal::internal::VNM_TerminalCanvas_render_bridge;
@@ -135,6 +166,7 @@ private:
 
     struct Private;
     std::unique_ptr<Private> m_private;
+    std::unique_ptr<vnm_terminal::internal::Terminal_touch_controller> m_touch_controller;
     QString                  m_font_family;
     QString                  m_font_style;
     int                      m_font_weight = 400;

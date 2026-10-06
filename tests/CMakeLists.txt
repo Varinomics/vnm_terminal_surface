@@ -2183,6 +2183,16 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_viewport>"
 )
 
+find_package(Qt6 REQUIRED COMPONENTS Test)
+add_executable(vnm_terminal_touch_selection touch_selection/touch_selection_tests.cpp)
+target_link_libraries(vnm_terminal_touch_selection PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface Qt6::Test)
+set_target_properties(vnm_terminal_touch_selection PROPERTIES AUTOMOC OFF)
+add_test(NAME vnm_terminal_touch_selection
+    COMMAND "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}" "QT_QPA_PLATFORM=offscreen"
+        "$<TARGET_FILE:vnm_terminal_touch_selection>")
+
 add_executable(vnm_terminal_backend_session
     backend_session/backend_session_tests.cpp
 )
@@ -2482,6 +2492,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_viewport
     vnm_terminal_wheel_gesture
     vnm_terminal_backend_session
+    vnm_terminal_touch_selection
     vnm_terminal_backend_output_capture
 )
 

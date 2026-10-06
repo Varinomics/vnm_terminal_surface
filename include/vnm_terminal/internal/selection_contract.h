@@ -237,6 +237,7 @@ public:
     Terminal_selection_anchor_domain anchor_domain()            const { return m_anchor_domain;            }
     std::uint64_t durable_payload_identity()                    const { return m_durable_payload_identity; }
     std::uint64_t provisional_payload_identity()                const { return m_provisional_payload_identity; }
+    std::uint64_t generation()                                 const { return m_generation; }
     const std::optional<terminal_selection_visual_lease_t>& visual_lease() const
     {
         return m_visual_lease;
@@ -273,6 +274,7 @@ private:
     std::optional<terminal_selection_visual_lease_t>
                                m_visual_lease;
     std::uint64_t              m_next_payload_identity        = 1U;
+    std::uint64_t              m_generation                   = 1U;
     std::uint64_t              m_durable_payload_identity     = 0U;
     std::uint64_t              m_provisional_payload_identity = 0U;
 };

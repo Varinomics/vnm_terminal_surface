@@ -8783,6 +8783,7 @@ void Terminal_session::publish_selection_snapshot(
         snapshot.metadata.visual_bell_active           = false;
         snapshot.metadata.mouse_reporting_mode_changed = false;
         snapshot.metadata.row_origin_generation        = m_row_origin_generation;
+        populate_touch_selection_projection(snapshot);
         m_latest_render_snapshot =
             std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -9516,7 +9517,8 @@ Terminal_screen_model_result Terminal_session::model_result_with_deferred_synchr
 void Terminal_session::set_selection_range_from_published_source_locked(
     Terminal_selection_range             range,
     std::optional<terminal_selection_source_identity_t>
-                                        expected_source)
+                                        expected_source,
+    bool                                publish_snapshot)
 {
     if (!m_screen_model.has_value()) {
         if (selection_trace_requested(m_config.selection_trace_enabled)) {
@@ -9626,7 +9628,9 @@ void Terminal_session::set_selection_range_from_published_source_locked(
             m_selection_buffer_id = current_source.has_value()
                 ? current_source->buffer_id
                 : m_screen_model->active_buffer_id();
-            publish_selection_snapshot(next_sequence(), QStringLiteral("selection cleared"));
+            if (publish_snapshot) {
+                publish_selection_snapshot(next_sequence(), QStringLiteral("selection cleared"));
+            }
         }
         else {
             if (selection_trace_requested(m_config.selection_trace_enabled)) {
@@ -9677,7 +9681,9 @@ void Terminal_session::set_selection_range_from_published_source_locked(
                 .arg(selection_trace_source_identity(current_source))
                 .arg(selection_trace_content_basis(m_selection_content_basis)));
     }
-    publish_selection_snapshot(next_sequence(), QStringLiteral("selection changed"));
+    if (publish_snapshot) {
+        publish_selection_snapshot(next_sequence(), QStringLiteral("selection changed"));
+    }
 }
 
 terminal_selection_visual_lease_t Terminal_session::make_selection_visual_lease(
@@ -10510,6 +10516,7 @@ bool Terminal_session::install_search_derived_snapshot(
         return false;
     }
 
+    populate_touch_selection_projection(snapshot);
     std::shared_ptr<const Terminal_render_snapshot> snapshot_handle =
         std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
@@ -10949,6 +10956,7 @@ bool Terminal_session::publish_public_projection_scroll_snapshot(
     }
 #endif
 
+    populate_touch_selection_projection(*snapshot);
     std::shared_ptr<const Terminal_render_snapshot> snapshot_handle =
         std::make_shared<const Terminal_render_snapshot>(std::move(*snapshot));
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
@@ -11065,6 +11073,7 @@ void Terminal_session::publish_render_snapshot(
     suppress_selection_spans_without_valid_line_provenance(snapshot);
     apply_search_matches_to_snapshot(snapshot, m_active_buffer_epoch);
     sync_viewport_controller_to_snapshot(m_viewport_controller, snapshot.viewport);
+    populate_touch_selection_projection(snapshot);
     std::shared_ptr<const Terminal_render_snapshot> snapshot_handle = std::make_shared<const Terminal_render_snapshot>(
         std::move(snapshot));
     const bool has_live_visible_basis =
@@ -11193,6 +11202,7 @@ void Terminal_session::publish_synchronized_resize_snapshot(
                 .arg(static_cast<qulonglong>(snapshot.selection_spans.size()))
                 .arg(selection_trace_selection_spans(snapshot.selection_spans)));
     }
+    populate_touch_selection_projection(snapshot);
     m_latest_render_snapshot =
         std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
 #if VNM_TERMINAL_PROFILING_ENABLED

@@ -847,6 +847,11 @@ struct Qsg_atlas_frame_report
     std::uint64_t render_font_epoch               = 0U;
     std::uint64_t render_ownership_generation     = 0U;
     std::uint64_t render_canvas_frame_generation  = 0U;
+    // The touch basis follows the frame actually drawn, including while a
+    // newer publication is still being prepared. It never freezes rendering.
+    std::optional<Terminal_canvas_selection> rendered_touch_selection;
+    terminal_cell_metrics_t rendered_touch_cell_metrics;
+    QRectF rendered_touch_block_cursor;
     bool          captured_light_options          = false;
     bool          first_captured_light_options    = false;
     bool          first_render_light_options      = false;

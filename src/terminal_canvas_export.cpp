@@ -132,6 +132,9 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     frame->cursor.shape                 = canvas_cursor_shape(snapshot->cursor.shape);
     frame->cursor.visible               = snapshot->cursor.visible;
     frame->cursor.blink_enabled         = snapshot->cursor.blink_enabled;
+    if (snapshot->touch_selection) {
+        frame->selection = surface.touch_selection_projection();
+    }
 
     frame->styles.reserve(snapshot->styles.size());
     frame->color_references.emplace();

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vnm_terminal/terminal_touch_selection.h"
+
 #include <QImage>
 #include <QString>
 #include <QtGlobal>
@@ -252,6 +254,7 @@ struct Terminal_canvas_frame
     std::optional<terminal_canvas_content_extent_t> content_extent;
     std::optional<Terminal_canvas_color_references> color_references;
     std::optional<Terminal_canvas_images> images;
+    std::optional<Terminal_canvas_selection> selection;
     std::vector<Terminal_canvas_style> styles;
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;

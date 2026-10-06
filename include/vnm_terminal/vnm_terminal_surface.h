@@ -3,6 +3,7 @@
 #include "vnm_terminal/backend_output_capture.h"
 #include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/terminal_message_submission.h"
+#include "vnm_terminal/terminal_touch_selection.h"
 
 #include <QQuickItem>
 #include <QByteArray>
@@ -65,6 +66,7 @@ class QMouseEvent;
 class QWheelEvent;
 class QInputMethodEvent;
 class QEvent;
+class QTouchEvent;
 
 namespace vnm_terminal::internal {
 class Terminal_backend;
@@ -77,6 +79,7 @@ struct Terminal_session_notification;
 struct Terminal_text_area_resize_arbitration_event;
 struct Terminal_session_result;
 class VNM_TerminalSurface_render_bridge;
+class Terminal_touch_controller;
 }
 
 class VNM_TerminalSurface : public QQuickItem
@@ -201,6 +204,10 @@ class VNM_TerminalSurface : public QQuickItem
         READ search_result_state NOTIFY search_changed)
     Q_PROPERTY(int searchMatchCount READ search_match_count NOTIFY search_changed)
     Q_PROPERTY(int currentSearchMatch READ current_search_match NOTIFY search_changed)
+    Q_PROPERTY(bool touchSelectionEnabled READ touch_selection_enabled
+        WRITE set_touch_selection_enabled NOTIFY touch_selection_enabled_changed)
+    Q_PROPERTY(QRectF touchViewport READ touch_viewport
+        WRITE set_touch_viewport NOTIFY touch_viewport_changed)
 
 public:
     enum class Cursor_style
@@ -707,6 +714,15 @@ public:
      */
     Q_INVOKABLE QByteArray explicit_hyperlink_at(qreal x, qreal y) const;
     Q_INVOKABLE QString selected_text();
+    vnm_terminal::Terminal_touch_selection_result apply_touch_selection(
+        const vnm_terminal::Terminal_touch_selection_request& request);
+    vnm_terminal::Terminal_canvas_selection touch_selection_projection() const;
+    bool touch_selection_enabled() const;
+    void set_touch_selection_enabled(bool enabled);
+    QRectF touch_viewport() const;
+    void set_touch_viewport(QRectF viewport);
+    Q_INVOKABLE qulonglong request_touch_selection_copy(qulonglong generation);
+    Q_INVOKABLE bool dismiss_touch_selection(qulonglong generation = 0U);
     Q_INVOKABLE void    clear_selection();
     // Cancels the current pointer gesture on the GUI thread without sending a
     // mouse release to the terminal child or completing a local click.
@@ -836,6 +852,14 @@ signals:
     void viewport_changed();
     void viewport_interaction_applied();
     void selection_changed();
+    void touch_selection_enabled_changed();
+    void touch_viewport_changed();
+    void terminal_tapped();
+    void touch_selection_completed(const vnm_terminal::Terminal_touch_selection_result& result);
+    void touch_context_menu_requested(
+        vnm_terminal::Terminal_touch_menu menu, QRectF anchor, qulonglong selection_generation);
+    void touch_context_menu_dismissed();
+    void touch_selection_notice(QString reason);
     void search_changed();
 
     void process_started();
@@ -903,6 +927,8 @@ private:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseUngrabEvent() override;
+    void touchEvent(QTouchEvent* event) override;
+    void touchUngrabEvent() override;
     void hoverMoveEvent(QHoverEvent* event) override;
     void hoverLeaveEvent(QHoverEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
@@ -1124,4 +1150,5 @@ private:
 
     struct Private;
     std::unique_ptr<Private> m_private;
+    std::unique_ptr<vnm_terminal::internal::Terminal_touch_controller> m_touch_controller;
 };

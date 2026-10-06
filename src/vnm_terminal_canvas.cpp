@@ -10,6 +10,7 @@
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_canvas_content_extent.h"
 #include "vnm_terminal/internal/terminal_style.h"
+#include "vnm_terminal/internal/terminal_touch_controller.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 
 #include <QColor>
@@ -18,6 +19,7 @@
 #include <QScreen>
 #include <QThread>
 #include <QTimer>
+#include <QTouchEvent>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -228,6 +230,26 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
         }
     }
 
+    if (frame.selection &&
+        frame.selection->record_version == vnm_terminal::k_terminal_canvas_selection_version)
+    {
+        snapshot->touch_selection = frame.selection;
+        const auto& selection = *frame.selection;
+        const int first_row = snapshot->viewport.scrollback_rows - snapshot->viewport.offset_from_tail;
+        for (int row = 0; row < frame.rows; ++row) {
+            const auto& source = selection.visible_rows[(std::size_t)row];
+            snapshot->visible_line_provenance.push_back({
+                first_row + row, source.retained_line_id, source.content_generation});
+        }
+        for (const auto& span : selection.spans) {
+            snapshot->selection_spans.push_back({
+                {{first_row + span.row, span.first_column},
+                 {first_row + span.row, span.first_column + span.column_count},
+                 term::Terminal_selection_mode::NORMAL},
+                span.row, span.first_column, span.column_count,
+            });
+        }
+    }
     return snapshot;
 }
 
@@ -347,6 +369,12 @@ term::Terminal_render_options render_options(
     options.default_foreground = QColor::fromRgba(frame.default_foreground_rgba);
     options.default_background = QColor::fromRgba(frame.default_background_rgba);
     options.cursor_color       = QColor::fromRgba(frame.cursor_rgba);
+    if (frame.selection &&
+        frame.selection->record_version == vnm_terminal::k_terminal_canvas_selection_version)
+    {
+        options.selection_background = QColor::fromRgba(frame.selection->background_rgba);
+        options.selection_foreground = QColor::fromRgba(frame.selection->foreground_rgba);
+    }
     options.text_renderer_policy = term::Terminal_text_renderer_policy::GLYPH;
     return options;
 }
@@ -420,6 +448,35 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
 {
     setFlag(ItemHasContents, true);
     setClip(true);
+    m_touch_controller = std::make_unique<term::Terminal_touch_controller>(
+        *this,
+        term::Terminal_touch_controller::Callbacks{
+            [this]() -> std::optional<term::Terminal_touch_presentation> {
+                const auto report = m_private->recorder->snapshot();
+                if (!report.rendered_touch_selection ||
+                    report.rendered_touch_selection->record_version != vnm_terminal::k_terminal_canvas_selection_version ||
+                    report.render_ownership_generation != m_private->ownership_generation)
+                {
+                    return std::nullopt;
+                }
+                return term::Terminal_touch_presentation{
+                    *report.rendered_touch_selection, report.rendered_touch_cell_metrics,
+                    report.rendered_touch_block_cursor};
+            },
+            [this](const vnm_terminal::Terminal_touch_selection_request& request) {
+                emit touch_selection_requested(request);
+            },
+            [this] { emit terminal_tapped(); },
+            [this](vnm_terminal::Terminal_touch_menu menu, QRectF rect, std::uint64_t generation) {
+                emit touch_context_menu_requested(menu, rect, generation);
+            },
+            [this] { emit touch_context_menu_dismissed(); },
+            [this](QString reason) { emit touch_selection_notice(std::move(reason)); },
+            [this] { return touch_paste_available(); },
+        },
+        false);
+    connect(this, &QQuickItem::visibleChanged, this,
+        [this] { if (!isVisible()) { m_touch_controller->cancel(); } });
     m_private->cursor_blink_timer = new QTimer(this);
     m_private->cursor_blink_timer->setInterval(500);
     connect(
@@ -625,6 +682,75 @@ QString VNM_TerminalCanvas::render_error() const
     return m_private->render_error;
 }
 
+bool VNM_TerminalCanvas::touch_selection_enabled() const { return m_touch_controller->enabled(); }
+QRectF VNM_TerminalCanvas::touch_viewport() const { return m_touch_controller->viewport(); }
+
+void VNM_TerminalCanvas::set_touch_selection_enabled(bool enabled)
+{
+    if (enabled == touch_selection_enabled()) {
+        return;
+    }
+    m_touch_controller->set_enabled(enabled);
+    setAcceptTouchEvents(enabled);
+    emit touch_selection_enabled_changed();
+}
+
+void VNM_TerminalCanvas::set_touch_viewport(QRectF viewport)
+{
+    if (viewport == touch_viewport()) {
+        return;
+    }
+    m_touch_controller->set_viewport(viewport);
+    emit touch_viewport_changed();
+}
+
+qulonglong VNM_TerminalCanvas::request_touch_selection_copy(qulonglong generation)
+{
+    return m_touch_controller->request_copy(generation);
+}
+
+bool VNM_TerminalCanvas::touch_selection_active() const
+{
+    return m_touch_controller->selection_active();
+}
+
+void VNM_TerminalCanvas::activate_terminal_tap()
+{
+    m_touch_controller->activate_tap();
+}
+
+bool VNM_TerminalCanvas::dismiss_touch_selection(qulonglong generation)
+{
+    return m_touch_controller->dismiss_selection(generation);
+}
+
+void VNM_TerminalCanvas::request_touch_padding_menu(QPointF position)
+{
+    m_touch_controller->request_padding_menu(position);
+}
+
+void VNM_TerminalCanvas::cancel_touch_gesture()
+{
+    m_touch_controller->cancel();
+}
+
+void VNM_TerminalCanvas::complete_touch_selection_request(
+    const vnm_terminal::Terminal_touch_selection_result& result)
+{
+    m_touch_controller->complete(result);
+    emit touch_selection_completed(result);
+}
+
+void VNM_TerminalCanvas::touchEvent(QTouchEvent* event)
+{
+    m_touch_controller->touch_event(*event);
+}
+
+void VNM_TerminalCanvas::touchUngrabEvent()
+{
+    m_touch_controller->touch_ungrabbed();
+}
+
 bool VNM_TerminalCanvas::set_canvas_frame(
     std::shared_ptr<const vnm_terminal::Terminal_canvas_frame> frame)
 {
@@ -633,6 +759,7 @@ bool VNM_TerminalCanvas::set_canvas_frame(
     }
 
     if (frame == nullptr) {
+        m_touch_controller->cancel();
         const bool had_frame = m_private->frame != nullptr;
         const bool cursor_blink_was_enabled =
             canvas_cursor_blink_enabled(m_private->frame);
@@ -674,6 +801,11 @@ bool VNM_TerminalCanvas::set_canvas_frame(
     }
 
     auto owned_frame = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    if (owned_frame->selection && !vnm_terminal::terminal_canvas_selection_is_valid(
+            *owned_frame->selection, owned_frame->rows, owned_frame->columns))
+    {
+        owned_frame->selection.reset();
+    }
     if (owned_frame->images &&
         !vnm_terminal::terminal_canvas_images_are_valid(*owned_frame->images, owned_frame->rows))
     {
@@ -1003,6 +1135,7 @@ void VNM_TerminalCanvas::refresh_render_status()
         emit render_error_changed();
     }
     emit render_status_changed();
+    m_touch_controller->presentation_changed();
 }
 
 void VNM_TerminalCanvas::refresh_cursor_blink(bool was_enabled)

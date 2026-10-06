@@ -48,6 +48,7 @@ int last_selected_row(const Terminal_selection_range& range)
 
 void Selection_contract_controller::begin(terminal_grid_position_t anchor)
 {
+    ++m_generation;
     m_range          = {anchor, anchor, Terminal_selection_mode::NORMAL};
     m_selected_text.reset();
     clear_visual_lease();
@@ -60,6 +61,7 @@ void Selection_contract_controller::begin(terminal_grid_position_t anchor)
 
 void Selection_contract_controller::extend(terminal_grid_position_t extent)
 {
+    ++m_generation;
     m_range.end = extent;
     m_selected_text.reset();
     clear_visual_lease();
@@ -72,6 +74,7 @@ void Selection_contract_controller::extend(terminal_grid_position_t extent)
 
 void Selection_contract_controller::clear()
 {
+    ++m_generation;
     m_has_selection  = false;
     m_internal_state = Terminal_selection_internal_state::NONE;
     m_anchor_domain  = Terminal_selection_anchor_domain::NONE;
@@ -88,6 +91,7 @@ void Selection_contract_controller::set_range(Terminal_selection_range range)
         return;
     }
 
+    ++m_generation;
     m_range          = range;
     m_selected_text.reset();
     clear_payload_identity();
@@ -124,6 +128,7 @@ void Selection_contract_controller::set_range(
 
 void Selection_contract_controller::detach_visual_attachment()
 {
+    ++m_generation;
     clear_visual_lease();
     if (!m_has_selection) {
         m_internal_state = Terminal_selection_internal_state::NONE;

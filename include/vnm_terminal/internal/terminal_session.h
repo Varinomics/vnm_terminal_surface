@@ -221,6 +221,8 @@ public:
     void detach_selection_visual_attachment();
 
     void clear_selection();
+    Terminal_touch_selection_result apply_touch_selection(
+        const Terminal_touch_selection_request& request);
     void set_scrollback_limit(int limit);
     void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
     void set_color_state(Terminal_color_state state);
@@ -869,6 +871,7 @@ private:
         std::uint64_t              sequence,
         QString                    message,
         bool                       allow_blocked_selection_only_snapshot = false);
+    void populate_touch_selection_projection(Terminal_render_snapshot& snapshot) const;
 
     void advance_selection_content_basis_for_model_result(
         const Terminal_screen_model_result&    result,
@@ -948,7 +951,8 @@ private:
     void set_selection_range_from_published_source_locked(
         Terminal_selection_range               range,
         std::optional<terminal_selection_source_identity_t>
-                                            expected_source);
+                                            expected_source,
+        bool                                publish_snapshot = true);
 
     terminal_selection_visual_lease_t make_selection_visual_lease(
         Terminal_selection_range               range) const;
@@ -1233,6 +1237,10 @@ private:
     Terminal_viewport_controller                           m_viewport_controller;
     Terminal_bell_state                                    m_bell_state;
     Selection_contract_controller                          m_selection;
+    QString                                                m_touch_gesture_id;
+    Terminal_selection_handle                              m_touch_handle = Terminal_selection_handle::END;
+    std::uint64_t                                          m_touch_selection_generation = 0U;
+    bool                                                   m_touch_handles_visible = false;
     Terminal_search_controller                             m_search;
     terminal_selection_content_basis_t                     m_selection_content_basis;
     std::optional<Synchronized_selection_continuity_hold>

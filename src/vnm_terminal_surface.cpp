@@ -15,6 +15,7 @@
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
+#include "vnm_terminal/internal/terminal_touch_controller.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
@@ -47,6 +48,7 @@
 #include <QStringDecoder>
 #include <QStringList>
 #include <QThread>
+#include <QTouchEvent>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QTimer>
@@ -2399,6 +2401,7 @@ struct VNM_TerminalSurface::Private
                 auto& surface_private = *surface.m_private;
                 if (!surface_private.shutting_down.load()) {
                     surface_private.reconcile_atlas_completion(surface);
+                    surface.m_touch_controller->presentation_changed();
                 }
             };
         (void)QObject::connect(
@@ -3239,6 +3242,41 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
     setAcceptedMouseButtons(Qt::AllButtons);
     setAcceptHoverEvents(true);
     setFocus(true);
+    setAcceptTouchEvents(true);
+    m_touch_controller = std::make_unique<term::Terminal_touch_controller>(
+        *this,
+        term::Terminal_touch_controller::Callbacks{
+            [this]() -> std::optional<term::Terminal_touch_presentation> {
+                const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(*this);
+                if (!report.rendered_touch_selection ||
+                    report.rendered_touch_selection->record_version != vnm_terminal::k_terminal_canvas_selection_version)
+                {
+                    return std::nullopt;
+                }
+                return term::Terminal_touch_presentation{
+                    *report.rendered_touch_selection,
+                    report.rendered_touch_cell_metrics,
+                    report.rendered_touch_block_cursor,
+                };
+            },
+            [this](const vnm_terminal::Terminal_touch_selection_request& request) {
+                const auto result = apply_touch_selection(request);
+                m_touch_controller->complete(result);
+                emit touch_selection_completed(result);
+            },
+            [this] { forceActiveFocus(Qt::MouseFocusReason); emit terminal_tapped(); },
+            [this](vnm_terminal::Terminal_touch_menu menu, QRectF rect, std::uint64_t generation) {
+                emit touch_context_menu_requested(menu, rect, generation);
+            },
+            [this] { emit touch_context_menu_dismissed(); },
+            [this](QString reason) { emit touch_selection_notice(std::move(reason)); },
+            [this] { return backend_ready(); },
+        },
+        true);
+    connect(this, &VNM_TerminalSurface::selection_changed, this,
+        [this] { m_touch_controller->presentation_changed(); });
+    connect(this, &QQuickItem::visibleChanged, this,
+        [this] { if (!isVisible()) { m_touch_controller->cancel(); } });
     m_private->cursor_settle_timer.setSingleShot(true);
     m_private->cursor_input_grace_timer.setSingleShot(true);
     QObject::connect(
@@ -4782,6 +4820,74 @@ QString VNM_TerminalSurface::selected_text()
         : QString();
 }
 
+vnm_terminal::Terminal_touch_selection_result VNM_TerminalSurface::apply_touch_selection(
+    const vnm_terminal::Terminal_touch_selection_request& request)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
+    if (m_private->session == nullptr) {
+        return {request.request_id, request.action,
+            vnm_terminal::Terminal_touch_selection_status::UNAVAILABLE, 0U, {},
+            QStringLiteral("The terminal session is unavailable.")};
+    }
+    const auto result = m_private->session->apply_touch_selection(request);
+    sync_from_session();
+    return result;
+}
+
+vnm_terminal::Terminal_canvas_selection VNM_TerminalSurface::touch_selection_projection() const
+{
+    const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(*this);
+    auto projection = snapshot != nullptr && snapshot->touch_selection
+        ? *snapshot->touch_selection : vnm_terminal::Terminal_canvas_selection{};
+    const auto options = render_options_for_surface(*this);
+    projection.background_rgba = options.selection_background.rgba();
+    projection.foreground_rgba = options.selection_foreground.rgba();
+    return projection;
+}
+
+bool VNM_TerminalSurface::touch_selection_enabled() const { return m_touch_controller->enabled(); }
+QRectF VNM_TerminalSurface::touch_viewport() const { return m_touch_controller->viewport(); }
+
+void VNM_TerminalSurface::set_touch_selection_enabled(bool enabled)
+{
+    if (enabled == touch_selection_enabled()) {
+        return;
+    }
+    m_touch_controller->set_enabled(enabled);
+    setAcceptTouchEvents(enabled);
+    emit touch_selection_enabled_changed();
+}
+
+void VNM_TerminalSurface::set_touch_viewport(QRectF viewport)
+{
+    if (viewport == touch_viewport()) {
+        return;
+    }
+    m_touch_controller->set_viewport(viewport);
+    emit touch_viewport_changed();
+}
+
+qulonglong VNM_TerminalSurface::request_touch_selection_copy(qulonglong generation)
+{
+    return m_touch_controller->request_copy(generation);
+}
+
+bool VNM_TerminalSurface::dismiss_touch_selection(qulonglong generation)
+{
+    return m_touch_controller->dismiss_selection(generation);
+}
+
+void VNM_TerminalSurface::touchEvent(QTouchEvent* event)
+{
+    m_touch_controller->touch_event(*event);
+}
+
+void VNM_TerminalSurface::touchUngrabEvent()
+{
+    m_touch_controller->touch_ungrabbed();
+}
+
 bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
     Selection_copy_policy policy)
 {
@@ -4855,6 +4961,7 @@ void VNM_TerminalSurface::clear_selection_within_input_event()
 void VNM_TerminalSurface::cancel_pointer_gesture()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_touch_controller->cancel();
 
     const bool pending_press = std::any_of(
         m_private->pending_published_mouse_reports.begin(),

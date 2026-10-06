@@ -4355,7 +4355,9 @@ private:
         m_cursor_text_pass      = cursor_text_passes.glyph;
         m_msdf_cursor_text_pass = cursor_text_passes.msdf;
         prune_prepared_text_cache(result.producer);
-        m_overlay_pass = append_rect_pass(render_frame.overlay_rects, opacity);
+        auto overlay_rects = render_frame.touch_handle_rects;
+        overlay_rects.insert(overlay_rects.end(), render_frame.overlay_rects.begin(), render_frame.overlay_rects.end());
+        m_overlay_pass = append_rect_pass(overlay_rects, opacity);
         build_render_rect_buffer_layout(result);
         build_render_glyph_buffer_layout(result);
         result.raw_font_rasterized = result.rasterized_glyphs > 0;
@@ -8486,6 +8488,25 @@ void Qsg_atlas_recorder::record_render(
     m_report.render_light_options           = captured_options_are_light(frame);
     m_report.viewport_rect                  = viewport_rect;
     m_report.drew                           = drew;
+    if (drew) {
+        m_report.rendered_touch_selection = frame.snapshot != nullptr
+            ? frame.snapshot->touch_selection : std::nullopt;
+        m_report.rendered_touch_cell_metrics = frame.cell_metrics;
+        m_report.rendered_touch_block_cursor = {};
+        if (frame.snapshot != nullptr &&
+            frame.options.cursor_shape_override.value_or(frame.snapshot->cursor.shape) == Terminal_cursor_shape::BLOCK &&
+            terminal_render_cursor_visible(*frame.snapshot, frame.options, true))
+        {
+            m_report.rendered_touch_block_cursor = QRectF(
+                frame.snapshot->cursor.position.column * frame.cell_metrics.width,
+                frame.snapshot->cursor.position.row * frame.cell_metrics.height,
+                frame.cell_metrics.width, frame.cell_metrics.height);
+        }
+        if (m_report.rendered_touch_selection) {
+            m_report.rendered_touch_selection->background_rgba = frame.options.selection_background.rgba();
+            m_report.rendered_touch_selection->foreground_rgba = frame.options.selection_foreground.rgba();
+        }
+    }
     if (m_report.first_render_snapshot_sequence == 0U) {
         m_report.first_render_capture_sequence  = frame.capture_sequence;
         m_report.first_render_snapshot_sequence = m_report.render_snapshot_sequence;

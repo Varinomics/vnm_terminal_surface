@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vnm_terminal/terminal_touch_selection.h"
+
 #include "vnm_terminal/internal/ime_contract.h"
 #include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/selection_contract.h"
@@ -587,6 +589,7 @@ struct Terminal_render_snapshot
     std::vector<Terminal_render_search_match_span>     search_match_spans;
     Terminal_render_metadata                           metadata;
     Terminal_mode_state                                modes;
+    std::optional<Terminal_canvas_selection>            touch_selection;
 };
 
 struct Terminal_render_snapshot_validation
