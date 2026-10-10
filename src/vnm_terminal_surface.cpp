@@ -5020,6 +5020,21 @@ void VNM_TerminalSurface::set_search_query(QString query)
     sync_from_session();
 }
 
+void VNM_TerminalSurface::set_search_case_sensitive(bool case_sensitive)
+{
+    Input_frontier_scope input_frontier(*this);
+    Q_ASSERT(thread() == QThread::currentThread());
+    if (m_search_case_sensitive == case_sensitive) {
+        return;
+    }
+    m_search_case_sensitive = case_sensitive;
+    if (m_private->session != nullptr) {
+        m_private->session->set_search_case_sensitive(case_sensitive);
+        sync_from_session();
+    }
+    emit search_changed();
+}
+
 void VNM_TerminalSurface::clear_search()
 {
     Q_ASSERT(thread() == QThread::currentThread());
@@ -8236,6 +8251,7 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
     m_private->session =
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
     m_private->session_generation = started_session_generation;
+    m_private->session->set_search_case_sensitive(m_search_case_sensitive);
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     // Before the backend starts, so the child's first winsize has pixels.

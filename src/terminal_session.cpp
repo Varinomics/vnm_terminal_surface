@@ -4030,6 +4030,15 @@ void Terminal_session::set_search_query(QString query)
         QStringLiteral("terminal search query changed"));
 }
 
+void Terminal_session::set_search_case_sensitive(bool case_sensitive)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_search.set_case_sensitive(case_sensitive);
+    m_search_reveal_pending = !m_search.query().isEmpty();
+    (void)publish_search_derived_snapshot(
+        QStringLiteral("terminal search matching changed"));
+}
+
 void Terminal_session::clear_search()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

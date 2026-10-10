@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QString>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -109,6 +110,46 @@ term::Terminal_search_source_row search_test_row(
             static_cast<int>(column) + 1);
     }
     return row;
+}
+
+bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
+{
+    term::Terminal_search_controller search;
+    term::Terminal_search_source_update source;
+    source.identity.grid_size = {3, 20};
+    source.identity.active_buffer_epoch = 1U;
+    source.revision = 1U;
+    source.reset_active_rows = true;
+    source.active_rows.push_back(search_test_row(1U, 0, u"Alpha ALPHA alpha"));
+    source.active_rows.push_back(search_test_row(2U, 1, u"k K"));
+    auto wide_row = search_test_row(3U, 2, u"");
+    wide_row.text.append_cell_text(QStringView(u"\u00c4"), 2, 4);
+    source.active_rows.push_back(std::move(wide_row));
+    search.update_source(std::move(source));
+    search.set_query(QStringLiteral("Alpha"), 0);
+    bool ok = check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "case-sensitive search completes");
+    ok &= check(search.result_state().match_count == 1,
+        "terminal search retains exact matching by default");
+    search.set_case_sensitive(false);
+    search.set_case_sensitive(true);
+    search.set_case_sensitive(false);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "latest case mode completes after rapid toggles");
+    ok &= check(search.result_state().match_count == 3,
+        "insensitive search rescans unchanged query and discards stale exact results");
+    search.set_query(QStringLiteral("\u212a"), 0);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "Unicode query against Latin-1 cells completes");
+    ok &= check(search.result_state().match_count == 2,
+        "Kelvin sign matches both cases of Latin-1 k through Unicode case folding");
+    search.set_query(QStringLiteral("\u00e4"), 2);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "insensitive wide-cell match completes");
+    const auto match = search.current_match();
+    ok &= check(match && match->first_column == 2 && match->column_count == 2,
+        "insensitive Unicode matches retain the original cell span");
+    return ok;
 }
 
 bool test_active_search_refresh_preserves_retained_prefix_and_navigation()
@@ -430,6 +471,7 @@ int main()
 {
     bool ok = true;
     ok &= test_identity_spans_stay_implicit_until_needed();
+    ok &= test_case_mode_rescans_and_preserves_unicode_cell_spans();
     ok &= test_active_search_refresh_preserves_retained_prefix_and_navigation();
     ok &= test_search_row_text_matches_published_snapshot_rows();
     ok &= test_retained_history_ordinal_range_tracks_appends_and_evictions();

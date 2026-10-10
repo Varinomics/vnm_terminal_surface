@@ -111,6 +111,7 @@ public:
     void clear();
     void set_source_unavailable(QString query);
     void set_query(QString query, std::int64_t preferred_public_row);
+    void set_case_sensitive(bool case_sensitive);
     void update_source(Terminal_search_source_update update);
     bool process_completion();
     bool wait_for_idle_for_testing(std::chrono::milliseconds timeout);
@@ -143,6 +144,7 @@ private:
     std::int64_t                               m_preferred_public_row = 0;
     bool                                       m_source_available = false;
     bool                                       m_searching = false;
+    bool                                       m_case_sensitive = true;
 };
 
 }

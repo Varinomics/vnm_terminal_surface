@@ -295,6 +295,7 @@ public:
     void record_selection_drag_proven_range();
     void clear_selection_drag_provenance();
     void set_search_query(QString query);
+    void set_search_case_sensitive(bool case_sensitive);
     void clear_search();
     bool search_next();
     bool search_previous();

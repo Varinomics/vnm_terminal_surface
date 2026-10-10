@@ -200,6 +200,8 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Selection_state selectionState READ selection_state NOTIFY selection_changed)
     Q_PROPERTY(QString searchQuery
         READ search_query WRITE set_search_query NOTIFY search_changed)
+    Q_PROPERTY(bool searchCaseSensitive
+        READ search_case_sensitive WRITE set_search_case_sensitive NOTIFY search_changed)
     Q_PROPERTY(Search_result_state searchResultState
         READ search_result_state NOTIFY search_changed)
     Q_PROPERTY(int searchMatchCount READ search_match_count NOTIFY search_changed)
@@ -728,6 +730,8 @@ public:
     // mouse release to the terminal child or completing a local click.
     void cancel_pointer_gesture();
     Q_INVOKABLE void    set_search_query(QString query);
+    bool search_case_sensitive() const { return m_search_case_sensitive; }
+    Q_INVOKABLE void set_search_case_sensitive(bool case_sensitive);
     Q_INVOKABLE void    clear_search();
     Q_INVOKABLE bool    search_next();
     Q_INVOKABLE bool    search_previous();
@@ -1144,6 +1148,7 @@ private:
     bool                     m_viewport_at_tail          = true;
     Selection_state          m_selection_state           = Selection_state::NONE;
     QString                  m_search_query;
+    bool                     m_search_case_sensitive = true;
     Search_result_state      m_search_result_state       = Search_result_state::INACTIVE;
     int                      m_search_match_count        = 0;
     int                      m_current_search_match      = 0;

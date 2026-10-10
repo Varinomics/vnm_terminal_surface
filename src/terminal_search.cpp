@@ -68,6 +68,7 @@ struct Search_query_text
     QStringView utf16;
     QByteArray  latin1;
     bool        latin1_exact = false;
+    Qt::CaseSensitivity case_sensitivity = Qt::CaseSensitive;
 };
 
 struct Search_corpus
@@ -107,10 +108,11 @@ Search_corpus_row make_search_corpus_row(Terminal_search_source_row& source)
     return row;
 }
 
-Search_query_text make_search_query_text(const QString& query)
+Search_query_text make_search_query_text(const QString& query, bool case_sensitive)
 {
     Search_query_text text;
     text.utf16 = QStringView(query);
+    text.case_sensitivity = case_sensitive ? Qt::CaseSensitive : Qt::CaseInsensitive;
     text.latin1_exact = std::all_of(
         query.cbegin(),
         query.cend(),
@@ -156,7 +158,7 @@ std::optional<std::vector<search_match_span_t>> search_row(
     }
 
     std::vector<search_match_span_t> matches;
-    if (row.complex_text == nullptr) {
+    if (row.complex_text == nullptr && query.case_sensitivity == Qt::CaseSensitive) {
         const std::size_t unit_count = column_count >= row.source_width
             ? static_cast<std::size_t>(row.identity_latin1_text.size())
             : std::min(
@@ -190,11 +192,17 @@ std::optional<std::vector<search_match_span_t>> search_row(
         return matches;
     }
 
-    const Terminal_search_row_text& complex = *row.complex_text;
-    const std::size_t unit_count = searchable_unit_count(complex, column_count);
-    const QStringView text(
-        complex.units.data(),
-        static_cast<qsizetype>(unit_count));
+    const Terminal_search_row_text* complex = row.complex_text.get();
+    const qsizetype latin1_units = column_count >= row.source_width
+        ? row.identity_latin1_text.size()
+        : std::min(row.identity_latin1_text.size(), static_cast<qsizetype>(std::max(0, column_count)));
+    const QString latin1_text = complex == nullptr
+        ? QString::fromLatin1(row.identity_latin1_text.constData(), latin1_units)
+        : QString();
+    const QStringView text = complex != nullptr
+        ? QStringView(complex->units.data(),
+              static_cast<qsizetype>(searchable_unit_count(*complex, column_count)))
+        : QStringView(latin1_text);
     if (query.utf16.isEmpty() || query.utf16.size() > text.size()) {
         return matches;
     }
@@ -202,18 +210,18 @@ std::optional<std::vector<search_match_span_t>> search_row(
     qsizetype search_from = 0;
     while (search_from <= text.size() - query.utf16.size()) {
         const qsizetype found =
-            text.indexOf(query.utf16, search_from, Qt::CaseSensitive);
+            text.indexOf(query.utf16, search_from, query.case_sensitivity);
         if (found < 0) {
             break;
         }
 
         const qsizetype last = found + query.utf16.size() - 1;
-        const int first_column = complex.identity_spans
+        const int first_column = complex == nullptr || complex->identity_spans
             ? static_cast<int>(found)
-            : complex.spans[static_cast<std::size_t>(found)].first_column;
-        const int end_column = complex.identity_spans
+            : complex->spans[static_cast<std::size_t>(found)].first_column;
+        const int end_column = complex == nullptr || complex->identity_spans
             ? static_cast<int>(last) + 1
-            : complex.spans[static_cast<std::size_t>(last)].end_column;
+            : complex->spans[static_cast<std::size_t>(last)].end_column;
         matches.push_back({first_column, std::max(1, end_column - first_column)});
         search_from = found + std::max<qsizetype>(1, query.utf16.size());
     }
@@ -234,6 +242,7 @@ struct Terminal_search_controller::Shared_state
         std::uint64_t                     work_generation = 0U;
         std::int64_t                      preferred_public_row = 0;
         bool                              source_available = false;
+        bool                              case_sensitive = true;
     };
 
     struct Corpus_changes
@@ -319,7 +328,7 @@ struct Terminal_search_controller::Shared_state
         const auto refresh_anchor = current_match_for_result(result);
         desired.work_generation =
             desired_work_generation.fetch_add(1U, std::memory_order_acq_rel) + 1U;
-        const Search_query_text query = make_search_query_text(desired.query);
+        const Search_query_text query = make_search_query_text(desired.query, desired.case_sensitive);
         for (auto& source_row : update.active_rows) {
             const auto index = static_cast<std::size_t>(source_row.active_grid_row);
             active_rows[index] = make_search_corpus_row(source_row);
@@ -789,7 +798,7 @@ private:
         }
 
         Search_match_rows matches;
-        const Search_query_text query = make_search_query_text(desired.query);
+        const Search_query_text query = make_search_query_text(desired.query, desired.case_sensitive);
         const int columns = desired.source_identity.grid_size.columns;
         const auto add_row = [&](
             const Search_corpus_row& row,
@@ -887,7 +896,7 @@ private:
         std::optional<terminal_search_match_t>& refresh_anchor)
     {
         Search_match_rows replacements;
-        const Search_query_text query = make_search_query_text(desired.query);
+        const Search_query_text query = make_search_query_text(desired.query, desired.case_sensitive);
         const int columns = desired.source_identity.grid_size.columns;
         for (std::uint64_t retained_ordinal : changes.changed_retained_ordinals) {
             if (retained_ordinal < corpus.first_retained_ordinal ||
@@ -1231,6 +1240,17 @@ void Terminal_search_controller::set_query(
     request_current_query();
 }
 
+void Terminal_search_controller::set_case_sensitive(bool case_sensitive)
+{
+    if (m_case_sensitive == case_sensitive) {
+        return;
+    }
+    m_case_sensitive = case_sensitive;
+    ++m_query_generation;
+    m_searching = m_source_available && !m_query.isEmpty();
+    request_current_query();
+}
+
 void Terminal_search_controller::update_source(Terminal_search_source_update update)
 {
     const bool can_refresh = m_source_available && !m_searching && !m_query.isEmpty();
@@ -1243,6 +1263,7 @@ void Terminal_search_controller::update_source(Terminal_search_source_update upd
 
     Shared_state::Desired_work desired;
     desired.query                   = m_query;
+    desired.case_sensitive          = m_case_sensitive;
     desired.source_identity         = m_source_identity;
     desired.query_generation        = m_query_generation;
     desired.source_revision         = m_source_revision;
@@ -1346,6 +1367,7 @@ void Terminal_search_controller::request_current_query()
 {
     Shared_state::Desired_work desired;
     desired.query                   = m_query;
+    desired.case_sensitive          = m_case_sensitive;
     desired.source_identity         = m_source_identity;
     desired.query_generation        = m_query_generation;
     desired.source_revision         = m_source_revision;
