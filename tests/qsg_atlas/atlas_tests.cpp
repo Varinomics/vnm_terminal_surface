@@ -4116,6 +4116,16 @@ Lcd_repeated_w_stability_stats measure_lcd_repeated_w_stability(
     return stats;
 }
 
+bool lcd_repeated_grayscale_pixels_stable(const Lcd_repeated_w_stability_stats& stats)
+{
+    // A floating-point sample at an 8-bit quantization boundary can round to
+    // either adjacent code. This bounds each pixel, not how many hit a boundary;
+    // the translated repeated-W probe uses the same one-code-value contract.
+    return stats.max_delta <= 1 &&
+        stats.ink_mask_diff_pixels == 0 &&
+        stats.max_ink_mask_diff_pixels_per_cell == 0;
+}
+
 std::vector<Lcd_intensity_x_row_stability> measure_lcd_intensity_x_stability(
     const Pixel_parity_fixture& fixture,
     const QImage&               image)
@@ -7260,6 +7270,61 @@ bool shader_has_invalid_es_array_sampler_variant(const QShader& shader)
         }
     }
     return false;
+}
+
+bool test_repeated_grayscale_pixel_stability_contract()
+{
+    const Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "grayscale_quantization_contract", {1, 2}, 1U, {4.0, 4.0, 3.0, 1.0}, 1.0);
+    QImage image(8, 4, QImage::Format_RGBA8888);
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            const int level = 80 + x * 4 + y * 7;
+            image.setPixelColor(x, y, QColor(level, level, level));
+            image.setPixelColor(x + 4, y, QColor(level + 1, level + 1, level + 1));
+        }
+    }
+    const auto measure = [&] {
+        return measure_lcd_repeated_w_stability(fixture, image, 0, 0, 1, 2);
+    };
+    const QImage rounding_only = image;
+    const Lcd_repeated_w_stability_stats rounding = measure();
+    bool ok = check(
+        rounding.compared_pixels == 16 && rounding.diff_pixels == 16 &&
+            lcd_repeated_grayscale_pixels_stable(rounding),
+        "grayscale stability allows one output-code difference at every compared pixel");
+
+    QColor two_levels = image.pixelColor(1, 1);
+    two_levels.setRed(two_levels.red() + 2);
+    image.setPixelColor(5, 1, two_levels);
+    const Lcd_repeated_w_stability_stats color_error = measure();
+    ok &= check(
+        color_error.max_delta == 2 && color_error.ink_mask_diff_pixels == 0 &&
+            !lcd_repeated_grayscale_pixels_stable(color_error),
+        "grayscale stability rejects one pixel exceeding the output-code bound even with identical ink");
+
+    image = rounding_only;
+    const QColor background = lcd_repeated_w_background(fixture);
+    QColor threshold = background;
+    threshold.setRed(background.red() + 8);
+    image.setPixelColor(1, 1, threshold);
+    threshold.setRed(background.red() + 9);
+    image.setPixelColor(5, 1, threshold);
+    const Lcd_repeated_w_stability_stats changed_ink = measure();
+    ok &= check(
+        changed_ink.max_delta == 1 && changed_ink.ink_mask_diff_pixels == 1 &&
+            !lcd_repeated_grayscale_pixels_stable(changed_ink),
+        "grayscale stability rejects an ink-mask change even within one output code");
+
+    image.fill(background);
+    image.setPixelColor(1, 1, QColor(160, 160, 160));
+    image.setPixelColor(6, 1, QColor(160, 160, 160));
+    const Lcd_repeated_w_stability_stats moved_ink = measure();
+    ok &= check(
+        moved_ink.max_ink_pixels_delta == 0 && moved_ink.max_relative_bbox_x_delta == 1 &&
+            !lcd_repeated_grayscale_pixels_stable(moved_ink),
+        "grayscale stability rejects a one-pixel glyph shift with unchanged ink count");
+    return ok;
 }
 
 bool test_shader_package_variant_contract()
@@ -19632,9 +19697,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             k_probe_subpixel_order);
     const Pixel_parity_fixture contiguous_x_fixture =
         make_lcd_contiguous_x_probe_fixture(device_pixel_ratio);
-    // The contiguous-X and intensity-X probes assert byte-identical crops
-    // across adjacent cells. LCD filtering is context-dependent across cell
-    // boundaries, so these geometry-stability probes run grayscale MSDF.
+    // LCD filtering is context-dependent across cell boundaries, so these
+    // repeated-cell geometry and quantization probes run grayscale MSDF.
     const Pixel_render_result contiguous_x_atlas =
         render_pixel_atlas_fixture(
             app,
@@ -21065,12 +21129,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 contiguous_x_stability.compared_pixels > 0,
             "LCD atlas probe contiguous-X stability comparison covers every repeated cell");
         ok &= check(
-            contiguous_x_stability.diff_pixels == 0 &&
-                contiguous_x_stability.max_diff_pixels_per_cell == 0 &&
-                contiguous_x_stability.max_delta == 0 &&
-                contiguous_x_stability.ink_mask_diff_pixels == 0 &&
-                contiguous_x_stability.max_ink_mask_diff_pixels_per_cell == 0,
-            "LCD atlas probe contiguous-X grayscale crops are identical across cells");
+            lcd_repeated_grayscale_pixels_stable(contiguous_x_stability),
+            "LCD atlas probe contiguous-X grayscale crops preserve ink within one output code");
         ok &= check(
             contiguous_x_stability.all_cells_have_ink &&
                 contiguous_x_stability.max_ink_pixels_delta == 0 &&
@@ -21116,15 +21176,9 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                     k_lcd_intensity_x_columns - 1 &&
                     stability.compared_pixels > 0,
                 " stability comparison covers every repeated cell");
-            // Grayscale MSDF sampling rounds a few boundary texels differently
-            // across absolute positions; the stability invariant is identical
-            // ink geometry, with color divergence limited to LSB rounding.
             ok &= check_row(
-                stability.max_delta <= 1 &&
-                    stability.diff_pixels * 200 <= stability.compared_pixels &&
-                    stability.ink_mask_diff_pixels == 0 &&
-                    stability.max_ink_mask_diff_pixels_per_cell == 0,
-                " grayscale crops are identical across cells up to MSDF sampling rounding");
+                lcd_repeated_grayscale_pixels_stable(stability),
+                " grayscale crops preserve ink within one output code");
             ok &= check_row(
                 stability.all_cells_have_ink &&
                     stability.max_ink_pixels_delta == 0 &&
@@ -22518,6 +22572,7 @@ bool test_font_file_bytes_for_font()
 bool run_unit_tests()
 {
     bool ok = true;
+    ok &= test_repeated_grayscale_pixel_stability_contract();
     ok &= test_shader_package_variant_contract();
     ok &= test_image_shader_package_variant_contract();
     ok &= test_image_texture_cache();
