@@ -2042,10 +2042,14 @@ bool test_surface_frame_fallback_requires_runner_progress(
         term::Terminal_backend_error_code::READ_FAILED,
         QStringLiteral("epoch-progress-watchdog-marker"),
     });
-    QByteArray sliced_output(64 * 1024, 'x');
+    // Keep several model slices pending below output high water so the frame
+    // watchdog retains ownership until the simulated stall.
+    QByteArray sliced_output(3 * k_backend_output_drain_slice_contract_bytes, 'x');
     sliced_output.append(QByteArrayLiteral("\r\nepoch-progress-watchdog-tail"));
     backend_ptr->emit_output_from_worker(std::move(sliced_output));
     backend_ptr->join_worker();
+    ok &= check(!backend_ptr->output_paused,
+        "epoch-progress watchdog fixture remains below output backpressure");
     const std::uint64_t target_epoch =
         term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
             surface);
@@ -2260,7 +2264,7 @@ bool test_surface_output_backpressure_uses_posted_callback_owner(
     }
 
     const QString tail_text = QStringLiteral("backpressure-owner-tail");
-    QByteArray high_water_output(1100 * 1024, 'x');
+    QByteArray high_water_output(70 * 1024, 'x');
     high_water_output.append(QByteArrayLiteral("\r\nbackpressure-owner-tail"));
     backend_ptr->emit_output_from_worker(std::move(high_water_output));
     backend_ptr->join_worker();
@@ -2362,7 +2366,7 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
     const term::Terminal_surface_backend_drain_stats_t stats_before_pressure =
         term::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface);
     const QString tail_text = QStringLiteral("pressure-handoff-tail");
-    QByteArray high_water_output(1100 * 1024, 'x');
+    QByteArray high_water_output(70 * 1024, 'x');
     high_water_output.append(QByteArrayLiteral("\r\npressure-handoff-tail"));
     backend_ptr->emit_output_from_worker(std::move(high_water_output));
     backend_ptr->join_worker();
@@ -6408,7 +6412,7 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
             backpressure_states.push_back(active);
         });
 
-    QByteArray zoom_drain_output(1100 * 1024, 'x');
+    QByteArray zoom_drain_output(70 * 1024, 'x');
     zoom_drain_output += QByteArrayLiteral("\r\nzoom-drain-output");
     backend_ptr->emit_output_from_worker(std::move(zoom_drain_output));
     backend_ptr->join_worker();

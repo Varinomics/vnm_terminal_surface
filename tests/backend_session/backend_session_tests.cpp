@@ -1772,6 +1772,97 @@ std::uint64_t arm_text_area_resize_arbitration(
     return requests.back().request->request_id;
 }
 
+bool test_text_area_resize_arbitration_batches_ordinary_ansi()
+{
+    bool ok = true;
+    for (bool c1_csi : {false, true}) {
+        const QByteArray csi = c1_csi
+            ? QByteArray(1, static_cast<char>(0x9b))
+            : QByteArrayLiteral("\x1b[");
+        QByteArray burst = csi + QByteArrayLiteral("H");
+        for (int index = 0; index < 96; ++index) {
+            burst.append(csi);
+            burst.append(QByteArrayLiteral("38;2;"));
+            burst.append(QByteArray::number(index));
+            burst.append(QByteArrayLiteral(";160;64m"));
+            burst.append(index == 95 ? 'Z' : 'X');
+        }
+
+        for (bool released_tail : {false, true}) {
+            std::unique_ptr<term::Terminal_session> session;
+            Scripted_backend* backend = make_session(
+                session, text_area_resize_arbitration_config());
+            ok &= check(session->start(launch_config_with_grid(4, 80)).code ==
+                term::Terminal_session_result_code::ACCEPTED,
+                "ordinary ANSI batching session starts");
+
+            QByteArray stream = burst;
+            if (released_tail) {
+                stream.prepend(QByteArrayLiteral("P\x1b[8;5;81t"));
+                const std::uint64_t request_id = arm_text_area_resize_arbitration(
+                    *session, *backend, stream);
+                ok &= check(request_id != 0U,
+                    "a resize request before the ANSI burst is arbitrated");
+                const std::optional<term::Terminal_render_snapshot> held =
+                    session->latest_render_snapshot();
+                ok &= check(held.has_value() &&
+                    snapshot_row_text(*held, 0) == QStringLiteral("P"),
+                    "the colored tail stays hidden until the resize answer");
+                session->set_dirty_row_stats_enabled(true);
+                ok &= check(session->settle_text_area_resize_arbitration({
+                    request_id,
+                    term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+                    {},
+                }).code == term::Terminal_session_result_code::ACCEPTED,
+                    "rejecting the resize releases the ordinary ANSI burst");
+                session->process_backend_callback_events();
+            }
+            else {
+                session->set_dirty_row_stats_enabled(true);
+                ok &= check(backend->emit_output(stream),
+                    "the ordinary ANSI burst is accepted directly");
+            }
+
+            const std::optional<term::Terminal_render_snapshot> snapshot =
+                session->latest_render_snapshot();
+            ok &= check(snapshot.has_value() &&
+                snapshot_row_text(*snapshot, 0) == QString(80, QChar(u'X')) &&
+                snapshot_row_text(*snapshot, 1) ==
+                    QString(15, QChar(u'X')) + QStringLiteral("Z"),
+                "batched color changes preserve every printed cell and wrap");
+            const term::Terminal_render_cell* last_cell = snapshot.has_value()
+                ? snapshot_cell_with_text(*snapshot, QStringLiteral("Z"))
+                : nullptr;
+            const bool style_resolves = last_cell != nullptr &&
+                static_cast<std::size_t>(last_cell->style_id) < snapshot->styles.size();
+            const term::Terminal_text_style last_style = style_resolves
+                ? snapshot->styles[static_cast<std::size_t>(last_cell->style_id)]
+                : term::Terminal_text_style{};
+            ok &= check(style_resolves &&
+                last_style.foreground.kind == term::Terminal_color_ref_kind::RGB &&
+                last_style.foreground.rgba == 0xff5fa040U,
+                "batched truecolor changes retain the final cell's exact color");
+            ok &= check(session->grid_size().rows == 4 &&
+                session->grid_size().columns == 80 && backend->resize_requests.empty() &&
+                !session->pending_text_area_resize_arbitration().has_value(),
+                "ordinary ANSI batching leaves no resize or pending arbitration");
+            ok &= check(session->text_area_resize_arbitration_work_counters().scanned_bytes ==
+                static_cast<std::uint64_t>(stream.size()),
+                "batch admission accounts for each source byte exactly once");
+
+            // Finalization collects dirty rows. This count catches the measured
+            // per-SGR/per-text finalization regression without a timing threshold.
+            const term::Terminal_screen_model_dirty_row_stats stats =
+                session->dirty_row_stats();
+            if (stats.enabled) {
+                ok &= check(stats.dirty_rows_snapshot_calls <= 8U,
+                    "ordinary ANSI does not finalize the model per color change");
+            }
+        }
+    }
+    return ok;
+}
+
 bool test_text_area_resize_arbitration_defers_the_grid_until_the_host_answers()
 {
     bool ok = true;
@@ -2446,10 +2537,22 @@ bool test_text_area_resize_arbitration_spans_a_chunk_boundary()
     ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "split-request session starts");
-    ok &= check(backend->emit_output(QByteArrayLiteral("aa\x1b[8;3")),
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[31ma\x1b[38;2;")),
+        "ordinary ANSI before an incomplete color change is accepted");
+    const std::optional<term::Terminal_render_snapshot> color_prefix =
+        session->latest_render_snapshot();
+    ok &= check(color_prefix.has_value() &&
+        snapshot_row_text(*color_prefix, 0) == QStringLiteral("a"),
+        "a complete ANSI prefix publishes before a split color change");
+    ok &= check(backend->emit_output(QByteArrayLiteral("0;255;0ma\x1b[8;3")),
         "the leading half of a split request is accepted");
     ok &= check(arbitration_requests(*session).empty(),
         "an incomplete request does not arm an arbitration");
+    const std::optional<term::Terminal_render_snapshot> resize_prefix =
+        session->latest_render_snapshot();
+    ok &= check(resize_prefix.has_value() &&
+        snapshot_row_text(*resize_prefix, 0) == QStringLiteral("aa"),
+        "completing a split color change preserves the prefix before a resize");
 
     ok &= check(backend->emit_output(QByteArrayLiteral(";5tZ")),
         "the trailing half of a split request is accepted");
@@ -22601,6 +22704,7 @@ int main()
     ok &= test_text_area_resize_request_updates_session_grid_in_sequence();
     ok &= test_text_area_resize_retry_publishes_geometry_metadata();
     ok &= test_text_area_resize_retry_precedes_later_changed_request_in_same_callback();
+    ok &= test_text_area_resize_arbitration_batches_ordinary_ansi();
     ok &= test_text_area_resize_arbitration_defers_the_grid_until_the_host_answers();
     ok &= test_rejected_text_area_resize_arbitration_costs_no_reflow_or_backend_resize();
     ok &= test_clamped_text_area_resize_arbitration_commits_the_effective_grid();

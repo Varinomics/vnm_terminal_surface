@@ -1352,6 +1352,56 @@ bool is_csi_embedded_control(unsigned char byte)
         Terminal_csi_byte_kind::EMBEDDED_CONTROL;
 }
 
+qsizetype batchable_text_area_resize_prefix(
+    QByteArrayView            bytes,
+    Terminal_utf8_scan_state  utf8_state)
+{
+    for (qsizetype offset = 0; offset < bytes.size(); ++offset) {
+        const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
+        if (utf8_scan_consumes_byte(byte, utf8_state)) {
+            continue;
+        }
+        if (byte != 0x1bU && byte != 0x9bU) {
+            if (byte >= 0x80U && byte <= 0x9fU) {
+                return offset;
+            }
+            continue;
+        }
+
+        const qsizetype candidate_start = offset;
+        if (byte == 0x1bU) {
+            if (offset + 1 == bytes.size() || bytes[offset + 1] != '[') {
+                return candidate_start;
+            }
+            ++offset;
+        }
+        ++offset;
+        while (offset < bytes.size() &&
+               is_csi_parameter_byte(static_cast<unsigned char>(bytes[offset])))
+        {
+            ++offset;
+        }
+        while (offset < bytes.size() &&
+               is_csi_intermediate_byte(static_cast<unsigned char>(bytes[offset])))
+        {
+            ++offset;
+        }
+        if (offset == bytes.size()) {
+            return candidate_start;
+        }
+
+        const unsigned char final_byte = static_cast<unsigned char>(bytes[offset]);
+        // Resize candidates need arbitration before dispatch. Macro invocation
+        // can change how the parser interprets the following host bytes. Keep
+        // both families, incomplete sequences and embedded controls on the
+        // incremental path; ordinary CSI and text can share one model ingest.
+        if (!is_csi_final_byte(final_byte) || final_byte == 't' || final_byte == 'z') {
+            return candidate_start;
+        }
+    }
+    return bytes.size();
+}
+
 Sync_parameter_location find_sync_parameter_location(QByteArrayView parameter_bytes)
 {
     if (parameter_bytes.empty() || parameter_bytes[0] != '?') {
@@ -6596,12 +6646,30 @@ bool Terminal_session::scan_backend_output_span(
     qsizetype offset = 0;
     qsizetype scanned_through = 0;
     while (offset < bytes.size()) {
+        Text_area_resize_scanner& scanner = m_text_area_resize_scanner;
+        if (scanner.state == Text_area_resize_scan_state::PLAIN && offset == plain_begin) {
+            const qsizetype batch_size = batchable_text_area_resize_prefix(
+                bytes.sliced(offset), scanner.utf8_state);
+            if (batch_size > 0) {
+                const qsizetype end = offset + batch_size;
+                if (end > scanned_through) {
+                    m_text_area_resize_arbitration_work_counters.scanned_bytes +=
+                        static_cast<std::uint64_t>(end - std::max(offset, scanned_through));
+                    scanned_through = end;
+                }
+                if (!flush_plain(end, !tail_already_owned && end == bytes.size())) {
+                    consumed_bytes = static_cast<std::size_t>(plain_begin);
+                    return false;
+                }
+                offset = end;
+                continue;
+            }
+        }
         if (offset >= scanned_through) {
             ++m_text_area_resize_arbitration_work_counters.scanned_bytes;
             scanned_through = offset + 1;
         }
         const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
-        Text_area_resize_scanner& scanner = m_text_area_resize_scanner;
 
         if (scanner.state == Text_area_resize_scan_state::PLAIN) {
             if (utf8_scan_consumes_byte(byte, scanner.utf8_state)) {

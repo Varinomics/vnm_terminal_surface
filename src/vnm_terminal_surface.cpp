@@ -275,7 +275,6 @@ constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
 constexpr int         k_msdf_availability_completion_poll_ms     = 10;
 constexpr int         k_msdf_availability_completion_timeout_ms  = 30000;
-constexpr std::size_t k_surface_output_queue_high_water_bytes    = 1024U * 1024U;
 constexpr std::size_t k_surface_output_queue_hard_limit_bytes    = 2U * 1024U * 1024U;
 constexpr std::size_t k_bytes_per_mib                             = 1024U * 1024U;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
@@ -8181,8 +8180,8 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
 #endif
 
     term::Terminal_session_config session_config;
-    session_config.output_queue_limits.high_water_bytes =
-        k_surface_output_queue_high_water_bytes;
+    // Use the session's default pause threshold to limit streaming backlog.
+    // The larger hard limit allows bursts already in flight.
     session_config.output_queue_limits.hard_limit_bytes =
         k_surface_output_queue_hard_limit_bytes;
     session_config.trace_notification_limit              = k_surface_notification_trace_limit;
