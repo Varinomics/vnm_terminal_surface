@@ -46,6 +46,9 @@ Writable Qt properties:
   and `color_scheme_preview(name)` returns a scheme's swatch colors (background,
   foreground, cursor, selection, and the 16 ANSI colors) for a picker UI. An
   unknown name is ignored and the current scheme is kept.
+  Settings editors can use `vnm_terminal::terminal_color_scheme_preview()` from
+  `vnm_terminal/terminal_canvas_appearance.h` without constructing a surface.
+  An unknown preview name returns an empty map.
 - `cursorStyle` is `BLOCK`, `BAR`, or `UNDERLINE`.
 - `cursorBlinkEnabled` enables the render-side blink override.
 - `textRendererMode` is `AUTO`, `MSDF`, or `GLYPH`. `AUTO` lets the atlas
@@ -120,6 +123,11 @@ Writable Qt properties:
   enabled bracketed paste mode.
 - `audibleBellPolicy` and `visualBellPolicy` enable or disable the corresponding
   bell effects.
+- `touchSelectionEnabled` enables the shared touch-selection gestures. It is
+  enabled by default on `VNM_TerminalSurface` and disabled by default on
+  `VNM_TerminalCanvas`.
+- `touchViewport` bounds touch menu placement and selection edge scrolling in
+  item coordinates. An empty rectangle uses the item's bounds.
 
 `backend_output_capture_config()` and `set_backend_output_capture_config()` are
 C++ diagnostic accessors rather than Qt properties. When configured before
@@ -147,7 +155,7 @@ continues. Capacity changes are ignored after a session has started.
 
 ## Published State
 
-Read-only Qt properties expose the host-visible state:
+Qt properties expose the host-visible state:
 
 - `terminalTitle` and `terminalIconName` come from terminal metadata updates.
 - `processState` is `NOT_STARTED`, `STARTING`, `RUNNING`, `EXITED`, or
@@ -164,8 +172,10 @@ Read-only Qt properties expose the host-visible state:
   values freeze at the last visible public state until live content is
   published. Hidden live scrollback growth does not change these properties.
 - `selectionState` is `NONE` or `ACTIVE`.
-- `searchQuery` is the current literal query. `searchResultState` distinguishes
-  inactive search, an unavailable safe source, no matches, and matches.
+- `searchQuery` is the current literal query, and writable `searchCaseSensitive`
+  selects exact case matching (the default) or Unicode case-insensitive matching.
+  `searchResultState` distinguishes inactive search, an unavailable safe source,
+  no matches, and matches.
   `searchMatchCount` is the total retained-public match count and
   `currentSearchMatch` is its one-based current index (zero when absent).
 
@@ -265,6 +275,7 @@ Invokable methods:
   `text_area_resize_requested()` notes under [Runtime Signals](#runtime-signals)
   for when a host needs it.
 - `set_search_query(QString query)` sets the literal terminal query;
+  `set_search_case_sensitive(bool)` changes its case mode and rescans it.
   `clear_search()` clears it. `search_next()` and `search_previous()` navigate
   with wraparound and reveal the current match, returning `false` when no match
   can be selected. See [Search and scrollback](search_and_scrollback.md) for
@@ -418,6 +429,41 @@ untrusted terminal data. The surface does not parse it as an application URL,
 validate a scheme, or open an external resource. Hosts must apply their own
 supported-scheme and URL policy before dispatch, and must not dispatch merely
 because lookup or hover identified a target.
+
+## Touch Selection
+
+`VNM_TerminalSurface` and `VNM_TerminalCanvas` share touch gestures for word
+selection, draggable selection handles, edge scrolling, and context-menu
+requests. A prolonged press near the block cursor requests a paste menu when
+paste is available. With the word-query capability, a prolonged press over text
+selects the proven word; a press over an empty area requests paste instead.
+Gestures use the selection projection from the frame actually rendered.
+
+The host presents its menu on
+`touch_context_menu_requested(menu, anchor, selection_generation)` and removes
+it on `touch_context_menu_dismissed()`. The anchor is in item coordinates.
+`request_touch_selection_copy(selection_generation)` returns a request id, or
+zero if that generation is no longer presented. The host correlates
+`touch_selection_completed(result)` with that id and writes `result.text` to its
+clipboard only when the copy result is `OK`. Copy results are bounded to 1 MiB
+of UTF-8 text; an oversized selection reports `OVER_LIMIT`. Paste actions use
+the host's normal paste path. `dismiss_touch_selection()` clears an active
+selection, and `touch_selection_notice(reason)` reports an unavailable or
+changed word target. A tap without a selection emits `terminal_tapped()`.
+
+The full surface applies requests to its session. A canvas host forwards
+`touch_selection_requested(request)` to the owning terminal surface's
+`apply_touch_selection(request)` and returns the result through
+`complete_touch_selection_request(result)`. Requests carry source, row, and
+selection identities so an obsolete request cannot select or copy newer text
+at the same coordinates. The public request/result types are in
+`vnm_terminal/terminal_touch_selection.h`; hosts crossing a JSON boundary use
+`vnm_terminal/terminal_touch_selection_codec.h`.
+
+Canvas frames carry an optional, independently versioned selection record.
+An absent, unknown, or invalid selection record leaves terminal text available
+while disabling selection from that record. The optional word-query capability
+has its own version and does not change the canvas frame version.
 
 ## Clipboard Policy
 
@@ -641,7 +687,10 @@ consumer API. They are never installed: the package smoke test
 (`tests/package_smoke`) hard-fails if any `vnm_terminal/internal` header reaches
 the install tree. Every build installs the bounded immutable canvas contract
 (`vnm_terminal/terminal_canvas_frame.h`), the backend-free Qt Quick canvas
-(`vnm_terminal/vnm_terminal_canvas.h`) and the renderer's graphics minimum
+(`vnm_terminal/vnm_terminal_canvas.h`), appearance helpers
+(`vnm_terminal/terminal_canvas_appearance.h`), touch-selection contracts and JSON
+codec (`vnm_terminal/terminal_touch_selection.h` and
+`vnm_terminal/terminal_touch_selection_codec.h`), and the renderer's graphics minimum
 (`vnm_terminal/terminal_renderer_surface_format.h`) through
 `vnm_terminal_surface::vnm_terminal_surface_renderer`. A full build additionally
 installs `vnm_terminal/backend_output_capture.h`,

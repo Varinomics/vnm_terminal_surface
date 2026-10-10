@@ -199,11 +199,26 @@ public:
         setHeight(100.0);
     }
     std::unique_ptr<term::Terminal_touch_controller> controller;
+    QPointF last_touch_scene_position;
 
 protected:
-    void touchEvent(QTouchEvent* event) override { controller->touch_event(*event); }
+    void touchEvent(QTouchEvent* event) override
+    {
+        if (!event->points().empty()) {
+            last_touch_scene_position = event->points().front().scenePosition();
+        }
+        controller->touch_event(*event);
+    }
     void touchUngrabEvent() override { controller->touch_ungrabbed(); }
 };
+
+bool wait_for_touch_hold(QQuickItem& item)
+{
+    // Qualification keeps the grab before selecting text or awaiting release.
+    // A fixed sleep can expire before the event loop delivers the hold timer.
+    return check(QTest::qWaitFor([&] { return item.keepTouchGrab(); }, 1000),
+        "the hold qualifies before release or presentation changes");
+}
 
 bool touch_intent_contract()
 {
@@ -245,7 +260,9 @@ bool touch_intent_contract()
     ok &= check(taps == 1 && requests.empty(), "scroll movement cancels pending hold and typing activation");
     QGuiApplication::styleHints()->setMousePressAndHoldInterval(20);
     QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
-    QTest::qWait(QGuiApplication::styleHints()->mousePressAndHoldInterval() + 30);
+    if (!wait_for_touch_hold(item)) {
+        return false;
+    }
     QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
     ok &= check(requests.size() == 1U && requests.front().action == touch::Terminal_touch_selection_action::SELECT_WORD &&
         requests.front().target.column == 5 && taps == 1 && copy_menus == 0,
@@ -290,7 +307,9 @@ bool touch_intent_contract()
             "the following tap activates typing after authoritative selection dismissal");
 
         QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
-        QTest::qWait(QGuiApplication::styleHints()->mousePressAndHoldInterval() + 30);
+        if (!wait_for_touch_hold(item)) {
+            return false;
+        }
         QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
         const auto pending_selection = requests.back();
         QTest::touchEvent(&window, device).press(0, QPoint(170, 10), &window);
@@ -342,12 +361,17 @@ bool direct_word_hold_contract()
     auto* device = QTest::createTouchDevice();
     const auto hold = [&](bool release = true) {
         QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
-        QTest::qWait(50);
+        if (!wait_for_touch_hold(item)) {
+            return false;
+        }
         if (release) {
             QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
         }
+        return true;
     };
-    hold(false);
+    if (!hold(false)) {
+        return false;
+    }
     bool ok = check(requests.size() == 1 &&
         requests.back().action == touch::Terminal_touch_selection_action::INSPECT_WORD && menus.empty() && taps == 0,
         "a capable-owner hold inspects the original word without issuing a selection mutation");
@@ -393,7 +417,9 @@ bool direct_word_hold_contract()
     shown.selection.has_selection = false;
     shown.selection.touch_handles_visible = false;
     shown.selection.spans.clear();
-    hold();
+    if (!hold()) {
+        return false;
+    }
     auto query = requests.back();
     item.controller->complete({query.request_id, query.action,
         touch::Terminal_touch_selection_status::OK, 2U, {}, {}, false});
@@ -411,7 +437,9 @@ bool direct_word_hold_contract()
     ok &= check(dismissals == dismissals_before_output + 1 && !item.controller->selection_active(),
         "a blank-cell Paste menu still closes when its terminal source changes");
     item.controller->cancel();
-    hold();
+    if (!hold()) {
+        return false;
+    }
     query = requests.back();
     const auto requests_before_changed_reply = requests.size();
     ++shown.selection.visible_rows[1].content_generation;
@@ -420,7 +448,9 @@ bool direct_word_hold_contract()
         touch::Terminal_touch_selection_status::OK, 2U, {}, {}, true});
     ok &= check(requests.size() == requests_before_changed_reply && !notices.isEmpty(),
         "a changed original target fails explicitly instead of selecting replacement text");
-    hold();
+    if (!hold()) {
+        return false;
+    }
     query = requests.back();
     const auto menus_before_dismissal = menus.size();
     item.controller->dismiss_selection();
@@ -428,7 +458,9 @@ bool direct_word_hold_contract()
         touch::Terminal_touch_selection_status::OK, 2U, {}, {}, true});
     ok &= check(menus.size() == menus_before_dismissal && taps == 0,
         "a late inspection result cannot reopen a dismissed menu or activate typing");
-    hold();
+    if (!hold()) {
+        return false;
+    }
     query = requests.back();
     item.controller->complete({query.request_id, query.action,
         touch::Terminal_touch_selection_status::OK, 2U, {}, {}, true});
@@ -460,7 +492,9 @@ bool direct_word_hold_contract()
         "viewport padding offers Paste without a fabricated word target");
     item.controller->cancel();
     QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
-    QTest::qWait(50);
+    if (!wait_for_touch_hold(item)) {
+        return false;
+    }
     query = requests.back();
     item.controller->complete({query.request_id, query.action,
         touch::Terminal_touch_selection_status::OK, 3U, {}, {}, false});
@@ -481,7 +515,9 @@ bool direct_word_hold_contract()
     QTest::touchEvent(&window, device).press(0, QPoint(155, 70), &window);
     shown.selection.selection_generation = 5U;
     item.controller->presentation_changed();
-    QTest::qWait(50);
+    if (!wait_for_touch_hold(item)) {
+        return false;
+    }
     shown.selection.selection_generation = 6U;
     item.controller->presentation_changed();
     QTest::touchEvent(&window, device).release(0, QPoint(155, 70), &window);
@@ -536,7 +572,9 @@ bool cursor_hold_contract()
         menus.clear();
         const QPoint point = item.mapToScene(test.point).toPoint();
         QTest::touchEvent(&window, device).press(0, point, &window);
-        QTest::qWait(50);
+        if (!wait_for_touch_hold(item)) {
+            return false;
+        }
         ok &= check(menus.empty(), "cursor holds do not open Paste before release");
         // Cursor movement after qualification does not reinterpret this hold.
         shown.block_cursor.translate(40, 0);
@@ -555,7 +593,9 @@ bool cursor_hold_contract()
     menus.clear();
     paste_available = false;
     QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
-    QTest::qWait(50);
+    if (!wait_for_touch_hold(item)) {
+        return false;
+    }
     QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
     ok &= check(requests.size() == 1 &&
         requests.front().action == touch::Terminal_touch_selection_action::INSPECT_WORD && menus.empty(),
@@ -568,7 +608,9 @@ bool cursor_hold_contract()
     requests.clear();
     menus.clear();
     QTest::touchEvent(&window, device).press(0, QPoint(55, 42), &window);
-    QTest::qWait(50);
+    if (!wait_for_touch_hold(item)) {
+        return false;
+    }
     QTest::touchEvent(&window, device).release(0, QPoint(55, 42), &window);
     ok &= check(requests.size() == 1 && menus.empty(),
         "the proximity margin cannot revive a cursor outside the visible viewport");
@@ -576,7 +618,9 @@ bool cursor_hold_contract()
     item.controller->set_viewport({});
     requests.clear();
     QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
-    QTest::qWait(50);
+    if (!wait_for_touch_hold(item)) {
+        return false;
+    }
     ++shown.selection.source.session_epoch;
     item.controller->presentation_changed();
     QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
@@ -640,7 +684,12 @@ bool touch_lifecycle_contract()
     available = false;
     complete(4U);
     QTest::touchEvent(&window, device).move(0, QPoint(130, 87), &window);
-    QTest::qWait(30);
+    // Qt Quick compresses moves until its next frame; restore the presentation
+    // only after the controller has actually received the move during the gap.
+    if (!check(QTest::qWaitFor([&] { return item.last_touch_scene_position == QPointF(130, 87); }, 1000),
+            "the render-gap move reaches the touch controller")) {
+        return false;
+    }
     bool ok = check(requests.size() == 2U, "a render gap defers the next move without cancelling the drag");
     available = true;
     shown.selection.selection_generation = 4U;
@@ -723,7 +772,19 @@ bool touch_lifecycle_contract()
     shown.selection.has_selection = true;
     shown.selection.touch_handles_visible = true;
     QTest::touchEvent(&window, device).press(0, QPoint(130, 87), &window);
-    QTest::qWait(5100);
+    const auto unacknowledged = requests.back();
+    if (!check(unacknowledged.action == touch::Terminal_touch_selection_action::BEGIN_HANDLE,
+            "the timeout fixture leaves a handle-begin request unacknowledged")) {
+        return false;
+    }
+    // The 5000 ms coarse timer may round its deadline by 250 ms. Observe its
+    // cancellation with the same 1000 ms delivery allowance as other events.
+    if (!check(QTest::qWaitFor([&] {
+            return requests.back().action == touch::Terminal_touch_selection_action::CANCEL_GESTURE &&
+                requests.back().gesture_id == unacknowledged.gesture_id;
+        }, 5000 + 1000), "the unacknowledged gesture is cancelled within a bounded wait")) {
+        return false;
+    }
     QTest::touchEvent(&window, device).release(0, QPoint(130, 87), &window);
     shown.selection.has_selection = false;
     shown.selection.touch_handles_visible = false;
@@ -746,8 +807,8 @@ bool touch_lifecycle_contract()
     }
     complete(shown.selection.selection_generation);
     const auto before_tick = requests.size();
-    QTest::qWait(130);
-    ok &= check(requests.size() > before_tick && requests.back().action == touch::Terminal_touch_selection_action::SCROLL_EXTEND,
+    ok &= check(QTest::qWaitFor([&] { return requests.size() > before_tick; }, 1000) &&
+        requests.back().action == touch::Terminal_touch_selection_action::SCROLL_EXTEND,
         "a held finger at the edge continues scrolling without another move event");
     item.controller->cancel();
     QTest::touchEvent(&window, device).release(0, QPoint(130, 3), &window);
@@ -1049,7 +1110,9 @@ bool item_touch_routing_contract()
         QTest::touchEvent(&window, device).press(0, QPoint(60, 30), &window);
         item.setY(0);
         item.set_touch_viewport(QRectF(0, 0, 200, 100));
-        QTest::qWait(50);
+        if (!wait_for_touch_hold(item)) {
+            return false;
+        }
         QTest::touchEvent(&window, device).release(0, QPoint(60, 30), &window);
         ok &= check(taps == 1 && paste_menus == 1 && paste_scene_position == QPointF(60, 30),
             "actual moving item routes Paste at the held screen point without a short tap");

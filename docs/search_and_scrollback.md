@@ -10,7 +10,9 @@ never changes selected text.
 
 Search uses a deliberately small contract:
 
-- the query is a non-empty, case-sensitive `QString` literal;
+- the query is a non-empty `QString` literal;
+- matching is case-sensitive by default; `searchCaseSensitive = false` uses
+  Qt's Unicode case-insensitive matching;
 - matches are non-overlapping;
 - each physical terminal row is searched independently;
 - each reflow fragment is a physical row, so a match never crosses a fragment
@@ -19,9 +21,9 @@ Search uses a deliberately small contract:
   trailing unoccupied grid fill is not appended to the searchable row;
 - a wide cell maps a match back to the complete cell width.
 
-No regular expressions, case folding, normalization, or whole-word mode are
-applied. Hosts that want a different query language can build it above this
-literal API without changing terminal row identity rules.
+No regular expressions, normalization, or whole-word mode are applied. Hosts
+that want a different query language can build it above this literal API
+without changing terminal row identity rules.
 
 ## Public API
 
@@ -30,10 +32,16 @@ literal API without changing terminal row identity rules.
 `search_previous()` wrap at the ends and return `false` when no match can be
 selected.
 
-Query evaluation runs asynchronously. Submitting a non-empty query publishes
-`SEARCHING` immediately; match counts, navigation, and visible overlays become
-available only after the completion for the latest query and published-content
-generation is accepted. Rapid edits coalesce, and stale completions are ignored.
+`searchCaseSensitive` is writable through `set_search_case_sensitive(bool)`.
+Changing it rescans the existing query; case-insensitive matches retain the
+original terminal cell spans, including wide cells.
+
+Query evaluation runs asynchronously. Submitting a non-empty query or changing
+its case mode publishes `SEARCHING` immediately; match counts, navigation, and
+visible overlays become available only after the completion for the latest
+query, case mode, and
+published-content generation is accepted. Rapid edits coalesce, and stale
+completions are ignored.
 
 Once a query is complete, ordinary active-grid updates refresh its dirty rows
 within the content publication. Counts, navigation, and highlights stay usable
@@ -52,9 +60,9 @@ The observable result properties are:
 - `currentSearchMatch`: a one-based display index, or zero when there is no
   current match.
 
-All four search properties share `search_changed()`. A non-empty query is kept
-across session replacement; until the next session has a safe published source,
-its state is `SOURCE_UNAVAILABLE`.
+The query, case mode, and result properties share `search_changed()`. The case
+mode and a non-empty query are kept across session replacement; until the next
+session has a safe published source, its state is `SOURCE_UNAVAILABLE`.
 
 Activating or changing a query chooses the first match at or after the published
 viewport, wrapping to the beginning when necessary, and reveals it. A refresh
