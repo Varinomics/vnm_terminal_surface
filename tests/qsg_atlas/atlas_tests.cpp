@@ -89,6 +89,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -10458,6 +10459,94 @@ bool pump_next_atlas_report_for_sequence(
     return false;
 }
 
+bool capture_first_atlas_report(
+    QGuiApplication&             app,
+    QQuickWindow&                window,
+    VNM_TerminalSurface&         surface,
+    std::uint64_t                previous_prepare_count,
+    std::uint64_t                expected_sequence,
+    const std::function<void()>& publish,
+    term::Qsg_atlas_frame_report& out_report)
+{
+    struct Atlas_report_capture
+    {
+        std::mutex                                  mutex;
+        std::optional<term::Qsg_atlas_frame_report> first_report;
+    };
+
+    const auto recorder =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_recorder(surface);
+    const auto capture = std::make_shared<Atlas_report_capture>();
+    // Prepare counters describe one frame. Capture the first matching frame on
+    // the render thread before an unchanged frame can overwrite its uploads.
+    // Own both objects in the callback so an in-flight disconnect is harmless.
+    const auto connection = QObject::connect(
+        &window,
+        &QQuickWindow::afterRendering,
+        &window,
+        [
+                recorder,
+                capture,
+                previous_prepare_count,
+                expected_sequence
+            ]()
+            {
+                const auto report = recorder->snapshot();
+                if (report.prepare_count <= previous_prepare_count ||
+                    report.prepared_snapshot_sequence != expected_sequence)
+                {
+                    return;
+                }
+                const std::lock_guard<std::mutex> lock(capture->mutex);
+                if (!capture->first_report.has_value()) {
+                    capture->first_report = report;
+                }
+            },
+        Qt::DirectConnection);
+
+    publish();
+    bool prepared = false;
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const std::lock_guard<std::mutex> lock(capture->mutex);
+        if (capture->first_report.has_value()) {
+            out_report = *capture->first_report;
+            prepared   = true;
+            break;
+        }
+    }
+    QObject::disconnect(connection);
+    if (!prepared) {
+        out_report = recorder->snapshot();
+    }
+    return prepared;
+}
+
+bool capture_atlas_snapshot_report(
+    QGuiApplication&                      app,
+    QQuickWindow&                         window,
+    VNM_TerminalSurface&                  surface,
+    const term::Terminal_render_snapshot& snapshot,
+    std::uint64_t                         previous_prepare_count,
+    term::Qsg_atlas_frame_report&          out_report)
+{
+    return capture_first_atlas_report(
+        app,
+        window,
+        surface,
+        previous_prepare_count,
+        snapshot.metadata.sequence,
+        [&]() {
+            term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                surface,
+                std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+        },
+        out_report);
+}
+
 class Direct_atlas_item final : public QQuickItem
 {
 public:
@@ -12743,16 +12832,12 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
     term::Terminal_render_snapshot unchanged_snapshot =
         make_atlas_msdf_resource_stability_snapshot(971U, false);
     unchanged_snapshot.dirty_row_ranges.clear();
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(
-            unchanged_snapshot));
-    term::Qsg_atlas_frame_report unchanged_report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool unchanged_prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report unchanged_report;
+    const bool unchanged_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        unchanged_snapshot,
         seeded_report.prepare_count,
         unchanged_report);
     reports.push_back(unchanged_report);
@@ -12760,16 +12845,12 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         "unchanged",
         unchanged_report);
 
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(
-            make_atlas_msdf_resource_stability_snapshot(972U, true)));
-    term::Qsg_atlas_frame_report color_report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool color_prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report color_report;
+    const bool color_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        make_atlas_msdf_resource_stability_snapshot(972U, true),
         unchanged_report.prepare_count,
         color_report);
     reports.push_back(color_report);
@@ -13159,16 +13240,12 @@ bool run_atlas_glyph_row_stable_report_case(
         return false;
     }
 
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(mutated_snapshot));
-
-    term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        mutated_snapshot,
         baseline_report.prepare_count,
         report);
     const term::Qsg_atlas_render_summary& render_summary = report.render;
@@ -13194,6 +13271,12 @@ bool run_atlas_glyph_row_stable_report_case(
     if (!prepared || !expected_upload || !extra) {
         std::cerr << "atlas glyph row-stable " << name
             << " prepared=" << prepared
+            << " previous_prepare_count=" << baseline_report.prepare_count
+            << " prepare_count=" << report.prepare_count
+            << " expected_snapshot=" << mutated_snapshot.metadata.sequence
+            << " prepared_snapshot=" << report.prepared_snapshot_sequence
+            << " render_snapshot=" << report.render_snapshot_sequence
+            << " generation_committed=" << report.prepared_generation_committed
             << " rect_full=" << render_summary.rect_buffer.full_upload
             << " rect_partial=" << render_summary.rect_buffer.partial_upload
             << " rect_non_dirty=" << render_summary.rect_buffer.non_dirty_state_upload
@@ -13273,20 +13356,15 @@ bool test_atlas_glyph_row_stable_dirty_update(QGuiApplication& app)
         return false;
     }
 
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(
-            make_atlas_row_stable_text_snapshot(
-                931U,
-                QStringLiteral("BC"),
-                {{1, 1}})));
-
-    term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        make_atlas_row_stable_text_snapshot(
+            931U,
+            QStringLiteral("BC"),
+            {{1, 1}}),
         baseline_report.prepare_count,
         report);
     const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
@@ -13364,20 +13442,15 @@ bool test_atlas_rect_row_stable_dense_graphic_update(QGuiApplication& app)
         return false;
     }
 
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(
-            make_atlas_row_stable_graphic_snapshot(
-                937U,
-                2U,
-                {{1, 1}})));
-
-    term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        make_atlas_row_stable_graphic_snapshot(
+            937U,
+            2U,
+            {{1, 1}}),
         baseline_report.prepare_count,
         report);
     const term::Qsg_atlas_buffer_update_summary& rect_buffer =
@@ -13476,20 +13549,15 @@ bool test_atlas_rect_row_stable_graphic_arc_update(
         return false;
     }
 
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(
-            make_atlas_row_stable_graphic_arc_snapshot(
-                939U,
-                2U,
-                {{1, 1}})));
-
-    term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        make_atlas_row_stable_graphic_arc_snapshot(
+            939U,
+            2U,
+            {{1, 1}}),
         baseline_report.prepare_count,
         report);
     const term::Qsg_atlas_buffer_update_summary& rect_buffer =
@@ -13580,16 +13648,12 @@ bool test_atlas_rect_row_stable_styled_blank_background_update(QGuiApplication& 
             947U,
             2U,
             {{1, 1}});
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(mutated));
-
-    term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        mutated,
         baseline_report.prepare_count,
         report);
     const term::Qsg_atlas_buffer_update_summary& rect_buffer =
@@ -13974,7 +14038,7 @@ bool test_atlas_prepared_text_reuse(QGuiApplication& app)
             QStringLiteral("\u00e9"),
             1U,
             {});
-    const bool unchanged_prepared = pump_prepared_text_reuse_report(
+    const bool unchanged_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
@@ -13989,7 +14053,7 @@ bool test_atlas_prepared_text_reuse(QGuiApplication& app)
             QStringLiteral("\u00ea"),
             2U,
             {{1, 1}});
-    const bool dirty_prepared = pump_prepared_text_reuse_report(
+    const bool dirty_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
@@ -14102,28 +14166,28 @@ bool run_atlas_report_case(
 
     term::Terminal_render_snapshot mutated = make_atlas_report_snapshot(901U);
     mutated.dirty_row_ranges.clear();
-    if (set_snapshot_before_mutate) {
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            surface,
-            std::make_shared<const term::Terminal_render_snapshot>(mutated));
-        mutate(surface, mutated);
-    }
-    else
-    {
-        mutate(surface, mutated);
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            surface,
-            std::make_shared<const term::Terminal_render_snapshot>(mutated));
-    }
-
     const std::uint64_t previous_prepare_count = baseline_report.prepare_count;
-    term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool prepared = pump_next_atlas_report(
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = capture_first_atlas_report(
         app,
         window,
         surface,
         previous_prepare_count,
+        mutated.metadata.sequence,
+        [&]() {
+            if (set_snapshot_before_mutate) {
+                term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                    surface,
+                    std::make_shared<const term::Terminal_render_snapshot>(mutated));
+                mutate(surface, mutated);
+            }
+            else {
+                mutate(surface, mutated);
+                term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                    surface,
+                    std::make_shared<const term::Terminal_render_snapshot>(mutated));
+            }
+        },
         report);
     const bool reported = prepared && expected(report.render);
     if (!reported) {
@@ -14590,17 +14654,13 @@ bool test_atlas_failed_prepare_forces_next_sparse_full_upload(
             19832U,
             QStringLiteral("BD"),
             {{2, 1}});
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(next_sparse));
-    term::Qsg_atlas_frame_report next_report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool next_prepared = pump_next_atlas_report_for_sequence(
+    term::Qsg_atlas_frame_report next_report;
+    const bool next_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        next_sparse,
         failed_report.prepare_count,
-        19832U,
         next_report);
     const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
         next_report.render.glyph_buffer;
@@ -14663,21 +14723,16 @@ bool test_atlas_failed_prepare_preserves_font_epoch_basis(
         19834U,
         failed_report);
 
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(
-            make_atlas_row_stable_text_snapshot(
-                19835U,
-                QStringLiteral("BD"),
-                {{2, 1}})));
-    term::Qsg_atlas_frame_report next_report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool next_prepared = pump_next_atlas_report_for_sequence(
+    term::Qsg_atlas_frame_report next_report;
+    const bool next_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        make_atlas_row_stable_text_snapshot(
+            19835U,
+            QStringLiteral("BD"),
+            {{2, 1}}),
         failed_report.prepare_count,
-        19835U,
         next_report);
 
     bool ok = true;
@@ -14742,17 +14797,13 @@ bool test_atlas_failed_prepare_preserves_cursor_layer_basis(
 
     term::Terminal_render_snapshot next = failed;
     next.metadata.sequence = 19838U;
-    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-        surface,
-        std::make_shared<const term::Terminal_render_snapshot>(next));
-    term::Qsg_atlas_frame_report next_report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    const bool next_prepared = pump_next_atlas_report_for_sequence(
+    term::Qsg_atlas_frame_report next_report;
+    const bool next_prepared = capture_atlas_snapshot_report(
         app,
         window,
         surface,
+        next,
         failed_report.prepare_count,
-        19838U,
         next_report);
 
     bool ok = true;

@@ -9413,6 +9413,14 @@ term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(
         : term::Qsg_atlas_frame_report{};
 }
 
+std::shared_ptr<term::Qsg_atlas_recorder>
+term::VNM_TerminalSurface_render_bridge::qsg_atlas_recorder(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->qsg_atlas_recorder;
+}
+
 term::Terminal_screen_model_dirty_row_stats
 term::VNM_TerminalSurface_render_bridge::dirty_row_stats(
     const VNM_TerminalSurface& surface)

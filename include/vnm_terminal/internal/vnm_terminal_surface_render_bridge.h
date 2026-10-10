@@ -101,6 +101,10 @@ public:
     static Qsg_atlas_frame_report qsg_atlas_frame(
         const VNM_TerminalSurface& surface);
 
+    // Acquire on the GUI thread; the recorder supports render-thread snapshots.
+    static std::shared_ptr<Qsg_atlas_recorder> qsg_atlas_recorder(
+        const VNM_TerminalSurface& surface);
+
     static Terminal_screen_model_dirty_row_stats dirty_row_stats(
         const VNM_TerminalSurface& surface);
 
