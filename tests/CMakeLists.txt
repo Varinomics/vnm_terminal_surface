@@ -70,7 +70,7 @@ else()
         "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:Qt6::Core>:$ENV{LD_LIBRARY_PATH}")
 endif()
 
-find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
+find_package(Qt6Gui 6.12 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 find_package(Threads REQUIRED)
 
 add_executable(vnm_terminal_native_backend_cleanup_owner_tests

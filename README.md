@@ -41,7 +41,7 @@ For the packaged terminal application and screenshots, see
 
 ## Requirements
 
-- Qt 6.11 or newer
+- Qt 6.12 or newer
 - A C++20 compiler
 - CMake 3.21 or newer
 

@@ -7,7 +7,7 @@ if(WIN32)
     vnm_terminal_deploy_conpty(vnm_terminal_embedded_benchmark)
 endif()
 
-find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
+find_package(Qt6Gui 6.12 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 
 target_link_libraries(vnm_terminal_embedded_benchmark PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
