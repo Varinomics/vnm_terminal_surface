@@ -2183,7 +2183,7 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_viewport>"
 )
 
-find_package(Qt6 REQUIRED COMPONENTS Test)
+find_package(Qt6 6.12 REQUIRED COMPONENTS Test)
 add_executable(vnm_terminal_touch_selection touch_selection/touch_selection_tests.cpp)
 target_link_libraries(vnm_terminal_touch_selection PRIVATE
     vnm_terminal_surface::vnm_terminal_surface Qt6::Test)

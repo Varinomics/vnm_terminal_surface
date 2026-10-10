@@ -43,7 +43,7 @@ For the packaged terminal application and screenshots, see
 
 - Qt 6.12 or newer
 - A C++20 compiler
-- CMake 3.21 or newer
+- CMake 3.25 or newer
 
 ## Start Here
 
