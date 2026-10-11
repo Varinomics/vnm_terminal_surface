@@ -166,6 +166,42 @@ bool framed_transport()
     return ok;
 }
 
+bool finite_send_requires_nonblocking()
+{
+    using namespace std::chrono_literals;
+    custody::Duplex_channel sender, receiver;
+    std::string error;
+    if (!custody::Duplex_channel::create_pair(64, &sender, &receiver, &error)) {
+        return check(false, error.c_str());
+    }
+    const int original_flags = fcntl(sender.native(), F_GETFL);
+    if (!check(original_flags >= 0 && (original_flags & O_NONBLOCK) == 0,
+        "finite-send refusal fixture starts with a blocking channel"))
+    {
+        return false;
+    }
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    int send_error = 0;
+    const auto started = Clock::now();
+    const auto status = sender.send_descriptors_until(payload.data(), payload.size(), {}, started + 80ms, &send_error);
+    pollfd peer{receiver.native(), POLLIN, 0};
+    bool ok = check(status == custody::Io_status::FAILED && send_error == EINVAL &&
+            sender.valid() && fcntl(sender.native(), F_GETFL) == original_flags && poll(&peer, 1, 0) == 0 &&
+            Clock::now() - started < 1s,
+        "finite send refuses a blocking descriptor without bytes, mode changes or channel closure");
+    ok &= check(sender.send(payload.data(), payload.size()) == custody::Io_status::TRANSFERRED,
+        "unbounded send remains available on the unchanged blocking channel");
+    std::array<std::uint8_t, 64> output{};
+    const auto received = receiver.receive(output.data(), output.size(), 1000);
+    ok &= check(received.status == custody::Receive_status::MESSAGE && received.size == payload.size() &&
+            std::memcmp(output.data(), payload.data(), payload.size()) == 0 && received.descriptors.empty(),
+        "unbounded retry delivers exactly its original payload");
+    for (const int descriptor : received.descriptors) {
+        close(descriptor);
+    }
+    return ok;
+}
+
 bool partial_frame_deadline_closes_stream()
 {
     using namespace std::chrono_literals;
@@ -621,7 +657,11 @@ int main(int argc, char** argv)
     if (!custody::prepare_parent_process(&error)) {
         return 2;
     }
-    bool ok = framed_transport();
+    if (std::string(argv[1]) == "--finite-send") {
+        return finite_send_requires_nonblocking() ? 0 : 1;
+    }
+    bool ok = finite_send_requires_nonblocking();
+    ok &= framed_transport();
     ok &= partial_frame_deadline_closes_stream();
     ok &= rejected_record_releases_descriptors(Rejected_record::OVERSIZE);
     ok &= rejected_record_releases_descriptors(Rejected_record::LATE_RIGHTS);

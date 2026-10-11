@@ -214,6 +214,17 @@ Io_status Duplex_channel::send_descriptors_until(
     const std::uint8_t* in_payload, std::size_t in_size,
     const std::vector<Native_handle>& in_descriptors, Clock::time_point in_deadline, int* out_error)
 {
+    if (in_deadline != Clock::time_point::max()) {
+        // Darwin's MSG_DONTWAIT does not bound every send-buffer wait on a
+        // blocking socket. Refuse before any bytes or descriptor ownership move.
+        const int flags = fcntl(m_impl->fd, F_GETFL);
+        if (flags < 0 || (flags & O_NONBLOCK) == 0) {
+            if (out_error) {
+                *out_error = flags < 0 ? errno : EINVAL;
+            }
+            return Io_status::FAILED;
+        }
+    }
     if (in_size > m_impl->max_message_bytes || in_descriptors.size() > k_max_descriptors) {
         if (out_error) {
             *out_error = EMSGSIZE;

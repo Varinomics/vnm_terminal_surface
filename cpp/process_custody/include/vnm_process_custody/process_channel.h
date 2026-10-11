@@ -86,6 +86,9 @@ public:
 #if defined(__APPLE__)
     /// Stream framing cannot retry a partially sent record from its beginning.
     /// One call owns all partial writes; failure closes a partially used stream.
+    /// A finite deadline requires O_NONBLOCK already set on the descriptor.
+    /// Otherwise returns FAILED/EINVAL (or the F_GETFL error) before writing,
+    /// preserving the channel and its mode. A maximum deadline may block.
     Io_status send_descriptors_until(
         const std::uint8_t* in_payload, std::size_t in_size,
         const std::vector<Native_handle>& in_descriptors,
