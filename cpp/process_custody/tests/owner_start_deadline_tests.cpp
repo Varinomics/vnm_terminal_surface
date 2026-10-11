@@ -71,9 +71,22 @@ bool delayed_reader(int delay_ms)
         return false;
     }
     int pipe_handles[2];
+#if defined(__APPLE__)
+    if (::pipe(pipe_handles) != 0) {
+#else
     if (::pipe2(pipe_handles, O_CLOEXEC) != 0) {
+#endif
         return check(false, "descriptor-transfer pipe setup");
     }
+#if defined(__APPLE__)
+    if (::fcntl(pipe_handles[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        ::fcntl(pipe_handles[1], F_SETFD, FD_CLOEXEC) < 0)
+    {
+        ::close(pipe_handles[0]);
+        ::close(pipe_handles[1]);
+        return check(false, "descriptor-transfer close-on-exec setup");
+    }
+#endif
 
     auto request = large_request();
     request.process.inherited = {{pipe_handles[1], 9}};
@@ -142,10 +155,20 @@ bool absent_reader_times_out()
     const auto elapsed = std::chrono::steady_clock::now() - started;
     bool ok = check(!sent, "an absent reader cannot complete a large fragmented START");
     ok &= check(elapsed >= 80ms && elapsed < 2s, "all fragments share one absolute deadline");
+#if defined(__APPLE__)
+    // Darwin closes a partially written record because a stream has no
+    // atomic record boundary at which the caller could safely retry it.
+    if (sender.valid()) {
+        ok &= check(::fcntl(sender.native(), F_GETFL, 0) == (original_flags | O_NONBLOCK),
+            "timeout preserves the mode of a still-open channel");
+        sender.close();
+    }
+#else
     ok &= check(::fcntl(sender.native(), F_GETFL, 0) == (original_flags | O_NONBLOCK),
         "timeout preserves the caller's channel mode");
     ok &= check(::shutdown(sender.native(), SHUT_WR) == 0,
         "caller can abandon a partial request by sending EOF");
+#endif
 
     custody::detail::Owner_message partial;
     const auto status = custody::detail::receive_message(receiver, &partial, 500, &error);
@@ -198,15 +221,15 @@ bool interrupted_receive_keeps_its_deadline()
     struct sigaction action{};
     struct sigaction previous_action{};
     action.sa_handler = interrupt_receive;
-    ::sigemptyset(&action.sa_mask);
+    sigemptyset(&action.sa_mask);
     if (::sigaction(SIGUSR1, &action, &previous_action) != 0) {
         return check(false, "install receive-interrupt handler");
     }
 
     sigset_t signals;
     sigset_t previous_mask;
-    ::sigemptyset(&signals);
-    ::sigaddset(&signals, SIGUSR1);
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGUSR1);
     if (::pthread_sigmask(SIG_UNBLOCK, &signals, &previous_mask) != 0) {
         (void)::sigaction(SIGUSR1, &previous_action, nullptr);
         return check(false, "unblock receive-interrupt signal");

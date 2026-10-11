@@ -229,6 +229,7 @@ bool Process_tree_owner::record_descendant_from_process(std::int64_t in_process_
 Kill_coordinates Process_tree_owner::coordinates() const
 {
     Kill_coordinates coordinates;
+    coordinates.cleanup_scope = Cleanup_scope::TRANSITIVE_TREE;
     coordinates.process_ids     = m_impl->process_ids;
     coordinates.process_handles = m_impl->process_handles;
     return coordinates;
@@ -291,6 +292,7 @@ Reap_outcome Process_tree_owner::terminate_and_reap(
 {
     const auto started = Deadline::Clock::now();
     Reap_outcome outcome;
+    outcome.cleanup_scope = Cleanup_scope::TRANSITIVE_TREE;
     const Deadline deadline = Deadline::after(in_reap_deadline);
     outcome.escalated_to_kill = TerminateJobObject(m_impl->job, 1) != FALSE;
     if (!outcome.escalated_to_kill) {

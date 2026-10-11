@@ -2,7 +2,9 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include <unistd.h>
 
 #include <cerrno>
@@ -43,6 +45,7 @@ Io_result io_result_from_errno()
 
 } // namespace
 
+#if defined(__linux__)
 int posix_pidfd_open(int in_pid)
 {
     return static_cast<int>(syscall(SYS_pidfd_open, in_pid, 0u));
@@ -52,6 +55,7 @@ int posix_pidfd_send_signal(int in_pidfd, int in_signal)
 {
     return static_cast<int>(syscall(SYS_pidfd_send_signal, in_pidfd, in_signal, nullptr, 0u));
 }
+#endif
 
 void close_native_handle(Native_handle in_handle)
 {
@@ -247,10 +251,23 @@ Io_result Writable_pipe::complete_write(Write_ticket /*in_ticket*/)
 bool create_pipe(Readable_pipe* out_read_end, Writable_pipe* out_write_end, std::string* out_error)
 {
     int fds[2] = {-1, -1};
+#if defined(__APPLE__)
+    if (pipe(fds) != 0) {
+        *out_error = std::string("pipe: ") + std::strerror(errno);
+        return false;
+    }
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(fds[1], F_SETFD, FD_CLOEXEC) < 0) {
+        *out_error = std::string("fcntl(FD_CLOEXEC): ") + std::strerror(errno);
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return false;
+    }
+#else
     if (pipe2(fds, O_CLOEXEC) != 0) {
         *out_error = std::string("pipe2: ") + std::strerror(errno);
         return false;
     }
+#endif
     *out_read_end  = Readable_pipe(fds[0]);
     *out_write_end = Writable_pipe(fds[1]);
     return true;

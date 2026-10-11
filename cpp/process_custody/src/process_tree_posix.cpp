@@ -405,6 +405,7 @@ bool Process_tree_owner::record_descendant(std::int64_t in_process_id, Native_ha
 Kill_coordinates Process_tree_owner::coordinates() const
 {
     Kill_coordinates coordinates;
+    coordinates.cleanup_scope = Cleanup_scope::TRANSITIVE_TREE;
     coordinates.process_group   = m_impl->process_group;
     coordinates.process_ids     = m_impl->process_ids;
     coordinates.process_handles = m_impl->process_handles;
@@ -467,6 +468,7 @@ Reap_outcome Process_tree_owner::terminate_and_reap(
 {
     const auto started = Deadline::Clock::now();
     Reap_outcome outcome;
+    outcome.cleanup_scope = Cleanup_scope::TRANSITIVE_TREE;
 
     // A zero grace is the retirement kill: nothing is asked of the tree first,
     // so the statuses it leaves carry SIGKILL and nothing else.

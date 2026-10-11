@@ -32,6 +32,11 @@ int run_owner(custody::Duplex_channel& channel)
     std::string error;
     custody::Process_tree_owner tree;
     const auto emit = [&](custody::Owner_event event) {
+#if defined(__APPLE__)
+        event.cleanup_scope = custody::Cleanup_scope::OWNED_PROCESS_GROUPS;
+#else
+        event.cleanup_scope = custody::Cleanup_scope::TRANSITIVE_TREE;
+#endif
         return detail::send_event(channel, event, &error);
     };
     const auto reject = [&](const std::string& reason) {
@@ -76,12 +81,18 @@ int run_owner(custody::Duplex_channel& channel)
         ~Pty_handles() { if (master >= 0) close(master); if (slave >= 0) close(slave); }
     } pty_handles{master, slave};
     if (request.mode == custody::Owner_mode::PTY) {
+#if defined(__APPLE__)
+        // Interactive job-control groups belong to the native terminal
+        // backend; an original-group receipt cannot settle that lifecycle.
+        return reject("Darwin command custody does not support PTY mode; use the native terminal backend");
+#else
         master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
         char slave_name[256];
         if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0 ||
             ptsname_r(master, slave_name, sizeof(slave_name)) != 0 ||
             (slave = open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC)) < 0 ||
             !resize_pty(master, request.dimensions)) return reject("owner could not establish PTY");
+#endif
         request.process.controlling_terminal = true;
         // The PTY guard owns the slave, not the transferred-request guard.
     }
@@ -111,7 +122,11 @@ int run_owner(custody::Duplex_channel& channel)
     custody::Owner_event started;
     started.kind = custody::Owner_event_kind::STARTED;
     started.root_exit.process_id = root.process_id;
+#if defined(__APPLE__)
+    started.root_birth_token = root.process_birth_token;
+#else
     started.root_reference = root.process_handle;
+#endif
     started.pty_master = master;
     bool stopping = !emit(started);
     int grace_ms = 250;

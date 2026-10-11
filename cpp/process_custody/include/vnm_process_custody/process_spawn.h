@@ -54,9 +54,11 @@ struct Spawn_request
     std::vector<Inherited_descriptor> inherited;         // everything else is closed / not inherited
     int                               failed_start_wait_ms = 5000; // preserves the existing failed-resume budget
     bool                              new_session = false;   // Linux: setsid(); no Windows equivalent
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     bool                              controlling_terminal = false; // mapped stdin becomes the controlling PTY
     std::function<bool()>             admit_execution; // parent-only, after pidfd acquisition, before exec
+#endif
+#if defined(__linux__)
     int                               generation_cgroup = -1; // retained cgroup directory; birth must be atomic
 #endif
 #if defined(_WIN32)
@@ -71,7 +73,10 @@ struct Spawn_result
     std::int64_t  process_id     = 0;
     // Owned by the caller even when ok is false: a failed Windows resume can
     // leave a created child whose native cleanup has not yet been confirmed.
-    Native_handle process_handle = k_invalid_handle;   // Linux: pidfd; Windows: process handle.
+    Native_handle process_handle = k_invalid_handle;   // Linux: pidfd; Darwin: local kqueue; Windows: process handle.
+#if defined(__APPLE__)
+    std::uint64_t process_birth_token = 0; // original PROC_PIDTBSDINFO birth time, in microseconds
+#endif
     std::vector<Native_handle> inherited_handles;      // child-visible values, parallel to Spawn_request::inherited
     std::string   error;
 };
@@ -84,6 +89,14 @@ struct Spawn_result
 /// PROC_THREAD_ATTRIBUTE_HANDLE_LIST (and PROC_THREAD_ATTRIBUTE_JOB_LIST when
 /// a job is given), CREATE_SUSPENDED, then resumed once creation succeeded.
 Spawn_result spawn(const Spawn_request& in_request);
+
+#if defined(__APPLE__)
+/// Creates a local NOTE_EXIT kqueue after checking the original birth identity
+/// before and after registration. This is observation only, never wait or
+/// signal authority. Keep the event unconsumed: poll(POLLIN) stays latched at
+/// death, including across PID reuse. Failure/absence cannot prove death.
+Native_handle open_process_observer(std::int64_t process_id, std::uint64_t birth_token, std::string* error);
+#endif
 
 Inherited_reference inherited_argument(std::size_t in_inherited_index);
 

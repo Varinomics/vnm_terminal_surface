@@ -11,6 +11,13 @@
 
 namespace vnm::process_custody {
 
+enum class Cleanup_scope : std::uint32_t
+{
+    UNSPECIFIED,
+    TRANSITIVE_TREE,
+    OWNED_PROCESS_GROUPS,
+};
+
 #if defined(_WIN32) && defined(LOGONOMIC_ENABLE_PROCESS_TREE_TEST_HOOKS)
 enum class Process_exit_observation_for_test
 {
@@ -42,8 +49,11 @@ struct Exit_status
 /// original process handles are safely duplicated to the desktop. Handles
 /// are owned by whoever produced the struct: the owner for coordinates(), the
 /// receiving channel for a desktop that got them over the control channel.
+/// Darwin coordinates are diagnostic only: the original sole wait owner is
+/// the signal authority and cannot be replaced after its loss.
 struct Kill_coordinates
 {
+    Cleanup_scope             cleanup_scope = Cleanup_scope::UNSPECIFIED;
     std::int64_t               process_group = 0;
     std::vector<std::int64_t>  process_ids;       // in recording order: supervisor, adapter
     std::vector<Native_handle> process_handles;   // Linux pidfds / Windows process handles, same order
@@ -51,13 +61,15 @@ struct Kill_coordinates
 
 /// What a teardown left behind. escalated_to_kill records that the kill
 /// signal was sent - after the grace passed, or at once for a zero grace;
-/// exits holds every status reaped during the teardown, in reap order;
+/// exits holds every status observed during the teardown (Darwin may retain
+/// the root zombie until its group settles);
 /// remaining_children names children whose cleanup remains unconfirmed
 /// (Linux: a tree process still alive after the kill phase; Windows: an
 /// uncollected recorded process).
 struct Reap_outcome
 {
-    bool                      complete          = false;   // nothing of the tree is left
+    Cleanup_scope             cleanup_scope     = Cleanup_scope::UNSPECIFIED;
+    bool                      complete          = false;   // settled within cleanup_scope only
     bool                      escalated_to_kill = false;
     std::vector<Exit_status>  exits;
     std::vector<std::int64_t> remaining_children;
@@ -71,6 +83,7 @@ struct Reap_outcome
 /// outer generation Job, leaving the custodian's inner kill-on-close Job intact.
 /// Failed observations never establish emptiness. The caller retains this object
 /// and continues bounded attempts until native settlement, even after timeout.
+/// Darwin has no independent containment and reports it unavailable.
 class Process_tree_containment
 {
 public:
@@ -95,6 +108,8 @@ private:
 /// supervisor) is spawned into its own session and process group, and this
 /// object is the only place that calls waitid() for that tree. Windows: this
 /// object owns the kill-on-close Job the root is created into.
+/// Darwin retains the direct root and its original process group only; it
+/// reports OWNED_PROCESS_GROUPS, never transitive detached-descendant cleanup.
 class Process_tree_owner
 {
 public:
@@ -141,7 +156,9 @@ public:
     /// exited: Linux the SIGCHLD signalfd, Windows the recorded process handles.
     std::vector<Native_handle> exit_wait_handles() const;
 
-    /// Sole wait owner: collects every status available without blocking.
+    /// Sole wait owner: reports available statuses without blocking. Darwin
+    /// retains the reported root zombie until terminate_and_reap settles its
+    /// original group; callers must not reap that root themselves.
     std::vector<Exit_status> reap_available();
 
     /// Linux: whether any child (including a reparented orphan) still exists;

@@ -3,6 +3,7 @@
 #include <vnm_process_custody/process_pipe.h>
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -23,7 +24,7 @@ struct Receive_result
 {
     Receive_status             status = Receive_status::FAILED;
     std::size_t                size   = 0;   // payload bytes in the caller's buffer
-    std::vector<Native_handle> descriptors;  // handles that travelled with the message (Linux only); the caller owns them
+    std::vector<Native_handle> descriptors;  // transferred POSIX descriptors; the caller owns them
     int                        error  = 0;
 };
 
@@ -35,6 +36,8 @@ struct Receive_result
 /// verifiable), Windows as one write on a named pipe. Descriptors travel with
 /// a message as SCM_RIGHTS on Linux; Windows transfers none, and
 /// transfers_descriptors() lets a caller branch without a platform test.
+/// Darwin frames a Unix stream and preserves partial receives across timeouts;
+/// malformed/oversized records close that stream because it has no packet boundary.
 class Duplex_channel
 {
 public:
@@ -79,6 +82,15 @@ public:
         std::size_t                       in_size,
         const std::vector<Native_handle>& in_descriptors,
         int*                              out_error = nullptr);
+
+#if defined(__APPLE__)
+    /// Stream framing cannot retry a partially sent record from its beginning.
+    /// One call owns all partial writes; failure closes a partially used stream.
+    Io_status send_descriptors_until(
+        const std::uint8_t* in_payload, std::size_t in_size,
+        const std::vector<Native_handle>& in_descriptors,
+        std::chrono::steady_clock::time_point in_deadline, int* out_error = nullptr);
+#endif
 
     /// Waits up to timeout_ms (-1: no timeout) for one message; in_capacity
     /// must be at least max_message_bytes() so a message the peer was allowed

@@ -9,8 +9,11 @@ if(WIN32)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND _native_sources src/process_pipe_posix.cpp src/process_channel_posix.cpp
         src/process_spawn_posix.cpp src/process_tree_posix.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    list(APPEND _native_sources src/process_pipe_posix.cpp src/process_channel_darwin.cpp
+        src/process_spawn_darwin.cpp src/process_tree_darwin.cpp)
 else()
-    message(FATAL_ERROR "vnm_process_custody currently supports Windows and Linux")
+    message(FATAL_ERROR "vnm_process_custody supports Windows, Linux and Darwin")
 endif()
 
 add_library(vnm_process_custody STATIC ${_native_sources})
@@ -30,7 +33,7 @@ if(WIN32)
     endif()
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     set_property(TARGET vnm_process_custody PROPERTY
         VNM_PROCESS_CUSTODY_OWNER_START_DEADLINE 1)
     set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
@@ -49,7 +52,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(VNM_PROCESS_CUSTODY_BUILD_TESTS)
         enable_testing()
         find_package(Threads REQUIRED)
-        add_executable(vnm_process_custody_tests tests/owner_tests.cpp)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+            set(owner_test_source tests/owner_darwin_tests.cpp)
+        else()
+            set(owner_test_source tests/owner_tests.cpp)
+        endif()
+        add_executable(vnm_process_custody_tests ${owner_test_source})
         target_link_libraries(vnm_process_custody_tests PRIVATE vnm_process_custody Threads::Threads)
         set_target_properties(vnm_process_custody_tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
         add_test(NAME vnm_process_custody_tests
