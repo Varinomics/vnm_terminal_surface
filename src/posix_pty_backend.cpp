@@ -37,7 +37,6 @@
 #include <unistd.h>
 
 #if defined(__APPLE__)
-#include <sys/sysctl.h>
 #include <util.h>
 #else
 #include <pty.h>
@@ -168,7 +167,24 @@ struct Signal_targets
     std::array<std::shared_ptr<Posix_process_group_custody>, 2> process_groups{};
     std::size_t count = 0U;
     bool complete = true;
+#if defined(__APPLE__)
+    std::shared_ptr<Unique_fd> terminal;
+#endif
 };
+
+#if defined(__APPLE__)
+bool retain_terminal(int master, Signal_targets& targets) noexcept
+{
+    try {
+        targets.terminal = std::make_shared<Unique_fd>();
+        targets.terminal->reset(::fcntl(master, F_DUPFD_CLOEXEC, 0));
+        return static_cast<bool>(*targets.terminal);
+    }
+    catch (...) {
+        return false;
+    }
+}
+#endif
 
 struct Native_launch_data
 {
@@ -513,6 +529,9 @@ Signal_targets process_signal_targets(
         return targets;
     }
     targets.process_groups[targets.count++] = child_group;
+#if defined(__APPLE__)
+    targets.complete = master >= 0 && retain_terminal(master, targets);
+#else
     if (master >= 0) {
         const pid_t foreground_pgid = ::tcgetpgrp(master);
         if (foreground_pgid > 0 && foreground_pgid != child_group->identity()) {
@@ -528,6 +547,7 @@ Signal_targets process_signal_targets(
             }
         }
     }
+#endif
     return targets;
 }
 
@@ -545,8 +565,32 @@ Signal_targets shutdown_signal_targets(
 std::optional<int> send_signal_to_targets(const Signal_targets& targets, int signal_number)
 {
     int first_error = targets.complete ? 0 : ENOTSUP;
+#if defined(__APPLE__)
+    // Only the retained terminal can signal an unowned foreground group.
+    // Its descriptor is held only while signal work is in flight.
+    if (targets.terminal && *targets.terminal &&
+        ::ioctl(targets.terminal->get(), TIOCSIG, signal_number) < 0 && first_error == 0)
+    {
+        first_error = errno;
+    }
+#endif
     for (std::size_t i = 0U; i < targets.count; ++i) {
-        const int error = targets.process_groups[i]->signal_group(signal_number);
+        int owned_signal = signal_number;
+#if defined(__APPLE__)
+        // Let an interactive shell hang up its ordinary background jobs before
+        // the forced fallback. Killing the shell first bypasses that cleanup.
+        if (owned_signal == SIGTERM) {
+            owned_signal = SIGHUP;
+        }
+#endif
+        int error = targets.process_groups[i]->signal_group(owned_signal);
+#if defined(__APPLE__)
+        if (error == ESTALE) {
+            // The sole wait has retired this root's authority. Do not retry its
+            // numeric group. Terminal-wide settlement remains unconfirmed.
+            continue;
+        }
+#endif
         if (error != 0 && error != ESRCH && first_error == 0) {
             first_error = error;
         }
@@ -572,6 +616,11 @@ public:
             [](void* context) noexcept {
 #if defined(__linux__)
                 return static_cast<Impl*>(context)->m_owner.confirmed();
+#elif defined(__APPLE__)
+                auto* impl = static_cast<Impl*>(context);
+                // Root exit and terminal hangup do not prove that every normal
+                // job group has exited, including groups created near root exit.
+                return impl->m_child_group_custody->identity() <= 1;
 #else
                 (void)context;
                 return true;
@@ -1083,7 +1132,7 @@ public:
                         QStringLiteral("POSIX PTY interrupt requires a running process"));
             }
 
-#if defined(__linux__) && defined(TIOCSIG)
+#if defined(TIOCSIG)
             if (::ioctl(master, TIOCSIG, SIGINT) < 0) {
                 interrupt_error = errno;
             }
@@ -1215,11 +1264,15 @@ public:
             reader_finished                      = m_reader_finished;
             if (m_master) {
                 master = m_master.get();
+#if defined(__APPLE__)
+                targets = process_signal_targets(child_custody, master);
+#else
                 targets = shutdown_signal_targets(
                     child_custody,
                     master,
                     child_reaped,
                     reader_finished);
+#endif
                 if (defer_master_close) {
                     m_close_master_pending = true;
                 }
@@ -1229,11 +1282,15 @@ public:
                 }
             }
             else {
+#if defined(__APPLE__)
+                targets = process_signal_targets(child_custody, master);
+#else
                 targets = shutdown_signal_targets(
                     child_custody,
                     master,
                     child_reaped,
                     reader_finished);
+#endif
             }
         }
 
@@ -1245,7 +1302,10 @@ public:
         std::string owner_error;
         (void)m_owner.stop(0, &owner_error);
 #else
-        (void)send_signal_to_targets(targets, SIGKILL);
+        (void)send_signal_to_targets(targets, SIGTERM);
+        if (!wait_for_signal_targets_exit_observed(targets, m_termination_policy.graceful_interval)) {
+            (void)send_signal_to_targets(targets, SIGKILL);
+        }
 
         // The signal above targets process groups (kill(-pgid)). During the
         // brief window after forkpty() but before the child has established its
@@ -1259,6 +1319,13 @@ public:
         if (child_custody) {
             (void)child_custody->signal_root(SIGKILL);
         }
+#endif
+#if defined(__APPLE__)
+        // This shutdown call has issued its last signal. Release its duplicate
+        // before closing/joining: pending slave output may otherwise keep the
+        // child in exit while this join keeps its PTY master connected. Other
+        // in-flight signal tasks retain their own references until they finish.
+        targets.terminal.reset();
 #endif
 
         // In ordinary shutdown, close the master before
@@ -1523,6 +1590,14 @@ private:
         if (!targets.complete) {
             return true; // Unconfirmed is not empty.
         }
+#if defined(__APPLE__)
+        {
+            const std::lock_guard lock(m_mutex);
+            if (m_child_reaped) {
+                return false; // No further owned-root authority, not all-jobs settlement.
+            }
+        }
+#endif
         for (std::size_t i = 0U; i < targets.count; ++i) {
             // Only ESRCH from an exact retained group proves its absence.
             // Permission/API/identity failures remain pending observations.
