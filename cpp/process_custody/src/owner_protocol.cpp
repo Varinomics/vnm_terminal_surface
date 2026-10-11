@@ -423,7 +423,7 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
                 break;
             }
             if (expected_descriptors > 2 ||
-                (event.kind != Owner_event_kind::STARTED && expected_descriptors != 0))
+                (event.kind == Owner_event_kind::STARTED ? expected_descriptors == 0 : expected_descriptors != 0))
                 input.valid = false;
             if (expected_descriptors >= 1) event.root_reference = received.descriptors[0];
             if (expected_descriptors == 2) event.pty_master = received.descriptors[1];
