@@ -60,6 +60,50 @@ bool prepare_socket(int fd, std::string* error)
     return false;
 }
 
+bool inspect_control(
+    const msghdr& message, std::size_t capacity, bool first_byte,
+    std::vector<Native_handle>* received_descriptors)
+{
+    bool valid = (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) == 0 && message.msg_controllen <= capacity;
+    const std::size_t size = std::min<std::size_t>(message.msg_controllen, capacity);
+    const auto* control = (const std::uint8_t*)message.msg_control;
+    std::size_t position = 0;
+    std::size_t descriptor_count = 0;
+    while (position < size) {
+        const std::size_t remaining = size - position;
+        if (remaining < CMSG_LEN(0)) {
+            return false;
+        }
+        cmsghdr header;
+        std::memcpy(&header, control + position, sizeof(header));
+        if (header.cmsg_len < CMSG_LEN(0)) {
+            return false;
+        }
+        const std::size_t descriptor_bytes = std::min<std::size_t>(header.cmsg_len, remaining) - CMSG_LEN(0);
+        const bool rights = header.cmsg_level == SOL_SOCKET && header.cmsg_type == SCM_RIGHTS;
+        valid &= rights && first_byte && header.cmsg_len <= remaining && descriptor_bytes % sizeof(int) == 0;
+        if (rights) {
+            descriptor_count += descriptor_bytes / sizeof(int);
+            valid &= descriptor_count <= k_max_descriptors;
+            // Darwin's peek returns zero placeholders, not installed FDs.
+            // Only a consuming receive may transfer descriptor ownership.
+            if (received_descriptors) {
+                for (std::size_t offset = 0; offset + sizeof(int) <= descriptor_bytes; offset += sizeof(int)) {
+                    int descriptor;
+                    std::memcpy(&descriptor, control + position + CMSG_LEN(0) + offset, sizeof(descriptor));
+                    received_descriptors->push_back(descriptor);
+                    valid &= fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0;
+                }
+            }
+        }
+        if (header.cmsg_len > remaining) {
+            return false;
+        }
+        position += CMSG_SPACE(header.cmsg_len - CMSG_LEN(0));
+    }
+    return valid;
+}
+
 } // namespace
 
 struct Duplex_channel::Impl
@@ -276,29 +320,31 @@ Receive_result Duplex_channel::receive(std::uint8_t* out_buffer, std::size_t in_
         message.msg_iovlen = 1;
         message.msg_control = control;
         message.msg_controllen = sizeof(control);
+        // Darwin installs all rights before truncating their returned numbers.
+        // Peek rejects excess or misplaced rights while they remain socket-owned.
+        const ssize_t peeked = recvmsg(m_impl->fd, &message, MSG_PEEK | MSG_DONTWAIT);
+        if (peeked < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            continue;
+        }
+        const bool valid_peek = peeked >= 0 && inspect_control(message, sizeof(control), already_read == 0, nullptr);
+        if (peeked <= 0 || !valid_peek) {
+            result.status = peeked == 0 && already_read == 0 && valid_peek ?
+                Receive_status::CLOSED : Receive_status::FAILED;
+            result.error = peeked < 0 ? errno : EPROTO;
+            close();
+            return result;
+        }
+        // This is the sole reader. A peer may append after the peek, so consume
+        // only the inspected bytes, excluding any newly appended ancillary data.
+        part.iov_len = (std::size_t)peeked;
+        message.msg_controllen = sizeof(control);
+        message.msg_flags = 0;
         const ssize_t count = recvmsg(m_impl->fd, &message, MSG_DONTWAIT);
         if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
             continue;
         }
-        bool malformed = (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0;
-        if (count >= 0) {
-            for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
-                if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
-                    header->cmsg_len < CMSG_LEN(0))
-                {
-                    malformed = true;
-                    continue;
-                }
-                const std::size_t descriptor_bytes = header->cmsg_len - CMSG_LEN(0);
-                malformed |= already_read != 0 || descriptor_bytes % sizeof(int) != 0;
-                for (std::size_t offset = 0; offset + sizeof(int) <= descriptor_bytes; offset += sizeof(int)) {
-                    int descriptor;
-                    std::memcpy(&descriptor, CMSG_DATA(header) + offset, sizeof(descriptor));
-                    m_impl->descriptors.push_back(descriptor);
-                    malformed |= fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0;
-                }
-            }
-        }
+        const bool malformed = count >= 0 &&
+            !inspect_control(message, sizeof(control), already_read == 0, &m_impl->descriptors);
         if (count <= 0 || malformed) {
             result.status = count == 0 && already_read == 0 && !malformed ?
                 Receive_status::CLOSED : Receive_status::FAILED;

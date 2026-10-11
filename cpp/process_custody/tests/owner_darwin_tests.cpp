@@ -166,6 +166,140 @@ bool framed_transport()
     return ok;
 }
 
+bool partial_frame_deadline_closes_stream()
+{
+    using namespace std::chrono_literals;
+    std::fprintf(stderr, "framing: bounded partial send\n");
+    constexpr std::size_t payload_bytes = 1024 * 1024;
+    custody::Duplex_channel sender, receiver;
+    std::string error;
+    if (!custody::Duplex_channel::create_pair(payload_bytes, &sender, &receiver, &error)) {
+        return check(false, error.c_str());
+    }
+    // Match send_owner_start_until's nonblocking-channel precondition.
+    const int send_flags = fcntl(sender.native(), F_GETFL);
+    const int receive_flags = fcntl(receiver.native(), F_GETFL);
+    if (!check(send_flags >= 0 && fcntl(sender.native(), F_SETFL, send_flags | O_NONBLOCK) == 0 &&
+            receive_flags >= 0 && fcntl(receiver.native(), F_SETFL, receive_flags | O_NONBLOCK) == 0,
+        "bounded writer and raw wire-progress observation are nonblocking"))
+    {
+        return false;
+    }
+    int send_capacity = 4096;
+    socklen_t capacity_size = sizeof(send_capacity);
+    if (!check(setsockopt(sender.native(), SOL_SOCKET, SO_SNDBUF, &send_capacity, sizeof(send_capacity)) == 0 &&
+            getsockopt(sender.native(), SOL_SOCKET, SO_SNDBUF, &send_capacity, &capacity_size) == 0 &&
+            send_capacity > 0 && (std::size_t)send_capacity < payload_bytes,
+        "single-record fixture has a send buffer smaller than its payload"))
+    {
+        return false;
+    }
+    const std::vector<std::uint8_t> payload(payload_bytes, 0x5a);
+    int send_error = 0;
+    const auto started = Clock::now();
+    const auto status = sender.send_descriptors_until(payload.data(), payload.size(), {}, started + 80ms, &send_error);
+    const auto elapsed = Clock::now() - started;
+
+    // Inspect actual wire progress, not an assumed relationship between the
+    // socket capacity and its first write. Zero-byte timeouts remain retryable.
+    std::array<std::uint8_t, 8192> wire{};
+    std::size_t transferred = 0;
+    ssize_t count;
+    do {
+        count = recv(receiver.native(), wire.data(), wire.size(), MSG_DONTWAIT);
+        if (count > 0) {
+            transferred += (std::size_t)count;
+        }
+    }
+    while (count > 0 && transferred <= payload_bytes + 4);
+    std::printf("partial frame: wire_bytes=%zu full_record=%zu elapsed_ms=%lld\n", transferred,
+        payload_bytes + 4, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    bool ok = check(transferred > 0 && transferred < payload_bytes + 4,
+        "deadline interrupted an actually partially transmitted single record");
+    ok &= check(status == custody::Io_status::FAILED && send_error == ETIMEDOUT &&
+            elapsed >= 80ms && elapsed < 2s,
+        "partial record consumes one bounded send deadline");
+    ok &= check(!sender.valid() && count == 0,
+        "failed partial record closes the sender and delivers EOF after its wire bytes");
+    return ok;
+}
+
+enum class Rejected_record { OVERSIZE, LATE_RIGHTS, TRUNCATED_RIGHTS };
+
+bool rejected_record_releases_descriptors(Rejected_record kind)
+{
+    const char* label = kind == Rejected_record::OVERSIZE ? "oversized frame" :
+        kind == Rejected_record::LATE_RIGHTS ? "late rights" : "truncated rights";
+    std::fprintf(stderr, "framing: %s\n", label);
+    custody::Duplex_channel sender, receiver;
+    custody::Readable_pipe read_end;
+    custody::Writable_pipe write_end;
+    std::string error;
+    if (!custody::Duplex_channel::create_pair(64, &sender, &receiver, &error) ||
+        !custody::create_pipe(&read_end, &write_end, &error) || !read_end.prepare_for_owner(&error))
+    {
+        return check(false, error.c_str());
+    }
+    std::array<std::uint8_t, 64> output{};
+    std::array<std::uint8_t, 5> wire{0, 0, 0, 1, 0x5a};
+    std::size_t offset = 0;
+    if (kind == Rejected_record::OVERSIZE) {
+        wire[3] = 65;
+    }
+    if (kind == Rejected_record::LATE_RIGHTS) {
+        if (!check(write(sender.native(), wire.data(), 1) == 1,
+            "late-rights fixture sends its first prefix byte without descriptors"))
+        {
+            return false;
+        }
+        const auto partial = receiver.receive(output.data(), output.size(), 10);
+        if (!check(partial.status == custody::Receive_status::TIMEOUT,
+            "receiver retains the prefix before late rights arrive"))
+        {
+            return false;
+        }
+        offset = 1;
+    }
+    // Repeating one pipe writer makes EOF an ownership oracle for every
+    // installed descriptor, including a truncated SCM_RIGHTS control message.
+    const std::size_t descriptor_count = kind == Rejected_record::TRUNCATED_RIGHTS ? 65 : 1;
+    const std::vector<int> descriptors(descriptor_count, write_end.native());
+    alignas(cmsghdr) std::uint8_t control[CMSG_SPACE(sizeof(int) * 65)]{};
+    iovec part{wire.data() + offset, wire.size() - offset};
+    msghdr message{};
+    message.msg_iov = &part;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = CMSG_SPACE(sizeof(int) * descriptor_count);
+    auto* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int) * descriptor_count);
+    std::memcpy(CMSG_DATA(header), descriptors.data(), sizeof(int) * descriptor_count);
+    if (!check(sendmsg(sender.native(), &message, 0) == (ssize_t)part.iov_len,
+        "malformed-frame fixture transfers its real pipe descriptors"))
+    {
+        return false;
+    }
+    write_end.close();
+    const auto received = receiver.receive(output.data(), output.size(), 1000);
+    const auto expected = kind == Rejected_record::OVERSIZE ?
+        custody::Receive_status::OVERSIZE : custody::Receive_status::FAILED;
+    std::uint8_t byte = 0;
+    pollfd pipe_state{read_end.native(), POLLIN, 0};
+    const bool writers_released = poll(&pipe_state, 1, 250) == 1 &&
+        read_end.read(&byte, 1).status == custody::Io_status::CLOSED;
+    std::printf("rejected %s: status=%d channel_closed=%d descriptors_returned=%zu pipe_eof=%d\n",
+        label, (int)received.status, !receiver.valid(), received.descriptors.size(), writers_released);
+    const bool ok = check(received.status == expected && !receiver.valid() && received.descriptors.empty() &&
+            writers_released,
+        "rejected record closes its stream and releases every received descriptor");
+    for (const int descriptor : received.descriptors) {
+        close(descriptor);
+    }
+    return ok;
+}
+
 bool retained_group(const std::string& self)
 {
     using namespace std::chrono_literals;
@@ -488,6 +622,13 @@ int main(int argc, char** argv)
         return 2;
     }
     bool ok = framed_transport();
+    ok &= partial_frame_deadline_closes_stream();
+    ok &= rejected_record_releases_descriptors(Rejected_record::OVERSIZE);
+    ok &= rejected_record_releases_descriptors(Rejected_record::LATE_RIGHTS);
+    ok &= rejected_record_releases_descriptors(Rejected_record::TRUNCATED_RIGHTS);
+    if (std::string(argv[1]) == "--framing") {
+        return ok ? 0 : 1;
+    }
     ok &= spawn_contract(argv[0]);
     ok &= unrelated_group_survives(argv[0]);
     ok &= command_owner(argv[1], false);

@@ -94,7 +94,9 @@ public:
 
     /// Waits up to timeout_ms (-1: no timeout) for one message; in_capacity
     /// must be at least max_message_bytes() so a message the peer was allowed
-    /// to send always fits.
+    /// to send always fits. The channel exclusively owns receives: calls must
+    /// be serialized, with no reads through native() or another descriptor alias.
+    /// Darwin validates queued ancillary data before consuming the inspected bytes.
     Receive_result receive(std::uint8_t* out_buffer, std::size_t in_capacity, int in_timeout_ms);
 
 private:
