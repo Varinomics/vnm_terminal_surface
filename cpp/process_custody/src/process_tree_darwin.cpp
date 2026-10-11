@@ -75,6 +75,7 @@ struct Process_tree_owner::Impl
     bool root_reported = false;
     bool root_reaped = false;
     bool ownership_lost = false;
+    bool terminal_unconfirmed = false;
     std::string error;
 
     bool observe(siginfo_t* info)
@@ -92,23 +93,57 @@ struct Process_tree_owner::Impl
         return false;
     }
 
-    void signal_group(int signal_number)
+    bool attempt_group_signal(int signal_number)
     {
         siginfo_t info{};
         if (!observe(&info)) {
-            return;
+            return false;
         }
         // Only this thread waits this direct child. Keeping its zombie pins
         // both the numeric root and original group until group settlement.
         if (kill(-root, signal_number) != 0 && errno != ESRCH) {
-            error = std::string("original process group signal failed: ") + std::strerror(errno);
+            const int signal_error = errno;
+            error = "original process group signal failed (errno " + std::to_string(signal_error) +
+                "): " + std::strerror(signal_error);
         }
         if (info.si_pid == 0 && kill(root, signal_number) != 0 && errno != ESRCH) {
-            error = std::string("original child signal failed: ") + std::strerror(errno);
+            const int signal_error = errno;
+            error = "original child signal failed (errno " + std::to_string(signal_error) +
+                "): " + std::strerror(signal_error);
         }
+        // The attempt had sole-parent authority; a failed syscall remains an
+        // error. Darwin can reject a group containing only zombies with EPERM.
+        // That cannot prove settlement, but must not prevent bounded negative
+        // retirement once the exact root has ended and its wait is collected.
+        return true;
     }
 
-    bool settle_group()
+    bool collect_root(const siginfo_t& info, std::vector<Exit_status>& exits)
+    {
+        // A final observation can discover the exit after reap_available() ran.
+        // Preserve that exact status before retiring the only workload wait.
+        if (!root_reported) {
+            exits.push_back(exit_status(info));
+            root_reported = true;
+        }
+        int status;
+        pid_t waited;
+        do {
+            waited = waitpid(root, &status, WNOHANG);
+        }
+        while (waited < 0 && errno == EINTR);
+        if (waited != root) {
+            error = "original root reap was not confirmed";
+            ownership_lost = waited < 0 && errno == ECHILD;
+            return false;
+        }
+        root_reaped = true;
+        close_native_handle(observer);
+        observer = -1;
+        return true;
+    }
+
+    bool settle_group(std::vector<Exit_status>& exits)
     {
         siginfo_t info{};
         if (!observe(&info) || info.si_pid != root) {
@@ -144,22 +179,25 @@ struct Process_tree_owner::Impl
             error = "original root missing from its retained process group";
             return false;
         }
-        int status;
-        pid_t waited;
-        do {
-            waited = waitpid(root, &status, WNOHANG);
-        }
-        while (waited < 0 && errno == EINTR);
-        if (waited != root) {
-            error = "original root reap was not confirmed";
-            ownership_lost = waited < 0 && errno == ECHILD;
+        if (!collect_root(info, exits)) {
             return false;
         }
-        root_reaped = true;
-        close_native_handle(observer);
-        observer = -1;
         error.clear();
         return true;
+    }
+
+    void retire_exhausted_group(std::vector<Exit_status>& exits)
+    {
+        siginfo_t info{};
+        if (!observe(&info) || info.si_pid != root || !collect_root(info, exits)) {
+            return;
+        }
+        // A dead member held by another parent can keep the group nonempty
+        // indefinitely. Exhaustion retires our authority, never proves empty.
+        terminal_unconfirmed = true;
+        if (error.empty()) {
+            error = "original process group cleanup exhausted; scoped settlement is unconfirmed";
+        }
     }
 };
 
@@ -230,24 +268,33 @@ Reap_outcome Process_tree_owner::terminate_and_reap(
 {
     Reap_outcome outcome;
     outcome.cleanup_scope = k_scope;
+    if (m_impl->terminal_unconfirmed) {
+        outcome.terminal_unconfirmed = true;
+        outcome.remaining_children.push_back(m_impl->root);
+        outcome.error = m_impl->error;
+        return outcome;
+    }
     const auto started = Deadline::Clock::now();
     outcome.escalated_to_kill = grace.count() <= 0;
     int signal_number = outcome.escalated_to_kill ? SIGKILL : SIGTERM;
     auto deadline = Deadline::after(outcome.escalated_to_kill ? reap_budget : grace);
-    m_impl->signal_group(signal_number);
+    bool attempted = m_impl->attempt_group_signal(signal_number);
     while (children_remain()) {
         const auto exits = reap_available();
         outcome.exits.insert(outcome.exits.end(), exits.begin(), exits.end());
-        if (m_impl->settle_group() || m_impl->ownership_lost) {
+        if (m_impl->settle_group(outcome.exits) || m_impl->ownership_lost) {
             break;
         }
         if (deadline.expired()) {
             if (outcome.escalated_to_kill) {
+                if (attempted) {
+                    m_impl->retire_exhausted_group(outcome.exits);
+                }
                 break;
             }
             outcome.escalated_to_kill = true;
             signal_number = SIGKILL;
-            m_impl->signal_group(signal_number);
+            attempted = m_impl->attempt_group_signal(signal_number);
             deadline = Deadline::after(reap_budget);
         }
         // Darwin has no event for arbitrary original-group membership. The
@@ -255,7 +302,8 @@ Reap_outcome Process_tree_owner::terminate_and_reap(
         pollfd descriptor{m_impl->root_reported ? -1 : m_impl->observer, POLLIN, 0};
         (void)poll(&descriptor, 1, Deadline::earlier_timeout_ms(deadline.remaining_ms(), k_group_probe_ms));
     }
-    outcome.complete = !children_remain() && !m_impl->ownership_lost;
+    outcome.terminal_unconfirmed = m_impl->terminal_unconfirmed;
+    outcome.complete = !children_remain() && !m_impl->ownership_lost && !outcome.terminal_unconfirmed;
     outcome.error = m_impl->error;
     if (!outcome.complete) {
         outcome.remaining_children.push_back(m_impl->root);

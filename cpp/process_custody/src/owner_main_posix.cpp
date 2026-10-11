@@ -163,10 +163,14 @@ int run_owner(custody::Duplex_channel& channel)
         report(outcome.exits);
         custody::Owner_event event;
         event.kind = custody::Owner_event_kind::TREE_SETTLEMENT;
-        event.settlement = outcome.complete ? custody::Tree_settlement::CONFIRMED : custody::Tree_settlement::PENDING;
+        event.settlement = outcome.complete
+            ? custody::Tree_settlement::CONFIRMED
+            : outcome.terminal_unconfirmed
+                ? custody::Tree_settlement::UNCONFIRMED
+                : custody::Tree_settlement::PENDING;
         event.detail = outcome.error;
-        if (outcome.complete || !pending_reported) (void)emit(event);
-        if (outcome.complete) return 0;
+        if (outcome.complete || outcome.terminal_unconfirmed || !pending_reported) (void)emit(event);
+        if (outcome.complete || outcome.terminal_unconfirmed) return 0;
         pending_reported = true;
         grace_ms = 0;
         std::this_thread::sleep_for(25ms);

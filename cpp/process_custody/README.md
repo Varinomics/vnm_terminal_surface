@@ -15,11 +15,20 @@ versions and lengths; an absent or unknown extension does not upgrade a claim.
 
 Darwin command ownership covers the directly owned root and its original
 process group. The owner starts the root in a new session, observes its exit
-without consuming its wait status, and retains the root zombie until a group
-membership snapshot contains only that zombie. This pins the original numeric
-group while signaling it. Only then does the owner reap its root. It never
-signals a saved group after reaping, opens signal authority by a discovered PID,
-or acquires another parent's exclusive wait.
+without consuming its wait status, and retains the root zombie while observing
+group membership. This pins the original numeric group while signaling it.
+A membership snapshot containing only that zombie permits a confirmed receipt
+and the owner's sole root reap. If an authorized forced-termination attempt and
+bounded observation exhaust without that snapshot, a fresh exact-root exit
+observation instead permits the sole reap and a terminal `UNCONFIRMED` receipt.
+For example, another
+parent may retain a dead group member indefinitely. The owner reports root exit
+before this receipt and exits; the caller retains the negative cleanup outcome.
+A failed signal remains an error, including Darwin's `EPERM` for a group of
+zombies; it cannot prove settlement or prevent an exhausted negative receipt.
+A live root remains pending. Exhausted cleanup never becomes confirmed on a
+later call. The owner never signals a saved group after reaping, opens signal
+authority by a discovered PID, or acquires another parent's exclusive wait.
 
 Independent generation containment and orphan adoption are unavailable on
 Darwin. `Process_tree_containment::establish()` reports that limitation, and

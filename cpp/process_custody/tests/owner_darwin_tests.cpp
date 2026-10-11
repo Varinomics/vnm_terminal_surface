@@ -3,6 +3,7 @@
 #include "../src/owner_protocol.h"
 
 #include <fcntl.h>
+#include <libproc.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -376,7 +377,8 @@ bool retained_group(const std::string& self)
         "root exit is reported while its original zombie remains owned");
     ok &= check(tree.children_remain(), "root exit is not group settlement");
     const auto outcome = tree.terminate_and_reap(10ms, 3000ms);
-    ok &= check(outcome.complete && outcome.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS,
+    ok &= check(outcome.complete && !outcome.terminal_unconfirmed &&
+            outcome.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS,
         outcome.error.empty() ? "original group cleanup settles within explicit scope" : outcome.error.c_str());
     ok &= check(waitpid((pid_t)root.process_id, nullptr, WNOHANG) == -1 && errno == ECHILD,
         "the owner reaps its root exactly once after group settlement");
@@ -432,6 +434,258 @@ struct Run
         return check(helper.ok, helper.error.c_str());
     }
 };
+
+struct held_group_ready_t
+{
+    pid_t parent = 0;
+    pid_t child = 0;
+    pid_t original_group = 0;
+    int child_status = 0;
+};
+
+bool read_fixture_bytes(int descriptor, void* destination, std::size_t size)
+{
+    const auto deadline = Clock::now() + std::chrono::seconds(3);
+    auto* bytes = static_cast<std::uint8_t*>(destination);
+    while (size != 0 && Clock::now() < deadline) {
+        pollfd ready{descriptor, POLLIN, 0};
+        const int remaining = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count());
+        if (poll(&ready, 1, remaining > 0 ? remaining : 0) != 1) {
+            return false;
+        }
+        const ssize_t count = read(descriptor, bytes, size);
+        if (count <= 0) {
+            return false;
+        }
+        bytes += count;
+        size -= static_cast<std::size_t>(count);
+    }
+    return size == 0;
+}
+
+class Held_group_fixture
+{
+public:
+    ~Held_group_fixture()
+    {
+        m_release_write.close();
+        custody::close_native_handle(m_parent_observer);
+    }
+
+    bool prepare(custody::Spawn_request& request)
+    {
+        std::string error;
+        if (!custody::create_pipe(&m_receipt_read, &m_receipt_write, &error) ||
+            !custody::create_pipe(&m_release_read, &m_release_write, &error))
+        {
+            return check(false, error.c_str());
+        }
+        request.inherited = {{m_receipt_write.native(), 9}, {m_release_read.native(), 10}};
+        return true;
+    }
+
+    bool ready(std::int64_t root)
+    {
+        m_receipt_write.close();
+        m_release_read.close();
+        held_group_ready_t ready;
+        if (!check(read_fixture_bytes(m_receipt_read.native(), &ready, sizeof(ready)) &&
+                ready.parent > 1 && ready.child > 1 && ready.original_group == root &&
+                ready.child_status == CLD_EXITED,
+            "fixture parent retains a dead child in the original root group"))
+        {
+            return false;
+        }
+        proc_bsdinfo info{};
+        if (!check(proc_pidinfo(ready.parent, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info) &&
+                info.pbi_pid == ready.parent && info.pbi_pgid == ready.parent,
+            "fixture holder moved to its own session after its child exited"))
+        {
+            return false;
+        }
+        std::string error;
+        m_parent_observer = custody::open_process_observer(ready.parent,
+            info.pbi_start_tvsec * 1'000'000 + info.pbi_start_tvusec, &error);
+        std::printf("held group root=%lld parent=%d child=%d observer=%d\n",
+            static_cast<long long>(root), ready.parent, ready.child, m_parent_observer);
+        return check(m_parent_observer >= 0 && holding(), "fixture holder is live before cleanup");
+    }
+
+    bool holding() const
+    {
+        pollfd parent{m_parent_observer, POLLIN, 0};
+        pollfd receipt{m_receipt_read.native(), POLLIN, 0};
+        return m_parent_observer >= 0 && poll(&parent, 1, 0) == 0 && poll(&receipt, 1, 0) == 0;
+    }
+
+    bool release()
+    {
+        // This private EOF releases only the fixture's own parent. The test
+        // never signals or waits either of these nonchild process numbers.
+        m_release_write.close();
+        char receipt = 0;
+        const bool reaped = read_fixture_bytes(m_receipt_read.native(), &receipt, 1) && receipt == 'R';
+        pollfd parent{m_parent_observer, POLLIN, 0};
+        return check(reaped && m_parent_observer >= 0 && poll(&parent, 1, 3000) == 1 &&
+                (parent.revents & POLLIN) != 0,
+            "fixture parent alone collects its dead child and ends after release");
+    }
+
+private:
+    custody::Readable_pipe m_receipt_read;
+    custody::Writable_pipe m_receipt_write;
+    custody::Readable_pipe m_release_read;
+    custody::Writable_pipe m_release_write;
+    int m_parent_observer = -1;
+};
+
+enum class Held_cleanup { FORCE_STOP, GRACEFUL_STOP, NORMAL_EXIT };
+
+bool exhausted_group_is_terminal(const std::string& self, Held_cleanup cleanup)
+{
+    using namespace std::chrono_literals;
+    const bool normal_exit = cleanup == Held_cleanup::NORMAL_EXIT;
+    Held_group_fixture fixture;
+    auto request = command(self, normal_exit ? "held_group_exit" : "held_group");
+    if (!fixture.prepare(request)) {
+        return false;
+    }
+    custody::Process_tree_owner tree;
+    std::string error;
+    if (!tree.establish(&error)) {
+        return check(false, error.c_str());
+    }
+    tree.configure_root_spawn(request);
+    const auto root = custody::spawn(request);
+    if (!check(root.ok, root.error.c_str())) {
+        return false;
+    }
+    tree.record_root(root);
+    bool ok = fixture.ready(root.process_id);
+    std::vector<custody::Exit_status> root_exits;
+    if (normal_exit) {
+        const auto deadline = Clock::now() + 3s;
+        while (root_exits.empty() && Clock::now() < deadline) {
+            root_exits = tree.reap_available();
+            if (root_exits.empty()) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+        ok &= check(root_exits.size() == 1 && root_exits.front().exit_code == 23,
+            "normal root exit is reported before cleanup begins");
+    }
+    const auto started = Clock::now();
+    const auto grace = cleanup == Held_cleanup::FORCE_STOP ? 0ms : 250ms;
+    const auto first = tree.terminate_and_reap(grace, 150ms);
+    root_exits.insert(root_exits.end(), first.exits.begin(), first.exits.end());
+    ok &= check(!first.complete && first.terminal_unconfirmed && first.escalated_to_kill &&
+            first.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS &&
+            Clock::now() - started < 2s && fixture.holding(),
+        "bounded cleanup ends unconfirmed while another parent still holds the dead member");
+    const int expected_signal = normal_exit ? 0 : grace.count() == 0 ? SIGKILL : SIGTERM;
+    ok &= check(root_exits.size() == 1 && root_exits.front().process_id == root.process_id &&
+            root_exits.front().signal == expected_signal &&
+            (!normal_exit || root_exits.front().exit_code == 23),
+        "terminal exhaustion preserves the exact original root exit receipt");
+    siginfo_t root_status{};
+    ok &= check(waitid(P_PID, static_cast<id_t>(root.process_id), &root_status, WEXITED | WNOHANG | WNOWAIT) == -1 &&
+            errno == ECHILD &&
+            !tree.children_remain() && tree.exit_wait_handles().empty() &&
+            tree.coordinates().process_group == 0 && tree.coordinates().process_ids.empty(),
+        "terminal exhaustion collects the root once and retires its action authority");
+    const auto repeated = tree.terminate_and_reap(0ms, 150ms);
+    ok &= check(!repeated.complete && repeated.terminal_unconfirmed && !repeated.escalated_to_kill &&
+            repeated.exits.empty() && fixture.holding(),
+        "repeated cleanup remains terminal without another signal or root receipt");
+    ok &= fixture.release();
+    const auto released = tree.terminate_and_reap(0ms, 150ms);
+    ok &= check(!released.complete && released.terminal_unconfirmed && !released.escalated_to_kill,
+        "later fixture collection cannot upgrade the retired outcome to confirmed");
+    std::printf("held group direct cleanup=%d terminal=%d repeat_terminal=%d result=%d detail=%s\n",
+        static_cast<int>(cleanup), first.terminal_unconfirmed, repeated.terminal_unconfirmed, ok,
+        first.error.c_str());
+    return ok;
+}
+
+bool exhausted_owner_receipts(const std::string& helper, const std::string& self, bool normal_exit)
+{
+    using namespace std::chrono_literals;
+    Run run;
+    Held_group_fixture fixture;
+    custody::Owner_start_request request;
+    request.process = command(self, normal_exit ? "held_group_exit" : "held_group");
+    if (!fixture.prepare(request.process) || !run.launch(helper)) {
+        return false;
+    }
+    std::string error;
+    if (!check(custody::send_owner_start(run.channel, request, &error), error.c_str())) {
+        return false;
+    }
+    custody::Owner_event started;
+    const auto start_status = custody::receive_owner_event(run.channel, &started, 3000, &error);
+    custody::close_native_handle(started.root_reference);
+    custody::close_native_handle(started.pty_master);
+    if (!check(start_status == custody::Receive_status::MESSAGE &&
+            started.kind == custody::Owner_event_kind::STARTED,
+        "held-group helper reports workload birth before cleanup"))
+    {
+        return false;
+    }
+    bool ok = fixture.ready(started.root_exit.process_id);
+    if (!normal_exit) {
+        ok &= check(custody::send_owner_stop(run.channel, 0, &error), "held-group stop request is delivered");
+    }
+    bool root_exited = false;
+    bool terminal = false;
+    const auto deadline = Clock::now() + 3s;
+    while (!terminal && Clock::now() < deadline) {
+        custody::Owner_event event;
+        const auto status = custody::receive_owner_event(run.channel, &event, 100, &error);
+        if (status == custody::Receive_status::TIMEOUT) {
+            continue;
+        }
+        custody::close_native_handle(event.root_reference);
+        custody::close_native_handle(event.pty_master);
+        if (!check(status == custody::Receive_status::MESSAGE, "held-group cleanup receipt is available")) {
+            ok = false;
+            break;
+        }
+        ok &= check(event.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS,
+            "held-group receipts retain their explicit scope");
+        if (event.kind == custody::Owner_event_kind::ROOT_EXITED) {
+            ok &= check(!root_exited && event.root_exit.process_id == started.root_exit.process_id &&
+                    event.root_exit.signal == (normal_exit ? 0 : SIGKILL) &&
+                    (!normal_exit || event.root_exit.exit_code == 23),
+                "helper reports its exact root exit once before terminal settlement");
+            root_exited = true;
+        }
+        if (event.kind == custody::Owner_event_kind::TREE_SETTLEMENT &&
+            event.settlement != custody::Tree_settlement::PENDING)
+        {
+            terminal = true;
+            ok &= check(root_exited && event.settlement == custody::Tree_settlement::UNCONFIRMED &&
+                    fixture.holding(),
+                "root receipt precedes terminal unconfirmed while the inert member remains held");
+            std::printf("held group helper normal_exit=%d settlement=%d detail=%s\n",
+                normal_exit, static_cast<int>(event.settlement), event.detail.c_str());
+        }
+    }
+    ok &= check(terminal, "held-group helper returns a bounded terminal receipt");
+    if (terminal) {
+        int status = 0;
+        const bool waited = wait_child(run.helper, &status);
+        if (waited) {
+            run.helper.process_id = 0;
+        }
+        ok &= check(waited && WIFEXITED(status) && WEXITSTATUS(status) == 0 && fixture.holding(),
+            "helper exits after retiring its root wait while fixture parent remains live");
+    }
+    ok &= fixture.release();
+    std::printf("held group helper normal_exit=%d root_receipt=%d terminal=%d result=%d\n",
+        normal_exit, root_exited, terminal, ok);
+    return ok;
+}
 
 bool command_owner(const std::string& helper, bool fail_start,
     custody::Owner_mode mode = custody::Owner_mode::COMMAND)
@@ -609,6 +863,65 @@ bool unknown_capabilities_remain_local()
 
 int fixture(const std::string& mode)
 {
+    if (mode == "held_group" || mode == "held_group_exit") {
+        const bool normal_exit = mode == "held_group_exit";
+        int detached[2] = {-1, -1};
+        if (normal_exit && pipe(detached) != 0) {
+            return 37;
+        }
+        const pid_t parent = fork();
+        if (parent < 0) {
+            return 38;
+        }
+        if (parent == 0) {
+            if (normal_exit) {
+                close(detached[0]);
+            }
+            const pid_t child = fork();
+            if (child < 0) {
+                _exit(39);
+            }
+            if (child == 0) {
+                _exit(0);
+            }
+            siginfo_t info{};
+            if (waitid(P_PID, child, &info, WEXITED | WNOWAIT) != 0) {
+                _exit(40);
+            }
+            const pid_t original_group = getpgrp();
+            if (setsid() < 0) {
+                _exit(41);
+            }
+            const held_group_ready_t ready{getpid(), child, original_group, info.si_code};
+            if (write(9, &ready, sizeof(ready)) != sizeof(ready)) {
+                _exit(43);
+            }
+            if (normal_exit) {
+                const char receipt = 'D';
+                (void)write(detached[1], &receipt, 1);
+                close(detached[1]);
+            }
+            // The holder self-releases even if the test cannot deliver EOF.
+            pollfd release{10, POLLIN, 0};
+            (void)poll(&release, 1, 8000);
+            int status = 0;
+            const bool reaped = waitpid(child, &status, 0) == child;
+            const char receipt = reaped ? 'R' : 'E';
+            (void)write(9, &receipt, 1);
+            _exit(reaped ? 0 : 44);
+        }
+        close(9);
+        close(10);
+        if (normal_exit) {
+            close(detached[1]);
+            char receipt = 0;
+            const bool ready = read_fixture_bytes(detached[0], &receipt, 1) && receipt == 'D';
+            close(detached[0]);
+            return ready ? 23 : 46;
+        }
+        (void)poll(nullptr, 0, 12000);
+        return 45;
+    }
     if (mode == "release") {
         char release;
         return read(9, &release, 1) == 1 && release == 'R' ? 0 : 36;
@@ -671,6 +984,11 @@ int main(int argc, char** argv)
     }
     ok &= spawn_contract(argv[0]);
     ok &= unrelated_group_survives(argv[0]);
+    ok &= exhausted_group_is_terminal(argv[0], Held_cleanup::FORCE_STOP);
+    ok &= exhausted_group_is_terminal(argv[0], Held_cleanup::GRACEFUL_STOP);
+    ok &= exhausted_group_is_terminal(argv[0], Held_cleanup::NORMAL_EXIT);
+    ok &= exhausted_owner_receipts(argv[1], argv[0], false);
+    ok &= exhausted_owner_receipts(argv[1], argv[0], true);
     ok &= command_owner(argv[1], false);
     ok &= command_owner(argv[1], true);
     ok &= command_owner(argv[1], false, custody::Owner_mode::PTY);

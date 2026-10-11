@@ -60,17 +60,19 @@ struct Kill_coordinates
 };
 
 /// What a teardown left behind. escalated_to_kill records that the kill
-/// signal was sent - after the grace passed, or at once for a zero grace;
-/// exits holds every status observed during the teardown (Darwin may retain
-/// the root zombie until its group settles);
+/// phase was attempted - after the grace passed, or at once for a zero grace;
+/// exits holds every status observed during the teardown (Darwin retains
+/// the root zombie until its group settles or bounded cleanup is exhausted);
 /// remaining_children names children whose cleanup remains unconfirmed
 /// (Linux: a tree process still alive after the kill phase; Windows: an
-/// uncollected recorded process).
+/// uncollected recorded process; Darwin: the diagnostic original root ID,
+/// even when its wait was collected without proving group settlement).
 struct Reap_outcome
 {
-    Cleanup_scope             cleanup_scope     = Cleanup_scope::UNSPECIFIED;
-    bool                      complete          = false;   // settled within cleanup_scope only
-    bool                      escalated_to_kill = false;
+    Cleanup_scope             cleanup_scope        = Cleanup_scope::UNSPECIFIED;
+    bool                      complete             = false; // settled within cleanup_scope only
+    bool                      terminal_unconfirmed = false; // authority retired without scoped settlement
+    bool                      escalated_to_kill     = false;
     std::vector<Exit_status>  exits;
     std::vector<std::int64_t> remaining_children;
     std::chrono::milliseconds elapsed{0};
@@ -158,7 +160,7 @@ public:
 
     /// Sole wait owner: reports available statuses without blocking. Darwin
     /// retains the reported root zombie until terminate_and_reap settles its
-    /// original group; callers must not reap that root themselves.
+    /// original group or retires exhausted cleanup; callers must not reap it.
     std::vector<Exit_status> reap_available();
 
     /// Linux: whether any child (including a reparented orphan) still exists;
@@ -167,13 +169,18 @@ public:
 
     /// Terminate, wait in_terminate_to_kill for the tree to vanish, kill,
     /// then reap until no child remains or in_reap_deadline passes after the
-    /// kill. A zero in_terminate_to_kill sends no terminate at all: the tree
-    /// is killed at once, so every status it produces carries the kill
-    /// signal. Linux signals the recorded pidfds, the root's process group
+    /// kill. A zero in_terminate_to_kill skips graceful termination and
+    /// attempts forced termination immediately. Linux signals the recorded
+    /// pidfds, the root's process group
     /// while the root is unreaped, and every child this subreaper acquires
     /// meanwhile, including one that left the root's session; having no
     /// child left is the completion. Windows has no graceful terminate for a
     /// Job, so the kill happens at once and in_terminate_to_kill is not used.
+    /// Darwin may return terminal_unconfirmed after an authorized kill attempt and
+    /// the bounded observation period, but only after observing and collecting
+    /// the exact root's exit. That outcome stays unconfirmed and retires every
+    /// subsequent signal to its original group; a live root remains pending.
+    /// Signal failures remain errors and never establish scoped settlement.
     Reap_outcome terminate_and_reap(
         std::chrono::milliseconds in_terminate_to_kill,
         std::chrono::milliseconds in_reap_deadline);
