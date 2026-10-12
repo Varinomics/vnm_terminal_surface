@@ -69,7 +69,9 @@ surface; source-tree consumers rebuild the surface against their own Qt.
   packaging sets it to `ON`; configure fails if transcript capture/replay is
   also enabled.
 - `VNM_TERMINAL_QT_LICENSE_ROUTE` is `lgpl_dynamic` by default and also accepts
-  `commercial`. The LGPL route requires shared Qt libraries.
+  `lgpl_static` and `commercial`. The LGPL routes require shared and static Qt
+  libraries respectively. Static consumers own the relinking package and
+  distribution obligations in `docs/qt_rendering_policy.md`.
 
 Useful configure shapes:
 
@@ -476,9 +478,10 @@ installed consumer API.
 The project is licensed under the GNU General Public License version 3 only.
 Dependency and reference boundaries are part of the build contract:
 
-- Qt Core, Gui, and Quick are allowed through either the commercial route or the
-  LGPL-compatible dynamic-linking route. GPL-only Qt modules are not allowed in
-  the product dependency graph.
+- Qt Core, Gui, and Quick are allowed through the commercial or LGPL routes.
+  The static LGPL route requires consumer-owned relinking artifacts; the dynamic
+  route requires separately replaceable shared libraries. GPL-only Qt modules
+  are not allowed in the product dependency graph.
 - The renderer contract is the documented QSG atlas path, including its
   QRhi/private-Qt integration under the project Qt posture checks. Per-cell
   `QQuickItem` trees and production row/frame `QImage` text rendering remain

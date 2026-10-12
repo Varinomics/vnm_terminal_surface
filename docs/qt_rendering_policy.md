@@ -90,15 +90,29 @@ selects MSDF text when available and permits shaped glyph-atlas fallback.
 `MSDF` and `GLYPH` force one text path for diagnostics; forced modes do not
 silently switch to the other text path.
 
-The project uses Qt through either a commercial Qt license held by the
-distributor or the LGPL-compatible dynamic-linking route recorded in
-`THIRD_PARTY_NOTICES.md` and `THIRD_PARTY/`. The default
-`VNM_TERMINAL_QT_LICENSE_ROUTE` is `lgpl_dynamic`; that route requires shared
-Qt libraries. No GPL-only Qt module is allowed in the product dependency graph.
+The project uses Qt through a commercial Qt license held by the distributor or
+an LGPL route recorded in `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY/`.
+`VNM_TERMINAL_QT_LICENSE_ROUTE` selects the linkage contract:
 
-Qt source is not vendored in this repository. Under the LGPL route, product
-packaging keeps Qt libraries separately replaceable and ships the applicable Qt
-notices.
+- `lgpl_dynamic` is the default and requires shared Qt libraries. Product
+  packaging keeps those libraries separately replaceable.
+- `lgpl_static` requires static Qt libraries, including the official Qt iOS kit.
+  The consuming application owns a relinking package containing its object code
+  (or source), other required link inputs, resources, and build instructions so
+  recipients can relink against a modified Qt. It must supply the corresponding
+  Qt source and applicable notices and license texts, permit the required
+  modifications and reverse engineering, and provide any required installation
+  information. The consumer must validate that package against its actual final
+  link inputs before distributing the application. Selecting this route checks
+  linkage; it does not certify a distribution package or distribution channel.
+- `commercial` requires the distributor's applicable commercial Qt license.
+
+No GPL-only Qt module is allowed in the product dependency graph in any route.
+Qt source is not vendored in this repository. Every LGPL distribution supplies
+the applicable notices and license texts. Distribution terms must preserve the
+recipient's LGPL rights; an app store is not an exception to those obligations.
+See [LGPLv3 section 4](https://www.gnu.org/licenses/lgpl-3.0.html#section4) and
+[Qt's LGPL guidance](https://www.qt.io/licensing/open-source-lgpl-obligations).
 
 ## Renderer Shape
 

@@ -1,7 +1,8 @@
 set(VNM_TERMINAL_QT_LICENSE_ROUTE "lgpl_dynamic" CACHE STRING
-    "Qt license route: lgpl_dynamic or commercial")
+    "Qt license route: lgpl_dynamic, lgpl_static, or commercial")
 set_property(CACHE VNM_TERMINAL_QT_LICENSE_ROUTE PROPERTY STRINGS
     "lgpl_dynamic"
+    "lgpl_static"
     "commercial")
 
 function(vnm_terminal_allowed_qt_targets out_var)
@@ -78,11 +79,12 @@ function(vnm_terminal_validate_qt_posture)
 
     set(allowed_routes
         "lgpl_dynamic"
+        "lgpl_static"
         "commercial")
 
     if(NOT VNM_TERMINAL_QT_LICENSE_ROUTE IN_LIST allowed_routes)
         message(FATAL_ERROR
-            "VNM_TERMINAL_QT_LICENSE_ROUTE must be lgpl_dynamic or commercial")
+            "VNM_TERMINAL_QT_LICENSE_ROUTE must be lgpl_dynamic, lgpl_static, or commercial")
     endif()
 
     vnm_terminal_allowed_qt_targets(allowed_qt_targets)
@@ -95,8 +97,17 @@ function(vnm_terminal_validate_qt_posture)
         return()
     endif()
 
-    if(DEFINED QT_FEATURE_shared)
-        if(NOT QT_FEATURE_shared)
+    if(VNM_TERMINAL_QT_LICENSE_ROUTE STREQUAL "lgpl_static")
+        set(required_target_type "STATIC_LIBRARY")
+        set(required_linkage "static")
+        if(DEFINED QT_FEATURE_shared AND QT_FEATURE_shared)
+            message(FATAL_ERROR
+                "The lgpl_static Qt route requires a static Qt build")
+        endif()
+    else()
+        set(required_target_type "SHARED_LIBRARY")
+        set(required_linkage "shared")
+        if(DEFINED QT_FEATURE_shared AND NOT QT_FEATURE_shared)
             message(FATAL_ERROR
                 "The lgpl_dynamic Qt route requires a shared Qt build")
         endif()
@@ -108,9 +119,9 @@ function(vnm_terminal_validate_qt_posture)
         endif()
 
         get_target_property(target_type ${target} TYPE)
-        if(NOT target_type STREQUAL "SHARED_LIBRARY")
+        if(NOT target_type STREQUAL required_target_type)
             message(FATAL_ERROR
-                "The lgpl_dynamic Qt route requires ${target} to be a shared library")
+                "The ${VNM_TERMINAL_QT_LICENSE_ROUTE} Qt route requires ${target} to be a ${required_linkage} library")
         endif()
     endforeach()
 endfunction()

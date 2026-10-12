@@ -9,8 +9,11 @@ Standalone custody packages include that license and the copyright notice.
 ## Qt 6
 
 Qt 6 Core, Gui, and Quick are required. The project uses Qt through either a
-commercial Qt license held by the distributor or an LGPLv3-compatible
-dynamic-linking posture. No GPL-only Qt module is allowed in the product
+commercial Qt license held by the distributor or LGPLv3. LGPL dynamic consumers
+keep the shared Qt libraries replaceable. LGPL static consumers supply the
+application relinking artifacts, corresponding Qt source, notices, license
+texts, and any required installation information described in
+`docs/qt_rendering_policy.md`. No GPL-only Qt module is allowed in the product
 dependency graph.
 
 The per-module records in `THIRD_PARTY/` name the Qt module, upstream project,

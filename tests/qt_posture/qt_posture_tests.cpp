@@ -294,11 +294,61 @@ int main(int argc, char** argv)
             "Qt6::Core Qt6::Gui Qt6::Quick", ""),
         "static_commercial");
 
+    ok &= expect_success(
+        run_script("allowed_static_lgpl", "lgpl_static", "STATIC", "STATIC", "STATIC",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "set(QT_FEATURE_shared OFF)\n"
+            "vnm_terminal_validate_qt_posture()\n"
+            "add_library(example INTERFACE)\n"
+            "target_link_libraries(example INTERFACE Qt6::GuiPrivate Qt6::QuickPrivate)\n"
+            "vnm_terminal_validate_qt_link_interface(example)\n"),
+        "allowed_static_lgpl");
+
+    ok &= expect_failure(
+        run_script("static_route_shared_core", "lgpl_static", "SHARED", "STATIC", "STATIC",
+            "Qt6::Core Qt6::Gui Qt6::Quick", ""),
+        "static_route_shared_core",
+        "requires Qt6::Core to be a static library");
+
+    ok &= expect_failure(
+        run_script("static_route_shared_gui", "lgpl_static", "STATIC", "SHARED", "STATIC",
+            "Qt6::Core Qt6::Gui Qt6::Quick", ""),
+        "static_route_shared_gui",
+        "requires Qt6::Gui to be a static library");
+
+    ok &= expect_failure(
+        run_script("static_route_shared_quick", "lgpl_static", "STATIC", "STATIC", "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick", ""),
+        "static_route_shared_quick",
+        "requires Qt6::Quick to be a static library");
+
+    ok &= expect_failure(
+        run_script("static_route_shared_feature", "lgpl_static", "STATIC", "STATIC", "STATIC",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "set(QT_FEATURE_shared ON)\n"
+            "vnm_terminal_validate_qt_posture()\n"),
+        "static_route_shared_feature",
+        "The lgpl_static Qt route requires a static Qt build");
+
+    ok &= expect_failure(
+        run_script("dynamic_route_static_feature", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "set(QT_FEATURE_shared OFF)\n"
+            "vnm_terminal_validate_qt_posture()\n"),
+        "dynamic_route_static_feature",
+        "The lgpl_dynamic Qt route requires a shared Qt build");
+
+    ok &= expect_failure(
+        run_script("static_route_forbidden_module", "lgpl_static", "STATIC", "STATIC", "STATIC",
+            "Qt6::Core Qt6::Gui Qt6::Quick Qt6::Network", ""),
+        "static_route_forbidden_module",
+        "Qt target Qt6::Network is outside the Qt module allowlist");
+
     ok &= expect_failure(
         run_script("bad_route", "unknown", "SHARED", "SHARED", "SHARED",
             "Qt6::Core Qt6::Gui Qt6::Quick", ""),
         "bad_route",
-        "VNM_TERMINAL_QT_LICENSE_ROUTE must be lgpl_dynamic or commercial");
+        "VNM_TERMINAL_QT_LICENSE_ROUTE must be lgpl_dynamic, lgpl_static");
 
     ok &= expect_failure(
         run_script("bad_arguments", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
