@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- The upstream Release configuration enables PDBs in common props and on
+       individual precompiled headers. Apply the release policy after both. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <DebugInformationFormat>None</DebugInformationFormat>
+      <MultiProcessorCompilation>false</MultiProcessorCompilation>
+      <!-- Adopted GSL 3.1 uses the older gsl::suppress spelling. v145 adds
+           C4875 for that annotation; retain the upstream dependency version. -->
+      <DisableSpecificWarnings>4875;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <AdditionalIncludeDirectories>$(VnmConptyShaderIncludes);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+      <AdditionalOptions>%(AdditionalOptions) /DEBUG:NONE /NOCOFFGRPINFO /CGTHREADS:1</AdditionalOptions>
+      <CETCompat Condition="'$(Platform)'=='x64'">true</CETCompat>
+    </Link>
+  </ItemDefinitionGroup>
+  <Target Name="VnmConptyReleasePolicy" BeforeTargets="ClCompile;FxCompile">
+    <Error Condition="'$(Configuration)' != 'Release' or '$(EnableHybridCRT)' != 'true'"
+           Text="ConPTY redistribution requires Release with the upstream Hybrid CRT." />
+    <ItemGroup>
+      <ClCompile Update="@(ClCompile)">
+        <DebugInformationFormat>None</DebugInformationFormat>
+        <MultiProcessorCompilation>false</MultiProcessorCompilation>
+      </ClCompile>
+      <FxCompile Update="@(FxCompile)">
+        <ExcludedFromBuild>true</ExcludedFromBuild>
+        <EnableDebuggingInformation>false</EnableDebuggingInformation>
+        <AdditionalOptions>/O3 /Qstrip_reflect</AdditionalOptions>
+      </FxCompile>
+    </ItemGroup>
+  </Target>
+</Project>

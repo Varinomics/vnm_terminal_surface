@@ -1,4 +1,5 @@
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_conpty_source.cmake")
 
 # Keep the host layout used by Microsoft's native NuGet targets: an emulated
 # application still needs the OpenConsole executable for the native OS CPU.
@@ -25,6 +26,8 @@ function(vnm_terminal_conpty_runtime_files output)
         list(APPEND files "build/native/runtimes/${host}/OpenConsole.exe|${host}/OpenConsole.exe")
     endforeach()
     list(APPEND files "LICENSE|licenses/conpty/LICENSE")
+    vnm_terminal_conpty_shared_resources("${package_dir}" shared_resources)
+    list(APPEND files ${shared_resources})
     foreach(file IN LISTS files)
         string(REPLACE "|" ";" parts "${file}")
         list(GET parts 0 source)

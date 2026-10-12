@@ -70,6 +70,46 @@ set `VNM_TERMINAL_CONPTY_VERSION` and its `VNM_TERMINAL_CONPTY_SHA256` together.
 The backend requires the `ConptyCreatePseudoConsole`, `ConptyResizePseudoConsole`,
 and `ConptyClosePseudoConsole` exports.
 
+For distribution without embedded debugging metadata, prepare the adopted
+ConPTY source revision `5a830b2bf7c053d5c7ac22208fe5a346cb5dd3dc` in a clean
+isolated checkout of `microsoft/terminal`, then run:
+
+```powershell
+./tools/prepare_windows_conpty.ps1 -SourceDirectory C:/b/conpty-source `
+    -OutputDirectory C:/b/conpty-package `
+    -VisualStudioDirectory 'C:/Program Files/Microsoft Visual Studio/18/Community' `
+    -VCToolsVersion 14.51.36231 -WindowsSdkVersion 10.0.26100.0 -Slots 2
+```
+
+The helper requires the VS2026 v145 x64 and ARM64 tools. It queues the upstream
+MSBuild projects and their pinned native dependencies; these projects do not
+support FASTBuild. It builds Release with the upstream Hybrid CRT, disables
+debug generation, and preserves the x64 DLL plus both native host architectures.
+Set `VNM_TERMINAL_CONPTY_PACKAGE_DIR` to the resulting directory. Its exact-byte
+`conpty-source-build.json` receipt and combined dependency notices accompany the
+SDK package; runtime deployment includes the notices once and leaves the receipt
+for release provenance. These binaries are source-built third-party software,
+not the Microsoft-signed NuGet binaries. Publisher signing requires independent
+receipt admission by the consuming product's signing policy.
+
+Both native hosts load one common set of four compiled shaders from
+`conpty-shaders/` beside their architecture directories. The producer applies a
+recorded patch to the frozen upstream source and restores that source after the
+build. Each host verifies the shader sizes and SHA256 hashes compiled into it;
+missing or changed files fail loading. The versioned host marker and receipt
+capability make those four files mandatory during package intake and deployment.
+Older vendor packages keep their embedded shader layout.
+
+After preparation, the focused loader gate compiles the same loader and generated
+hash metadata, creates all four shaders on D3D11 WARP, and checks missing/corrupt
+resources from an unrelated working directory:
+
+```powershell
+./tests/conpty_package/verify_shader_loader.ps1 -ConptySourceDirectory C:/b/conpty-source `
+    -PackageDirectory C:/b/conpty-package -OutputDirectory C:/b/conpty-loader-probe `
+    -VisualStudioDirectory 'C:/Program Files/Microsoft Visual Studio/18/Community'
+```
+
 Windows hosts linking the full surface target must call
 `vnm_terminal_deploy_conpty(their_executable)` after creating their executable.
 An executable that runs from somewhere other than its build output directory,

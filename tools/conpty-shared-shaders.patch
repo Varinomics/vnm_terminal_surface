@@ -1,0 +1,55 @@
+diff --git a/src/renderer/atlas/BackendD3D.cpp b/src/renderer/atlas/BackendD3D.cpp
+index f8d026d..3421301 100644
+--- a/src/renderer/atlas/BackendD3D.cpp
++++ b/src/renderer/atlas/BackendD3D.cpp
+@@ -6,10 +6,7 @@
+ 
+ #include <til/unicode.h>
+ 
+-#include <custom_shader_ps.h>
+-#include <custom_shader_vs.h>
+-#include <shader_ps.h>
+-#include <shader_vs.h>
++#include <conpty-shared-shaders.h>
+ 
+ #include "BuiltinGlyphs.h"
+ #include "dwrite.h"
+@@ -65,8 +62,10 @@ static u64 queryPerfCount() noexcept
+ 
+ BackendD3D::BackendD3D(const RenderingPayload& p)
+ {
+-    THROW_IF_FAILED(p.device->CreateVertexShader(&shader_vs[0], sizeof(shader_vs), nullptr, _vertexShader.addressof()));
+-    THROW_IF_FAILED(p.device->CreatePixelShader(&shader_ps[0], sizeof(shader_ps), nullptr, _pixelShader.addressof()));
++    const auto vertex = vnm_conpty::load_builtin_shader(vnm_conpty::Builtin_shader::shader_vs);
++    const auto pixel = vnm_conpty::load_builtin_shader(vnm_conpty::Builtin_shader::shader_ps);
++    THROW_IF_FAILED(p.device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, _vertexShader.addressof()));
++    THROW_IF_FAILED(p.device->CreatePixelShader(pixel->GetBufferPointer(), pixel->GetBufferSize(), nullptr, _pixelShader.addressof()));
+ 
+     {
+         static constexpr D3D11_INPUT_ELEMENT_DESC layout[]{
+@@ -78,7 +77,7 @@ BackendD3D::BackendD3D(const RenderingPayload& p)
+             { "texcoord", 0, DXGI_FORMAT_R16G16_UINT, 1, offsetof(QuadInstance, texcoord), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+             { "color", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, offsetof(QuadInstance, color), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+         };
+-        THROW_IF_FAILED(p.device->CreateInputLayout(&layout[0], std::size(layout), &shader_vs[0], sizeof(shader_vs), _inputLayout.addressof()));
++        THROW_IF_FAILED(p.device->CreateInputLayout(&layout[0], std::size(layout), vertex->GetBufferPointer(), vertex->GetBufferSize(), _inputLayout.addressof()));
+     }
+ 
+     {
+@@ -488,12 +487,14 @@ void BackendD3D::_recreateCustomShader(const RenderingPayload& p)
+     }
+     else if (p.s->misc->useRetroTerminalEffect)
+     {
+-        THROW_IF_FAILED(p.device->CreatePixelShader(&custom_shader_ps[0], sizeof(custom_shader_ps), nullptr, _customPixelShader.put()));
++        const auto pixel = vnm_conpty::load_builtin_shader(vnm_conpty::Builtin_shader::custom_shader_ps);
++        THROW_IF_FAILED(p.device->CreatePixelShader(pixel->GetBufferPointer(), pixel->GetBufferSize(), nullptr, _customPixelShader.put()));
+     }
+ 
+     if (_customPixelShader)
+     {
+-        THROW_IF_FAILED(p.device->CreateVertexShader(&custom_shader_vs[0], sizeof(custom_shader_vs), nullptr, _customVertexShader.put()));
++        const auto vertex = vnm_conpty::load_builtin_shader(vnm_conpty::Builtin_shader::custom_shader_vs);
++        THROW_IF_FAILED(p.device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, _customVertexShader.put()));
+ 
+         {
+             static constexpr D3D11_BUFFER_DESC desc{
