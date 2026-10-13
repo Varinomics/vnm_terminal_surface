@@ -41,15 +41,14 @@ For the packaged terminal application and screenshots, see
 
 ## macOS cleanup scope
 
-macOS PTY cleanup currently retains the original shell's wait and process-group
-signal authority, signals the current foreground job through the PTY, and hangs
-up the terminal when its master descriptors close. This supports normal shell
-job cleanup, but does not establish a complete exit receipt for every job group
-across shell exit. The internal cleanup registry therefore records admitted Mac
-PTY cleanup as unconfirmed, separately from the shell's actual exit callback.
-Closing this observation gap is platform debt; a surviving ordinary shell job
-must not be described as an intentionally detached descendant. Windows and Linux
-cleanup contracts are unchanged.
+macOS PTY cleanup uses a persistent native helper that retains the controlling
+session and the shell's sole wait. Its retained tty authorizes cleanup of
+ordinary foreground and background jobs even after the shell exits. Workload
+START requires a host receipt hook that retains and persists the exact helper
+observation first. Root exit and scoped cleanup are independent receipts;
+failed observations leave cleanup unconfirmed. Deliberately detached descendants
+may survive, so this is owned-process-group cleanup rather than transitive
+containment. Windows and Linux cleanup contracts are unchanged.
 
 ## Requirements
 

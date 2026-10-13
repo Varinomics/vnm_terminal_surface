@@ -235,6 +235,7 @@ term::Terminal_launch_config terminal_launch_config(
     launch_config.argv                = std::move(request.argv);
     launch_config.working_directory   = std::move(request.working_directory);
     launch_config.windows_native_arguments = std::move(request.windows_native_arguments);
+    launch_config.native_receipt_hook = std::move(request.native_receipt_hook);
     launch_config.inherit_environment = false;
     launch_config.environment_edits.reserve(
         request.base_environment.size() +

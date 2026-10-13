@@ -51,8 +51,13 @@ bool set_nonblocking(int fd, std::string* error)
 bool prepare_socket(int fd, std::string* error)
 {
     const int enabled = 1;
+    int configured = 0;
+    socklen_t size = sizeof(configured);
+    // Inherited channels already carry this option. Darwin rejects setsockopt
+    // after peer shutdown, but the owner must still receive that original EOF.
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 &&
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) == 0)
+        getsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &configured, &size) == 0 &&
+        (configured != 0 || setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) == 0))
     {
         return true;
     }

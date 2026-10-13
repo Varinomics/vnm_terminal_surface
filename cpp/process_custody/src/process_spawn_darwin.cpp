@@ -26,6 +26,35 @@ std::uint64_t process_birth_token(pid_t pid)
     return info.pbi_start_tvsec * 1'000'000 + info.pbi_start_tvusec;
 }
 
+Native_handle open_occurrence_observer(std::int64_t process_id, std::uint64_t birth_token,
+    bool include_status, std::string* error)
+{
+    if (process_id <= 0 || process_id > std::numeric_limits<pid_t>::max() || birth_token == 0 ||
+        process_birth_token((pid_t)process_id) != birth_token)
+    {
+        if (error) {
+            *error = "original process occurrence is no longer observable";
+        }
+        return k_invalid_handle;
+    }
+    const int observer = kqueue();
+    struct kevent event;
+    EV_SET(&event, (pid_t)process_id, EVFILT_PROC,
+        EV_ADD | EV_ENABLE | (include_status ? EV_CLEAR : 0),
+        NOTE_EXIT | (include_status ? NOTE_EXITSTATUS : 0), 0, nullptr);
+    if (observer < 0 || fcntl(observer, F_SETFD, FD_CLOEXEC) != 0 ||
+        kevent(observer, &event, 1, nullptr, 0, nullptr) != 0 ||
+        process_birth_token((pid_t)process_id) != birth_token)
+    {
+        if (error) {
+            *error = "original process observation registration failed or the occurrence changed";
+        }
+        close_native_handle(observer);
+        return k_invalid_handle;
+    }
+    return observer;
+}
+
 bool cloexec_pipe(int descriptors[2])
 {
     if (pipe(descriptors) != 0) {
@@ -57,6 +86,8 @@ enum class Child_step : std::uint32_t
     CHDIR,
     EXECVE,
     CONTROLLING_TERMINAL,
+    PROCESS_GROUP,
+    FOREGROUND_TERMINAL,
 };
 
 const char* step_name(Child_step step)
@@ -71,6 +102,8 @@ const char* step_name(Child_step step)
         case Child_step::CHDIR:            return "chdir";
         case Child_step::EXECVE:           return "execve";
         case Child_step::CONTROLLING_TERMINAL: return "controlling terminal";
+        case Child_step::PROCESS_GROUP:       return "process group";
+        case Child_step::FOREGROUND_TERMINAL: return "foreground terminal";
         default:                           return "unknown step";
     }
 }
@@ -116,6 +149,9 @@ struct Child_failure
 {
     if (request.new_session && setsid() < 0) {
         fail_child(error_fd, Child_step::SETSID, errno);
+    }
+    if (request.new_process_group && setpgid(0, 0) != 0) {
+        fail_child(error_fd, Child_step::PROCESS_GROUP, errno);
     }
 
     // The parent may ignore SIGPIPE and block SIGCHLD for its own purposes;
@@ -165,6 +201,20 @@ struct Child_failure
     if (request.controlling_terminal && ioctl(STDIN_FILENO, TIOCSCTTY, 0) != 0) {
         fail_child(error_fd, Child_step::CONTROLLING_TERMINAL, errno);
     }
+    if (request.foreground_terminal) {
+        // The persistent owner holds the controlling session. A newly created
+        // shell group hands itself foreground before executing user code.
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGTTOU);
+        pid_t group = getpgrp();
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0 ||
+            ioctl(STDIN_FILENO, TIOCSPGRP, &group) != 0 ||
+            sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0)
+        {
+            fail_child(error_fd, Child_step::FOREGROUND_TERMINAL, errno);
+        }
+    }
     for (int fd = 0; fd <= highest_target; ++fd) {
         bool is_target = false;
         for (std::size_t i = 0; i < count; ++i) {
@@ -195,33 +245,78 @@ struct Child_failure
 
 Native_handle open_process_observer(std::int64_t process_id, std::uint64_t birth_token, std::string* error)
 {
-    if (process_id <= 0 || process_id > std::numeric_limits<pid_t>::max() || birth_token == 0 ||
-        process_birth_token((pid_t)process_id) != birth_token)
-    {
+    return open_occurrence_observer(process_id, birth_token, false, error);
+}
+
+struct Native_process_status_observer::Impl
+{
+    Native_handle observer = k_invalid_handle;
+    std::int64_t process_id = 0;
+    bool attempted = false;
+    Native_process_status status;
+    ~Impl() { close_native_handle(observer); }
+};
+
+Native_process_status_observer::Native_process_status_observer()
+:
+    m_impl(std::make_unique<Impl>())
+{}
+Native_process_status_observer::~Native_process_status_observer() = default;
+Native_process_status_observer::Native_process_status_observer(Native_process_status_observer&&) noexcept = default;
+Native_process_status_observer& Native_process_status_observer::operator=(
+    Native_process_status_observer&&) noexcept = default;
+
+bool Native_process_status_observer::open(
+    std::int64_t process_id, std::uint64_t birth_token, std::string* error)
+{
+    if (!m_impl || m_impl->attempted) {
         if (error) {
-            *error = "original process occurrence is no longer observable";
+            *error = "process status observation cannot replace an original occurrence";
         }
-        return k_invalid_handle;
+        return false;
     }
-    const int observer = kqueue();
-    struct kevent event;
-    EV_SET(&event, (pid_t)process_id, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, nullptr);
-    if (observer < 0 || fcntl(observer, F_SETFD, FD_CLOEXEC) != 0 ||
-        kevent(observer, &event, 1, nullptr, 0, nullptr) != 0 ||
-        process_birth_token((pid_t)process_id) != birth_token)
-    {
-        if (error) {
-            *error = "original process observation registration failed or the occurrence changed";
-        }
-        close_native_handle(observer);
-        return k_invalid_handle;
+    m_impl->attempted = true;
+    m_impl->observer = open_occurrence_observer(process_id, birth_token, true, error);
+    if (m_impl->observer < 0) {
+        return false;
     }
-    return observer;
+    m_impl->process_id = process_id;
+    m_impl->status.state = Native_process_observation::LIVE;
+    return true;
+}
+
+Native_handle Native_process_status_observer::native_handle() const noexcept
+{
+    return m_impl ? m_impl->observer : k_invalid_handle;
+}
+
+Native_process_status Native_process_status_observer::observe() noexcept
+{
+    if (!m_impl || m_impl->status.state != Native_process_observation::LIVE) {
+        return m_impl ? m_impl->status : Native_process_status{};
+    }
+    struct kevent event{};
+    const timespec immediate{};
+    const int count = kevent(m_impl->observer, nullptr, 0, &event, 1, &immediate);
+    if (count == 0 || (count < 0 && errno == EINTR)) {
+        return m_impl->status;
+    }
+    const bool ended = count == 1 && (event.flags & EV_ERROR) == 0 && event.filter == EVFILT_PROC &&
+        event.ident == static_cast<std::uintptr_t>(m_impl->process_id) && (event.fflags & NOTE_EXIT) != 0;
+    m_impl->status.state = ended ? Native_process_observation::ENDED : Native_process_observation::UNCONFIRMED;
+    m_impl->status.status_valid = ended && (event.fflags & NOTE_EXITSTATUS) != 0;
+    if (m_impl->status.status_valid) {
+        m_impl->status.wait_status = static_cast<int>(event.data);
+    }
+    close_native_handle(m_impl->observer);
+    m_impl->observer = k_invalid_handle;
+    return m_impl->status;
 }
 
 Spawn_result spawn(const Spawn_request& in_request)
 {
     Spawn_result result;
+    result.no_workload_admitted = true;
 
     if (in_request.inherited.size() > 64) {
         result.error = "spawn: more than 64 inherited descriptors";
@@ -330,6 +425,7 @@ Spawn_result spawn(const Spawn_request& in_request)
 
     close(error_pipe[1]);
     close(admission_pipe[0]);
+    result.no_workload_admitted = false;
 
     // The sole parent registers before execution is admitted. This descriptor
     // observes the original occurrence; it never authorizes a numeric signal.
@@ -347,8 +443,15 @@ Spawn_result spawn(const Spawn_request& in_request)
         // Still our unreaped child: no workload instruction passed the gate.
         (void)kill(pid, SIGKILL);
         int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-        if (observer >= 0) close(observer);
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        result.no_workload_admitted = waited == pid;
+        if (waited == pid) {
+            close_native_handle(observer);
+        }
+        else {
+            result.failed_birth = Darwin_spawn_failure{pid, birth_token, observer, false, false, 0};
+        }
         close(error_pipe[0]);
         result.error = !observed ? "spawn: " + observer_error :
             "spawn: execution admission cancelled";
@@ -377,11 +480,11 @@ Spawn_result spawn(const Spawn_request& in_request)
         // The child never reached exec and has exited (or is about to); it is
         // this process's direct child and no other owner waits it.
         int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-        }
-        if (observer >= 0) {
-            close(observer);
-        }
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        result.failed_birth = Darwin_spawn_failure{
+            pid, birth_token, waited == pid ? k_invalid_handle : observer, true, waited == pid, status};
+        if (waited == pid) close_native_handle(observer);
         if (filled == sizeof(failure)) {
             result.error = std::string("spawn: ") + step_name(static_cast<Child_step>(failure.step)) +
                 " failed in the child: " + std::strerror(failure.error);

@@ -164,7 +164,7 @@ set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 set(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE
     "${VNM_TERMINAL_SURFACE_BUILD_FULL}")
 set(vnm_terminal_surface_process_custody_required OFF)
-if(VNM_TERMINAL_SURFACE_BUILD_FULL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+if(VNM_TERMINAL_SURFACE_BUILD_FULL AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set(vnm_terminal_surface_process_custody_required ON)
 endif()
 
@@ -365,6 +365,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_canvas_export.h
     include/vnm_terminal/terminal_message_submission.h
+    include/vnm_terminal/terminal_native_receipt.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/native_backend_cleanup_owner.h
     src/backend_output_capture.cpp
@@ -561,6 +562,7 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL)
         include/vnm_terminal/font_metrics.h
         include/vnm_terminal/terminal_canvas_export.h
         include/vnm_terminal/terminal_message_submission.h
+        include/vnm_terminal/terminal_native_receipt.h
         include/vnm_terminal/vnm_terminal_surface.h
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
     )

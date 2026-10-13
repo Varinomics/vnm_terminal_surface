@@ -14,11 +14,18 @@
 
 namespace vnm::process_custody {
 
-// Darwin implements COMMAND. Interactive PTY jobs use the terminal backend;
-// a PTY helper request is rejected before workload birth on that platform.
+// Darwin PTY requests require the explicit outcome contract below. COMMAND
+// retains its independent root/process-group cleanup and ordinary exit codes.
 enum class Owner_mode : std::uint32_t { COMMAND, PTY };
 enum class Tree_settlement : std::uint32_t { PENDING, CONFIRMED, UNCONFIRMED };
 enum class Owner_event_kind : std::uint32_t { STARTED, START_REJECTED, ROOT_EXITED, TREE_SETTLEMENT };
+
+// These normal exit codes carry a scoped result only for a helper admitted
+// with this exact Darwin PTY mode contract before workload START. Generic
+// helper exit, signal death and other owner modes have no such meaning.
+inline constexpr char k_darwin_pty_owner_contract[] = "darwin-pty-owner-v1";
+inline constexpr char k_darwin_pty_owner_argument[] = "--darwin-pty-outcome-v1";
+enum class Darwin_pty_owner_exit : int { NO_WORKLOAD = 90, CONFIRMED = 91, UNCONFIRMED = 92 };
 
 struct Pty_dimensions
 {

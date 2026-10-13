@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/metrics_contract.h"
+#include "vnm_terminal/terminal_native_receipt.h"
 #include <QProcessEnvironment>
 #include <QString>
 #include <QStringList>
@@ -114,6 +115,7 @@ struct Terminal_launch_config
     std::optional<Terminal_backend_output_delivery_limits>
                                            output_delivery_limits;
     std::optional<QString>                 windows_native_arguments = std::nullopt;
+    Terminal_native_receipt_hook           native_receipt_hook;
 };
 
 struct Terminal_effective_launch_config
@@ -128,6 +130,7 @@ struct Terminal_effective_launch_config
     std::optional<Terminal_backend_output_delivery_limits>
                                            output_delivery_limits;
     std::optional<QString>                 windows_native_arguments = std::nullopt;
+    Terminal_native_receipt_hook           native_receipt_hook;
 };
 
 struct Terminal_backend_error
@@ -437,6 +440,7 @@ inline std::optional<Terminal_effective_launch_config> make_effective_launch_con
         config.termination_policy,
         config.output_delivery_limits,
         config.windows_native_arguments,
+        config.native_receipt_hook,
     };
 }
 

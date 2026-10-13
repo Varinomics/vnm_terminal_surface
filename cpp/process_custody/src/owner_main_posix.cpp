@@ -7,6 +7,9 @@
 #include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <util.h>
+#endif
 
 namespace custody = vnm::process_custody;
 namespace detail = custody::detail;
@@ -24,7 +27,7 @@ bool resize_pty(int master, custody::Pty_dimensions dimensions)
     return ioctl(master, TIOCSWINSZ, &size) == 0;
 }
 
-int run_owner(custody::Duplex_channel& channel)
+int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
 {
     // Capture inherited stdio before our signalfd, PTY or pidfds can occupy
     // vacant low slots. Only these original streams belong to the workload.
@@ -39,15 +42,19 @@ int run_owner(custody::Duplex_channel& channel)
 #endif
         return detail::send_event(channel, event, &error);
     };
-    const auto reject = [&](const std::string& reason) {
+    const auto reject = [&](const std::string& reason, bool supported_mode = true) {
         custody::Owner_event event;
         event.kind = custody::Owner_event_kind::START_REJECTED;
         event.detail = reason;
         (void)emit(event);
         event.kind = custody::Owner_event_kind::TREE_SETTLEMENT;
-        event.settlement = custody::Tree_settlement::CONFIRMED;
+        event.settlement = supported_mode
+            ? custody::Tree_settlement::CONFIRMED : custody::Tree_settlement::UNCONFIRMED;
         (void)emit(event);
-        return 0;
+        if (!supported_mode) {
+            return 2;
+        }
+        return darwin_pty_contract ? static_cast<int>(custody::Darwin_pty_owner_exit::NO_WORKLOAD) : 0;
     };
     if (!tree.establish(&error)) return reject(error);
     detail::Owner_message message;
@@ -63,6 +70,11 @@ int run_owner(custody::Duplex_channel& channel)
         custody::Owner_start_request& request;
         ~Request_handles() { detail::close_start_descriptors(request); }
     } request_handles{request};
+#if defined(__APPLE__)
+    if (darwin_pty_contract && request.mode != custody::Owner_mode::PTY) {
+        return reject("Darwin PTY outcome contract requires PTY mode", false);
+    }
+#endif
     if (request.process.executable.empty() || request.process.executable.front() != '/' ||
         request.process.argv.empty()) return reject("owner requires an absolute executable and argv[0]");
     for (const auto& mapping : request.process.inherited) {
@@ -82,9 +94,13 @@ int run_owner(custody::Duplex_channel& channel)
     } pty_handles{master, slave};
     if (request.mode == custody::Owner_mode::PTY) {
 #if defined(__APPLE__)
-        // Interactive job-control groups belong to the native terminal
-        // backend; an original-group receipt cannot settle that lifecycle.
-        return reject("Darwin command custody does not support PTY mode; use the native terminal backend");
+        if (!darwin_pty_contract) return reject("Darwin PTY mode requires its explicit native outcome contract");
+        if (openpty(&master, &slave, nullptr, nullptr, nullptr) != 0 ||
+            fcntl(master, F_SETFD, FD_CLOEXEC) != 0 || fcntl(slave, F_SETFD, FD_CLOEXEC) != 0 ||
+            !resize_pty(master, request.dimensions) || !tree.establish_pty(master, slave, &error))
+        {
+            return reject("owner could not establish retained PTY: " + error);
+        }
 #else
         master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
         char slave_name[256];
@@ -110,11 +126,32 @@ int run_owner(custody::Duplex_channel& channel)
         detail::close_start_descriptors(pending.start);
         return status == custody::Receive_status::TIMEOUT;
     };
-    const auto root = custody::spawn(spawn);
-    if (!root.ok) return reject(root.error);
-    tree.record_root(root);
+    auto root = custody::spawn(spawn);
+    bool failed_admitted_birth = false;
+    if (!root.ok) {
+#if defined(__APPLE__)
+        if (darwin_pty_contract && !root.no_workload_admitted && root.failed_birth) {
+            // STARTED below supplies identity evidence only: no master is
+            // transferred, so it cannot satisfy PTY readiness. The exact
+            // ROOT_EXITED receipt precedes START_REJECTED and final settlement.
+            tree.record_failed_root(*root.failed_birth);
+            root.process_id = root.failed_birth->process_id;
+            root.process_birth_token = root.failed_birth->birth_token;
+            failed_admitted_birth = true;
+        }
+        else
+#endif
+        {
+            return reject(root.error);
+        }
+    }
+    else {
+        tree.record_root(root);
+    }
     detail::close_start_descriptors(request);
+#if !defined(__APPLE__)
     if (slave >= 0) { close(slave); slave = -1; }
+#endif
     // Only the workload keeps its stdio. In particular, the owner must not
     // keep a pipe writer alive after the root and its descendants close it.
     for (const auto& descriptor : inherited_standard_streams)
@@ -127,8 +164,8 @@ int run_owner(custody::Duplex_channel& channel)
 #else
     started.root_reference = root.process_handle;
 #endif
-    started.pty_master = master;
-    bool stopping = !emit(started);
+    started.pty_master = failed_admitted_birth ? -1 : master;
+    bool stopping = !emit(started) || failed_admitted_birth;
     int grace_ms = 250;
     bool root_reported = false;
     const auto report = [&](const std::vector<custody::Exit_status>& exits) {
@@ -158,9 +195,17 @@ int run_owner(custody::Duplex_channel& channel)
         detail::close_start_descriptors(incoming.start);
     }
     bool pending_reported = false;
+    bool rejection_reported = false;
     while (true) {
         const auto outcome = tree.terminate_and_reap(std::chrono::milliseconds(grace_ms), 1000ms);
         report(outcome.exits);
+        if (failed_admitted_birth && root_reported && !rejection_reported) {
+            custody::Owner_event rejection;
+            rejection.kind = custody::Owner_event_kind::START_REJECTED;
+            rejection.detail = root.error;
+            (void)emit(rejection);
+            rejection_reported = true;
+        }
         custody::Owner_event event;
         event.kind = custody::Owner_event_kind::TREE_SETTLEMENT;
         event.settlement = outcome.complete
@@ -170,7 +215,13 @@ int run_owner(custody::Duplex_channel& channel)
                 : custody::Tree_settlement::PENDING;
         event.detail = outcome.error;
         if (outcome.complete || outcome.terminal_unconfirmed || !pending_reported) (void)emit(event);
-        if (outcome.complete || outcome.terminal_unconfirmed) return 0;
+        if (outcome.complete || outcome.terminal_unconfirmed) {
+            if (darwin_pty_contract) {
+                return static_cast<int>(outcome.complete
+                    ? custody::Darwin_pty_owner_exit::CONFIRMED : custody::Darwin_pty_owner_exit::UNCONFIRMED);
+            }
+            return 0;
+        }
         pending_reported = true;
         grace_ms = 0;
         std::this_thread::sleep_for(25ms);
@@ -181,13 +232,17 @@ int run_owner(custody::Duplex_channel& channel)
 
 int main(int argc, char** argv)
 {
+    bool darwin_pty_contract = false;
+#if defined(__APPLE__)
+    darwin_pty_contract = argc == 4 && std::string(argv[3]) == custody::k_darwin_pty_owner_argument;
+#endif
     custody::Native_handle control = custody::k_invalid_handle;
-    if (argc != 3 || std::string(argv[1]) != "--control" ||
+    if ((argc != 3 && !darwin_pty_contract) || std::string(argv[1]) != "--control" ||
         !custody::parse_native_handle_argument(argv[2], &control) || control < 3 ||
         !custody::native_handle_is_open(control)) return 2;
     std::string error;
     if (!custody::prepare_parent_process(&error)) return 2;
     custody::Duplex_channel channel(control, custody::k_owner_message_bytes);
     if (!channel.prepare_for_owner(&error)) return 2;
-    return run_owner(channel);
+    return run_owner(channel, darwin_pty_contract);
 }

@@ -6,6 +6,8 @@
 #include <libproc.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -76,7 +78,82 @@ struct Process_tree_owner::Impl
     bool root_reaped = false;
     bool ownership_lost = false;
     bool terminal_unconfirmed = false;
+    bool pty = false;
+    bool pty_settled = false;
+    int master = -1;
+    int slave = -1;
+    std::uint32_t tty_device = 0;
+    pid_t owner = 0;
+    std::vector<Exit_status> collected_exits;
     std::string error;
+
+    bool attempt_tty_signal(int signal_number)
+    {
+        // Only discovery uses numeric identities. TIOCSPGRP checks membership
+        // in this retained controlling session and retains the selected group;
+        // TIOCSIG acts through that kernel reference, never a saved group ID.
+        if (terminal_unconfirmed || pty_settled || getsid(0) != owner || getpgrp() != owner) {
+            error = "retained PTY owner session is unavailable";
+            return false;
+        }
+        // The direct-child wait pins the root independently of tty discovery.
+        // Even a discovery failure must not suppress this remaining authority.
+        if (!root_reaped) {
+            siginfo_t info{};
+            if (!observe(&info)) {
+                return false;
+            }
+            if (info.si_pid == 0 && kill(root, signal_number) != 0 && errno != ESRCH) {
+                const int action_error = errno;
+                error = "original PTY root signal failed (errno " + std::to_string(action_error) +
+                    "): " + std::strerror(action_error);
+            }
+        }
+        std::vector<pid_t> members(256);
+        int copied = -1;
+        while (members.size() <= 262144) {
+            const int capacity = static_cast<int>(members.size() * sizeof(pid_t));
+            copied = proc_listpids(PROC_TTY_ONLY, tty_device, members.data(), capacity);
+            if (copied <= 0 || copied % sizeof(pid_t) != 0) {
+                error = "PTY membership discovery failed";
+                return true;
+            }
+            if (copied < capacity) {
+                break;
+            }
+            members.resize(members.size() * 2);
+        }
+        if (members.size() > 262144) {
+            error = "PTY membership discovery exceeded its bounded capacity";
+            return true;
+        }
+        std::vector<pid_t> groups;
+        for (std::size_t index = 0; index < static_cast<std::size_t>(copied) / sizeof(pid_t); ++index) {
+            if (members[index] <= 0 || members[index] == owner) {
+                continue;
+            }
+            struct proc_bsdinfo info{};
+            // Include zombies for candidate discovery; their state never proves
+            // group emptiness. A raced or rejected candidate remains unknown.
+            if (proc_pidinfo(members[index], PROC_PIDTBSDINFO, 1, &info, sizeof(info)) != sizeof(info)) {
+                error = "PTY member metadata became unavailable";
+                continue;
+            }
+            const pid_t group = static_cast<pid_t>(info.pbi_pgid);
+            if (group <= 0 || group == owner || std::find(groups.begin(), groups.end(), group) != groups.end()) {
+                continue;
+            }
+            groups.push_back(group);
+        }
+        for (pid_t group : groups) {
+            if (ioctl(slave, TIOCSPGRP, &group) != 0 || ioctl(master, TIOCSIG, signal_number) != 0) {
+                const int action_error = errno;
+                error = "PTY group action failed (errno " + std::to_string(action_error) +
+                    "): " + std::strerror(action_error);
+            }
+        }
+        return true;
+    }
 
     bool observe(siginfo_t* info)
     {
@@ -95,6 +172,9 @@ struct Process_tree_owner::Impl
 
     bool attempt_group_signal(int signal_number)
     {
+        if (pty) {
+            return attempt_tty_signal(signal_number);
+        }
         siginfo_t info{};
         if (!observe(&info)) {
             return false;
@@ -145,6 +225,29 @@ struct Process_tree_owner::Impl
 
     bool settle_group(std::vector<Exit_status>& exits)
     {
+        if (pty) {
+            if (!root_reaped) {
+                siginfo_t info{};
+                if (!observe(&info) || info.si_pid != root || !collect_root(info, exits)) {
+                    return false;
+                }
+            }
+            // This fixed two-slot query is settlement only, never discovery.
+            // A single original owner is necessarily nontruncated. The owner
+            // has permanently closed root admission before this query and is
+            // the only remaining scoped process that could create a child.
+            pid_t members[2]{};
+            const int copied = proc_listpids(PROC_TTY_ONLY, tty_device, members, sizeof(members));
+            if (copied == sizeof(pid_t) && members[0] == owner && getsid(0) == owner) {
+                pty_settled = true;
+                error.clear();
+                return true;
+            }
+            if (copied != sizeof(members)) {
+                error = "PTY only-owner settlement was not established";
+            }
+            return false;
+        }
         siginfo_t info{};
         if (!observe(&info) || info.si_pid != root) {
             return false;
@@ -189,7 +292,8 @@ struct Process_tree_owner::Impl
     void retire_exhausted_group(std::vector<Exit_status>& exits)
     {
         siginfo_t info{};
-        if (!observe(&info) || info.si_pid != root || !collect_root(info, exits)) {
+        if (!(pty && root_reaped) &&
+            (!observe(&info) || info.si_pid != root || !collect_root(info, exits))) {
             return;
         }
         // A dead member held by another parent can keep the group nonempty
@@ -213,15 +317,68 @@ Process_tree_owner::~Process_tree_owner()
 bool Process_tree_owner::enable_subreaper() { return false; }
 bool Process_tree_owner::establish(std::string*) { return true; }
 
+bool Process_tree_owner::establish_pty(Native_handle master, Native_handle slave, std::string* error)
+{
+    struct stat info{};
+    struct sigaction action{};
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    const pid_t owner = getpid();
+    // Retiring the controlling terminal sends SIGHUP to its session leader.
+    // The owner must survive its own teardown to return the typed outcome;
+    // spawn() restores default signal dispositions for the workload.
+    if (m_impl->root != 0 || m_impl->pty || master < 0 || slave < 0 ||
+        (getsid(0) != owner && setsid() < 0) || sigaction(SIGHUP, &action, nullptr) != 0 ||
+        ioctl(slave, TIOCSCTTY, 0) != 0 ||
+        sigaction(SIGTTOU, &action, nullptr) != 0 || fstat(slave, &info) != 0)
+    {
+        if (error) {
+            *error = "persistent owner could not retain its controlling PTY";
+        }
+        return false;
+    }
+    m_impl->pty = true;
+    m_impl->master = master;
+    m_impl->slave = slave;
+    m_impl->tty_device = static_cast<std::uint32_t>(info.st_rdev);
+    m_impl->owner = owner;
+    return true;
+}
+
 void Process_tree_owner::configure_root_spawn(Spawn_request& request) const
 {
-    request.new_session = true;
+    request.new_session = !m_impl->pty;
+    if (m_impl->pty) {
+        request.new_process_group = true;
+        request.controlling_terminal = false;
+        request.foreground_terminal = true;
+    }
 }
 
 void Process_tree_owner::record_root(const Spawn_result& root)
 {
     m_impl->root = (pid_t)root.process_id;
     m_impl->observer = root.process_handle;
+}
+
+void Process_tree_owner::record_failed_root(const Darwin_spawn_failure& failure)
+{
+    m_impl->root = static_cast<pid_t>(failure.process_id);
+    m_impl->observer = failure.process_handle;
+    if (failure.wait_collected) {
+        m_impl->root_reaped = true;
+        m_impl->root_reported = true;
+        Exit_status status;
+        status.process_id = failure.process_id;
+        if (WIFEXITED(failure.wait_status)) {
+            status.exit_code = WEXITSTATUS(failure.wait_status);
+        }
+        else
+        if (WIFSIGNALED(failure.wait_status)) {
+            status.signal = WTERMSIG(failure.wait_status);
+        }
+        m_impl->collected_exits.push_back(status);
+    }
 }
 
 bool Process_tree_owner::record_descendant(std::int64_t, Native_handle transferred_handle)
@@ -250,6 +407,9 @@ std::vector<Native_handle> Process_tree_owner::exit_wait_handles() const
 
 std::vector<Exit_status> Process_tree_owner::reap_available()
 {
+    if (!m_impl->collected_exits.empty()) {
+        return std::exchange(m_impl->collected_exits, {});
+    }
     siginfo_t info{};
     if (!m_impl->root_reported && m_impl->observe(&info) && info.si_pid == m_impl->root) {
         m_impl->root_reported = true;
@@ -260,6 +420,9 @@ std::vector<Exit_status> Process_tree_owner::reap_available()
 
 bool Process_tree_owner::children_remain() const
 {
+    if (m_impl->pty && m_impl->root > 0) {
+        return !m_impl->pty_settled && !m_impl->terminal_unconfirmed;
+    }
     return m_impl->root > 0 && !m_impl->root_reaped;
 }
 
@@ -296,6 +459,12 @@ Reap_outcome Process_tree_owner::terminate_and_reap(
             signal_number = SIGKILL;
             attempted = m_impl->attempt_group_signal(signal_number);
             deadline = Deadline::after(reap_budget);
+        }
+        else
+        if (m_impl->pty) {
+            // Re-discover every pass, including groups born during grace.
+            // A discovery error stays negative and never becomes emptiness.
+            attempted = m_impl->attempt_group_signal(signal_number) || attempted;
         }
         // Darwin has no event for arbitrary original-group membership. The
         // bounded probe is required after the root's NOTE_EXIT has fired.

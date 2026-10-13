@@ -1,7 +1,6 @@
 include_guard(GLOBAL)
 
-# Apple's forkpty backend owns its child directly and does not use this leaf.
-if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT APPLE)
     return()
 endif()
 
@@ -9,7 +8,7 @@ set(VNM_PROCESS_CUSTODY_SOURCE_DIR "" CACHE PATH
     "Explicit path to the standalone process_custody leaf")
 
 function(vnm_terminal_require_owner_start_deadline)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
         get_target_property(has_deadline vnm_process_custody::vnm_process_custody
             VNM_PROCESS_CUSTODY_OWNER_START_DEADLINE)
         if(NOT has_deadline)

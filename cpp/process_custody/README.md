@@ -44,8 +44,23 @@ background terminal jobs are not classified as deliberately detached: their
 controlling-PTY lifecycle belongs to the terminal backend. The command helper's
 group receipt does not establish cleanup of interactive jobs moved into other
 groups. Applications must use the terminal backend for that lifecycle.
-The Darwin command helper rejects `Owner_mode::PTY` before spawning a workload;
-the existing native terminal backend supplies interactive terminals.
+The terminal backend launches the same helper with `--darwin-pty-outcome-v1`.
+It retains the controlling PTY session while the shell runs in a separate
+foreground group. During cleanup, discovered group numbers are inputs to
+`TIOCSPGRP`, which validates membership in that retained session; `TIOCSIG`
+then signals the kernel-retained tty group. A fixed two-PID tty snapshot naming
+only the helper establishes scoped settlement after the original root's sole
+reap. Truncated or failed observations never establish emptiness. Ordinary
+foreground and background jobs remain in scope after shell exit.
+
+Before sending START, the backend requires an accepted native receipt hook:
+the receiver must retain a local exact-helper status observer and persist its
+identity and `darwin-pty-owner-v1` contract. Root birth and exact root exit are
+separate retained receipts. This admitted helper's normal exit codes mean
+`90 = NO_WORKLOAD`, `91 = CONFIRMED`, and `92 = UNCONFIRMED`. Signals, generic
+exit codes, and unrelated helper modes carry no positive cleanup meaning.
+The receiver consumes and latches the status event once and persists the raw
+status before interpreting it; loss before persistence remains unknown.
 
 Darwin process references are observation-only local kqueues. Since macOS does
 not transfer kqueues through `SCM_RIGHTS`, a STARTED receipt carries the original

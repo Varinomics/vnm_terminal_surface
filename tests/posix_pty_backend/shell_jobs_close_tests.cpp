@@ -1,5 +1,5 @@
 #include "helpers/test_check.h"
-#include "../../src/native_backend_cleanup_owner.h"
+#include "native_receipt_capture.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 
 #include <QByteArray>
@@ -78,6 +78,12 @@ public:
         return m_changed.wait_for(lock, std::chrono::seconds(3), [&] {
             return m_exit.has_value();
         }) && !m_error;
+    }
+
+    bool exited_with(int code)
+    {
+        const std::lock_guard lock(m_mutex);
+        return m_exit && m_exit->reason == term::Terminal_exit_reason::EXITED && m_exit->exit_code == code;
     }
 
 private:
@@ -165,10 +171,13 @@ bool wait_for_foreground(pid_t shell, pid_t foreground)
     return false;
 }
 
-bool test_shell_jobs_close(bool destroy)
+enum class Closure { TERMINATE, DESTRUCTION, SHELL_EXIT };
+
+bool test_shell_jobs_close(Closure closure)
 {
-    std::fprintf(stderr, "PHASE %s BEGIN fixture=%d\n", destroy ? "destruction" : "terminate", ::getpid());
-    const auto prior_unconfirmed = term::Native_backend_cleanup_reservation::unconfirmed_tasks();
+    const bool shell_first = closure == Closure::SHELL_EXIT;
+    const char* label = shell_first ? "shell-first" : closure == Closure::DESTRUCTION ? "destruction" : "terminate";
+    std::fprintf(stderr, "PHASE %s BEGIN fixture=%d\n", label, ::getpid());
     Capture capture;
     auto backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config;
@@ -176,6 +185,7 @@ bool test_shell_jobs_close(bool destroy)
         QStringLiteral("+o"), QStringLiteral("zle")};
     config.working_directory = QStringLiteral("/tmp");
     config.initial_grid_size = term::terminal_grid_size_t{24, 120};
+    const auto receipts = vnm_terminal::test_helpers::retain_native_receipts(config);
     if (!check(backend->start(config, capture.callbacks()).code ==
         term::Terminal_backend_result_code::ACCEPTED, "interactive zsh starts"))
     {
@@ -186,20 +196,28 @@ bool test_shell_jobs_close(bool destroy)
     if (!check(shell > 1, "interactive shell reports readiness")) {
         return false;
     }
-    backend->write(QByteArrayLiteral(
-        "/bin/sleep 20 & b=$!; printf '\\nJOB_BG:%s\\n' $b; "
-        "/bin/sleep 20 & f=$!; printf '\\nJOB_FG:%s\\n' $f; fg %+\n"));
+    if (shell_first) {
+        backend->write(QByteArrayLiteral(
+            "/bin/sh -c 'trap \"\" HUP; printf \"\\nJOB_BG:%s\\n\" $$; exec /bin/sleep 20' & "
+            "/bin/sh -c 'trap \"\" HUP; printf \"\\nJOB_FG:%s\\n\" $$; exec /bin/sleep 20' &\n"));
+    }
+    else {
+        backend->write(QByteArrayLiteral(
+            "/bin/sleep 20 & b=$!; printf '\\nJOB_BG:%s\\n' $b; "
+            "/bin/sleep 20 & f=$!; printf '\\nJOB_FG:%s\\n' $f; fg %+\n"));
+    }
     const pid_t background = capture.wait_for_pid(QByteArrayLiteral("\nJOB_BG:"));
     const pid_t foreground = capture.wait_for_pid(QByteArrayLiteral("\nJOB_FG:"));
     if (!check(background > 1 && foreground > 1 && background != foreground &&
-        foreground != shell && background != shell && wait_for_foreground(shell, foreground),
-        "ordinary foreground and background jobs use distinct groups"))
+        foreground != shell && background != shell &&
+        wait_for_foreground(shell, shell_first ? shell : foreground),
+        "ordinary shell jobs are live with the expected foreground owner"))
     {
         return false;
     }
     const std::array<pid_t, 3> pids{shell, foreground, background};
     std::fprintf(stderr, "PHASE %s READY shell=%d foreground=%d background=%d\n",
-        destroy ? "destruction" : "terminate", shell, foreground, background);
+        label, shell, foreground, background);
     Exit_observers observers;
     for (const pid_t pid : pids) {
         if (!check(observers.add(pid), "exact live process exit observer registers")) {
@@ -210,27 +228,38 @@ bool test_shell_jobs_close(bool destroy)
         return false;
     }
     bool ok = true;
-    if (destroy) {
+    if (closure == Closure::DESTRUCTION) {
         backend.reset();
+    }
+    else
+    if (shell_first) {
+        ok &= check(backend->write(QByteArrayLiteral("setopt no_check_jobs; exit 23\n")).code ==
+            term::Terminal_backend_result_code::ACCEPTED, "original shell accepts its own exit request");
+        ok &= check(capture.wait_for_exit() && capture.exited_with(23),
+            "shell exits with its requested status while HUP-ignoring jobs require cleanup");
     }
     else {
         ok &= check(backend->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
             "ordinary interactive termination is accepted");
         ok &= check(capture.wait_for_exit(), "original shell exits without a backend error");
     }
-    std::fprintf(stderr, "PHASE %s CLOSE_RETURNED\n", destroy ? "destruction" : "terminate");
+    std::fprintf(stderr, "PHASE %s CLOSE_RETURNED\n", label);
     ok &= check(observers.wait_for_all(pids),
         "closure ends the original shell and its ordinary foreground and background jobs");
     backend.reset();
-    const auto deadline = Clock::now() + std::chrono::seconds(3);
-    while (term::Native_backend_cleanup_reservation::unconfirmed_tasks() == prior_unconfirmed &&
-        Clock::now() < deadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    ok &= check(term::Native_backend_cleanup_reservation::unconfirmed_tasks() == prior_unconfirmed + 1,
-        "observed fixture exits do not fabricate complete terminal-wide cleanup coverage");
-    std::fprintf(stderr, "PHASE %s END result=%d\n", destroy ? "destruction" : "terminate", ok);
+    ok &= check(receipts->helper_exited(vnm::process_custody::Darwin_pty_owner_exit::CONFIRMED),
+        "exact admitted helper confirms the original terminal's group cleanup");
+    ok &= check(receipts->wait_for_receipts(3), "original root exit reaches the independent receipt consumer");
+    const auto retained = receipts->receipts();
+    ok &= check(retained.size() == 3 &&
+        retained[0].kind == vnm_terminal::Terminal_native_receipt_kind::HELPER_PRE_START &&
+        retained[1].kind == vnm_terminal::Terminal_native_receipt_kind::ROOT_BORN &&
+        retained[2].kind == vnm_terminal::Terminal_native_receipt_kind::ROOT_ENDED &&
+        retained[1].root_pid == static_cast<std::uint32_t>(shell) &&
+        retained[2].root_pid == retained[1].root_pid &&
+        retained[2].root_birth_token == retained[1].root_birth_token,
+        "pre-START observation, original root birth and exact root exit are retained in order");
+    std::fprintf(stderr, "PHASE %s END result=%d\n", label, ok);
     return ok;
 }
 
@@ -238,7 +267,8 @@ bool test_shell_jobs_close(bool destroy)
 
 int main()
 {
-    bool ok = test_shell_jobs_close(false);
-    ok &= test_shell_jobs_close(true);
+    bool ok = test_shell_jobs_close(Closure::TERMINATE);
+    ok &= test_shell_jobs_close(Closure::DESTRUCTION);
+    ok &= test_shell_jobs_close(Closure::SHELL_EXIT);
     return ok ? 0 : 1;
 }

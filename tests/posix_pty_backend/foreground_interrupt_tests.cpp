@@ -1,4 +1,5 @@
 #include "helpers/test_check.h"
+#include "native_receipt_capture.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 
 #include <QByteArray>
@@ -150,6 +151,9 @@ bool test_foreground_interrupt(const QString& executable)
     config.argv = {executable, QStringLiteral("--shell")};
     config.working_directory = QFileInfo(executable).absolutePath();
     config.initial_grid_size = term::terminal_grid_size_t{24, 80};
+#if defined(__APPLE__)
+    const auto receipts = vnm_terminal::test_helpers::retain_native_receipts(config);
+#endif
     if (!check(backend->start(config, capture.callbacks()).code ==
         term::Terminal_backend_result_code::ACCEPTED, "foreground interrupt fixture starts"))
     {
@@ -174,6 +178,11 @@ bool test_foreground_interrupt(const QString& executable)
     ok &= check(backend->write(QByteArrayLiteral("q\n")).code ==
         term::Terminal_backend_result_code::ACCEPTED, "original shell still accepts input");
     ok &= check(capture.wait_for_normal_exit(), "shell exits normally on explicit request");
+#if defined(__APPLE__)
+    backend.reset();
+    ok &= check(receipts->helper_exited(vnm::process_custody::Darwin_pty_owner_exit::CONFIRMED),
+        "exact retained helper confirms cleanup after foreground interruption");
+#endif
     return ok;
 }
 

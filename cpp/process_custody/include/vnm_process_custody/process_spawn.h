@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -61,11 +63,27 @@ struct Spawn_request
 #if defined(__linux__)
     int                               generation_cgroup = -1; // retained cgroup directory; birth must be atomic
 #endif
+#if defined(__APPLE__)
+    bool                              new_process_group = false; // same retained session, distinct shell group
+    bool                              foreground_terminal = false; // mapped stdin; after group creation
+#endif
 #if defined(_WIN32)
     void*                             generation_job = nullptr; // nested after the process-wide family Job
     void*                             job = nullptr;         // HANDLE the child joins at creation
 #endif
 };
+
+#if defined(__APPLE__)
+struct Darwin_spawn_failure
+{
+    std::int64_t process_id = 0;
+    std::uint64_t birth_token = 0;
+    Native_handle process_handle = k_invalid_handle; // caller owns it if the sole wait could not be collected
+    bool execution_admitted = false;
+    bool wait_collected = false;
+    int wait_status = 0;
+};
+#endif
 
 struct Spawn_result
 {
@@ -76,6 +94,12 @@ struct Spawn_result
     Native_handle process_handle = k_invalid_handle;   // Linux: pidfd; Darwin: local kqueue; Windows: process handle.
 #if defined(__APPLE__)
     std::uint64_t process_birth_token = 0; // original PROC_PIDTBSDINFO birth time, in microseconds
+    // Failure alone is not no-birth evidence. This is true only before native
+    // birth, or after the still-gated child was positively collected without
+    // admitting execution. Admitted/uncertain failures retain their identity
+    // and exact collected status (or remaining observation handle) separately.
+    bool no_workload_admitted = false;
+    std::optional<Darwin_spawn_failure> failed_birth;
 #endif
     std::vector<Native_handle> inherited_handles;      // child-visible values, parallel to Spawn_request::inherited
     std::string   error;
@@ -96,6 +120,39 @@ Spawn_result spawn(const Spawn_request& in_request);
 /// signal authority. Keep the event unconsumed: poll(POLLIN) stays latched at
 /// death, including across PID reuse. Failure/absence cannot prove death.
 Native_handle open_process_observer(std::int64_t process_id, std::uint64_t birth_token, std::string* error);
+
+enum class Native_process_observation { LIVE, ENDED, UNCONFIRMED };
+
+struct Native_process_status
+{
+    Native_process_observation state = Native_process_observation::UNCONFIRMED;
+    bool status_valid = false;
+    int wait_status = 0;
+};
+
+/// Receiver-local NOTE_EXITSTATUS observation of one original occurrence.
+/// It grants neither wait nor signal authority. open() is one-shot; observe()
+/// consumes the kernel event once and retains its terminal status or error.
+/// The caller serializes access. A normal code has meaning only after the
+/// caller separately admitted the exact helper's outcome contract.
+class Native_process_status_observer
+{
+public:
+    Native_process_status_observer();
+    ~Native_process_status_observer();
+    Native_process_status_observer(Native_process_status_observer&&) noexcept;
+    Native_process_status_observer& operator=(Native_process_status_observer&&) noexcept;
+    Native_process_status_observer(const Native_process_status_observer&) = delete;
+    Native_process_status_observer& operator=(const Native_process_status_observer&) = delete;
+
+    bool open(std::int64_t process_id, std::uint64_t birth_token, std::string* error);
+    Native_handle native_handle() const noexcept;
+    Native_process_status observe() noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
 #endif
 
 Inherited_reference inherited_argument(std::size_t in_inherited_index);

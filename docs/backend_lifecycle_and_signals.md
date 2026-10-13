@@ -2,7 +2,7 @@
 
 This document is the per-platform contract for the native terminal backends:
 the Windows ConPTY backend in `src/windows_conpty_backend.cpp` and the POSIX
-forkpty backend in `src/posix_pty_backend.cpp`. Both implement the
+PTY backend in `src/posix_pty_backend.cpp`. Both implement the
 `Terminal_backend` interface in
 `include/vnm_terminal/internal/backend_contract.h` and share start validation,
 launch environment construction, write-queue accounting, callback delivery, and
@@ -37,18 +37,20 @@ outcome is safe to retry; they do not refine or replace the error code.
 
 ### POSIX session and process group
 
-The POSIX child always becomes its own session and process-group leader.
-`forkpty` runs `login_tty` in the child, which calls `setsid()`; the child
-branch then reasserts its own process group with `setpgid(0, 0)` before
-`execve`. The `setpgid` result is intentionally unchecked because `setsid` has
-already established the group and the child is about to exec.
+The POSIX backend launches `vnm_process_custody_owner` beside its hosting
+executable. The helper owns the workload's sole wait and native cleanup; the
+backend owns its helper's sole wait and the presentation's master descriptor.
+Linux gives the shell a new session and uses the helper's subreaper for tree
+cleanup. On macOS, the persistent helper retains the controlling PTY session
+and places the shell in its own foreground process group within that session.
+Both `Terminal_process_group_policy` values use this isolated terminal session.
 
-Because the child is always its own session/process-group leader, the two
-`Terminal_process_group_policy` values (`BACKEND_DEFAULT` and
-`CREATE_NEW_SESSION`) collapse to the same new-session behavior on POSIX. The
-backend records the child's process group as the child pid directly rather than
-reading `getpgid(child_pid)`, which could otherwise race the child running
-`setsid`.
+Darwin workload START requires `Terminal_native_receipt_hook` to acknowledge
+retention and persistence of the original helper's identity and status observer.
+The hook separately receives exact root birth, root exit, or no-birth evidence;
+revoking presentation callbacks does not revoke these native obligations.
+The [custody contract](../cpp/process_custody/README.md) defines the helper's
+scoped status and the distinction between root and helper observation.
 
 ### Windows session and process group
 
@@ -60,18 +62,13 @@ Windows mapping of the new-session request.
 
 ### Early-child setup-failure cleanup
 
-When PTY setup fails after `forkpty` but before the session becomes live, the
-POSIX backend reaps the child through one `terminate_unstarted_child(pid, bool)`
-helper whose signal target depends on the child's lifecycle stage:
-
-- Before exec is confirmed, the child may not yet have run
-  `login_tty` -> `setsid` (or the explicit `setpgid`), so its own process group
-  is not reliably its pid. The helper signals the single child pid.
-- After exec is confirmed (the startup-error pipe closed without delivering an
-  errno), the child is its own session/process-group leader, so the helper
-  signals the whole group (`-pid`) to also reap any descendants it spawned.
-
-This lifecycle-dependent targeting is intentional, not an inconsistency.
+The POSIX helper withholds execution until it retains the child's native
+identity and confirms that START remains admitted. A rejected gate permits
+no-workload evidence only when no child was born or the still-gated child was
+positively reaped. An admitted or uncertain birth retains its exact identity
+and root-exit evidence separately from the startup rejection. Startup failure
+never fabricates group settlement. Native cleanup continues independently of
+the bounded startup return.
 
 ## Output Read, Pause, And Backpressure
 
@@ -243,33 +240,26 @@ native exit code are unchanged.
 ## Terminate And Escalation
 
 `terminate()` sets a `TERMINATED` exit-reason override under the mutex, clears
-the paused state, wakes the workers, and starts an escalation worker governed by
-`Terminal_termination_policy` (a graceful interval followed by a kill interval).
+the paused state, and wakes the workers.
 
-- POSIX escalation sends `SIGTERM` to the process-group signal targets, waits up
-  to the graceful interval for them to disappear, then sends `SIGKILL` and waits
-  up to the kill interval. On macOS, the post-signal check excludes zombies and
-  processes marked `P_WEXIT`: both have committed to termination even though
-  `kill(-pgid, 0)` can still report their process group as present. If a group
-  signal races that transition and returns `EPERM`, the backend rechecks the
-  group and ignores the error only when no unterminated member remains. A group
-  with an unterminated member after forced termination, or a genuine signal
-  failure, is reported as `TERMINATE_FAILED`.
+- POSIX sends STOP with the requested grace interval to its persistent helper.
+  The helper attempts graceful termination, then forced cleanup. On macOS it
+  signals ordinary foreground and background groups through the retained tty
+  and keeps the original root's sole wait. After that wait is collected, a tty
+  membership snapshot naming only the retained helper confirms scoped cleanup.
+  Bounded exhaustion while inert members remain produces terminal
+  `UNCONFIRMED`; failure or timeout never proves emptiness. A live root remains
+  pending. A failed STOP send closes the sending direction so control EOF
+  requests the same native cleanup.
 - ConPTY escalation waits up to the graceful interval for the process to exit,
   then calls `TerminateJobObject` on the child process job, then waits up to the
   kill interval for the root process to exit. A process still active after
   forced termination, or a `TerminateJobObject` failure followed by a failed
   root-process `TerminateProcess` fallback, is reported as `TERMINATE_FAILED`.
 
-If the escalation worker thread cannot be created, both backends fall back to an
-immediate forced kill (`SIGKILL` to the targets / ConPTY job termination with
-root-process fallback) and report `TERMINATE_FAILED`.
-
-After the direct child exits and the exit drain completes, the POSIX backend
-also sends `SIGKILL` to the child's process group to reap any leftover
-descendants (for example a backgrounded process still holding the slave open).
-This kill happens after the child's exit is reported, so a descendant remains
-observable as alive until the direct child's exit is delivered.
+The POSIX helper starts cleanup on root exit independently of the presentation's
+output drain and exit callback. Root exit does not establish job emptiness, and
+callback delivery does not authorize releasing a native cleanup obligation.
 
 ## Exit-Reason Resolution
 
@@ -332,57 +322,27 @@ recorded once; a second exit command is rejected as invalid state.
 
 ### Final output drain after process exit
 
-When the process-wait thread reaps the child, the backend delivers any buffered
-paused output before reporting exit, so output produced up to the moment of exit
-is not lost. Delivery remains FIFO: reader tail bytes append behind existing
-paused bytes, and deferred-session backpressure can pause running-state drain
-between bounded chunks. Exit-drain itself does not latch new pause requests, so
-the process exit callback cannot be lost behind a callback re-pause. The POSIX
-backend additionally honors a consistent exit-drain window
-(`k_exit_output_drain_timeout`) before finalizing the exit: on Linux the master
-stays readable while a descendant holds the slave open, so the reader drains for
-the full window; on macOS the master EOFs the instant the
-session-leader child exits, so the reader finishes immediately and the wait
-thread waits out the remainder of the window so the observable behavior matches
-Linux. The drain wait is interruptible by shutdown so teardown is never delayed.
+When the process-wait thread observes the original root's exit, the backend
+delivers buffered paused output before reporting exit. Delivery remains FIFO:
+reader tail bytes append behind existing paused bytes, and deferred-session
+backpressure can pause running-state drain between bounded chunks. Exit drain
+does not latch new pause requests, so the exit callback cannot remain trapped
+behind a callback re-pause. The POSIX backend honors
+`k_exit_output_drain_timeout` even if PTY EOF finishes the reader early. Shutdown
+can interrupt the drain without interrupting the helper's native cleanup.
 
 ## Teardown
 
-`shutdown()` is idempotent (guarded by a shutdown-started flag). It marks the
-backend stopping, clears paused state, detaches the callbacks, wakes the
-workers, kills the child (and its process group where established), and joins
-the worker threads.
+`shutdown()` is idempotent. It marks the backend stopping, clears paused state,
+revokes presentation callbacks, wakes workers, and requests native cleanup.
+A cleanup reservation created before native birth retains the implementation
+until active public calls and worker threads have drained, including destruction
+from inside a callback. No cleanup thread allocation is required after birth.
 
-Backend destructors run shutdown inline when no backend-owned stack frame can
-still touch the implementation. If destruction is reached from a backend worker
-callback, or while a public backend call is still unwinding, the destructor
-releases the implementation and defers `shutdown(); delete this;` to a fresh
-thread. That keeps worker threads joined by a non-worker thread and keeps the
-implementation alive until active public-call frames have returned.
-
-The POSIX teardown ordering is load-bearing on macOS and is therefore explicit:
-
-- The pending process-group `SIGKILL` targets `kill(-pgid)`, which fails with
-  `ESRCH` during the brief window after `forkpty` before the child established
-  its own group. To guarantee the wait thread's blocking `waitpid` returns, the
-  child pid is also signaled directly with `kill(child_pid, SIGKILL)`.
-- In ordinary shutdown, the master fd is closed before joining the workers, not
-  after. While output is paused, the reader drains only up to the paused-output
-  high-water mark and then parks; a high-volume child can still block in
-  `write()` to the slave and fail to act on a pending `SIGKILL`. Closing the
-  master releases that blocked write (delivering `EIO`/`SIGHUP`) so the kill can
-  land and the wait thread can be joined. If the wait thread still needs the
-  master for post-exit foreground/process-group cleanup, the close is deferred
-  until that cleanup finishes.
-- The bounded reader and writer poll intervals (`k_native_master_poll_interval`)
-  exist so the I/O threads re-check their stop flags rather than trusting a poll
-  on the PTY master, which is unreliable on macOS once the child has exited while
-  a descendant still holds the slave open.
-
-The deferred-teardown fallback is leak-not-use-after-free. If the fresh thread
-cannot be started, the backend stops accepting callbacks, wakes its workers, and
-issues the best termination request still available without joining threads or
-deleting the leaked implementation. POSIX signals the known process groups and,
-when the direct child has not already been reaped, the child pid. It keeps the
-master fd owned by the leaked implementation because worker threads may already
-have copied that fd before the fallback decided not to join them.
+On POSIX, shutdown sends forced STOP to the helper, closes the presentation's
+master descriptor, joins the reader/writer/wait workers, and drains the helper's
+remaining receipts before collecting that helper's sole wait. The helper retains
+its own PTY descriptors throughout native cleanup. Bounded I/O polling allows
+presentation threads to re-check their stop flags even when the slave remains
+open. Helper death without an admitted terminal outcome leaves native cleanup
+unconfirmed; presentation teardown and root exit never replace that outcome.

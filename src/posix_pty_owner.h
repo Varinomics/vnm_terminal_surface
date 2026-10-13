@@ -1,8 +1,9 @@
 #pragma once
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
 #include <vnm_process_custody/owner.h>
+#include <vnm_terminal/terminal_native_receipt.h>
 #ifndef VNM_PROCESS_CUSTODY_HAS_OWNER_START_DEADLINE
 #error "Selected process_custody provider must expose send_owner_start_until; update the maintained provider"
 #endif
@@ -23,6 +24,9 @@
 #include <sys/wait.h>
 #include <type_traits>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 namespace vnm_terminal::internal {
 
@@ -31,17 +35,17 @@ namespace pty_custody = vnm::process_custody;
 // This client deliberately uses only the maintained process_custody surface.
 // Native access is used for channel flags and the failed-send EOF fallback.
 static_assert(std::is_same_v<pty_custody::Native_handle, int>,
-    "Linux PTY ownership requires the process_custody POSIX native handle API");
+    "PTY ownership requires the process_custody POSIX native handle API");
 static_assert(requires(pty_custody::Duplex_channel& channel) {
     { channel.valid() } -> std::same_as<bool>;
     { channel.native() } -> std::same_as<pty_custody::Native_handle>;
-}, "Linux PTY ownership requires the maintained Duplex_channel native API");
+}, "PTY ownership requires the maintained Duplex_channel native API");
 static_assert(requires(pty_custody::Duplex_channel& channel,
     const pty_custody::Owner_start_request& request, std::string* error,
     std::chrono::steady_clock::time_point deadline)
 {
     { pty_custody::send_owner_start_until(channel, request, deadline, error) } -> std::same_as<bool>;
-}, "Linux PTY ownership requires deadline-aware process_custody START transmission");
+}, "PTY ownership requires deadline-aware process_custody START transmission");
 
 constexpr std::chrono::seconds k_owner_startup_timeout(10);
 constexpr std::chrono::milliseconds k_owner_startup_receive_slice(100);
@@ -65,14 +69,31 @@ class Posix_pty_owner
 {
 public:
     bool launch(const pty_custody::Owner_start_request& request,
-        int* master, pid_t* root, std::string* error)
+        int* master, pid_t* root, std::string* error, Terminal_native_receipt_hook receipt_hook = {})
     {
+#if defined(__APPLE__)
+        m_receipt_hook = std::move(receipt_hook);
+        if (!m_receipt_hook) {
+            *error = "Darwin PTY startup requires a retained native receipt handler";
+            return false;
+        }
+#else
+        (void)receipt_hook;
+#endif
         pty_custody::Duplex_channel child;
         if (!pty_custody::Duplex_channel::create_pair(
                 pty_custody::k_owner_message_bytes, &m_channel, &child, error)) {
             return false;
         }
+#if defined(__APPLE__)
+        std::uint32_t path_size = 0;
+        (void)_NSGetExecutablePath(nullptr, &path_size);
+        std::vector<char> path_bytes(path_size);
+        const auto executable_path = path_size > 0 && _NSGetExecutablePath(path_bytes.data(), &path_size) == 0
+            ? QFileInfo(QFile::decodeName(path_bytes.data())).canonicalFilePath() : QString();
+#else
         const auto executable_path = QFileInfo(QStringLiteral("/proc/self/exe")).symLinkTarget();
+#endif
         if (executable_path.isEmpty()) {
             *error = "cannot locate the hosting executable for the PTY owner";
             return false;
@@ -82,6 +103,9 @@ public:
         pty_custody::Spawn_request helper;
         helper.executable = helper_path;
         helper.argv = {helper_path, "--control", pty_custody::inherited_argument(0)};
+#if defined(__APPLE__)
+        helper.argv.emplace_back(pty_custody::k_darwin_pty_owner_argument);
+#endif
         helper.inherited = {{child.native(), 3}};
         // The helper has no terminal stdio of its own. Give it explicit null
         // streams even when a GUI host has closed 0/1/2, so native helper
@@ -103,6 +127,16 @@ public:
             return false;
         }
         m_settlement = pty_custody::Tree_settlement::PENDING;
+#if defined(__APPLE__)
+        m_receipt.helper_pid = static_cast<std::uint32_t>(m_helper.process_id);
+        m_receipt.helper_birth_token = m_helper.process_birth_token;
+        if (!publish_native_receipt(Terminal_native_receipt_kind::HELPER_PRE_START)) {
+            *error = "Darwin PTY helper observation was not retained before workload START";
+            close_sending_direction(error);
+            (void)publish_native_receipt(Terminal_native_receipt_kind::NO_BIRTH);
+            return false;
+        }
+#endif
 
         // The provider resumes only an untransferred fragment under this
         // absolute deadline; the client never replays a partial START.
@@ -151,6 +185,12 @@ public:
             return false;
         }
 
+        int retained_master = -1;
+        struct Retained_master
+        {
+            int& descriptor;
+            ~Retained_master() { if (descriptor >= 0) ::close(descriptor); }
+        } retained_master_guard{retained_master};
         while (std::chrono::steady_clock::now() < startup_deadline) {
             pty_custody::Owner_event event;
             const int receive_timeout = std::min(
@@ -166,15 +206,28 @@ public:
             }
             if (event.kind == pty_custody::Owner_event_kind::STARTED && event.pty_master >= 0 &&
                 event.root_exit.process_id > 1) {
-                *master = event.pty_master;
-                *root = static_cast<pid_t>(event.root_exit.process_id);
-                return true;
+                retained_master = event.pty_master;
+                event.pty_master = -1;
+                m_root = static_cast<pid_t>(event.root_exit.process_id);
             }
             if (event.pty_master >= 0) {
                 ::close(event.pty_master);
             }
             if (event.kind == pty_custody::Owner_event_kind::START_REJECTED) {
                 *error = event.detail;
+                return false;
+            }
+            if (retained_master >= 0
+#if defined(__APPLE__)
+                && m_root_retained
+#endif
+            ) {
+                *master = std::exchange(retained_master, -1);
+                *root = m_root;
+                return true;
+            }
+            if (m_settlement != pty_custody::Tree_settlement::PENDING) {
+                *error = "PTY root receipt could not be retained before startup settlement";
                 return false;
             }
         }
@@ -208,6 +261,9 @@ public:
 
     std::optional<pty_custody::Exit_status> wait_root()
     {
+        if (m_root_exit) {
+            return m_root_exit;
+        }
         std::string error;
         while (m_settlement == pty_custody::Tree_settlement::PENDING) {
             pty_custody::Owner_event event;
@@ -258,6 +314,19 @@ public:
     }
 
 private:
+#if defined(__APPLE__)
+    bool publish_native_receipt(Terminal_native_receipt_kind kind) noexcept
+    {
+        m_receipt.kind = kind;
+        try {
+            return m_receipt_hook && m_receipt_hook(m_receipt) == Terminal_native_receipt_ack::RETAINED;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+#endif
+
     bool close_sending_direction(std::string* error) noexcept
     {
         if (!m_channel.valid()) {
@@ -287,6 +356,26 @@ private:
             // the noexcept native-cleanup worker or prove tree emptiness.
             status = pty_custody::Receive_status::FAILED;
         }
+        if (status == pty_custody::Receive_status::MESSAGE) {
+            if (event->kind == pty_custody::Owner_event_kind::ROOT_EXITED) {
+                m_root_exit = event->root_exit;
+            }
+#if defined(__APPLE__)
+            if (event->kind == pty_custody::Owner_event_kind::STARTED) {
+                m_receipt.root_pid = static_cast<std::uint32_t>(event->root_exit.process_id);
+                m_receipt.root_birth_token = event->root_birth_token;
+                m_root_retained = publish_native_receipt(Terminal_native_receipt_kind::ROOT_BORN);
+            }
+            else if (event->kind == pty_custody::Owner_event_kind::ROOT_EXITED) {
+                m_receipt.root_exit_code = event->root_exit.exit_code;
+                m_receipt.root_signal = event->root_exit.signal;
+                m_root_retained = publish_native_receipt(Terminal_native_receipt_kind::ROOT_ENDED) || m_root_retained;
+            }
+            else if (event->kind == pty_custody::Owner_event_kind::START_REJECTED && m_receipt.root_pid == 0) {
+                (void)publish_native_receipt(Terminal_native_receipt_kind::NO_BIRTH);
+            }
+#endif
+        }
         // STARTED transfers an observation reference, not wait ownership.
         // PTY callbacks use the reported exit status; no numeric reopen or
         // additional wait owner is needed, and every received fd must retire.
@@ -297,6 +386,11 @@ private:
         if (status == pty_custody::Receive_status::MESSAGE &&
             event->kind == pty_custody::Owner_event_kind::TREE_SETTLEMENT) {
             m_settlement = event->settlement;
+#if defined(__APPLE__)
+            if (event->cleanup_scope != pty_custody::Cleanup_scope::OWNED_PROCESS_GROUPS) {
+                m_settlement = pty_custody::Tree_settlement::UNCONFIRMED;
+            }
+#endif
         }
         else if (status != pty_custody::Receive_status::MESSAGE &&
                  status != pty_custody::Receive_status::TIMEOUT) {
@@ -310,6 +404,13 @@ private:
     pty_custody::Tree_settlement m_settlement = pty_custody::Tree_settlement::CONFIRMED;
     std::mutex m_send_mutex;
     bool m_helper_reaped = false;
+    pid_t m_root = -1;
+    std::optional<pty_custody::Exit_status> m_root_exit;
+#if defined(__APPLE__)
+    Terminal_native_receipt_hook m_receipt_hook;
+    Terminal_native_receipt m_receipt;
+    bool m_root_retained = false;
+#endif
 };
 
 } // namespace vnm_terminal::internal

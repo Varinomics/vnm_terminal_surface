@@ -107,7 +107,8 @@ bool spawn_contract(const std::string& self)
     custody::close_native_handle(child.process_handle);
     request.admit_execution = [] { return false; };
     child = custody::spawn(request);
-    ok &= check(!child.ok && child.process_id == 0 && child.process_handle == custody::k_invalid_handle,
+    ok &= check(!child.ok && child.process_id == 0 && child.process_handle == custody::k_invalid_handle &&
+            child.no_workload_admitted && !child.failed_birth,
         "pre-execution cancellation reaps the withheld child");
     return ok;
 }
@@ -418,7 +419,7 @@ struct Run
         }
         custody::close_native_handle(helper.process_handle);
     }
-    bool launch(const std::string& executable)
+    bool launch(const std::string& executable, bool pty_contract = false)
     {
         std::string error;
         custody::Duplex_channel child;
@@ -428,12 +429,74 @@ struct Run
         custody::Spawn_request request;
         request.executable = executable;
         request.argv = {executable, "--control", custody::inherited_argument(0)};
+        if (pty_contract) {
+            request.argv.emplace_back(custody::k_darwin_pty_owner_argument);
+        }
         request.inherited = {{child.native(), 3}};
         request.environment = {"PATH=/usr/bin:/bin"};
         helper = custody::spawn(request);
         return check(helper.ok, helper.error.c_str());
     }
 };
+
+bool unsupported_pty_mode(const std::string& helper)
+{
+    Run run;
+    if (!run.launch(helper, true)) {
+        return false;
+    }
+    std::string error;
+    custody::Native_process_status_observer observer;
+    if (!check(observer.open(run.helper.process_id, run.helper.process_birth_token, &error),
+        "unsupported-mode fixture retains the original helper status before START"))
+    {
+        return false;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::COMMAND;
+    request.process.executable = "/bin/sh";
+    request.process.argv = {"sh", "-c", "exit 23"};
+    if (!check(custody::send_owner_start(run.channel, request, &error), error.c_str())) {
+        return false;
+    }
+    bool rejected = false;
+    bool positive_settlement = false;
+    bool root_born = false;
+    const auto deadline = Clock::now() + std::chrono::seconds(3);
+    while (Clock::now() < deadline) {
+        custody::Owner_event event;
+        const auto status = custody::receive_owner_event(run.channel, &event, 100, &error);
+        if (status == custody::Receive_status::TIMEOUT) {
+            continue;
+        }
+        if (status != custody::Receive_status::MESSAGE) {
+            break;
+        }
+        custody::close_native_handle(event.root_reference);
+        custody::close_native_handle(event.pty_master);
+        rejected |= event.kind == custody::Owner_event_kind::START_REJECTED;
+        root_born |= event.kind == custody::Owner_event_kind::STARTED;
+        positive_settlement |= event.kind == custody::Owner_event_kind::TREE_SETTLEMENT &&
+            event.settlement == custody::Tree_settlement::CONFIRMED;
+    }
+    int wait_status = 0;
+    const bool waited = wait_child(run.helper, &wait_status);
+    if (waited) {
+        run.helper.process_id = 0;
+    }
+    const auto observed = observer.observe();
+    const bool positive_outcome = observed.status_valid && WIFEXITED(observed.wait_status) &&
+        (WEXITSTATUS(observed.wait_status) == static_cast<int>(custody::Darwin_pty_owner_exit::NO_WORKLOAD) ||
+         WEXITSTATUS(observed.wait_status) == static_cast<int>(custody::Darwin_pty_owner_exit::CONFIRMED));
+    std::printf("UNSUPPORTED_PTY_MODE rejected=%d root_born=%d confirmed=%d wait_status=%d observed_status=%d\n",
+        rejected, root_born, positive_settlement, wait_status, observed.wait_status);
+    bool ok = check(waited && observed.status_valid && observed.wait_status == wait_status,
+        "unsupported mode preserves the exact original helper status");
+    ok &= check(rejected && !root_born, "unsupported mode rejects before root admission");
+    ok &= check(!positive_settlement && !positive_outcome,
+        "unsupported mode has no positive PTY cleanup meaning on either channel");
+    return ok;
+}
 
 struct held_group_ready_t
 {
@@ -963,6 +1026,10 @@ int main(int argc, char** argv)
     if (argc == 3 && std::string(argv[1]) == "--fixture") {
         return fixture(argv[2]);
     }
+    if (argc == 3 && std::string(argv[1]) == "--unsupported-pty-mode") {
+        std::string error;
+        return custody::prepare_parent_process(&error) && unsupported_pty_mode(argv[2]) ? 0 : 1;
+    }
     if (argc != 2) {
         return 2;
     }
@@ -996,6 +1063,7 @@ int main(int argc, char** argv)
     ok &= stop_or_lose_owner(argv[1], argv[0], "close");
     ok &= stop_or_lose_owner(argv[1], argv[0], "loss");
     ok &= unknown_capabilities_remain_local();
+    ok &= unsupported_pty_mode(argv[1]);
     custody::Process_tree_containment containment;
     ok &= check(!containment.establish("fixture", &error) && !containment.available() && !error.empty(),
         "Darwin reports unavailable independent containment");

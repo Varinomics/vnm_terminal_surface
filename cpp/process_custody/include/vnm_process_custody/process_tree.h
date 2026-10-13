@@ -110,8 +110,9 @@ private:
 /// supervisor) is spawned into its own session and process group, and this
 /// object is the only place that calls waitid() for that tree. Windows: this
 /// object owns the kill-on-close Job the root is created into.
-/// Darwin retains the direct root and its original process group only; it
-/// reports OWNED_PROCESS_GROUPS, never transitive detached-descendant cleanup.
+/// Darwin retains the direct root and its original process group for COMMAND,
+/// or the controlling PTY session for PTY. Both report OWNED_PROCESS_GROUPS,
+/// never transitive detached-descendant cleanup.
 class Process_tree_owner
 {
 public:
@@ -129,6 +130,17 @@ public:
     /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
     /// and no breakaway.
     bool establish(std::string* out_error);
+
+#if defined(__APPLE__)
+    /// The persistent helper retains both descriptors until cleanup ends.
+    /// Establishes its controlling session before the single root admission;
+    /// the root receives a separate foreground group in that same session.
+    bool establish_pty(Native_handle master, Native_handle slave, std::string* out_error);
+
+    /// Takes the failed spawn's remaining observer/wait obligation, or its
+    /// exact already-collected receipt. Failure never means no workload.
+    void record_failed_root(const Darwin_spawn_failure& failure);
+#endif
 
     /// Makes a spawn request produce the tree's root: Linux sets new_session,
     /// Windows assigns the Job.
