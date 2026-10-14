@@ -21,13 +21,9 @@ For the packaged terminal application and screenshots, see
   supported protocol surface and recovery behavior.
 - Native process hosting per platform: ConPTY on Windows and PTY on Linux and
   macOS, with resize propagation and process lifecycle signals.
-- Sixel graphics: images decode as their data streams in and show as
-  per-row slices that scroll into history with their rows, within a
-  decoded-size cap. The matrix rows for the
-  [image](docs/terminal_sequence_matrix.md#dcs-sixel-image), its
-  [product decisions](docs/terminal_sequence_matrix.md#dcs-sixel-product-decisions)
-  and the [decoded-size limit](docs/terminal_sequence_matrix.md#dcs-sixel-decoded-limit)
-  give the contract.
+- Sixel graphics: images decode as their data streams in and scroll into history
+  with their rows, within a decoded-size cap. See the
+  [terminal sequence matrix](docs/terminal_sequence_matrix.md#dcs-sixel-image).
 - Explicit text semantics: Qt IME commit/preedit handling and an owned
   [Unicode 16.0 cell-width policy](docs/unicode_width_policy.md) that is
   independent of rendering-library glyph metrics.
@@ -36,8 +32,6 @@ For the packaged terminal application and screenshots, see
 - A documented [public API](docs/public_surface.md), host-owned interaction and
   clipboard policies, provenance-aware scrollback selection, typed scroll
   diagnostics, and a public diagnostics serialization API.
-- Continuously tested on Windows, Linux, and macOS: contract, model, backend,
-  renderer, conformance, randomized-parser, and lifecycle test families.
 
 ## Requirements
 
@@ -81,10 +75,9 @@ isolated checkout of `microsoft/terminal`, then run:
     -VCToolsVersion 14.51.36231 -WindowsSdkVersion 10.0.26100.0 -Slots 2
 ```
 
-The helper requires the VS2026 v145 x64 and ARM64 tools. It queues the upstream
-MSBuild projects and their pinned native dependencies; these projects do not
-support FASTBuild. It builds Release with the upstream Hybrid CRT, disables
-debug generation, and preserves the x64 DLL plus both native host architectures.
+The helper requires the VS2026 v145 x64 and ARM64 tools. It builds Release with
+the upstream Hybrid CRT, disables debug generation, and preserves the x64 DLL
+plus both native host architectures.
 Set `VNM_TERMINAL_CONPTY_PACKAGE_DIR` to the resulting directory. Its exact-byte
 `conpty-source-build.json` receipt and combined dependency notices accompany the
 SDK package; runtime deployment includes the notices once and leaves the receipt
@@ -92,13 +85,10 @@ for release provenance. These binaries are source-built third-party software,
 not the Microsoft-signed NuGet binaries. Publisher signing requires independent
 receipt admission by the consuming product's signing policy.
 
-Both native hosts load one common set of four compiled shaders from
-`conpty-shaders/` beside their architecture directories. The producer applies a
-recorded patch to the frozen upstream source and restores that source after the
-build. Each host verifies the shader sizes and SHA256 hashes compiled into it;
-missing or changed files fail loading. The versioned host marker and receipt
-capability make those four files mandatory during package intake and deployment.
-Older vendor packages keep their embedded shader layout.
+Both native hosts require one common set of four compiled shaders in
+`conpty-shaders/` beside their architecture directories. Package intake and
+runtime loading reject missing or changed shader files; deployment must include
+all four. Older vendor packages keep their embedded shader layout.
 
 See the [repository guide](docs/repository_guide.md#local-windows-build) for
 source-built ConPTY package verification.

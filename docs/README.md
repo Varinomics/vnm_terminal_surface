@@ -72,10 +72,3 @@ the repository without reading every implementation detail.
   extraction.
 - [Search and scrollback](search_and_scrollback.md) records literal match
   semantics, public result state, safe-source rules, and match identity.
-
-## Maintenance Rule
-
-Documentation should describe stable contracts, policy, repository structure,
-and supported operational workflows. Keep temporary working notes, plans,
-reviews, investigations, audits, phase reports, and historical implementation
-artifacts outside this directory.
