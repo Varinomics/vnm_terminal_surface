@@ -122,6 +122,40 @@ The root CMake project builds:
 
 ## Local Windows Build
 
+Windows process hosting uses the Microsoft ConPTY NuGet runtime, downloaded
+and hash-verified during configuration. To supply an extracted package offline,
+set `VNM_TERMINAL_CONPTY_PACKAGE_DIR`. To select a newer compatible release,
+set `VNM_TERMINAL_CONPTY_VERSION` and its `VNM_TERMINAL_CONPTY_SHA256` together.
+The backend requires the `ConptyCreatePseudoConsole`, `ConptyResizePseudoConsole`,
+`ConptyClosePseudoConsole`, and `ConptyReparentPseudoConsole` exports.
+
+For distribution without embedded debugging metadata, prepare the adopted
+ConPTY source revision `5a830b2bf7c053d5c7ac22208fe5a346cb5dd3dc` in a clean
+isolated checkout of `microsoft/terminal`, then run:
+
+```powershell
+./tools/prepare_windows_conpty.ps1 -SourceDirectory C:/b/conpty-source `
+    -OutputDirectory C:/b/conpty-package `
+    -VisualStudioDirectory 'C:/Program Files/Microsoft Visual Studio/18/Community' `
+    -VCToolsVersion 14.51.36231 -WindowsSdkVersion 10.0.26100.0 -Slots 2
+```
+
+The helper requires the VS2026 v145 x64 and ARM64 tools. It builds Release with
+the upstream Hybrid CRT, disables debug generation, and preserves the x64 DLL
+plus both native host architectures.
+Set `VNM_TERMINAL_CONPTY_PACKAGE_DIR` to the resulting directory. Its exact-byte
+`conpty-source-build.json` receipt and combined dependency notices accompany the
+SDK package; runtime deployment includes the notices once and leaves the receipt
+for release provenance. These binaries are source-built third-party software,
+not the Microsoft-signed NuGet binaries. Publisher signing requires independent
+receipt admission by the consuming product's signing policy.
+
+Both native hosts require one common set of four compiled shaders in
+`conpty-shaders/` beside their architecture directories. Package intake and
+runtime loading reject missing or changed shader files; deployment must include
+all four. Older vendor packages keep their embedded shader layout.
+
+Configure with the [build options](#build-options), then build the surface.
 Use an x64 MSVC Developer Command Prompt or another shell where the Visual
 Studio C++ environment has already been initialized:
 
@@ -469,6 +503,25 @@ Every installed package exports
 Source-tree headers under
 `include/vnm_terminal/internal` are implementation and test contracts, not
 installed consumer API.
+
+### Windows ConPTY Runtime
+
+Windows hosts linking the full surface target must call
+`vnm_terminal_deploy_conpty(their_executable)` after creating their executable.
+An executable that runs from somewhere other than its build output directory,
+or that was created in another directory, passes
+`vnm_terminal_deploy_conpty(their_executable DESTINATION <directory>)` instead.
+The global property `vnm_terminal_conpty_deploy_destination_supported` is `TRUE`
+where that form is available, so a consumer that requires it can say so itself
+rather than fail inside the helper.
+
+For distribution, call
+`vnm_terminal_install_conpty(DESTINATION bin COMPONENT runtime)` with the
+executable's install directory and component. These helpers preserve the native
+and emulated architecture host layout and the Microsoft MIT license; they are
+available with both source and installed surface packages. Source-built
+packages also deploy their shared shaders and combined dependency notices as
+described under [Local Windows Build](#local-windows-build).
 
 ## Generated And Provenance Artifacts
 

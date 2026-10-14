@@ -2,145 +2,77 @@
 
 [![CI Linux](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml) [![CI Windows](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml) [![CI macOS](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-macos.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-macos.yml)
 
-`vnm_terminal_surface` is a Qt Quick terminal component licensed under the GNU
-General Public License version 3 only. It embeds
-a real interactive terminal, backed by a ConPTY (Windows) or PTY (Linux, macOS)
-child process, in a Qt Quick application as a single C++ `QQuickItem`:
-`VNM_TerminalSurface`. It was built for and ships in Varinomics products, and
-the same component is usable by any Qt Quick host.
+`vnm_terminal_surface` embeds an interactive terminal in a Qt Quick application.
+Its C++ `QQuickItem`, `VNM_TerminalSurface`, runs a child process through ConPTY
+on Windows or a PTY on Linux and macOS, handles terminal input and output, and
+renders the terminal through the Qt Scene Graph. It ships in Varinomics products
+and can be used by other Qt Quick hosts.
 
-For the packaged terminal application and screenshots, see
+For a complete terminal application and screenshots, see
 [`vnm_terminal`](https://github.com/Varinomics/vnm_terminal).
 
-## Highlights
+## Features
 
-- Real terminal behavior, not a log viewer: alternate screen, cursor
-  addressing, scrollback, keyboard and mouse reporting modes, bracketed paste,
-  selection, clipboard policy, and terminal replies. The maintained
-  [terminal sequence matrix](docs/terminal_sequence_matrix.md) records the
-  supported protocol surface and recovery behavior.
-- Native process hosting per platform: ConPTY on Windows and PTY on Linux and
-  macOS, with resize propagation and process lifecycle signals.
-- Sixel graphics: images decode as their data streams in and scroll into history
-  with their rows, within a decoded-size cap. See the
-  [terminal sequence matrix](docs/terminal_sequence_matrix.md#dcs-sixel-image).
-- Explicit text semantics: Qt IME commit/preedit handling and an owned
-  [Unicode 16.0 cell-width policy](docs/unicode_width_policy.md) that is
-  independent of rendering-library glyph metrics.
-- GPU text rendering through the Qt Scene Graph: a glyph-atlas render node
-  with MSDF and glyph raster paths and LCD subpixel modes.
-- A documented [public API](docs/public_surface.md), host-owned interaction and
-  clipboard policies, provenance-aware scrollback selection, typed scroll
-  diagnostics, and a public diagnostics serialization API.
+- Interactive shells and terminal applications, with alternate screen,
+  scrollback, keyboard and mouse reporting, bracketed paste, selection, and
+  clipboard support.
+- Sixel images that scroll into history with their terminal rows.
+- Unicode cell-width handling and Qt input-method support for text composition.
+- GPU text rendering with glyph and MSDF paths, configurable fonts and colors,
+  and LCD subpixel modes.
+
+The host owns the surrounding application UI and its interaction policies.
 
 ## Requirements
 
-- Qt 6.12 or newer
+- Qt 6.12 or newer, including its Gui and Quick private development modules
 - A C++20 compiler
 - CMake 3.25 or newer
 
-## Start Here
+Native process hosting supports Windows x64, Linux x86_64, and macOS. Windows
+uses a ConPTY runtime that CMake downloads and verifies during configuration;
+[Windows build instructions](docs/repository_guide.md#local-windows-build)
+cover offline packages and distribution inputs.
 
-For a first pass through the repository, read these in order:
+## Use In A Qt Quick Host
 
-1. [Developer orientation](docs/developer_orientation.md) - the shortest stable explanation
-   of what the project is, where the important code lives, and how the pieces
-   fit together.
-2. [Architecture](docs/architecture.md) - the runtime model, ownership
-   boundaries, and data flow.
-3. [Public surface](docs/public_surface.md) - the `VNM_TerminalSurface` API.
-4. [Repository guide](docs/repository_guide.md) - build targets, test families,
-   generated/provenance material, and common entry points.
+Clone this repository beside your host project. After creating the host's Qt
+Quick executable target, add and link the component:
 
-The [documentation index](docs/README.md) has a time-budgeted reading path and
-links to the reference material.
+```cmake
+add_subdirectory("../vnm_terminal_surface" "${CMAKE_BINARY_DIR}/_deps/vnm_terminal_surface")
+target_link_libraries(my_terminal PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface)
 
-## Build On Windows
-
-Windows process hosting uses the Microsoft ConPTY NuGet runtime, downloaded
-and hash-verified during configuration. To supply an extracted package offline,
-set `VNM_TERMINAL_CONPTY_PACKAGE_DIR`. To select a newer compatible release,
-set `VNM_TERMINAL_CONPTY_VERSION` and its `VNM_TERMINAL_CONPTY_SHA256` together.
-The backend requires the `ConptyCreatePseudoConsole`, `ConptyResizePseudoConsole`,
-and `ConptyClosePseudoConsole` exports.
-
-For distribution without embedded debugging metadata, prepare the adopted
-ConPTY source revision `5a830b2bf7c053d5c7ac22208fe5a346cb5dd3dc` in a clean
-isolated checkout of `microsoft/terminal`, then run:
-
-```powershell
-./tools/prepare_windows_conpty.ps1 -SourceDirectory C:/b/conpty-source `
-    -OutputDirectory C:/b/conpty-package `
-    -VisualStudioDirectory 'C:/Program Files/Microsoft Visual Studio/18/Community' `
-    -VCToolsVersion 14.51.36231 -WindowsSdkVersion 10.0.26100.0 -Slots 2
+if(WIN32)
+    vnm_terminal_deploy_conpty(my_terminal)
+endif()
 ```
 
-The helper requires the VS2026 v145 x64 and ARM64 tools. It builds Release with
-the upstream Hybrid CRT, disables debug generation, and preserves the x64 DLL
-plus both native host architectures.
-Set `VNM_TERMINAL_CONPTY_PACKAGE_DIR` to the resulting directory. Its exact-byte
-`conpty-source-build.json` receipt and combined dependency notices accompany the
-SDK package; runtime deployment includes the notices once and leaves the receipt
-for release provenance. These binaries are source-built third-party software,
-not the Microsoft-signed NuGet binaries. Publisher signing requires independent
-receipt admission by the consuming product's signing policy.
+Once the host's `QGuiApplication` exists, call
+`vnm_terminal::apply_terminal_renderer_minimum_surface_format()` before creating
+its first window. Create a `VNM_TerminalSurface` under the window's content item
+or expose it to QML, size it, and call `start_terminal()` with the executable,
+arguments, absolute working directory, and explicit child environment. The
+[public surface reference](docs/public_surface.md) describes the launch request
+and host operations.
 
-Both native hosts require one common set of four compiled shaders in
-`conpty-shaders/` beside their architecture directories. Package intake and
-runtime loading reject missing or changed shader files; deployment must include
-all four. Older vendor packages keep their embedded shader layout.
+On Windows, call the deployment helper for each executable that hosts a
+terminal. For installed packages, custom runtime destinations, and distribution
+installation, see [CMake consumers](docs/repository_guide.md#cmake-consumers).
 
-See the [repository guide](docs/repository_guide.md#local-windows-build) for
-source-built ConPTY package verification.
+## Documentation
 
-Windows hosts linking the full surface target must call
-`vnm_terminal_deploy_conpty(their_executable)` after creating their executable.
-An executable that runs from somewhere other than its build output directory,
-or that was created in another directory, passes
-`vnm_terminal_deploy_conpty(their_executable DESTINATION <directory>)` instead.
-The global property `vnm_terminal_conpty_deploy_destination_supported` is `TRUE`
-where that form is available, so a consumer that requires it can say so itself
-rather than fail inside the helper.
-For distribution, call `vnm_terminal_install_conpty(DESTINATION bin COMPONENT runtime)`
-with the executable's install directory and component. These helpers preserve
-the native and emulated architecture host layout and the Microsoft MIT license;
-they are available with both source and installed surface packages.
-
-Configure once:
-
-```powershell
-cmake -S . -B build -DBUILD_TESTING=ON
-```
-
-Project tests are configured only when both CTest's `BUILD_TESTING` switch and
-`VNM_TERMINAL_SURFACE_BUILD_TESTING` are `ON`. The project-specific gate defaults
-to `ON` for a top-level checkout and `OFF` when embedded as a subproject.
-
-Diagnostic transcript capture/replay is compiled out by default. Enable it only
-for local diagnostic builds with
-`-DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`; distribution builds must
-use `-DVNM_TERMINAL_DISTRIBUTION_BUILD=ON` and leave transcript capture/replay
-disabled.
-
-Build from an x64 MSVC Developer Command Prompt or another shell where the
-Visual Studio C++ environment has already been initialized:
-
-```bat
-cmake --build build --target vnm_terminal_surface --config Release
-```
-
-Run the configured test suite:
-
-```powershell
-ctest --test-dir build -C Release --output-on-failure
-```
-
-On Linux and macOS, use the same configure step and the normal generated build
-command for the selected generator.
-
-Use the [repository guide](docs/repository_guide.md) for test families,
-conformance controls, benchmarks, and focused validation commands.
+- [Build and packaging guide](docs/repository_guide.md) — build options,
+  installation, Windows runtime packaging, and tests.
+- [Public surface reference](docs/public_surface.md) — properties, process
+  launch, input, selection, scrolling, and signals.
+- [Terminal sequence matrix](docs/terminal_sequence_matrix.md) — supported
+  terminal behavior.
+- [Documentation index](docs/README.md) — architecture, rendering, Unicode,
+  diagnostics, and other reference material.
 
 ## License
 
-GNU General Public License version 3 only. See [LICENSE](LICENSE).
+GNU General Public License version 3 only. See [LICENSE](LICENSE) and
+[third-party notices](THIRD_PARTY_NOTICES.md).
