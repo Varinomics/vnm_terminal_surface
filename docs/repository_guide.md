@@ -135,6 +135,14 @@ Build only the surface library:
 cmake --build build --target vnm_terminal_surface --config Release
 ```
 
+Verify a source-built ConPTY package with its shader loader check:
+
+```powershell
+./tests/conpty_package/verify_shader_loader.ps1 -ConptySourceDirectory C:/b/conpty-source `
+    -PackageDirectory C:/b/conpty-package -OutputDirectory C:/b/conpty-loader-probe `
+    -VisualStudioDirectory 'C:/Program Files/Microsoft Visual Studio/18/Community'
+```
+
 ## Test Families
 
 CTest names are the stable way to find a test. The main families are:
@@ -188,6 +196,17 @@ ctest --test-dir build -C Release -R "^vnm_terminal_(screen|terminal_modes|viewp
 ctest --test-dir build -C Release -R "^vnm_terminal_(backend_session|windows_conpty_backend|posix_pty_backend)$" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(qt|render|qsg|shaping)" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(surface_host|input_encoder|behavior_smoke)$" --output-on-failure
+```
+
+For AddressSanitizer checks on Windows, use a separate build directory and an
+x64 MSVC Developer Command Prompt so the sanitizer runtime is resolvable on
+`PATH`. `VNM_TERMINAL_SANITIZE_ADDRESS=ON` instruments the surface and its tests;
+Qt and the FetchContent dependencies remain uninstrumented:
+
+```powershell
+cmake -S . -B build-asan -DBUILD_TESTING=ON -DVNM_TERMINAL_SANITIZE_ADDRESS=ON
+cmake --build build-asan --target vnm_terminal_windows_conpty_backend --config Release
+ctest --test-dir build-asan -C Release -R vnm_terminal_windows_conpty_backend --output-on-failure
 ```
 
 Default capture replay and parser fuzz smoke are added when

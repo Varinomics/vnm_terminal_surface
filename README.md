@@ -100,15 +100,8 @@ missing or changed files fail loading. The versioned host marker and receipt
 capability make those four files mandatory during package intake and deployment.
 Older vendor packages keep their embedded shader layout.
 
-After preparation, the focused loader gate compiles the same loader and generated
-hash metadata, creates all four shaders on D3D11 WARP, and checks missing/corrupt
-resources from an unrelated working directory:
-
-```powershell
-./tests/conpty_package/verify_shader_loader.ps1 -ConptySourceDirectory C:/b/conpty-source `
-    -PackageDirectory C:/b/conpty-package -OutputDirectory C:/b/conpty-loader-probe `
-    -VisualStudioDirectory 'C:/Program Files/Microsoft Visual Studio/18/Community'
-```
+See the [repository guide](docs/repository_guide.md#local-windows-build) for
+source-built ConPTY package verification.
 
 Windows hosts linking the full surface target must call
 `vnm_terminal_deploy_conpty(their_executable)` after creating their executable.
@@ -151,25 +144,6 @@ Run the configured test suite:
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
 ```
-
-Windows CI runs `vnm_terminal_windows_conpty_backend` in the normal test suite
-and in a focused AddressSanitizer job. `vnm_terminal_compat_smoke` is a local
-Windows gate for the full native-surface fixture smoke. To reproduce the
-ASan job locally, configure a separate AddressSanitizer build (only our library
-and tests are instrumented; Qt and the FetchContent dependencies are left
-uninstrumented). This focused run exercises the worker-thread
-backend-destruction path under ASan; failures in that path can surface after
-the triggering callback returns, so repeat the command when chasing a suspected
-lifetime regression:
-
-```powershell
-cmake -S . -B build-asan -DBUILD_TESTING=ON -DVNM_TERMINAL_SANITIZE_ADDRESS=ON
-cmake --build build-asan --target vnm_terminal_windows_conpty_backend --config Release
-ctest --test-dir build-asan -C Release -R vnm_terminal_windows_conpty_backend --output-on-failure
-```
-
-Run from an x64 MSVC Developer Command Prompt so the AddressSanitizer runtime is
-resolvable on `PATH`.
 
 On Linux and macOS, use the same configure step and the normal generated build
 command for the selected generator.
