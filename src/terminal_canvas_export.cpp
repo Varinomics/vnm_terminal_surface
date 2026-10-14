@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <utility>
+#include <vector>
 
 namespace term = vnm_terminal::internal;
 
@@ -84,8 +85,26 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
     {
         return {Terminal_canvas_export_status::CELL_LIMIT_EXCEEDED, {}};
     }
-    if (snapshot->styles.size() > k_terminal_canvas_max_styles) {
-        return {Terminal_canvas_export_status::STYLE_LIMIT_EXCEEDED, {}};
+    // A render snapshot also retains styles used only by earlier output.
+    // The bounded canvas palette belongs to the cells this frame exports.
+    std::vector<int> exported_style_ids(snapshot->styles.size(), -1);
+    std::vector<term::Terminal_style_id> referenced_styles{
+        term::k_default_terminal_style_id,
+    };
+    exported_style_ids[term::k_default_terminal_style_id] = 0;
+    for (const term::Terminal_render_cell& source_cell : snapshot->cells) {
+        if (source_cell.wide_continuation) {
+            continue;
+        }
+        int& exported_style_id = exported_style_ids[source_cell.style_id];
+        if (exported_style_id >= 0) {
+            continue;
+        }
+        if (referenced_styles.size() == k_terminal_canvas_max_styles) {
+            return {Terminal_canvas_export_status::STYLE_LIMIT_EXCEEDED, {}};
+        }
+        exported_style_id = static_cast<int>(referenced_styles.size());
+        referenced_styles.push_back(source_cell.style_id);
     }
 
     auto frame = std::make_shared<Terminal_canvas_frame>();
@@ -136,10 +155,11 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         frame->selection = surface.touch_selection_projection();
     }
 
-    frame->styles.reserve(snapshot->styles.size());
+    frame->styles.reserve(referenced_styles.size());
     frame->color_references.emplace();
-    frame->color_references->styles.reserve(snapshot->styles.size());
-    for (const term::Terminal_text_style& source_style : snapshot->styles) {
+    frame->color_references->styles.reserve(referenced_styles.size());
+    for (const term::Terminal_style_id source_style_id : referenced_styles) {
+        const term::Terminal_text_style& source_style = snapshot->styles[source_style_id];
         frame->color_references->styles.push_back({
             canvas_color_reference(source_style.foreground),
             canvas_color_reference(source_style.background),
@@ -194,7 +214,7 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
             source_cell.position.row,
             source_cell.position.column,
             source_cell.display_width,
-            static_cast<std::uint16_t>(source_cell.style_id),
+            static_cast<std::uint16_t>(exported_style_ids[source_cell.style_id]),
             std::move(text),
         });
     }

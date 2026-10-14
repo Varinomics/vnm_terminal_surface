@@ -4,16 +4,21 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 
+#include <QByteArray>
 #include <QColor>
 #include <QGuiApplication>
 #include <QImage>
 #include <QString>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -127,6 +132,15 @@ bool test_no_frame_and_invalid_source_are_explicit()
         "invalid source publication reports INVALID_SOURCE_FRAME");
     ok &= check(invalid_result.frame == nullptr,
         "invalid source publication never returns a partial frame");
+
+    auto invalid_style = make_snapshot(1, 1);
+    invalid_style->cells.push_back(make_cell(0, 0, QStringLiteral("x"), 1, 1U));
+    const auto invalid_style_result = export_snapshot(surface, std::move(invalid_style));
+    ok &= check(
+        invalid_style_result.status ==
+            vnm_terminal::Terminal_canvas_export_status::INVALID_SOURCE_FRAME &&
+        invalid_style_result.frame == nullptr,
+        "a cell referring outside the source style table fails before palette remapping");
     return ok;
 }
 
@@ -188,7 +202,7 @@ bool test_frame_preserves_canvas_authority_and_prior_immutability()
         first.frame->reverse_video,
         "color state and reverse-video authority survive export");
     ok &= check(first.frame->styles.size() == 2U,
-        "source style table cardinality survives export");
+        "referenced source styles survive export");
     ok &= check(
         first.frame->styles[1].foreground_rgba == 0xff123456U &&
         first.frame->styles[1].background_rgba == 0xff654321U &&
@@ -501,24 +515,104 @@ bool test_exact_bounds_and_one_over_fail_closed()
         vnm_terminal::Terminal_canvas_export_status::CELL_LIMIT_EXCEEDED,
         "materialized-cell bound plus one fails explicitly");
 
-    auto exact_styles = make_snapshot(1, 1);
-    exact_styles->styles.resize(
-        vnm_terminal::k_terminal_canvas_max_styles,
-        term::make_default_terminal_text_style());
+    const auto make_referenced_styles = [
+        ](
+            std::size_t count)
+        {
+            auto snapshot = make_snapshot(static_cast<int>((count + 15U) / 16U), 16);
+            snapshot->styles.resize(count, term::make_default_terminal_text_style());
+            for (std::size_t index = 0; index < count; ++index) {
+                if (index != 0U) {
+                    snapshot->styles[index].foreground = term::make_rgb_terminal_color_ref(
+                        0xff000000U | static_cast<quint32>(index));
+                }
+                snapshot->cells.push_back(make_cell(
+                    static_cast<int>(index / 16U),
+                    static_cast<int>(index % 16U),
+                    QStringLiteral("x"),
+                    1,
+                    static_cast<term::Terminal_style_id>(index)));
+            }
+            return snapshot;
+        };
     ok &= expect_status(
         surface,
-        std::move(exact_styles),
+        make_referenced_styles(vnm_terminal::k_terminal_canvas_max_styles),
         vnm_terminal::Terminal_canvas_export_status::OK,
-        "exact style bound exports");
-    auto excess_styles = make_snapshot(1, 1);
-    excess_styles->styles.resize(
-        vnm_terminal::k_terminal_canvas_max_styles + 1U,
-        term::make_default_terminal_text_style());
+        "exact referenced style bound exports");
     ok &= expect_status(
         surface,
-        std::move(excess_styles),
+        make_referenced_styles(vnm_terminal::k_terminal_canvas_max_styles + 1U),
         vnm_terminal::Terminal_canvas_export_status::STYLE_LIMIT_EXCEEDED,
-        "style bound plus one fails explicitly");
+        "referenced style bound plus one fails explicitly");
+    return ok;
+}
+
+bool test_sparse_style_ids_preserve_colors_and_attributes()
+{
+    bool                ok = true;
+    VNM_TerminalSurface surface;
+    auto                snapshot = make_snapshot(1, 8);
+    snapshot->styles.resize(400U, term::make_default_terminal_text_style());
+    snapshot->styles[310].foreground = term::make_palette_terminal_color_ref(12U);
+    snapshot->styles[310].background = term::make_rgb_terminal_color_ref(0xff123456U);
+    snapshot->styles[310].attributes =
+        term::terminal_style_attribute_mask(term::Terminal_style_attribute::BOLD) |
+        term::terminal_style_attribute_mask(term::Terminal_style_attribute::UNDERLINE);
+    snapshot->styles[375].background = term::make_palette_terminal_color_ref(7U);
+    snapshot->styles[375].attributes =
+        term::terminal_style_attribute_mask(term::Terminal_style_attribute::ITALIC);
+    snapshot->cells.push_back(make_cell(0, 0, QStringLiteral("A"), 1, 375U));
+    snapshot->cells.push_back(make_cell(0, 1, QString::fromUtf8("\xe7\x95\x8c"), 2, 310U));
+    snapshot->cells.push_back(make_wide_continuation(0, 2, 310U));
+    snapshot->cells.push_back(make_cell(0, 3, QStringLiteral("B"), 1, 375U));
+    snapshot->cells.push_back(make_cell(0, 4, QStringLiteral("C")));
+
+    const auto result = export_snapshot(surface, snapshot);
+    ok &= check(
+        result.status == vnm_terminal::Terminal_canvas_export_status::OK && result.frame,
+        "sparse source style ids export through a dense canvas palette");
+    if (!result.frame) {
+        return false;
+    }
+    const auto& frame = *result.frame;
+    ok &= check(
+        frame.styles.size() == 3U && frame.color_references &&
+        frame.color_references->styles.size() == 3U && frame.cells.size() == 4U,
+        "palette retains default plus referenced styles with matching color references");
+    if (frame.styles.size() != 3U || !frame.color_references ||
+        frame.color_references->styles.size() != 3U || frame.cells.size() != 4U)
+    {
+        return false;
+    }
+    ok &= check(
+        frame.cells[0].style_index == 1U && frame.cells[1].style_index == 2U &&
+        frame.cells[2].style_index == 1U && frame.cells[3].style_index == 0U &&
+        frame.cells[1].display_width == 2,
+        "cells remap repeated, wide and default styles consistently");
+    const std::array<std::size_t, 3> source_ids{0U, 375U, 310U};
+    for (std::size_t index = 0; index < source_ids.size(); ++index) {
+        const std::size_t source_id = source_ids[index];
+        const auto& source = snapshot->styles[source_id];
+        ok &= check(
+            frame.styles[index].foreground_rgba ==
+                term::resolve_terminal_color_ref(source.foreground, snapshot->color_state, true) &&
+            frame.styles[index].background_rgba ==
+                term::resolve_terminal_color_ref(source.background, snapshot->color_state, false) &&
+            frame.styles[index].attributes == source.attributes,
+            "remapped palette preserves resolved colors and every style attribute");
+    }
+    ok &= check(
+        frame.color_references->styles[0].foreground ==
+            vnm_terminal::k_terminal_canvas_color_default &&
+        frame.color_references->styles[1].foreground ==
+            vnm_terminal::k_terminal_canvas_color_default &&
+        frame.color_references->styles[1].background == 7U &&
+        frame.color_references->styles[2].foreground == 12U &&
+        frame.color_references->styles[2].background ==
+            vnm_terminal::k_terminal_canvas_color_rgba &&
+        snapshot->styles.size() == 400U && snapshot->cells[0].style_id == 375U,
+        "remapping preserves color-reference semantics without mutating the snapshot");
     return ok;
 }
 
@@ -694,11 +788,92 @@ bool test_row_images_export_with_publication()
     return ok;
 }
 
+bool test_historical_styles_do_not_prevent_small_visible_frame_export()
+{
+    bool                        ok = true;
+    VNM_TerminalSurface          surface;
+    term::Terminal_screen_model model({{2, 8}, 4, 4});
+
+    const auto overwrite_color = [
+            &model
+        ](
+            int index)
+        {
+            model.ingest(
+                QByteArrayLiteral("\r\x1b[38;2;") +
+                QByteArray::number(index / 256) + ';' +
+                QByteArray::number(index % 256) +
+                QByteArrayLiteral(";73mX"));
+        };
+    for (int index = 0; index < 255; ++index) {
+        overwrite_color(index);
+    }
+    model.ingest(QByteArrayLiteral("\r\x1b[0mOK"));
+
+    const auto export_model = [
+            &
+        ](
+            std::uint64_t sequence,
+            const char* phase)
+        {
+            auto snapshot = std::make_shared<term::Terminal_render_snapshot>(
+                model.render_snapshot(sequence));
+            const auto validation = term::validate_render_snapshot(*snapshot);
+            std::set<term::Terminal_style_id> visible_styles;
+            for (const auto& cell : snapshot->cells) {
+                visible_styles.insert(cell.style_id);
+            }
+            const auto stats = model.style_table_stats();
+            std::cout << "HISTORICAL_STYLE_REPRO phase=" << phase
+                      << " rows=" << snapshot->grid_size.rows
+                      << " columns=" << snapshot->grid_size.columns
+                      << " styles=" << snapshot->styles.size()
+                      << " visible_styles=" << visible_styles.size()
+                      << " compactions=" << stats.compaction_count
+                      << " source_valid="
+                      << (validation.status == term::Terminal_render_snapshot_status::OK)
+                      << '\n';
+            ok &= check(
+                validation.status == term::Terminal_render_snapshot_status::OK &&
+                visible_styles.size() == 1U && stats.compaction_count == 0U,
+                "normal parser output leaves a valid one-style visible frame without compaction");
+            const auto result = export_snapshot(surface, std::move(snapshot));
+            std::cout << "HISTORICAL_STYLE_REPRO phase=" << phase
+                      << " export_ok="
+                      << (result.status == vnm_terminal::Terminal_canvas_export_status::OK)
+                      << " style_limit="
+                      << (result.status == vnm_terminal::Terminal_canvas_export_status::STYLE_LIMIT_EXCEEDED)
+                      << " frame=" << (result.frame != nullptr) << '\n';
+            return result;
+        };
+
+    const auto before = export_model(1U, "before_limit");
+    ok &= check(
+        before.status == vnm_terminal::Terminal_canvas_export_status::OK,
+        "small visible frame exports before historical style count crosses the canvas limit");
+
+    overwrite_color(255);
+    model.ingest(QByteArrayLiteral("\r\x1b[0mOK"));
+    const auto after = export_model(2U, "after_limit");
+    ok &= check(
+        after.status == vnm_terminal::Terminal_canvas_export_status::OK && after.frame,
+        "unused historical styles must not prevent the unchanged small visible frame from exporting");
+
+    const auto idle = export_model(3U, "idle_repeat");
+    ok &= check(
+        idle.status == vnm_terminal::Terminal_canvas_export_status::OK && idle.frame,
+        "the same valid visible frame remains exportable without further terminal output");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     QGuiApplication application(argc, argv);
+    if (application.arguments().contains(QStringLiteral("--historical-style-repro"))) {
+        return test_historical_styles_do_not_prevent_small_visible_frame_export() ? 0 : 1;
+    }
     bool            ok = true;
     ok &= check(terminal_canvas_public_header_contract(),
         "public header compiles independently and publishes exact bounds");
@@ -708,6 +883,8 @@ int main(int argc, char** argv)
     ok &= test_frame_preserves_canvas_authority_and_prior_immutability();
     ok &= test_content_extent_uses_semantic_cells_cursor_and_viewport();
     ok &= test_exact_bounds_and_one_over_fail_closed();
+    ok &= test_sparse_style_ids_preserve_colors_and_attributes();
+    ok &= test_historical_styles_do_not_prevent_small_visible_frame_export();
     ok &= test_text_bounds_fail_closed_without_truncation();
     ok &= test_row_images_export_with_publication();
     return ok ? 0 : 1;
