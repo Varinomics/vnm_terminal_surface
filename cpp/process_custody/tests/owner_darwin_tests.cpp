@@ -846,7 +846,7 @@ bool exhausted_owner_receipts(const std::string& helper, const std::string& self
     return ok;
 }
 
-bool command_owner(const std::string& helper, bool fail_start,
+bool command_owner(const std::string& helper,
     custody::Owner_mode mode = custody::Owner_mode::COMMAND)
 {
     Run run;
@@ -855,7 +855,7 @@ bool command_owner(const std::string& helper, bool fail_start,
     }
     custody::Owner_start_request request;
     request.mode = mode;
-    request.process.executable = fail_start ? "/vnm-no-such-command" : "/bin/sh";
+    request.process.executable = "/bin/sh";
     request.process.argv = {"sh", "-c", "exit 23"};
     std::string error;
     if (!custody::send_owner_start(run.channel, request, &error)) {
@@ -887,12 +887,76 @@ bool command_owner(const std::string& helper, bool fail_start,
         if (event.kind == custody::Owner_event_kind::TREE_SETTLEMENT &&
             event.settlement == custody::Tree_settlement::CONFIRMED)
         {
-            const bool expect_rejection = fail_start || mode == custody::Owner_mode::PTY;
+            const bool expect_rejection = mode == custody::Owner_mode::PTY;
             return check(expect_rejection ? rejected && !started : started && exited,
                 "command birth/rejection, root status and scoped settlement are distinct");
         }
     }
     return check(false, "owner settlement deadline");
+}
+
+bool command_failed_birth(const std::string& helper)
+{
+    Run run;
+    if (!run.launch(helper)) {
+        return false;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::COMMAND;
+    request.process.executable = "/vnm-no-such-command";
+    request.process.argv = {request.process.executable};
+    std::string error;
+    if (!custody::send_owner_start(run.channel, request, &error)) {
+        return check(false, error.c_str());
+    }
+    std::int64_t root = 0;
+    bool exited = false;
+    bool rejected = false;
+    bool ok = true;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < deadline) {
+        custody::Owner_event event;
+        const auto status = custody::receive_owner_event(run.channel, &event, 100, &error);
+        if (status == custody::Receive_status::TIMEOUT) {
+            continue;
+        }
+        if (!check(status == custody::Receive_status::MESSAGE, error.c_str())) {
+            return false;
+        }
+        custody::close_native_handle(event.root_reference);
+        custody::close_native_handle(event.pty_master);
+        std::printf("failed command: kind=%d pid=%lld birth=%llu exit=%d settlement=%d\n",
+            static_cast<int>(event.kind), static_cast<long long>(event.root_exit.process_id),
+            static_cast<unsigned long long>(event.root_birth_token), event.root_exit.exit_code,
+            static_cast<int>(event.settlement));
+        ok &= check(event.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS,
+            "failed command receipts retain their Darwin cleanup scope");
+        if (event.kind == custody::Owner_event_kind::STARTED) {
+            ok &= check(root == 0 && event.root_exit.process_id > 1 && event.root_birth_token != 0 &&
+                    event.pty_master == custody::k_invalid_handle,
+                "failed admitted command publishes its original native birth without PTY readiness");
+            root = event.root_exit.process_id;
+        }
+        if (event.kind == custody::Owner_event_kind::ROOT_EXITED) {
+            ok &= check(root > 1 && !exited && event.root_exit.process_id == root &&
+                    event.root_exit.exit_code == 127 && event.root_exit.signal == 0,
+                "failed command exit retains the original child's collected exec-failure status");
+            exited = true;
+        }
+        if (event.kind == custody::Owner_event_kind::START_REJECTED) {
+            ok &= check(root > 1 && exited && !rejected,
+                "failed admitted command is rejected only after its original child exit receipt");
+            rejected = true;
+        }
+        if (event.kind == custody::Owner_event_kind::TREE_SETTLEMENT &&
+            event.settlement != custody::Tree_settlement::PENDING)
+        {
+            ok &= check(root > 1 && exited && rejected && event.settlement == custody::Tree_settlement::CONFIRMED,
+                "command settlement accounts for the admitted failed birth and exact exit");
+            return ok;
+        }
+    }
+    return check(false, "failed command settlement deadline");
 }
 
 bool stop_or_lose_owner(const std::string& helper, const std::string& self, const std::string& mode)
@@ -1119,6 +1183,10 @@ int fixture(const std::string& mode)
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string(argv[1]) == "--command-failed-birth") {
+        std::string error;
+        return custody::prepare_parent_process(&error) && command_failed_birth(argv[2]) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--fixture") {
         return fixture(argv[2]);
     }
@@ -1159,9 +1227,9 @@ int main(int argc, char** argv)
     ok &= exhausted_group_is_terminal(argv[0], Held_cleanup::NORMAL_EXIT);
     ok &= exhausted_owner_receipts(argv[1], argv[0], false);
     ok &= exhausted_owner_receipts(argv[1], argv[0], true);
-    ok &= command_owner(argv[1], false);
-    ok &= command_owner(argv[1], true);
-    ok &= command_owner(argv[1], false, custody::Owner_mode::PTY);
+    ok &= command_owner(argv[1]);
+    ok &= command_failed_birth(argv[1]);
+    ok &= command_owner(argv[1], custody::Owner_mode::PTY);
     ok &= stop_or_lose_owner(argv[1], argv[0], "stop");
     ok &= stop_or_lose_owner(argv[1], argv[0], "close");
     ok &= stop_or_lose_owner(argv[1], argv[0], "loss");

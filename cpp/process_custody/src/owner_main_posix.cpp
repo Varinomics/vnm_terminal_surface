@@ -130,10 +130,11 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
     bool failed_admitted_birth = false;
     if (!root.ok) {
 #if defined(__APPLE__)
-        if (darwin_pty_contract && !root.no_workload_admitted && root.failed_birth) {
+        if (!root.no_workload_admitted && root.failed_birth) {
             // STARTED below supplies identity evidence only: no master is
-            // transferred, so it cannot satisfy PTY readiness. The exact
-            // ROOT_EXITED receipt precedes START_REJECTED and final settlement.
+            // transferred and successful exec is not established. Every Darwin
+            // mode retains the exact ROOT_EXITED receipt before START_REJECTED
+            // and final settlement, including a wait already collected by spawn.
             tree.record_failed_root(*root.failed_birth);
             root.process_id = root.failed_birth->process_id;
             root.process_birth_token = root.failed_birth->birth_token;

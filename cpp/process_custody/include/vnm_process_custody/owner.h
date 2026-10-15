@@ -53,6 +53,9 @@ struct Owner_event
     Owner_event_kind kind = Owner_event_kind::START_REJECTED;
     Exit_status root_exit;
     Tree_settlement settlement = Tree_settlement::PENDING;
+    // Darwin STARTED records native birth, not successful exec. An admitted
+    // failed birth retains its ROOT_EXITED receipt before START_REJECTED and
+    // final settlement, including when spawn already collected the exact wait.
     // STARTED: receiver owns an observation pidfd (Linux) or a locally created
     // kqueue (Darwin). A command already gone may have no Darwin observer.
     // Neither reference transfers the helper's exclusive wait authority.

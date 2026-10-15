@@ -67,7 +67,13 @@ not transfer kqueues through `SCM_RIGHTS`, a STARTED receipt carries the origina
 public `PROC_PIDTBSDINFO` birth identity in microseconds. The receiver checks that
 identity before and after registering its own `NOTE_EXIT` observer. An already
 exited workload may have no receiver observer while its birth and root-exit
-receipts remain valid. Never consume the kqueue event: `poll(POLLIN)` remains
+receipts remain valid. STARTED establishes native birth, not successful exec.
+An admitted command or PTY birth that fails before exec still supplies its exact
+ROOT_EXITED receipt before START_REJECTED and final settlement. A failure before
+birth, or a positively reaped child whose execution was never admitted, needs
+no native birth/exit receipts.
+
+Never consume the kqueue event: `poll(POLLIN)` remains
 latched after the original occurrence dies. A consumer that verifies live
 executable identity must check that observer before and after verification.
 Neither a birth token nor a local observer authorizes a numeric signal.

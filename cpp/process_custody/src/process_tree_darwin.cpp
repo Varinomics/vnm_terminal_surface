@@ -431,6 +431,9 @@ Reap_outcome Process_tree_owner::terminate_and_reap(
 {
     Reap_outcome outcome;
     outcome.cleanup_scope = k_scope;
+    // A failed spawn may have collected the exact root wait already. Deliver
+    // its queued receipt even when no child remains for the cleanup loop.
+    outcome.exits = reap_available();
     if (m_impl->terminal_unconfirmed) {
         outcome.terminal_unconfirmed = true;
         outcome.remaining_children.push_back(m_impl->root);
