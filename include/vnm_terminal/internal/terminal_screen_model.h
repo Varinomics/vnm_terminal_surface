@@ -1251,10 +1251,8 @@ private:
     void put_text(
         QString                        text);
 
-    void put_printable_ascii_text(
-        QStringView                    text);
-
-    void put_single_width_bmp_text(
+    template<bool ascii>
+    void put_single_width_text(
         QStringView                    text);
 
     void write_printable_ascii_span(

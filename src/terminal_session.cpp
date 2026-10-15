@@ -7,6 +7,7 @@
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include <QKeyEvent>
+#include <QScopedValueRollback>
 #include <QString>
 #include <QtGlobal>
 #include <algorithm>
@@ -137,30 +138,6 @@ bool model_allows_render_snapshot(const Terminal_screen_model& model)
 {
     return !model.mode_state().synchronized_output && !model.sixel_placement_started();
 }
-
-// Lends a drain step's work budget to the session for the step, and takes it
-// back however the step ends.
-template <typename Budget>
-class Step_budget_scope final
-{
-public:
-    Step_budget_scope(Budget*& slot, Budget* budget)
-    :
-        m_slot(slot),
-        m_previous(slot)
-    {
-        m_slot = budget;
-    }
-
-    ~Step_budget_scope() { m_slot = m_previous; }
-
-    Step_budget_scope(const Step_budget_scope&)            = delete;
-    Step_budget_scope& operator=(const Step_budget_scope&) = delete;
-
-private:
-    Budget*& m_slot;
-    Budget*  m_previous;
-};
 
 bool render_snapshot_can_advance_latest_content_snapshot(
     const Terminal_render_snapshot& snapshot)
@@ -4888,10 +4865,10 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             }
             std::size_t macro_replay_bytes_remaining =
                 static_cast<std::size_t>(k_backend_output_drain_slice_bytes);
-            const Step_budget_scope<Sixel_work_budget> sixel_budget_scope(
+            const QScopedValueRollback sixel_budget_scope(
                 m_sixel_work_budget,
                 step_budget.has_value() ? &*step_budget : nullptr);
-            const Step_budget_scope<std::size_t> macro_budget_scope(
+            const QScopedValueRollback macro_budget_scope(
                 m_macro_replay_bytes_remaining,
                 deadline.has_value() ? &macro_replay_bytes_remaining : nullptr);
             run_operation_step(deadline.has_value());

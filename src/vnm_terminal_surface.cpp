@@ -45,6 +45,7 @@
 #include <QThreadPool>
 #include <QQuickWindow>
 #include <QScreen>
+#include <QScopedValueRollback>
 #include <QStringDecoder>
 #include <QStringList>
 #include <QThread>
@@ -1506,33 +1507,6 @@ surface_text_area_resize_arbitration_outcome(
 
     return Surface_outcome::REJECTED;
 }
-
-// Marks the notification delivery loop that owns the current batch. Lowering the
-// latch from the destructor matters: the loop returns early whenever the active
-// session changes under it, and a latch left raised would silence every later
-// notification.
-class Session_notification_delivery_scope
-{
-public:
-    explicit Session_notification_delivery_scope(bool& delivering)
-    :
-        m_delivering(delivering)
-    {
-        m_delivering = true;
-    }
-
-    Session_notification_delivery_scope(const Session_notification_delivery_scope&) = delete;
-    Session_notification_delivery_scope& operator=(
-        const Session_notification_delivery_scope&) = delete;
-
-    ~Session_notification_delivery_scope()
-    {
-        m_delivering = false;
-    }
-
-private:
-    bool& m_delivering;
-};
 
 QString surface_synchronized_output_scroll_policy_name(
     VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
@@ -8879,8 +8853,7 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         // CSI 8 t sequences answered inline turned into a stack overflow after a
         // few hundred of them. The latch makes the nested delivery a no-op and
         // this loop drains what it queued, in order and without recursing.
-        Session_notification_delivery_scope delivering(
-            m_private->delivering_session_notifications);
+        const QScopedValueRollback delivering(m_private->delivering_session_notifications, true);
         for (;;) {
             const std::vector<term::Terminal_session_delivery> deliveries =
                 session->take_pending_deliveries();

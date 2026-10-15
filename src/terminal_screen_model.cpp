@@ -13,6 +13,7 @@
 #include <QChar>
 #include <QDateTime>
 #include <QImage>
+#include <QScopedValueRollback>
 #include <QSize>
 #include <QStringList>
 #include <algorithm>
@@ -996,7 +997,7 @@ void Terminal_screen_model::apply_action(
                         ++m_profile_stats.print_text_calls;
                     }
 #endif
-                    put_printable_ascii_text(QStringView(mutation.text));
+                    put_single_width_text<true>(QStringView(mutation.text));
                 }
                 else {
                     put_text(mutation.text);
@@ -5245,7 +5246,7 @@ void Terminal_screen_model::put_text(QString text)
             ++i;
         }
         if (i > ascii_begin) {
-            put_printable_ascii_text(QStringView(text).sliced(ascii_begin, i - ascii_begin));
+            put_single_width_text<true>(QStringView(text).sliced(ascii_begin, i - ascii_begin));
             continue;
         }
 
@@ -5254,7 +5255,7 @@ void Terminal_screen_model::put_text(QString text)
             ++i;
         }
         if (i > single_width_bmp_begin) {
-            put_single_width_bmp_text(
+            put_single_width_text<false>(
                 QStringView(text).sliced(single_width_bmp_begin, i - single_width_bmp_begin));
             continue;
         }
@@ -5274,21 +5275,12 @@ void Terminal_screen_model::put_text(QString text)
     }
 }
 
-void Terminal_screen_model::put_printable_ascii_text(QStringView text)
+template<bool ascii>
+void Terminal_screen_model::put_single_width_text(QStringView text)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
-    struct profile_depth_guard_t
-    {
-        int& depth;
-
-        ~profile_depth_guard_t()
-        {
-            --depth;
-        }
-    };
-
-    ++m_text_span_profile_depth;
-    const profile_depth_guard_t profile_depth_guard{m_text_span_profile_depth};
+    const QScopedValueRollback profile_depth(
+        m_text_span_profile_depth, m_text_span_profile_depth + 1);
 #endif
     qsizetype offset = 0;
     while (offset < text.size()) {
@@ -5321,29 +5313,32 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                 right_margin + 1);
             bool selection_content_changed = false;
             if (available_columns > 1) {
-                selection_content_changed =
-                    printable_ascii_span_changes_selection_content(
-                        screen_row,
-                        m_cursor.column,
-                        text.sliced(offset, available_columns - 1));
-                write_printable_ascii_span_content(
-                    screen_row,
-                    m_cursor.column,
-                    text.sliced(offset, available_columns - 1));
+                const auto span = text.sliced(offset, available_columns - 1);
+                if constexpr (ascii) {
+                    selection_content_changed = printable_ascii_span_changes_selection_content(
+                        screen_row, m_cursor.column, span);
+                    write_printable_ascii_span_content(screen_row, m_cursor.column, span);
+                }
+                else {
+                    selection_content_changed = single_width_bmp_span_changes_selection_content(
+                        screen_row, m_cursor.column, span);
+                    write_single_width_bmp_span_content(screen_row, m_cursor.column, span);
+                }
             }
             else {
                 mark_terminal_content_changed();
             }
-            selection_content_changed =
-                selection_content_changed ||
-                printable_ascii_cell_changes_selection_content(
-                    screen_row,
-                    right_margin,
-                    text[text.size() - 1]);
-            write_printable_ascii_cell_content(
-                screen_row,
-                right_margin,
-                text[text.size() - 1]);
+            const QChar margin_character = text.back();
+            if constexpr (ascii) {
+                selection_content_changed = selection_content_changed ||
+                    printable_ascii_cell_changes_selection_content(screen_row, right_margin, margin_character);
+                write_printable_ascii_cell_content(screen_row, right_margin, margin_character);
+            }
+            else {
+                selection_content_changed = selection_content_changed ||
+                    single_width_bmp_cell_changes_selection_content(screen_row, right_margin, margin_character);
+                write_single_width_bmp_cell_content(screen_row, right_margin, QString(margin_character));
+            }
             advance_row_content_generation_with_change_flag(
                 screen_row,
                 selection_content_changed);
@@ -5357,111 +5352,13 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
             remaining,
             available_columns));
         mark_cursor_dirty();
-        write_printable_ascii_span(
-            m_cursor.row,
-            m_cursor.column,
-            text.sliced(offset, span_length));
-        if (span_length >= available_columns) {
-            m_cursor.column = right_margin;
-            m_pending_wrap = m_modes.autowrap;
+        const auto span = text.sliced(offset, span_length);
+        if constexpr (ascii) {
+            write_printable_ascii_span(m_cursor.row, m_cursor.column, span);
         }
         else {
-            m_cursor.column += span_length;
-            m_pending_wrap = false;
+            write_single_width_bmp_span(m_cursor.row, m_cursor.column, span);
         }
-        mark_cursor_dirty();
-        offset += span_length;
-    }
-}
-
-void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
-{
-#if VNM_TERMINAL_PROFILING_ENABLED
-    struct profile_depth_guard_t
-    {
-        int& depth;
-
-        ~profile_depth_guard_t()
-        {
-            --depth;
-        }
-    };
-
-    ++m_text_span_profile_depth;
-    const profile_depth_guard_t profile_depth_guard{m_text_span_profile_depth};
-#endif
-    qsizetype offset = 0;
-    while (offset < text.size()) {
-        if (m_modes.autowrap && m_pending_wrap) {
-#if VNM_TERMINAL_PROFILING_ENABLED
-            if (m_profile_stats.enabled) {
-                ++m_profile_stats.line_wraps_from_text_writes;
-            }
-#endif
-            wrap_line();
-            m_pending_wrap = false;
-        }
-
-        const int right_margin = cursor_right_margin();
-        const int available_columns = right_margin + 1 - m_cursor.column;
-        if (available_columns <= 0) {
-            return;
-        }
-
-        const qsizetype remaining = text.size() - offset;
-        if (!m_modes.autowrap && remaining > available_columns) {
-            mark_cursor_dirty();
-            Terminal_screen_row& screen_row =
-                active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
-            // The touched cells run from the cursor to the margin: clear their
-            // image before any cell changes.
-            screen_row.image_slice = image_slice_without_cells(
-                screen_row,
-                m_cursor.column,
-                right_margin + 1);
-            bool selection_content_changed = false;
-            if (available_columns > 1) {
-                selection_content_changed =
-                    single_width_bmp_span_changes_selection_content(
-                        screen_row,
-                        m_cursor.column,
-                        text.sliced(offset, available_columns - 1));
-                write_single_width_bmp_span_content(
-                    screen_row,
-                    m_cursor.column,
-                    text.sliced(offset, available_columns - 1));
-            }
-            else {
-                mark_terminal_content_changed();
-            }
-            selection_content_changed =
-                selection_content_changed ||
-                single_width_bmp_cell_changes_selection_content(
-                    screen_row,
-                    right_margin,
-                    text[text.size() - 1]);
-            const QString margin_text(text[text.size() - 1]);
-            write_single_width_bmp_cell_content(
-                screen_row,
-                right_margin,
-                margin_text);
-            advance_row_content_generation_with_change_flag(
-                screen_row,
-                selection_content_changed);
-            m_cursor.column = right_margin;
-            m_pending_wrap = false;
-            mark_cursor_dirty();
-            return;
-        }
-
-        const int span_length = static_cast<int>(std::min<qsizetype>(
-            remaining,
-            available_columns));
-        mark_cursor_dirty();
-        write_single_width_bmp_span(
-            m_cursor.row,
-            m_cursor.column,
-            text.sliced(offset, span_length));
         if (span_length >= available_columns) {
             m_cursor.column = right_margin;
             m_pending_wrap = m_modes.autowrap;
