@@ -5026,6 +5026,26 @@ bool test_future_queued_interrupt_does_not_keep_cleared_exit_130_observation(
     const auto exited_state = backend->write_state_for_testing();
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    // ConPTY can drain the ordinary write after it was observed in flight.
+    // The future interrupt is the fourth write; use writer progress rather
+    // than the exit-classification flag to distinguish that lost premise.
+    const bool future_interrupt_started =
+        exited_state.successful_write_count + exited_state.failed_write_count >= 4U ||
+        exited_state.in_flight_write_bytes == 1U;
+    if (future_interrupt_started) {
+        std::cerr
+            << "note: the future interrupt reached the writer, so "
+               "this run does not isolate an undelivered interrupt and its "
+               "natural-exit classification is not asserted\n";
+        ok &= check(exit.has_value() && exit->exit_code == 130 &&
+            (exit->reason == term::Terminal_exit_reason::EXITED ||
+             exit->reason == term::Terminal_exit_reason::INTERRUPTED),
+            "future interrupt that reached the writer preserves code-130 exit");
+        ok &= check_no_backend_errors(capture,
+            "future-interrupt fixture produces no backend errors");
+        return ok;
+    }
+
     const bool natural_exit = exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::EXITED &&
         exit->exit_code == 130;
