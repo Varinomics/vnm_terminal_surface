@@ -5,6 +5,12 @@ on:
     branches: [ master, main, dev ]
   pull_request:
     branches: [ master, main, dev ]
+  workflow_dispatch:
+    inputs:
+      focused_units:
+        description: 'Run only screen, Unicode width, backend session and surface host units'
+        type: boolean
+        default: false
 
 defaults:
   run:
@@ -32,35 +38,53 @@ jobs:
 
       - name: Configure CMake
         run: |
-          cmake -B build -S . \
+          cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
             -DVNM_TERMINAL_BUILD_BENCHMARKS=OFF \
             -DVNM_TERMINAL_ENABLE_PROFILING=OFF \
             -DBUILD_TESTING=ON
 
       - name: Build
-        run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel
+        run: |
+          targets=()
+          if [[ "${{ inputs.focused_units }}" == "true" ]]; then
+            targets=(--target
+              vnm_terminal_screen_basic
+              vnm_terminal_screen_operations
+              vnm_terminal_unicode_width
+              vnm_terminal_backend_session
+              vnm_terminal_surface_host)
+          fi
+          cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel 2 "${targets[@]}"
 
       - name: Run tests
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --output-on-failure
+        run: |
+          tests=()
+          if [[ "${{ inputs.focused_units }}" == "true" ]]; then
+            tests=(-R '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session|surface_host)$')
+          fi
+          ctest --output-on-failure --parallel 1 --no-tests=error "${tests[@]}"
 
       # The package fixture builds a real LCD-only provider and a separate
       # atlas-disabled surface against it. Reuse that producer for distribution;
       # the main source-atlas build remains a development configuration.
       - name: Install package
+        if: ${{ !inputs.focused_units }}
         run: |
           cmake --install build/package_smoke/source_package/surface-build \
             --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
 
       - name: Configure package smoke
+        if: ${{ !inputs.focused_units }}
         run: |
-          cmake -B package-smoke -S tests/package_smoke \
+          cmake -B package-smoke -S tests/package_smoke -G Ninja \
             -C build/package_smoke/source_package/dependencies.cmake \
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
             -DCMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/install"
 
       - name: Build package smoke
-        run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel
+        if: ${{ !inputs.focused_units }}
+        run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel 2
