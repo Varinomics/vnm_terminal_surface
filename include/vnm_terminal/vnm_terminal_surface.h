@@ -3,6 +3,7 @@
 #include "vnm_terminal/backend_output_capture.h"
 #include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/terminal_message_submission.h"
+#include "vnm_terminal/terminal_native_receipt.h"
 #include "vnm_terminal/terminal_touch_selection.h"
 
 #include <QQuickItem>
@@ -40,6 +41,7 @@ struct Terminal_process_start_request
     // The tail is passed verbatim, without argv escaping. Embedded NUL and use
     // on other platforms are rejected; absence preserves ordinary argv handling.
     std::optional<QString> windows_native_arguments = std::nullopt;
+    Terminal_native_receipt_hook native_receipt_hook;
 };
 
 enum class Terminal_process_start_determinacy

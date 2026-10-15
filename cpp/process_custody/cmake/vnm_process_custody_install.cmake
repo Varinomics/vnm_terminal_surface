@@ -23,7 +23,7 @@ function(vnm_process_custody_install_package)
         ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT vnm_process_custody
         LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT vnm_process_custody
         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT vnm_process_custody)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         install(TARGETS vnm_process_custody_owner
             EXPORT vnm_process_custody_targets
             RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
@@ -57,7 +57,7 @@ function(vnm_process_custody_register_source_package)
     if(provider_imported)
         return()
     endif()
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$" AND
        NOT TARGET vnm_process_custody::vnm_process_custody_owner)
         add_executable(vnm_process_custody::vnm_process_custody_owner ALIAS vnm_process_custody_owner)
     endif()

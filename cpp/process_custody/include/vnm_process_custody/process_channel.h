@@ -3,6 +3,7 @@
 #include <vnm_process_custody/process_pipe.h>
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -23,7 +24,7 @@ struct Receive_result
 {
     Receive_status             status = Receive_status::FAILED;
     std::size_t                size   = 0;   // payload bytes in the caller's buffer
-    std::vector<Native_handle> descriptors;  // handles that travelled with the message (Linux only); the caller owns them
+    std::vector<Native_handle> descriptors;  // transferred POSIX descriptors; the caller owns them
     int                        error  = 0;
 };
 
@@ -35,6 +36,12 @@ struct Receive_result
 /// verifiable), Windows as one write on a named pipe. Descriptors travel with
 /// a message as SCM_RIGHTS on Linux; Windows transfers none, and
 /// transfers_descriptors() lets a caller branch without a platform test.
+/// Darwin frames a Unix stream and preserves partial receives across timeouts;
+/// malformed/oversized records close that stream because it has no packet boundary.
+/// On Darwin, one sender and the sole receiver may run concurrently. Retirement
+/// wakes both directions and retains their descriptor and receive staging until
+/// active calls return. Move and destruction require those calls to have ended;
+/// a native() result is borrowed and must not outlive concurrent retirement.
 class Duplex_channel
 {
 public:
@@ -80,9 +87,27 @@ public:
         const std::vector<Native_handle>& in_descriptors,
         int*                              out_error = nullptr);
 
+#if defined(__APPLE__)
+    /// Sends EOF while keeping the receiving direction open. Retains the native
+    /// descriptor across concurrent retirement; an already retired channel is done.
+    bool shutdown_send(int* out_error = nullptr);
+
+    /// Stream framing cannot retry a partially sent record from its beginning.
+    /// One call owns all partial writes; failure closes a partially used stream.
+    /// A finite deadline requires O_NONBLOCK already set on the descriptor.
+    /// Otherwise returns FAILED/EINVAL (or the F_GETFL error) before writing,
+    /// preserving the channel and its mode. A maximum deadline may block.
+    Io_status send_descriptors_until(
+        const std::uint8_t* in_payload, std::size_t in_size,
+        const std::vector<Native_handle>& in_descriptors,
+        std::chrono::steady_clock::time_point in_deadline, int* out_error = nullptr);
+#endif
+
     /// Waits up to timeout_ms (-1: no timeout) for one message; in_capacity
     /// must be at least max_message_bytes() so a message the peer was allowed
-    /// to send always fits.
+    /// to send always fits. The channel exclusively owns receives: calls must
+    /// be serialized, with no reads through native() or another descriptor alias.
+    /// Darwin validates queued ancillary data before consuming the inspected bytes.
     Receive_result receive(std::uint8_t* out_buffer, std::size_t in_capacity, int in_timeout_ms);
 
 private:

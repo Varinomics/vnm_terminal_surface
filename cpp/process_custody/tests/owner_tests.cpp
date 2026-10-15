@@ -1,5 +1,7 @@
 #include <vnm_process_custody/owner.h>
 
+#include "../src/owner_protocol.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +20,53 @@ bool check(bool condition, const char* message)
 {
     if (!condition) std::fprintf(stderr, "FAIL: %s\n", message);
     return condition;
+}
+
+bool started_descriptor_contract()
+{
+    custody::Duplex_channel sender, receiver;
+    std::string error;
+    if (!check(custody::Duplex_channel::create_pair(
+            custody::k_owner_message_bytes, &sender, &receiver, &error),
+        "STARTED descriptor fixture opens a native control channel"))
+    {
+        return false;
+    }
+    custody::Owner_event started;
+    started.kind = custody::Owner_event_kind::STARTED;
+    started.root_exit.process_id = getpid();
+    if (!check(custody::detail::send_event(sender, started, &error),
+        "STARTED without a descriptor reaches the receiver"))
+    {
+        return false;
+    }
+    custody::Owner_event received;
+    bool ok = check(custody::receive_owner_event(receiver, &received, 1000, &error) ==
+            custody::Receive_status::FAILED,
+        "Linux STARTED without its process reference is a protocol failure");
+    custody::close_native_handle(received.root_reference);
+    custody::close_native_handle(received.pty_master);
+
+    started.root_reference = custody::posix_pidfd_open(getpid());
+    if (!check(started.root_reference >= 0, "valid STARTED fixture retains its own process reference")) {
+        return false;
+    }
+    const bool sent = custody::detail::send_event(sender, started, &error);
+    custody::close_native_handle(started.root_reference);
+    if (!check(sent, "valid STARTED transfers its process reference")) {
+        return false;
+    }
+    received = {};
+    ok &= check(custody::receive_owner_event(receiver, &received, 1000, &error) ==
+            custody::Receive_status::MESSAGE && received.kind == custody::Owner_event_kind::STARTED &&
+            received.root_exit.process_id == getpid() && received.root_reference >= 0,
+        "Linux STARTED with its process reference remains valid");
+    ok &= check(received.root_reference >= 0 &&
+            custody::posix_pidfd_send_signal(received.root_reference, 0) == 0,
+        "received process reference names the live fixture occurrence");
+    custody::close_native_handle(received.root_reference);
+    custody::close_native_handle(received.pty_master);
+    return ok;
 }
 
 struct Run
@@ -268,11 +317,15 @@ int fixture(const std::string& mode)
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string(argv[1]) == "--started-descriptor") {
+        return started_descriptor_contract() ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--fixture") return fixture(argv[2]);
     if (argc != 2) return 2;
     std::string error;
     if (!custody::prepare_parent_process(&error)) return 2;
-    bool ok = abort_before_execution();
+    bool ok = started_descriptor_contract();
+    ok &= abort_before_execution();
     ok &= large_bounded_start(argv[1]);
     for (auto mode : {custody::Owner_mode::COMMAND, custody::Owner_mode::PTY}) {
         const bool passed = vacant_standard_slots(argv[1], mode);

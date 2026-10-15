@@ -2406,6 +2406,60 @@ if(WIN32)
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    add_executable(vnm_terminal_posix_pty_foreground_interrupt
+        posix_pty_backend/foreground_interrupt_tests.cpp
+    )
+    target_link_libraries(vnm_terminal_posix_pty_foreground_interrupt PRIVATE
+        vnm_terminal_surface::vnm_terminal_surface
+    )
+    if(APPLE)
+        target_link_libraries(vnm_terminal_posix_pty_foreground_interrupt PRIVATE
+            vnm_process_custody::vnm_process_custody)
+    endif()
+    set_target_properties(vnm_terminal_posix_pty_foreground_interrupt PROPERTIES
+        AUTOMOC OFF
+    )
+    add_test(
+        NAME vnm_terminal_posix_pty_foreground_interrupt
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_posix_pty_foreground_interrupt>"
+    )
+    set_tests_properties(vnm_terminal_posix_pty_foreground_interrupt PROPERTIES
+        LABELS "conformance;posix;pty"
+        TIMEOUT 20
+    )
+
+    if(APPLE)
+        add_executable(vnm_terminal_posix_pty_native_receipts
+            posix_pty_backend/native_receipt_tests.cpp)
+        target_link_libraries(vnm_terminal_posix_pty_native_receipts PRIVATE
+            vnm_terminal_surface::vnm_terminal_surface
+            vnm_process_custody::vnm_process_custody)
+        set_target_properties(vnm_terminal_posix_pty_native_receipts PROPERTIES AUTOMOC OFF)
+        add_test(NAME vnm_terminal_posix_pty_native_receipts
+            COMMAND "$<TARGET_FILE:vnm_terminal_posix_pty_native_receipts>")
+        set_tests_properties(vnm_terminal_posix_pty_native_receipts PROPERTIES
+            LABELS "conformance;macos;pty;custody" TIMEOUT 30)
+
+        add_executable(vnm_terminal_posix_pty_shell_jobs_close
+            posix_pty_backend/shell_jobs_close_tests.cpp
+        )
+        target_link_libraries(vnm_terminal_posix_pty_shell_jobs_close PRIVATE
+            vnm_terminal_surface::vnm_terminal_surface
+            vnm_process_custody::vnm_process_custody
+        )
+        set_target_properties(vnm_terminal_posix_pty_shell_jobs_close PROPERTIES AUTOMOC OFF)
+        add_test(NAME vnm_terminal_posix_pty_shell_jobs_close
+            COMMAND "$<TARGET_FILE:vnm_terminal_posix_pty_shell_jobs_close>"
+        )
+        set_tests_properties(vnm_terminal_posix_pty_shell_jobs_close PROPERTIES
+            LABELS "conformance;macos;pty"
+            TIMEOUT 30
+        )
+    endif()
+
     add_executable(vnm_terminal_posix_pty_backend
         posix_pty_backend/posix_pty_backend_tests.cpp
     )
@@ -2417,6 +2471,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_link_libraries(vnm_terminal_posix_pty_backend PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
     )
+    if(APPLE)
+        target_link_libraries(vnm_terminal_posix_pty_backend PRIVATE
+            vnm_process_custody::vnm_process_custody)
+    endif()
 
     set_target_properties(vnm_terminal_posix_pty_backend PROPERTIES
         AUTOMOC OFF
@@ -2517,6 +2575,14 @@ endif()
 if(TARGET vnm_terminal_posix_pty_backend)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_posix_pty_backend
+        vnm_terminal_posix_pty_foreground_interrupt
+    )
+endif()
+
+if(TARGET vnm_terminal_posix_pty_shell_jobs_close)
+    list(APPEND vnm_terminal_test_process_targets
+        vnm_terminal_posix_pty_shell_jobs_close
+        vnm_terminal_posix_pty_native_receipts
     )
 endif()
 
@@ -2612,7 +2678,7 @@ if(vnm_terminal_surface_process_custody_required)
 endif()
 if(vnm_terminal_custody_imported)
     set(vnm_terminal_custody_package_dir "${vnm_process_custody_DIR}")
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         set(vnm_terminal_custody_imported_owner
             "$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>")
     endif()
@@ -2704,7 +2770,7 @@ set_tests_properties(
 
 foreach(vnm_terminal_test_process_target IN LISTS vnm_terminal_test_process_targets)
     vnm_terminal_configure_test_process(${vnm_terminal_test_process_target})
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         vnm_process_custody_deploy_owner(${vnm_terminal_test_process_target})
     endif()
 endforeach()

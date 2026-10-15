@@ -11,6 +11,13 @@
 
 namespace vnm::process_custody {
 
+enum class Cleanup_scope : std::uint32_t
+{
+    UNSPECIFIED,
+    TRANSITIVE_TREE,
+    OWNED_PROCESS_GROUPS,
+};
+
 #if defined(_WIN32) && defined(LOGONOMIC_ENABLE_PROCESS_TREE_TEST_HOOKS)
 enum class Process_exit_observation_for_test
 {
@@ -42,23 +49,30 @@ struct Exit_status
 /// original process handles are safely duplicated to the desktop. Handles
 /// are owned by whoever produced the struct: the owner for coordinates(), the
 /// receiving channel for a desktop that got them over the control channel.
+/// Darwin coordinates are diagnostic only: the original sole wait owner is
+/// the signal authority and cannot be replaced after its loss.
 struct Kill_coordinates
 {
+    Cleanup_scope             cleanup_scope = Cleanup_scope::UNSPECIFIED;
     std::int64_t               process_group = 0;
     std::vector<std::int64_t>  process_ids;       // in recording order: supervisor, adapter
     std::vector<Native_handle> process_handles;   // Linux pidfds / Windows process handles, same order
 };
 
 /// What a teardown left behind. escalated_to_kill records that the kill
-/// signal was sent - after the grace passed, or at once for a zero grace;
-/// exits holds every status reaped during the teardown, in reap order;
+/// phase was attempted - after the grace passed, or at once for a zero grace;
+/// exits holds every status observed during the teardown (Darwin retains
+/// the root zombie until its group settles or bounded cleanup is exhausted);
 /// remaining_children names children whose cleanup remains unconfirmed
 /// (Linux: a tree process still alive after the kill phase; Windows: an
-/// uncollected recorded process).
+/// uncollected recorded process; Darwin: the diagnostic original root ID,
+/// even when its wait was collected without proving group settlement).
 struct Reap_outcome
 {
-    bool                      complete          = false;   // nothing of the tree is left
-    bool                      escalated_to_kill = false;
+    Cleanup_scope             cleanup_scope        = Cleanup_scope::UNSPECIFIED;
+    bool                      complete             = false; // settled within cleanup_scope only
+    bool                      terminal_unconfirmed = false; // authority retired without scoped settlement
+    bool                      escalated_to_kill     = false;
     std::vector<Exit_status>  exits;
     std::vector<std::int64_t> remaining_children;
     std::chrono::milliseconds elapsed{0};
@@ -71,6 +85,7 @@ struct Reap_outcome
 /// outer generation Job, leaving the custodian's inner kill-on-close Job intact.
 /// Failed observations never establish emptiness. The caller retains this object
 /// and continues bounded attempts until native settlement, even after timeout.
+/// Darwin has no independent containment and reports it unavailable.
 class Process_tree_containment
 {
 public:
@@ -95,6 +110,9 @@ private:
 /// supervisor) is spawned into its own session and process group, and this
 /// object is the only place that calls waitid() for that tree. Windows: this
 /// object owns the kill-on-close Job the root is created into.
+/// Darwin retains the direct root and its original process group for COMMAND,
+/// or the controlling PTY session for PTY. Both report OWNED_PROCESS_GROUPS,
+/// never transitive detached-descendant cleanup.
 class Process_tree_owner
 {
 public:
@@ -112,6 +130,17 @@ public:
     /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
     /// and no breakaway.
     bool establish(std::string* out_error);
+
+#if defined(__APPLE__)
+    /// The persistent helper retains both descriptors until cleanup ends.
+    /// Establishes its controlling session before the single root admission;
+    /// the root receives a separate foreground group in that same session.
+    bool establish_pty(Native_handle master, Native_handle slave, std::string* out_error);
+
+    /// Takes the failed spawn's remaining observer/wait obligation, or its
+    /// exact already-collected receipt. Failure never means no workload.
+    void record_failed_root(const Darwin_spawn_failure& failure);
+#endif
 
     /// Makes a spawn request produce the tree's root: Linux sets new_session,
     /// Windows assigns the Job.
@@ -141,7 +170,9 @@ public:
     /// exited: Linux the SIGCHLD signalfd, Windows the recorded process handles.
     std::vector<Native_handle> exit_wait_handles() const;
 
-    /// Sole wait owner: collects every status available without blocking.
+    /// Sole wait owner: reports available statuses without blocking. Darwin
+    /// retains the reported root zombie until terminate_and_reap settles its
+    /// original group or retires exhausted cleanup; callers must not reap it.
     std::vector<Exit_status> reap_available();
 
     /// Linux: whether any child (including a reparented orphan) still exists;
@@ -150,13 +181,18 @@ public:
 
     /// Terminate, wait in_terminate_to_kill for the tree to vanish, kill,
     /// then reap until no child remains or in_reap_deadline passes after the
-    /// kill. A zero in_terminate_to_kill sends no terminate at all: the tree
-    /// is killed at once, so every status it produces carries the kill
-    /// signal. Linux signals the recorded pidfds, the root's process group
+    /// kill. A zero in_terminate_to_kill skips graceful termination and
+    /// attempts forced termination immediately. Linux signals the recorded
+    /// pidfds, the root's process group
     /// while the root is unreaped, and every child this subreaper acquires
     /// meanwhile, including one that left the root's session; having no
     /// child left is the completion. Windows has no graceful terminate for a
     /// Job, so the kill happens at once and in_terminate_to_kill is not used.
+    /// Darwin may return terminal_unconfirmed after an authorized kill attempt and
+    /// the bounded observation period, but only after observing and collecting
+    /// the exact root's exit. That outcome stays unconfirmed and retires every
+    /// subsequent signal to its original group; a live root remains pending.
+    /// Signal failures remain errors and never establish scoped settlement.
     Reap_outcome terminate_and_reap(
         std::chrono::milliseconds in_terminate_to_kill,
         std::chrono::milliseconds in_reap_deadline);

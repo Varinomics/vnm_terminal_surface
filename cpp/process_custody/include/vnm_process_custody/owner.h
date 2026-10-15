@@ -8,15 +8,24 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <chrono>
 #endif
 
 namespace vnm::process_custody {
 
+// Darwin PTY requests require the explicit outcome contract below. COMMAND
+// retains its independent root/process-group cleanup and ordinary exit codes.
 enum class Owner_mode : std::uint32_t { COMMAND, PTY };
 enum class Tree_settlement : std::uint32_t { PENDING, CONFIRMED, UNCONFIRMED };
 enum class Owner_event_kind : std::uint32_t { STARTED, START_REJECTED, ROOT_EXITED, TREE_SETTLEMENT };
+
+// These normal exit codes carry a scoped result only for a helper admitted
+// with this exact Darwin PTY mode contract before workload START. Generic
+// helper exit, signal death and other owner modes have no such meaning.
+inline constexpr char k_darwin_pty_owner_contract[] = "darwin-pty-owner-v1";
+inline constexpr char k_darwin_pty_owner_argument[] = "--darwin-pty-outcome-v1";
+enum class Darwin_pty_owner_exit : int { NO_WORKLOAD = 90, CONFIRMED = 91, UNCONFIRMED = 92 };
 
 struct Pty_dimensions
 {
@@ -39,10 +48,15 @@ struct Owner_start_request
 
 struct Owner_event
 {
+    Cleanup_scope cleanup_scope = Cleanup_scope::UNSPECIFIED;
+    std::uint64_t root_birth_token = 0; // optional Darwin occurrence capability; zero means absent/unknown
     Owner_event_kind kind = Owner_event_kind::START_REJECTED;
     Exit_status root_exit;
     Tree_settlement settlement = Tree_settlement::PENDING;
-    Native_handle root_reference = k_invalid_handle; // STARTED: receiver owns exact observation pidfd, not wait authority
+    // STARTED: receiver owns an observation pidfd (Linux) or a locally created
+    // kqueue (Darwin). A command already gone may have no Darwin observer.
+    // Neither reference transfers the helper's exclusive wait authority.
+    Native_handle root_reference = k_invalid_handle;
     Native_handle pty_master = k_invalid_handle; // receiving caller owns it
     std::string detail;
 };
@@ -58,7 +72,7 @@ bool send_owner_start(Duplex_channel& channel, const Owner_start_request& reques
 // caller supplies a nonblocking channel and serializes writers; this operation
 // retries only the unsent record under one absolute deadline. Parent handles
 // remain borrowed, and a failed partial request must be abandoned, not replayed.
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #define VNM_PROCESS_CUSTODY_HAS_OWNER_START_DEADLINE 1
 bool send_owner_start_until(Duplex_channel& channel, const Owner_start_request& request,
     std::chrono::steady_clock::time_point deadline, std::string* error);

@@ -3,6 +3,7 @@
 #include "callback_lifetime_checks.h"
 #include "foreground_cleanup_checks.h"
 #include "native_session_checks.h"
+#include "native_receipt_capture.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/session_contract.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
@@ -345,6 +346,9 @@ term::Terminal_launch_config launch_config(
     config.initial_grid_size  = term::terminal_grid_size_t{24, 80};
     config.identity.term      = QStringLiteral("xterm-256color");
     config.identity.colorterm = QStringLiteral("truecolor");
+#if defined(__APPLE__)
+    vnm_terminal::test_helpers::retain_native_receipts(config);
+#endif
     return config;
 }
 

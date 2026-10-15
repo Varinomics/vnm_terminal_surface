@@ -16,6 +16,8 @@ constexpr std::uint32_t k_wire_revision = 1;
 constexpr std::size_t k_max_list_entries = 65536;
 constexpr std::size_t k_max_request_bytes = 4 * 1024 * 1024;
 constexpr std::uint32_t k_fragment_kind = 5;
+constexpr std::uint32_t k_cleanup_scope_extension = 1;
+constexpr std::uint32_t k_darwin_birth_extension = 2;
 
 struct Encoder
 {
@@ -112,8 +114,14 @@ bool send(Duplex_channel& channel, const Encoder& message,
             }
 
             native_error = 0;
+#if defined(__APPLE__)
+            const auto status = channel.send_descriptors_until(
+                fragment.bytes.data(), fragment.bytes.size(), fragment_descriptors,
+                deadline.value_or(std::chrono::steady_clock::time_point::max()), &native_error);
+#else
             const auto status = channel.send_descriptors(
                 fragment.bytes.data(), fragment.bytes.size(), fragment_descriptors, &native_error);
+#endif
             if (status == Io_status::TRANSFERRED) {
                 break;
             }
@@ -256,6 +264,19 @@ bool send_event(Duplex_channel& channel, const Owner_event& event, std::string* 
     message.number(static_cast<std::uint32_t>(event.root_exit.signal));
     message.number(static_cast<std::uint32_t>(event.settlement));
     message.text(event.detail);
+    if (event.cleanup_scope != Cleanup_scope::UNSPECIFIED) {
+        message.number(k_cleanup_scope_extension);
+        message.number(1); // capability-local version
+        message.number(4); // byte length allows unknown extensions to be skipped
+        message.number(static_cast<std::uint32_t>(event.cleanup_scope));
+    }
+    if (event.root_birth_token != 0) {
+        message.number(k_darwin_birth_extension);
+        message.number(1);
+        message.number(8);
+        message.number(static_cast<std::uint32_t>(event.root_birth_token >> 32));
+        message.number(static_cast<std::uint32_t>(event.root_birth_token));
+    }
     std::vector<Native_handle> descriptors;
     if (event.root_reference != k_invalid_handle) descriptors.push_back(event.root_reference);
     if (event.pty_master != k_invalid_handle) descriptors.push_back(event.pty_master);
@@ -352,15 +373,55 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
             break;
         case Message_kind::EVENT: {
             auto& event = message->event;
+            bool local_observer_record = false;
             event.kind = static_cast<Owner_event_kind>(input.number());
             event.root_exit.process_id = input.number();
             event.root_exit.exit_code = static_cast<std::int32_t>(input.number());
             event.root_exit.signal = static_cast<int>(input.number());
             event.settlement = static_cast<Tree_settlement>(input.number());
             event.detail = input.text();
+            while (input.valid && input.position < bytes.size()) {
+                const auto tag = input.number();
+                const auto version = input.number();
+                const auto length = input.number();
+                if (!input.valid || length > bytes.size() - input.position) {
+                    input.valid = false;
+                    break;
+                }
+                if (tag == k_cleanup_scope_extension) {
+                    event.cleanup_scope = Cleanup_scope::UNSPECIFIED;
+                }
+                if (tag == k_darwin_birth_extension) {
+                    local_observer_record = true;
+                    event.root_birth_token = 0;
+                }
+                if (tag == k_cleanup_scope_extension && version == 1 && length == 4) {
+                    const auto scope = input.number();
+                    if (scope == static_cast<std::uint32_t>(Cleanup_scope::TRANSITIVE_TREE) ||
+                        scope == static_cast<std::uint32_t>(Cleanup_scope::OWNED_PROCESS_GROUPS))
+                    {
+                        event.cleanup_scope = static_cast<Cleanup_scope>(scope);
+                    }
+                }
+                else
+                if (tag == k_darwin_birth_extension && version == 1 && length == 8) {
+                    event.root_birth_token = static_cast<std::uint64_t>(input.number()) << 32;
+                    event.root_birth_token |= input.number();
+                }
+                else {
+                    input.position += length;
+                }
+            }
             if (event.kind > Owner_event_kind::TREE_SETTLEMENT || event.settlement > Tree_settlement::UNCONFIRMED)
                 input.valid = false;
             expected_descriptors = received.descriptors.size();
+            if (local_observer_record) {
+                if (event.kind != Owner_event_kind::STARTED || expected_descriptors > 1) {
+                    input.valid = false;
+                }
+                if (expected_descriptors == 1) event.pty_master = received.descriptors[0];
+                break;
+            }
             if (expected_descriptors > 2 ||
                 (event.kind == Owner_event_kind::STARTED ? expected_descriptors == 0 : expected_descriptors != 0))
                 input.valid = false;
@@ -393,7 +454,14 @@ Receive_status receive_owner_event(Duplex_channel& channel, Owner_event* event,
         if (error) *error = "unexpected owner control message";
         status = Receive_status::FAILED;
     }
-    if (status == Receive_status::MESSAGE) *event = std::move(message.event);
+    if (status == Receive_status::MESSAGE) {
+        *event = std::move(message.event);
+#if defined(__APPLE__)
+        if (event->kind == Owner_event_kind::STARTED && event->root_birth_token != 0) {
+            event->root_reference = open_process_observer(event->root_exit.process_id, event->root_birth_token, nullptr);
+        }
+#endif
+    }
     return status;
 }
 

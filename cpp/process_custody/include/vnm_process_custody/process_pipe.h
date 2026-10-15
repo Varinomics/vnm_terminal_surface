@@ -19,7 +19,7 @@ using Native_handle = int;
 inline constexpr Native_handle k_invalid_handle = -1;
 #endif
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 // The pidfd syscalls, called directly rather than through <sys/pidfd.h>:
 // that glibc header (2.39) is missing its extern-"C" guard, so its wrappers
 // do not link from C++. The runtime-owner service reaches pidfd the same way

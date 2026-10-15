@@ -23,6 +23,17 @@ For a complete terminal application and screenshots, see
 
 The host owns the surrounding application UI and its interaction policies.
 
+## macOS cleanup scope
+
+macOS PTY cleanup uses a persistent native helper that retains the controlling
+session and the shell's sole wait. Its retained tty authorizes cleanup of
+ordinary foreground and background jobs even after the shell exits. Workload
+START requires a host receipt hook that retains and persists the exact helper
+observation first. Root exit and scoped cleanup are independent receipts;
+failed observations leave cleanup unconfirmed. Deliberately detached descendants
+may survive, so this is owned-process-group cleanup rather than transitive
+containment. Windows and Linux cleanup contracts are unchanged.
+
 ## Requirements
 
 - Qt 6.12 or newer, including its Gui and Quick private development modules
