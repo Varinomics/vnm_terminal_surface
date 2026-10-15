@@ -278,7 +278,7 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
             frame.columns) ||
         frame.cells.size() > vnm_terminal::k_terminal_canvas_max_cells ||
         frame.styles.empty() ||
-        frame.styles.size() > vnm_terminal::k_terminal_canvas_max_styles ||
+        frame.styles.size() > vnm_terminal::terminal_canvas_style_limit(frame) ||
         !canvas_cursor_shape_is_valid(frame.cursor.shape))
     {
         return false;
@@ -350,9 +350,15 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
         return false;
     }
 
+    if (frame.wide_styles &&
+        !vnm_terminal::terminal_canvas_color_scheme_available(frame))
+    {
+        return false;
+    }
     if (frame.color_references &&
         (frame.color_references->record_version == 0 ||
-            frame.color_references->styles.size() > vnm_terminal::k_terminal_canvas_max_styles ||
+            frame.color_references->styles.size() >
+                vnm_terminal::terminal_canvas_style_limit(frame) ||
             (frame.color_references->record_version ==
                     vnm_terminal::k_terminal_canvas_color_references_version &&
                 !vnm_terminal::terminal_canvas_color_scheme_available(frame))))

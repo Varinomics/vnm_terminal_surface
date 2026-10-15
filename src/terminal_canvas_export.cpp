@@ -56,6 +56,14 @@ vnm_terminal::Terminal_canvas_cursor_shape canvas_cursor_shape(
 vnm_terminal::Terminal_canvas_export_result
 vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
 {
+    return export_terminal_canvas_frame(surface, false);
+}
+
+vnm_terminal::Terminal_canvas_export_result
+vnm_terminal::export_terminal_canvas_frame(
+    const VNM_TerminalSurface& surface,
+    bool allow_wide_styles)
+{
     if (surface.thread() != QThread::currentThread()) {
         return {Terminal_canvas_export_status::WRONG_THREAD, {}};
     }
@@ -92,6 +100,9 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         term::k_default_terminal_style_id,
     };
     exported_style_ids[term::k_default_terminal_style_id] = 0;
+    const std::size_t style_limit = allow_wide_styles
+        ? k_terminal_canvas_max_wide_styles
+        : k_terminal_canvas_max_styles;
     for (const term::Terminal_render_cell& source_cell : snapshot->cells) {
         if (source_cell.wide_continuation) {
             continue;
@@ -100,7 +111,7 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         if (exported_style_id >= 0) {
             continue;
         }
-        if (referenced_styles.size() == k_terminal_canvas_max_styles) {
+        if (referenced_styles.size() == style_limit) {
             return {Terminal_canvas_export_status::STYLE_LIMIT_EXCEEDED, {}};
         }
         exported_style_id = static_cast<int>(referenced_styles.size());
@@ -155,6 +166,9 @@ vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
         frame->selection = surface.touch_selection_projection();
     }
 
+    if (referenced_styles.size() > k_terminal_canvas_max_styles) {
+        frame->wide_styles.emplace();
+    }
     frame->styles.reserve(referenced_styles.size());
     frame->color_references.emplace();
     frame->color_references->styles.reserve(referenced_styles.size());

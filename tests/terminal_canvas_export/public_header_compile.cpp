@@ -16,6 +16,10 @@ bool terminal_canvas_public_header_contract()
         decltype(vnm_terminal::Terminal_canvas_frame{}.images),
         std::optional<vnm_terminal::Terminal_canvas_images>>);
 
+    static_assert(std::is_same_v<
+        decltype(vnm_terminal::Terminal_canvas_frame{}.wide_styles),
+        std::optional<vnm_terminal::Terminal_canvas_wide_styles>>);
+
     const vnm_terminal::terminal_canvas_content_extent_t extent;
     return
         vnm_terminal::k_terminal_canvas_frame_api_version == 4U &&
@@ -31,6 +35,8 @@ bool terminal_canvas_public_header_contract()
         vnm_terminal::k_terminal_canvas_max_columns == 32'768 &&
         vnm_terminal::k_terminal_canvas_max_cells         == 32'768U &&
         vnm_terminal::k_terminal_canvas_max_styles        == 256U &&
+        vnm_terminal::k_terminal_canvas_max_wide_styles == 32'769U &&
+        vnm_terminal::Terminal_canvas_wide_styles{}.record_version == 1U &&
         vnm_terminal::k_terminal_canvas_max_cell_text_utf16_code_units == 4'096 &&
         vnm_terminal::k_terminal_canvas_max_frame_text_utf8_bytes == 96 * 1'024;
 }

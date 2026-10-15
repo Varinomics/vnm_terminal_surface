@@ -57,7 +57,7 @@ bool terminal_canvas_color_scheme_available(const Terminal_canvas_frame& frame)
     if (!frame.color_references ||
         frame.color_references->record_version != k_terminal_canvas_color_references_version ||
         frame.styles.empty() ||
-        frame.styles.size() > k_terminal_canvas_max_styles ||
+        frame.styles.size() > terminal_canvas_style_limit(frame) ||
         frame.color_references->styles.size() != frame.styles.size() ||
         frame.color_references->styles.front().foreground != k_terminal_canvas_color_default ||
         frame.color_references->styles.front().background != k_terminal_canvas_color_default)

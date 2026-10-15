@@ -76,7 +76,8 @@ term::Terminal_render_cell make_wide_continuation(
 
 vnm_terminal::Terminal_canvas_export_result export_snapshot(
     VNM_TerminalSurface&                              surface,
-    std::shared_ptr<term::Terminal_render_snapshot> snapshot)
+    std::shared_ptr<term::Terminal_render_snapshot> snapshot,
+    bool allow_wide_styles = false)
 {
     const term::terminal_cell_metrics_t cell_metrics =
         term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
@@ -85,7 +86,7 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot(
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         std::move(snapshot));
-    return vnm_terminal::export_terminal_canvas_frame(surface);
+    return vnm_terminal::export_terminal_canvas_frame(surface, allow_wide_styles);
 }
 
 bool expect_content_extent(
@@ -616,6 +617,103 @@ bool test_sparse_style_ids_preserve_colors_and_attributes()
     return ok;
 }
 
+bool test_wide_style_export_is_explicit_and_lossless()
+{
+    namespace canvas = vnm_terminal;
+    bool ok = true;
+    VNM_TerminalSurface surface;
+    auto snapshot = make_snapshot(52, 144);
+    snapshot->styles.resize(3'640U, term::make_default_terminal_text_style());
+    constexpr std::size_t k_referenced_styles = 698U;
+    for (std::size_t index = 0U; index < k_referenced_styles; ++index) {
+        const auto source_id = static_cast<term::Terminal_style_id>(
+            index == 0U ? 0U : index + 1'000U);
+        auto& source = snapshot->styles[source_id];
+        if (index != 0U) {
+            const auto palette_index = static_cast<std::uint8_t>(index % 256U);
+            source.foreground = index % 2U == 0U
+                ? term::make_rgb_terminal_color_ref(0xff100000U | static_cast<quint32>(index))
+                : term::make_palette_terminal_color_ref(palette_index);
+            source.background = index % 2U == 0U
+                ? term::make_palette_terminal_color_ref(palette_index)
+                : term::make_rgb_terminal_color_ref(0xff200000U | static_cast<quint32>(index));
+            source.attributes = static_cast<std::uint16_t>(index % 256U);
+        }
+        snapshot->cells.push_back(make_cell(
+            static_cast<int>(index / 144U),
+            static_cast<int>(index % 144U),
+            QStringLiteral("x"),
+            1,
+            source_id));
+    }
+    const auto unrequested = export_snapshot(surface, snapshot);
+    ok &= check(
+        unrequested.status == canvas::Terminal_canvas_export_status::STYLE_LIMIT_EXCEEDED &&
+            !unrequested.frame,
+        "698 referenced styles remain unavailable without explicit wide-style opt-in");
+
+    const auto result = export_snapshot(surface, snapshot, true);
+    ok &= check(result.status == canvas::Terminal_canvas_export_status::OK && result.frame,
+        "explicit opt-in exports the 698-style workload");
+    if (!result.frame) {
+        return false;
+    }
+    const auto& frame = *result.frame;
+    if (!check(
+            frame.styles.size() == k_referenced_styles && frame.wide_styles &&
+                frame.wide_styles->record_version == canvas::k_terminal_canvas_wide_styles_version &&
+                frame.cells.size() == k_referenced_styles && frame.color_references &&
+                frame.color_references->styles.size() == k_referenced_styles,
+            "wide export contains exactly the referenced palette and its matching color selectors"))
+    {
+        return false;
+    }
+    bool exact_styles = true;
+    for (std::size_t index = 0U; index < k_referenced_styles; ++index) {
+        const auto& source = snapshot->styles[index == 0U ? 0U : index + 1'000U];
+        const auto& style  = frame.styles[index];
+        const auto& refs   = frame.color_references->styles[index];
+        const auto palette_index = static_cast<std::uint16_t>(index % 256U);
+        const std::uint16_t expected_foreground = index == 0U
+            ? canvas::k_terminal_canvas_color_default
+            : index % 2U == 0U ? canvas::k_terminal_canvas_color_rgba : palette_index;
+        const std::uint16_t expected_background = index == 0U
+            ? canvas::k_terminal_canvas_color_default
+            : index % 2U == 0U ? palette_index : canvas::k_terminal_canvas_color_rgba;
+        exact_styles &=
+            frame.cells[index].style_index == index &&
+            style.foreground_rgba ==
+                term::resolve_terminal_color_ref(source.foreground, snapshot->color_state, true) &&
+            style.background_rgba ==
+                term::resolve_terminal_color_ref(source.background, snapshot->color_state, false) &&
+            style.attributes == source.attributes &&
+            refs.foreground == expected_foreground && refs.background == expected_background;
+    }
+    ok &= check(exact_styles && frame.cells.back().style_index == 697U,
+        "all 698 resolved colors, attributes, selectors and indices survive without truncation");
+    auto themed = frame;
+    ok &= check(canvas::apply_terminal_canvas_color_scheme(
+            themed, canvas::terminal_canvas_default_color_scheme_name()),
+        "wide palettes retain local color-scheme selection");
+    bool explicit_colors_preserved = true;
+    for (std::size_t index = 1U; index < k_referenced_styles; ++index) {
+        explicit_colors_preserved &= themed.styles[index].attributes == frame.styles[index].attributes;
+        explicit_colors_preserved &= index % 2U == 0U
+            ? themed.styles[index].foreground_rgba == frame.styles[index].foreground_rgba
+            : themed.styles[index].background_rgba == frame.styles[index].background_rgba;
+    }
+    ok &= check(explicit_colors_preserved,
+        "local schemes preserve every explicit RGB channel and presentation attribute");
+
+    snapshot->cells.resize(canvas::k_terminal_canvas_max_styles);
+    const auto narrow = export_snapshot(surface, snapshot, true);
+    ok &= check(narrow.status == canvas::Terminal_canvas_export_status::OK && narrow.frame &&
+            narrow.frame->styles.size() == canvas::k_terminal_canvas_max_styles &&
+            !narrow.frame->wide_styles,
+        "opt-in keeps an exact 256-style publication in the unmarked representation");
+    return ok;
+}
+
 bool test_text_bounds_fail_closed_without_truncation()
 {
     bool                ok = true;
@@ -884,6 +982,7 @@ int main(int argc, char** argv)
     ok &= test_content_extent_uses_semantic_cells_cursor_and_viewport();
     ok &= test_exact_bounds_and_one_over_fail_closed();
     ok &= test_sparse_style_ids_preserve_colors_and_attributes();
+    ok &= test_wide_style_export_is_explicit_and_lossless();
     ok &= test_historical_styles_do_not_prevent_small_visible_frame_export();
     ok &= test_text_bounds_fail_closed_without_truncation();
     ok &= test_row_images_export_with_publication();

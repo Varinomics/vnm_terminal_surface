@@ -33,7 +33,12 @@ struct Terminal_canvas_export_result
 // that exceeds either published limit fails explicitly and is never truncated.
 // Images are an independently versioned record on the same publication. Invalid
 // image data leaves text available and marks only that record unavailable.
+// Wide-style export requires explicit opt-in. Only palettes above 256 styles
+// carry the wide marker, together with their complete color references.
 Terminal_canvas_export_result export_terminal_canvas_frame(
     const VNM_TerminalSurface& surface);
+Terminal_canvas_export_result export_terminal_canvas_frame(
+    const VNM_TerminalSurface& surface,
+    bool allow_wide_styles);
 
 } // namespace vnm_terminal

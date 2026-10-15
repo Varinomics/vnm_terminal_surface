@@ -1,5 +1,6 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/terminal_canvas_frame.h"
+#include "vnm_terminal/terminal_canvas_appearance.h"
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
 #include <QGuiApplication>
@@ -145,6 +146,107 @@ bool test_frame_contract_and_text_bounds()
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");
     ok &= check(canvas.rows() == 0 && canvas.columns() == 0,
         "clear releases published canvas geometry");
+    return ok;
+}
+
+std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_wide_style_frame(
+    std::size_t style_count)
+{
+    namespace canvas = vnm_terminal;
+    auto frame = make_frame(50U);
+    frame->rows           = static_cast<int>((style_count - 1U + 255U) / 256U);
+    frame->columns        = 256;
+    frame->content_width  = frame->cell_width * frame->columns;
+    frame->content_height = frame->cell_height * frame->rows;
+    frame->content_extent.reset();
+    frame->cells.clear();
+    frame->wide_styles.emplace();
+    frame->color_references.emplace();
+    frame->color_references->styles.push_back({});
+    for (std::size_t index = 1U; index < style_count; ++index) {
+        frame->styles.push_back({
+            0xff100000U | static_cast<quint32>(index),
+            frame->default_background_rgba,
+            static_cast<std::uint16_t>(canvas::Terminal_canvas_style_attribute::UNDERLINE),
+        });
+        frame->color_references->styles.push_back({
+            canvas::k_terminal_canvas_color_rgba,
+            canvas::k_terminal_canvas_color_default,
+        });
+        frame->cells.push_back({
+            static_cast<int>((index - 1U) / 256U),
+            static_cast<int>((index - 1U) % 256U),
+            1,
+            static_cast<std::uint16_t>(index),
+            QStringLiteral("x"),
+        });
+    }
+    return frame;
+}
+
+bool test_wide_styles_require_coherent_admission_and_color_references()
+{
+    namespace terminal = vnm_terminal;
+    bool ok = true;
+    VNM_TerminalCanvas canvas;
+    auto frame = make_wide_style_frame(698U);
+    ok &= check(canvas.set_canvas_frame(frame),
+        "renderer admits 698 styles with a recognized marker and matching color references");
+    const auto installed = canvas.canvas_frame();
+    ok &= check(installed && installed->cells.back().style_index == 697U &&
+            installed->styles.back().foreground_rgba == 0xff1002b9U,
+        "renderer preserves a cell and exact color beyond the eight-bit style range");
+    if (!installed) {
+        return false;
+    }
+    const auto expect_rejected = [
+            &canvas
+        ](
+            const std::shared_ptr<terminal::Terminal_canvas_frame>& candidate,
+            const char* message)
+        {
+            const auto previous = canvas.canvas_frame();
+            return check(!canvas.set_canvas_frame(candidate) && canvas.canvas_frame() == previous &&
+                    !terminal::terminal_canvas_color_scheme_available(*candidate),
+                message);
+        };
+    auto missing_marker = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    missing_marker->wide_styles.reset();
+    ok &= expect_rejected(missing_marker, "wide palette without its admission marker is rejected");
+    auto unknown_marker = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    ++unknown_marker->wide_styles->record_version;
+    ok &= expect_rejected(unknown_marker, "unknown wide-style version never admits a narrowed palette");
+    auto missing_refs = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    missing_refs->color_references.reset();
+    ok &= expect_rejected(missing_refs, "wide palette cannot lose its color-reference record");
+    auto unknown_refs = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    ++unknown_refs->color_references->record_version;
+    ok &= expect_rejected(unknown_refs, "wide palette requires a known color-reference version");
+    auto truncated_refs = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    truncated_refs->color_references->styles.pop_back();
+    ok &= expect_rejected(truncated_refs, "wide color-reference table must cover every style");
+    auto invalid_refs = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    invalid_refs->color_references->styles.back().foreground = terminal::k_terminal_canvas_color_rgba + 1U;
+    ok &= expect_rejected(invalid_refs, "invalid selector above index 255 is rejected");
+    auto excess_palette = std::make_shared<terminal::Terminal_canvas_frame>(*frame);
+    excess_palette->styles.push_back(excess_palette->styles.back());
+    excess_palette->color_references->styles.push_back(excess_palette->color_references->styles.back());
+    ok &= expect_rejected(excess_palette, "wide palette is bounded by exported cells plus the default");
+
+    auto narrow = make_wide_style_frame(terminal::k_terminal_canvas_max_styles);
+    narrow->wide_styles.reset();
+    ok &= check(canvas.set_canvas_frame(narrow), "unmarked 256-style frames remain accepted");
+    narrow->wide_styles.emplace();
+    ++narrow->wide_styles->record_version;
+    ok &= expect_rejected(narrow, "unknown wide marker cannot silently become an unmarked narrow frame");
+
+    auto maximum = make_wide_style_frame(terminal::k_terminal_canvas_max_wide_styles);
+    ok &= check(canvas.set_canvas_frame(maximum) &&
+            canvas.canvas_frame()->cells.back().style_index == 32'768U,
+        "maximum cell budget admits one distinct style per cell plus the reserved default");
+    maximum->styles.push_back(maximum->styles.back());
+    maximum->color_references->styles.push_back(maximum->color_references->styles.back());
+    ok &= expect_rejected(maximum, "absolute wide palette bound plus one is rejected");
     return ok;
 }
 
@@ -548,6 +650,7 @@ int main(int argc, char** argv)
     QGuiApplication application(argc, argv);
     bool            ok = true;
     ok &= test_frame_contract_and_text_bounds();
+    ok &= test_wide_styles_require_coherent_admission_and_color_references();
     ok &= test_content_extent_properties_and_atomic_lifecycle();
     ok &= test_image_records_are_atomic_and_capability_local();
     ok &= test_cursor_blink_phase_and_lifecycle();

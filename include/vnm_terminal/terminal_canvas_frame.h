@@ -31,6 +31,9 @@ inline constexpr int k_terminal_canvas_axis_max =
 inline constexpr int k_terminal_canvas_max_rows = k_terminal_canvas_axis_max;
 inline constexpr int k_terminal_canvas_max_columns = k_terminal_canvas_axis_max;
 inline constexpr std::size_t   k_terminal_canvas_max_styles        = 256U;
+inline constexpr std::uint16_t k_terminal_canvas_wide_styles_version = 1U;
+inline constexpr std::size_t k_terminal_canvas_max_wide_styles =
+    k_terminal_canvas_max_cells + 1U;
 inline constexpr qsizetype k_terminal_canvas_max_cell_text_utf16_code_units =
     4'096;
 // The 96 KiB text budget leaves the surrounding 128 KiB wire envelope room
@@ -134,6 +137,15 @@ struct Terminal_canvas_color_references
     std::vector<terminal_canvas_style_color_refs_t> styles;
 
     bool operator==(const Terminal_canvas_color_references&) const = default;
+};
+
+// A wide palette needs one style per exported cell plus the reserved default.
+// Its marker and complete known color references belong to the same frame;
+// removing either would lose the admission contract or color selectors.
+// An unknown version makes this canvas frame unavailable.
+struct Terminal_canvas_wide_styles
+{
+    std::uint16_t record_version = k_terminal_canvas_wide_styles_version;
 };
 
 struct Terminal_canvas_cell
@@ -258,6 +270,22 @@ struct Terminal_canvas_frame
     std::vector<Terminal_canvas_style> styles;
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;
+    std::optional<Terminal_canvas_wide_styles> wide_styles;
 };
+
+// Zero rejects an unsupported marker instead of interpreting it as the
+// unmarked 256-style contract. Callers still validate cells and color references.
+inline std::size_t terminal_canvas_style_limit(const Terminal_canvas_frame& frame)
+{
+    if (!frame.wide_styles) {
+        return k_terminal_canvas_max_styles;
+    }
+    if (frame.wide_styles->record_version != k_terminal_canvas_wide_styles_version) {
+        return 0U;
+    }
+    return frame.cells.size() < k_terminal_canvas_max_cells
+        ? frame.cells.size() + 1U
+        : k_terminal_canvas_max_wide_styles;
+}
 
 } // namespace vnm_terminal
