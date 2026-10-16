@@ -23,10 +23,39 @@ jobs:
   build-and-test:
     name: Qt Quick Terminal Surface (macOS)
     runs-on: macos-15-intel
+    env:
+      CCACHE_MAXSIZE: 2GiB
+      CCACHE_COMPILERCHECK: content
+      # Nested package builds inherit the launchers without caching their trees.
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Install and identify compiler cache
+        id: compiler_cache
+        run: |
+          brew install ccache
+          echo "CCACHE_DIR=${RUNNER_TEMP}/vnm-terminal-surface-ccache" >> "${GITHUB_ENV}"
+          {
+            ccache --version
+            xcodebuild -version
+            xcrun --show-sdk-path
+            xcrun --show-sdk-version
+            shasum -a 256 "$(xcrun --find clang++)" "$(command -v ccache)"
+          } | tee "${RUNNER_TEMP}/compiler-cache-toolchain.txt"
+          toolchain_hash=$(shasum -a 256 "${RUNNER_TEMP}/compiler-cache-toolchain.txt" | cut -d ' ' -f 1)
+          echo "key_prefix=${RUNNER_OS}-${RUNNER_ARCH}-ccache-${CMAKE_BUILD_TYPE}-${{ hashFiles('.github/workflows/ci-macos.yml') }}-${toolchain_hash}-" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore compiler cache
+        id: restore_compiler_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.run_id }}-${{ github.run_attempt }}-build
+          restore-keys: ${{ steps.compiler_cache.outputs.key_prefix }}
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
@@ -38,6 +67,7 @@ jobs:
 
       - name: Configure CMake
         run: |
+          ccache --zero-stats
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
             -DVNM_TERMINAL_BUILD_BENCHMARKS=OFF \
@@ -45,6 +75,7 @@ jobs:
             -DBUILD_TESTING=ON
 
       - name: Build
+        id: build
         run: |
           targets=()
           if [[ "${{ inputs.focused_units }}" == "true" ]]; then
@@ -56,6 +87,33 @@ jobs:
               vnm_terminal_surface_host)
           fi
           cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel 2 "${targets[@]}"
+
+      - name: Report main build compiler cache
+        if: ${{ !cancelled() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
+        run: |
+          ccache --show-stats --verbose | tee "${RUNNER_TEMP}/compiler-cache-stats.txt"
+          for source in build/_deps/*-src; do
+            if [[ -e "${source}/.git" ]]; then
+              revision=$(git -C "${source}" rev-parse HEAD)
+              printf '%s %s\n' "${source}" "${revision}"
+            fi
+          done > "${RUNNER_TEMP}/compiler-cache-sources.txt"
+
+      # A runner lost during tests cannot run post-job cache saves.
+      - name: Save main build compiler cache
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore_compiler_cache.outputs.cache-primary-key }}
+
+      - name: Upload main build cache statistics
+        if: ${{ !cancelled() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-compiler-cache-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compiler-cache-*.txt
+          if-no-files-found: error
 
       - name: Run tests
         working-directory: build
@@ -88,3 +146,14 @@ jobs:
       - name: Build package smoke
         if: ${{ !inputs.focused_units }}
         run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel 2
+
+      - name: Report package compiler cache
+        if: ${{ !inputs.focused_units }}
+        run: ccache --show-stats --verbose
+
+      - name: Save package compiler cache
+        if: ${{ !inputs.focused_units }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.run_id }}-${{ github.run_attempt }}-package
