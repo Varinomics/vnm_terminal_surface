@@ -9,6 +9,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -95,6 +96,20 @@ struct Process_tree_owner::Impl
         if (terminal_unconfirmed || pty_settled || getsid(0) != owner || getpgrp() != owner) {
             error = "retained PTY owner session is unavailable";
             return false;
+        }
+        // TIOCSIG otherwise discards unread output, even for an exited root's
+        // retained group. Preserve it during cleanup; running terminals keep
+        // their workload-selected flushing policy for interactive signals.
+        termios attributes{};
+        bool preserved = tcgetattr(slave, &attributes) == 0;
+        if (preserved && (attributes.c_lflag & NOFLSH) == 0) {
+            attributes.c_lflag |= NOFLSH;
+            preserved = tcsetattr(slave, TCSANOW, &attributes) == 0;
+        }
+        if (!preserved) {
+            const int action_error = errno;
+            error = "PTY cleanup output preservation failed (errno " + std::to_string(action_error) +
+                "): " + std::strerror(action_error);
         }
         // The direct-child wait pins the root independently of tty discovery.
         // Even a discovery failure must not suppress this remaining authority.

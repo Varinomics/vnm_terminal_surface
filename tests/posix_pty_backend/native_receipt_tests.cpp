@@ -2,9 +2,15 @@
 #include "native_receipt_capture.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 
+#include <QByteArray>
 #include <QFile>
 #include <QFileInfo>
 #include <QTemporaryDir>
+
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <utility>
 
 namespace term = vnm_terminal::internal;
 namespace custody = vnm::process_custody;
@@ -110,6 +116,78 @@ bool root_receipts(bool failed_exec)
     return ok;
 }
 
+bool output_survives_delayed_birth_receipt()
+{
+    auto config = shell_config(QStringLiteral("printf retained-terminal-output"));
+    const auto receipts = retain_native_receipts(config);
+    config.native_receipt_hook = [receipts](const vnm_terminal::Terminal_native_receipt& receipt) {
+        const auto retained = receipts->retain(receipt);
+        if (receipt.kind == Kind::ROOT_BORN) {
+            // Hold startup until the helper exits or its bounded observation
+            // wait expires. The backend reader cannot drain output yet.
+            (void)receipts->wait_for_helper();
+        }
+        return retained;
+    };
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    QByteArray output;
+    bool exited = false;
+    bool output_before_exit = false;
+    term::Terminal_backend_exit exit;
+    auto events = callbacks();
+    events.output_received = [&](QByteArray bytes) {
+        const std::lock_guard lock(mutex);
+        output += bytes;
+    };
+    events.process_exited = [&](term::Terminal_backend_exit observed) {
+        const std::lock_guard lock(mutex);
+        exit = observed;
+        output_before_exit = output == QByteArrayLiteral("retained-terminal-output");
+        exited = true;
+        changed.notify_all();
+    };
+    auto backend = term::make_posix_pty_backend();
+    const auto result = backend->start(config, std::move(events));
+    bool ok = check(result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "delayed birth receipt preserves admitted terminal startup");
+    {
+        std::unique_lock lock(mutex);
+        ok &= check(changed.wait_for(lock, std::chrono::seconds(5), [&] { return exited; }),
+            "short-lived root delivers its terminal exit");
+        ok &= check(output_before_exit && exit.reason == term::Terminal_exit_reason::EXITED && exit.exit_code == 0,
+            "all terminal output precedes normal exit despite delayed birth receipt");
+    }
+    backend.reset();
+    ok &= check(receipts->helper_exited(custody::Darwin_pty_owner_exit::CONFIRMED),
+        "delayed receipt retains exact confirmed native cleanup");
+    return ok;
+}
+
+bool rejected_root_receipt_releases_unread_output()
+{
+    auto config = shell_config(QStringLiteral("printf abandoned-terminal-output"));
+    const auto receipts = retain_native_receipts(config);
+    config.native_receipt_hook = [receipts](const vnm_terminal::Terminal_native_receipt& receipt) {
+        const auto retained = receipts->retain(receipt);
+        if (receipt.kind == Kind::ROOT_BORN) {
+            (void)receipts->wait_for_helper();
+        }
+        return receipt.kind == Kind::ROOT_BORN || receipt.kind == Kind::ROOT_ENDED
+            ? Ack::REJECTED : retained;
+    };
+    auto backend = term::make_posix_pty_backend();
+    const auto result = backend->start(config, callbacks());
+    bool ok = check(result.code == term::Terminal_backend_result_code::REJECTED && result.error &&
+        result.error->code == term::Terminal_backend_error_code::START_FAILED,
+        "rejected root receipts abandon startup before any output reader begins");
+    backend.reset();
+    ok &= check(receipts->helper_exited(custody::Darwin_pty_owner_exit::CONFIRMED),
+        "abandoning unread terminal output still releases the exact confirmed helper");
+    return ok;
+}
+
 } // namespace
 
 int main()
@@ -118,5 +196,7 @@ int main()
     ok &= no_ack_prevents_workload(false);
     ok &= root_receipts(false);
     ok &= root_receipts(true);
+    ok &= output_survives_delayed_birth_receipt();
+    ok &= rejected_root_receipt_releases_unread_output();
     return ok ? 0 : 1;
 }
