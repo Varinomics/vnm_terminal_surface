@@ -1653,6 +1653,10 @@ target_link_libraries(vnm_terminal_behavior_smoke PRIVATE
     Qt6::Gui
     Qt6::Quick
 )
+if(APPLE)
+    target_link_libraries(vnm_terminal_behavior_smoke PRIVATE
+        vnm_process_custody::vnm_process_custody)
+endif()
 
 set_target_properties(vnm_terminal_behavior_smoke PROPERTIES
     AUTOMOC OFF
@@ -1716,6 +1720,10 @@ if(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_link_libraries(vnm_terminal_compat_smoke PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
     )
+    if(APPLE)
+        target_link_libraries(vnm_terminal_compat_smoke PRIVATE
+            vnm_process_custody::vnm_process_custody)
+    endif()
 
     set_target_properties(vnm_terminal_compat_smoke PROPERTIES
         AUTOMOC OFF

@@ -17,6 +17,10 @@ namespace {
 
 constexpr std::size_t k_prefix_bytes = 4;
 constexpr std::size_t k_max_descriptors = 64;
+// XNU bounds the expanded control message to MCLBYTES and reserves at most
+// UIPC_MAX_CMSG_FD (512) descriptors. Receive that whole native envelope:
+// Darwin installs all rights before truncating their returned descriptor numbers.
+constexpr std::size_t k_native_max_descriptors = 512;
 using Clock = std::chrono::steady_clock;
 
 int remaining_ms(Clock::time_point deadline)
@@ -68,7 +72,7 @@ bool prepare_socket(int fd, std::string* error)
 
 bool inspect_control(
     const msghdr& message, std::size_t capacity, bool first_byte,
-    std::vector<Native_handle>* received_descriptors)
+    std::vector<Native_handle>& received_descriptors)
 {
     bool valid = (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) == 0 && message.msg_controllen <= capacity;
     const std::size_t size = std::min<std::size_t>(message.msg_controllen, capacity);
@@ -91,14 +95,15 @@ bool inspect_control(
         if (rights) {
             descriptor_count += descriptor_bytes / sizeof(int);
             valid &= descriptor_count <= k_max_descriptors;
-            // Darwin's peek returns zero placeholders, not installed FDs.
-            // Only a consuming receive may transfer descriptor ownership.
-            if (received_descriptors) {
-                for (std::size_t offset = 0; offset + sizeof(int) <= descriptor_bytes; offset += sizeof(int)) {
-                    int descriptor;
-                    std::memcpy(&descriptor, control + position + CMSG_LEN(0) + offset, sizeof(descriptor));
-                    received_descriptors->push_back(descriptor);
+            for (std::size_t offset = 0; offset + sizeof(int) <= descriptor_bytes; offset += sizeof(int)) {
+                int descriptor;
+                std::memcpy(&descriptor, control + position + CMSG_LEN(0) + offset, sizeof(descriptor));
+                if (valid) {
+                    received_descriptors.push_back(descriptor);
                     valid &= fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0;
+                }
+                else {
+                    ::close(descriptor);
                 }
             }
         }
@@ -417,37 +422,22 @@ Receive_result Duplex_channel::receive(std::uint8_t* out_buffer, std::size_t in_
             m_impl->payload.data() + m_impl->payload_received;
         part.iov_len = reading_prefix ? k_prefix_bytes - m_impl->prefix_received :
             m_impl->payload.size() - m_impl->payload_received;
-        alignas(cmsghdr) std::uint8_t control[CMSG_SPACE(sizeof(int) * k_max_descriptors)]{};
+        alignas(cmsghdr) std::uint8_t control[CMSG_SPACE(sizeof(int) * k_native_max_descriptors)]{};
         msghdr message{};
         message.msg_iov = &part;
         message.msg_iovlen = 1;
         message.msg_control = control;
         message.msg_controllen = sizeof(control);
-        // Darwin installs all rights before truncating their returned numbers.
-        // Peek rejects excess or misplaced rights while they remain socket-owned.
-        const ssize_t peeked = recvmsg(fd, &message, MSG_PEEK | MSG_DONTWAIT);
-        if (peeked < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-            continue;
-        }
-        const bool valid_peek = peeked >= 0 && inspect_control(message, sizeof(control), already_read == 0, nullptr);
-        if (peeked <= 0 || !valid_peek) {
-            result.status = peeked == 0 && already_read == 0 && valid_peek ?
-                Receive_status::CLOSED : Receive_status::FAILED;
-            result.error = peeked < 0 ? errno : EPROTO;
-            close();
-            return result;
-        }
-        // This is the sole reader. A peer may append after the peek, so consume
-        // only the inspected bytes, excluding any newly appended ancillary data.
-        part.iov_len = (std::size_t)peeked;
-        message.msg_controllen = sizeof(control);
-        message.msg_flags = 0;
+        // Reserve before ownership transfers; rejected rights close directly.
+        m_impl->descriptors.reserve(k_max_descriptors);
+        // A consuming receive stops before the next ancillary record. Peeking
+        // SCM_RIGHTS can zero XNU's shared external control storage instead.
         const ssize_t count = recvmsg(fd, &message, MSG_DONTWAIT);
         if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
             continue;
         }
         const bool malformed = count >= 0 &&
-            !inspect_control(message, sizeof(control), already_read == 0, &m_impl->descriptors);
+            !inspect_control(message, sizeof(control), already_read == 0, m_impl->descriptors);
         if (count <= 0 || malformed) {
             result.status = count == 0 && already_read == 0 && !malformed ?
                 Receive_status::CLOSED : Receive_status::FAILED;

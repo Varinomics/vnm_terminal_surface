@@ -114,7 +114,8 @@ public:
     /// must be at least max_message_bytes() so a message the peer was allowed
     /// to send always fits. The channel exclusively owns receives: calls must
     /// be serialized, with no reads through native() or another descriptor alias.
-    /// Darwin validates queued ancillary data before consuming the inspected bytes.
+    /// Darwin accepts descriptors only with a frame's first byte and retains
+    /// ownership until the complete frame is delivered or the stream is closed.
     Receive_result receive(std::uint8_t* out_buffer, std::size_t in_capacity, int in_timeout_ms);
 
 private:

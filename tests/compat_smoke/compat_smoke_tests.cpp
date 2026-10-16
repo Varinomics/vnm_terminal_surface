@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
+#include "posix_pty_backend/native_receipt_capture.h"
 
 #include <QByteArray>
 #include <QEventLoop>
@@ -292,6 +293,11 @@ bool is_live_surface_process_state(VNM_TerminalSurface::Process_state state)
 
 struct Surface_fixture
 {
+#if defined(__APPLE__)
+    // Native observations must outlive surface/backend teardown.
+    std::shared_ptr<vnm_terminal::test_helpers::Native_receipt_capture> native_receipts =
+        std::make_shared<vnm_terminal::test_helpers::Native_receipt_capture>();
+#endif
     QQuickWindow           window;
     VNM_TerminalSurface    surface;
 
@@ -412,19 +418,25 @@ std::vector<vnm_terminal::Terminal_environment_entry> explicit_environment_entri
 }
 
 vnm_terminal::Terminal_process_start_result start_terminal_fixture(
-    VNM_TerminalSurface& surface,
+    Surface_fixture& fixture,
     QStringList argv,
     QString working_directory,
     std::vector<vnm_terminal::Terminal_environment_entry> base_environment,
     std::optional<std::vector<vnm_terminal::Terminal_environment_entry>>
         capability_environment = std::nullopt)
 {
-    return surface.start_terminal({
+    vnm_terminal::Terminal_process_start_request request{
         std::move(argv),
         std::move(working_directory),
         std::move(base_environment),
         std::move(capability_environment),
-    });
+    };
+#if defined(__APPLE__)
+    request.native_receipt_hook = [capture = fixture.native_receipts](const auto& receipt) {
+        return capture->retain(receipt);
+    };
+#endif
+    return fixture.surface.start_terminal(std::move(request));
 }
 
 term::Terminal_launch_config environment_validation_config()
@@ -689,7 +701,7 @@ bool test_exact_environment_rejection_allows_retry(
     bool ok = true;
     const vnm_terminal::Terminal_process_start_result invalid_result =
         start_terminal_fixture(
-            fixture.surface,
+            fixture,
             argv,
             QFileInfo(fixture_path).absolutePath(),
             std::move(invalid_environment));
@@ -714,7 +726,7 @@ bool test_exact_environment_rejection_allows_retry(
 
     const vnm_terminal::Terminal_process_start_result retry_result =
         start_terminal_fixture(
-            fixture.surface,
+            fixture,
             argv,
             QFileInfo(fixture_path).absolutePath(),
             {});
@@ -835,7 +847,7 @@ bool test_capability_environment_rejections(
 
         const vnm_terminal::Terminal_process_start_result result =
             start_terminal_fixture(
-                fixture.surface,
+                fixture,
                 {fixture_path},
                 QFileInfo(fixture_path).absolutePath(),
                 rejection_case.base,
@@ -950,7 +962,7 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
     argv.append(probe_names);
     const vnm_terminal::Terminal_process_start_result start_result =
         start_terminal_fixture(
-            fixture.surface,
+            fixture,
             argv,
             QFileInfo(fixture_path).absolutePath(),
             explicit_environment_entries(environment),
@@ -1088,7 +1100,7 @@ bool test_caller_captured_process_environment(
 
     const vnm_terminal::Terminal_process_start_result start_result =
         start_terminal_fixture(
-            fixture.surface,
+            fixture,
             {
                 fixture_path,
                 QStringLiteral("--echo-environment"),
@@ -1175,7 +1187,7 @@ bool test_final_path_and_executable_token_semantics(
             });
         const vnm_terminal::Terminal_process_start_result result =
             start_terminal_fixture(
-                fixture->surface,
+                *fixture,
                 {std::move(executable)},
                 working_directory,
                 std::move(base_environment));
@@ -1277,7 +1289,7 @@ bool test_invalid_second_start_preserves_live_session(
     bool ok = true;
     const vnm_terminal::Terminal_process_start_result initial_start =
         start_terminal_fixture(
-            fixture.surface,
+            fixture,
             {
                 fixture_path,
                 QStringLiteral("--shell-like-smoke"),
@@ -1322,7 +1334,7 @@ bool test_invalid_second_start_preserves_live_session(
         });
     const vnm_terminal::Terminal_process_start_result rejected_start =
         start_terminal_fixture(
-            fixture.surface,
+            fixture,
             {},
             QFileInfo(fixture_path).absolutePath(),
             {});
@@ -1406,7 +1418,7 @@ bool test_shell_like_surface_native_smoke(QGuiApplication& app, const QString& f
         });
 
     const bool started = start_terminal_fixture(
-        fixture.surface,
+        fixture,
         {
             fixture_path,
             QStringLiteral("--shell-like-smoke"),
@@ -1620,7 +1632,7 @@ bool test_shell_like_surface_interrupt_smoke(QGuiApplication& app, const QString
         });
 
     const bool started = start_terminal_fixture(
-        fixture.surface,
+        fixture,
         {
             fixture_path,
             QStringLiteral("--shell-like-smoke"),
@@ -1757,7 +1769,7 @@ bool test_shell_like_surface_chord_interrupt_smoke(
         });
 
     const bool started = start_terminal_fixture(
-        fixture.surface,
+        fixture,
         {
             fixture_path,
             QStringLiteral("--shell-like-smoke"),
