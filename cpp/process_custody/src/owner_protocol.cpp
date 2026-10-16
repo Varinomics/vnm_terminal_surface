@@ -290,6 +290,8 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
     auto received = channel.receive(bytes.data(), bytes.size(), timeout_ms);
     if (received.status != Receive_status::MESSAGE) {
         for (auto handle : received.descriptors) close_native_handle(handle);
+        if (error && received.status == Receive_status::FAILED)
+            *error = "owner control receive failed: " + std::to_string(received.error);
         return received.status;
     }
     bytes.resize(received.size);
@@ -322,7 +324,11 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
         for (auto handle : continuation.descriptors) close_native_handle(handle);
         if (invalid) {
             for (auto handle : received.descriptors) close_native_handle(handle);
-            if (error) *error = "incomplete owner control request";
+            if (error) {
+                *error = "incomplete owner control request";
+                if (continuation.status == Receive_status::FAILED)
+                    *error += ": native receive error " + std::to_string(continuation.error);
+            }
             return Receive_status::FAILED;
         }
         bytes.resize(continuation.size);

@@ -77,6 +77,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             add_test(NAME vnm_process_custody_started_descriptor_tests
                 COMMAND vnm_process_custody_tests --started-descriptor)
             set_tests_properties(vnm_process_custody_started_descriptor_tests PROPERTIES TIMEOUT 10)
+            add_test(NAME vnm_process_custody_receive_error_tests
+                COMMAND vnm_process_custody_tests --receive-error)
+            add_test(NAME vnm_process_custody_late_stop_tests
+                COMMAND vnm_process_custody_tests --late-stop $<TARGET_FILE:vnm_process_custody_owner>)
+            set_tests_properties(vnm_process_custody_receive_error_tests
+                vnm_process_custody_late_stop_tests PROPERTIES TIMEOUT 20)
         endif()
         add_executable(vnm_process_custody_start_deadline_tests
             tests/owner_start_deadline_tests.cpp)
