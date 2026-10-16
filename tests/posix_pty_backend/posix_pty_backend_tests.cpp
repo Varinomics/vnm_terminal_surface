@@ -1076,12 +1076,6 @@ bool test_process_exit_reports_with_descendant_slave_open()
             "descendant-open shell produces no backend errors");
     }
 
-    if (descendant_pid.has_value()) {
-        if (process_is_alive(*descendant_pid)) {
-            ::kill(*descendant_pid, SIGKILL);
-        }
-    }
-
     return ok;
 }
 
@@ -1512,9 +1506,6 @@ bool test_destructor_from_process_exited_callback_returns()
                         ok &= check(wait_for_process_absent(*descendant_pid),
                             "process-exited-destroy wait loop cleans up descendant after callback");
                     }
-                    if (process_is_alive(*descendant_pid)) {
-                        ::kill(*descendant_pid, SIGKILL);
-                    }
                 }
             }
         }
@@ -1576,9 +1567,6 @@ bool test_terminate_kills_descendant_in_target_group()
     if (descendant_pid.has_value()) {
         ok &= check(wait_for_process_absent(*descendant_pid),
             "terminate escalation kills descendant target group");
-        if (process_is_alive(*descendant_pid)) {
-            ::kill(*descendant_pid, SIGKILL);
-        }
     }
     ok &= check_no_backend_errors(capture,
         "terminate-descendant shell produces no backend errors");
