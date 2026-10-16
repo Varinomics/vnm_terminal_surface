@@ -253,9 +253,12 @@ public:
     // up to the epoch has been processed and no runner operation is open. An
     // open operation (a callback's output, or output a hold captured and a
     // release let go) owns what it has not yet applied, its replies included,
-    // so input reads its modes and a frame counts as caught up only once this
-    // holds for its frontier.
+    // so a frame counts as caught up only once this holds for its frontier.
     bool backend_callbacks_settled(std::uint64_t epoch) const;
+    // Input waits for captured callback work, not for bytes that have not
+    // arrived yet. A retained partial escape prefix can leave the snapshot
+    // epoch incomplete after all work through this frontier has been consumed.
+    bool input_frontier_ready(std::uint64_t epoch) const;
     // Counts runner steps. A drain that advanced it made progress, whether or
     // not a callback epoch completed.
     std::uint64_t backend_output_step_count() const;

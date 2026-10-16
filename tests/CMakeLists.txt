@@ -1502,6 +1502,21 @@ set_target_properties(vnm_terminal_surface_host PROPERTIES
 )
 
 add_test(
+    NAME vnm_terminal_surface_host_resize_frontier
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --resize-frontier-only
+)
+set_tests_properties(vnm_terminal_surface_host_resize_frontier PROPERTIES
+    LABELS "conformance;input;resize"
+    TIMEOUT 30
+)
+
+add_test(
     NAME vnm_terminal_surface_host
     COMMAND
         "${CMAKE_COMMAND}" -E env
@@ -2213,6 +2228,19 @@ target_compile_definitions(vnm_terminal_backend_session PRIVATE
 
 set_target_properties(vnm_terminal_backend_session PROPERTIES
     AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_backend_session_resize_frontier
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_backend_session>"
+        --resize-frontier-only
+)
+set_tests_properties(vnm_terminal_backend_session_resize_frontier PROPERTIES
+    LABELS "conformance;input;resize"
+    TIMEOUT 30
 )
 
 add_test(

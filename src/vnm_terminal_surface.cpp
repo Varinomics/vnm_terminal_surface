@@ -714,7 +714,7 @@ bool protocol_callbacks_before_input_frontier_pending(
 {
     const std::optional<std::uint64_t> frontier = session.input_frontier_epoch();
     return frontier.has_value()
-        ? !session.backend_callbacks_settled(*frontier)
+        ? !session.input_frontier_ready(*frontier)
         : session.has_pending_backend_callback_events();
 }
 
@@ -3154,6 +3154,7 @@ struct VNM_TerminalSurface::Private
     std::unique_ptr<term::Terminal_session>                session;
     std::uint64_t                                          session_generation = 0U;
     std::unique_ptr<term::Terminal_resize_controller>      resize_controller;
+    bool                                                   geometry_refresh_pending = false;
     std::shared_ptr<term::Terminal_transcript_recorder>    transcript_recorder;
     std::uint64_t                                          last_installed_render_publication_generation = 0U;
     std::uint64_t                                          last_ime_preedit_generation           = 0U;
@@ -8564,10 +8565,17 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     }
     record_total_elapsed();
     if (session_still_active && !session->input_frontier_epoch().has_value()) {
-        (void)m_private->retry_pending_published_mouse_reports(
-            *this,
-            false,
-            pending_mouse_report_follow_up);
+        if (m_private->geometry_refresh_pending) {
+            // The geometry route drains its fixed input frontier. Waiting for
+            // the latest callbacks to be ready here can starve a busy terminal.
+            refresh_active_session_geometry();
+        }
+        if (m_private->active_session_matches(session, session_generation)) {
+            (void)m_private->retry_pending_published_mouse_reports(
+                *this,
+                false,
+                pending_mouse_report_follow_up);
+        }
     }
     return result;
 }
@@ -8651,16 +8659,31 @@ void VNM_TerminalSurface::refresh_active_session_geometry()
     Input_frontier_scope input_frontier(*this, true, false);
 
     if (m_private->session == nullptr || m_private->resize_controller == nullptr) {
+        m_private->geometry_refresh_pending = false;
         return;
     }
 
     if (!is_live_process_state(m_private->session->process_state())) {
+        m_private->geometry_refresh_pending = false;
         sync_from_session();
         return;
     }
 
+    term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
+    m_private->geometry_refresh_pending = false;
     const term::Terminal_session_result result =
         m_private->resize_controller->refresh_from_geometry(boundingRect().size());
+    if (!m_private->active_session_matches(session, session_generation)) {
+        return;
+    }
+    if (!is_accepted(result.code) &&
+        !session->input_frontier_ready(*session->input_frontier_epoch()))
+    {
+        // The item's current geometry and metrics remain the desired size.
+        // A later drain retries them, even when this surface has no window.
+        m_private->geometry_refresh_pending = true;
+    }
     sync_from_session();
     if (!is_accepted(result.code)) {
         report_result_failure(result);
@@ -9118,6 +9141,7 @@ void VNM_TerminalSurface::reset_session()
     m_private->synchronized_output_recovery_timer.stop();
     ++m_private->session_generation;
     m_private->clear_pending_published_mouse_reports();
+    m_private->geometry_refresh_pending = false;
     m_private->resize_controller.reset();
     m_private->session.reset();
     m_private->transcript_recorder.reset();

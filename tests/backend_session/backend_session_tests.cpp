@@ -18131,6 +18131,129 @@ bool test_output_callback_snapshot_inside_command_claims_processed_epoch()
     return ok;
 }
 
+// An output callback that ends inside an escape prefix leaves its epoch
+// unclaimed for snapshots, but every byte that arrived before the resize has
+// been consumed. The resize drains to its frontier and is applied.
+bool test_resize_after_output_ending_in_escape_prefix_is_applied()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(launch_config_with_grid(50, 97)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "escape-prefix resize session starts");
+    session->process_backend_callback_events();
+
+    QByteArray output = QByteArrayLiteral("frame");
+    output += QByteArray("\x1b[", 2);
+    ok &= check(backend->emit_output(output), "escape-prefix resize queues output");
+
+    const term::Terminal_session_result result =
+        session->resize(QSizeF(439.2, 501.6), term::terminal_grid_size_t{33, 61});
+    ok &= check(result.code == term::Terminal_session_result_code::ACCEPTED,
+        "a resize after output ending in an escape prefix is applied");
+    ok &= check(session->grid_size().rows == 33 && session->grid_size().columns == 61,
+        "the session grid follows the applied resize");
+    const std::uint64_t prefix_epoch = session->backend_callback_enqueue_epoch();
+    const auto resized_snapshot = session->latest_render_snapshot();
+    ok &= check(session->backend_callback_processed_epoch() < prefix_epoch &&
+            resized_snapshot.has_value() &&
+            resized_snapshot->metadata.processed_backend_callback_epoch < prefix_epoch,
+        "resizing does not claim completion of the retained escape prefix");
+    ok &= check(backend->emit_output(QByteArrayLiteral("Hrest")),
+        "escape-prefix resize queues the completing output");
+    session->process_backend_callback_events();
+    ok &= check(session->backend_callback_processed_epoch() ==
+            session->backend_callback_enqueue_epoch(),
+        "the completing output claims its epoch after the resize");
+    const auto completed_snapshot = session->latest_render_snapshot();
+    ok &= check(completed_snapshot.has_value() &&
+            snapshot_row_text(*completed_snapshot, 0) == QStringLiteral("reste"),
+        "the retained CSI completes as cursor-home after resizing");
+    return ok;
+}
+
+// The same frontier rule for key input: output that has not yet arrived
+// cannot precede the key, so the key is written rather than refused.
+bool test_key_after_output_ending_in_escape_prefix_is_written()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "escape-prefix key session starts");
+    session->process_backend_callback_events();
+
+    QByteArray output = QByteArrayLiteral("frame");
+    output += QByteArray("\x1b", 1);
+    ok &= check(backend->emit_output(output), "escape-prefix key queues output");
+
+    const QKeyEvent key(QEvent::KeyPress, Qt::Key_K, Qt::NoModifier, QStringLiteral("k"));
+    const term::Terminal_key_event_result key_result = session->write_key_event(key);
+    ok &= check(key_result.handled &&
+            key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+            !backend->writes.empty() &&
+            backend->writes.back() == expected_encoded_key_event_bytes(key),
+        "a key after output ending in a lone ESC is written");
+    const auto prefix_epoch = session->backend_callback_enqueue_epoch();
+    ok &= check(session->backend_callback_processed_epoch() < prefix_epoch,
+        "key input does not claim completion of the retained ESC");
+    ok &= check(backend->emit_output(QByteArrayLiteral("[2;3HZ")),
+        "escape-prefix key queues the completing cursor-position sequence");
+    session->process_backend_callback_events();
+    const auto completed_snapshot = session->latest_render_snapshot();
+    ok &= check(completed_snapshot.has_value() &&
+            snapshot_row_text(*completed_snapshot, 1) == QStringLiteral("  Z") &&
+            session->backend_callback_processed_epoch() ==
+                session->backend_callback_enqueue_epoch(),
+        "the retained ESC completes at the intended cell after key input");
+    return ok;
+}
+
+// A callback that resumes a held prefix and ends with a complete two-byte
+// escape (a sixel string terminator) has applied every byte, so it claims
+// its epoch.
+bool test_carried_callback_ending_in_two_byte_escape_claims_its_epoch()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "carried two-byte escape session starts");
+    session->process_backend_callback_events();
+
+    QByteArray first = QByteArrayLiteral("a");
+    first += QByteArray("\x1b[", 2);
+    ok &= check(backend->emit_output(first), "carried two-byte escape queues the prefix");
+    session->process_backend_callback_events();
+
+    QByteArray second = QByteArrayLiteral("1mb");
+    second += QByteArray("\x1b\\", 2);
+    ok &= check(backend->emit_output(second), "carried two-byte escape queues the completion");
+    const std::uint64_t second_epoch = session->backend_callback_enqueue_epoch();
+    session->process_backend_callback_events();
+
+    ok &= check(session->backend_callback_processed_epoch() == second_epoch,
+        "a carried callback ending in a two-byte escape claims its epoch");
+    const auto completed_snapshot = session->latest_render_snapshot();
+    ok &= check(completed_snapshot.has_value() &&
+            snapshot_row_text(*completed_snapshot, 0) == QStringLiteral("ab"),
+        "the carried CSI and trailing escape retain their stream meaning");
+    ok &= check(session->resize(QSizeF(400.0, 120.0), {12, 40}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "a resize after that callback is applied");
+    return ok;
+}
+
+
 bool test_incomplete_csi_output_callback_snapshot_keeps_previous_processed_epoch()
 {
     bool ok = true;
@@ -22693,9 +22816,25 @@ bool test_stop_failure_preserves_commitment_and_prior_geometry()
 
 }
 
-int main()
+int main(int argc, char** argv)
 {
     bool ok = true;
+    ok &= test_resize_after_output_ending_in_escape_prefix_is_applied();
+    ok &= test_key_after_output_ending_in_escape_prefix_is_written();
+    ok &= test_carried_callback_ending_in_two_byte_escape_claims_its_epoch();
+    if (argc == 2 && std::string_view(argv[1]) == "--resize-frontier-only") {
+        ok &= test_resize_controller_fast_path_applies_only_captured_callbacks();
+        ok &= test_key_input_precedes_output_queued_after_frontier();
+        ok &= test_captured_callback_frontier_seals_coalesced_output();
+        ok &= test_synchronous_input_routes_do_not_chase_replenished_output();
+        ok &= test_reentrant_input_takes_the_unsettled_outcome();
+        ok &= test_final_settlement_step_keeps_its_ownership();
+        ok &= test_incomplete_csi_output_callback_snapshot_keeps_previous_processed_epoch();
+        ok &= test_non_output_after_incomplete_csi_does_not_advance_processed_epoch();
+        ok &= test_rejected_callback_epoch_waits_for_lower_sliced_output();
+        ok &= test_rejected_callback_epoch_waits_for_lower_non_output_callback();
+        return ok ? 0 : 1;
+    }
     ok &= test_stop_failure_preserves_commitment_and_prior_geometry();
     ok &= test_start_callback_ordering_and_output();
     ok &= test_backend_output_capture_file();

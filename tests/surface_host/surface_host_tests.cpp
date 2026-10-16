@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
+#include "vnm_terminal/terminal_canvas_export.h"
 #include "helpers/test_check.h"
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
@@ -839,6 +840,9 @@ public:
     term::Terminal_backend_result write(QByteArray bytes) override
     {
         writes.push_back(std::move(bytes));
+        if (on_write != nullptr) {
+            on_write();
+        }
         if (write_delay > std::chrono::steady_clock::duration::zero()) {
             const auto deadline = std::chrono::steady_clock::now() + write_delay;
             // Stay inside the owner drain without depending on platform sleep granularity.
@@ -1006,6 +1010,7 @@ public:
     std::vector<term::Terminal_launch_config>*
                                start_config_observer  = nullptr;
     std::function<void()>      on_start;
+    std::function<void()>      on_write;
     std::shared_ptr<Scripted_backend_lifecycle_state>
                                lifecycle_state;
     int*                       start_attempt_observer = nullptr;
@@ -19345,6 +19350,97 @@ bool test_window_destroy_keeps_surface_session_until_surface_destroy(QGuiApplica
     return ok;
 }
 
+bool test_hidden_surface_retries_latest_geometry_after_frontier_refusal(
+    QGuiApplication& app,
+    bool             replenish_output)
+{
+    bool ok = true;
+    VNM_TerminalSurface surface;
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(12.0);
+    const auto metrics = term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
+    surface.setSize(QSizeF(97 * metrics.width, 50 * metrics.height));
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+    ok &= check(started && surface.window() == nullptr,
+        "resize retry starts without a window or polish delivery");
+    backend_ptr->emit_output(QByteArrayLiteral("frame"));
+    ok &= check(pump_until(app, [&] {
+        return vnm_terminal::export_terminal_canvas_frame(surface).status ==
+            vnm_terminal::Terminal_canvas_export_status::OK;
+    }, 100), "hidden surface first publishes a coherent canvas");
+    int refusal_count = 0;
+    QObject::connect(&surface, &VNM_TerminalSurface::backend_error, &surface,
+        [&](VNM_TerminalSurface::Backend_error_code, const QString& message) {
+            if (message == QStringLiteral("input callback frontier is unsettled")) {
+                ++refusal_count;
+            }
+        });
+    bool changed_geometry = false;
+    auto refused_export_status = vnm_terminal::Terminal_canvas_export_status::NO_FRAME;
+    backend_ptr->on_write = [&] {
+        if (replenish_output) {
+            backend_ptr->outputs_during_output_resume.push_back(
+                surface_backpressure_output(*backend_ptr, QByteArrayLiteral("\x1b[c")));
+        }
+        if (changed_geometry) {
+            return;
+        }
+        changed_geometry = true;
+        surface.setSize(QSizeF(73 * metrics.width, 40 * metrics.height));
+        surface.setSize(QSizeF(61 * metrics.width, 33 * metrics.height));
+        refused_export_status = vnm_terminal::export_terminal_canvas_frame(surface).status;
+    };
+    bool converged = false;
+    if (replenish_output) {
+        // Each reply holds its drain past either posted-work budget. Resuming
+        // output supplies the next callback before the queue can become empty.
+        backend_ptr->write_delay = std::chrono::milliseconds{40};
+        const std::uint64_t resize_frontier = queue_surface_frontier_output(
+            surface, *backend_ptr, QByteArrayLiteral("\x1b[c"));
+        backend_ptr->outputs_during_output_resume = {
+            surface_backpressure_output(*backend_ptr, QByteArrayLiteral("\x1b[c")),
+        };
+        for (int drain = 0; drain < 32 && backend_ptr->resize_requests.empty(); ++drain) {
+            term::VNM_TerminalSurface_render_bridge::
+                drain_backend_callback_events_for_posted_work(surface);
+        }
+        ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+                surface) >= resize_frontier,
+            "persistent output retires the callback that refused the resize");
+        ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(surface) > 0,
+            "persistent output remains queued when the deferred resize is checked");
+        converged = surface.rows() == 33 && surface.columns() == 61;
+    }
+    else {
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[c"));
+        converged = pump_until(app, [&] {
+            return surface.rows() == 33 && surface.columns() == 61 &&
+                vnm_terminal::export_terminal_canvas_frame(surface).status ==
+                    vnm_terminal::Terminal_canvas_export_status::OK;
+        }, 100);
+    }
+    backend_ptr->on_write = {};
+    backend_ptr->write_delay = {};
+    backend_ptr->outputs_during_output_resume.clear();
+    ok &= check(changed_geometry, "the backend reply enters the geometry-change hook");
+    ok &= check(refusal_count >= 1, "a reentrant resize reports the unsettled frontier");
+    ok &= check(refused_export_status ==
+            vnm_terminal::Terminal_canvas_export_status::INVALID_SOURCE_FRAME,
+        "strict export rejects the old snapshot at the refused geometry");
+    ok &= check(converged && surface.window() == nullptr,
+        replenish_output
+            ? "posted callback drain retries latest hidden geometry while later output remains queued"
+            : "posted callback drain retries the latest geometry without window polish");
+    ok &= check(backend_ptr->resize_requests.size() == 1 &&
+            backend_ptr->resize_requests.back().grid_size.rows == 33 &&
+            backend_ptr->resize_requests.back().grid_size.columns == 61,
+        "only the latest refused geometry reaches the backend");
+    return ok;
+}
+
 bool test_geometry_change_resizes_session(QGuiApplication& app)
 {
     bool ok = true;
@@ -20761,6 +20857,15 @@ int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
 
+    if (app.arguments().contains(QStringLiteral("--resize-frontier-only"))) {
+        bool ok = test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
+        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
+        ok &= test_geometry_change_resizes_session(app);
+        ok &= test_control_wheel_resize_keeps_event_frontier(app);
+        ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+        ok &= test_async_surface_resize_receipt_updates_geometry_snapshot(app);
+        return ok ? 0 : 1;
+    }
     if (app.arguments().contains(QStringLiteral("--selection-copy-intent-only"))) {
         return test_selection_copy_intent_after_output(app) ? 0 : 1;
     }
@@ -20953,6 +21058,8 @@ int main(int argc, char** argv)
     ok &= test_after_frame_callback_update_latch_falls_back_on_window_destroy(app);
     ok &= test_window_destroy_keeps_surface_session_until_surface_destroy(app);
     ok &= test_geometry_change_resizes_session(app);
+    ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
+    ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
     ok &= test_backend_exit_updates_surface(app);
     ok &= test_public_lifecycle_methods(app);
     ok &= test_terminal_icon_name_notifications(app);

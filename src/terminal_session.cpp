@@ -1942,6 +1942,19 @@ public:
             m_active_callbacks != 0U;
     }
 
+    bool has_pending_callbacks_through(std::uint64_t epoch) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        return
+            (m_pending_backend_output_capture_failure.has_value() &&
+                m_pending_backend_output_capture_failure->backend_callback_epoch <= epoch) ||
+            std::any_of(m_pending_commands.begin(), m_pending_commands.end(),
+                [epoch](const Terminal_session_command& command) {
+                    return command.backend_callback_epoch <= epoch;
+                });
+    }
+
     std::size_t pending_command_count() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2193,7 +2206,7 @@ Terminal_session::try_write_user_bytes_without_backend_drain_if_callbacks_empty(
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if ((!m_input_frontier_epoch.has_value() ||
-            !backend_output_settled(*m_input_frontier_epoch)) &&
+            !input_frontier_ready(*m_input_frontier_epoch)) &&
         (output_operation_open() ||
             !m_pending_commands.empty() ||
             m_callback_lifetime->has_pending_or_active_callbacks()))
@@ -2303,7 +2316,7 @@ Terminal_session::try_write_mouse_event_without_backend_drain_if_callbacks_empty
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if ((!m_input_frontier_epoch.has_value() ||
-            !backend_output_settled(*m_input_frontier_epoch)) &&
+            !input_frontier_ready(*m_input_frontier_epoch)) &&
         (output_operation_open() ||
             !m_pending_commands.empty() ||
             m_callback_lifetime->has_pending_or_active_callbacks()))
@@ -2463,7 +2476,7 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     };
 
     if (m_input_frontier_epoch.has_value() &&
-        !backend_output_settled(*m_input_frontier_epoch))
+        !input_frontier_ready(*m_input_frontier_epoch))
     {
         return refuse_before_encoding(
             Terminal_session_result_code::INVALID_STATE,
@@ -2711,7 +2724,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines(int line
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
     if (m_input_frontier_epoch.has_value() &&
-        !backend_output_settled(*m_input_frontier_epoch))
+        !input_frontier_ready(*m_input_frontier_epoch))
     {
         return {};
     }
@@ -2829,7 +2842,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_line
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
     if (m_input_frontier_epoch.has_value() &&
-        !backend_output_settled(*m_input_frontier_epoch))
+        !input_frontier_ready(*m_input_frontier_epoch))
     {
         return {};
     }
@@ -2886,7 +2899,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_o
     Input_frontier_scope frontier(*this);
     process_backend_callback_events_to_current_epoch();
     if (m_input_frontier_epoch.has_value() &&
-        !backend_output_settled(*m_input_frontier_epoch))
+        !input_frontier_ready(*m_input_frontier_epoch))
     {
         return {};
     }
@@ -3103,7 +3116,7 @@ void Terminal_session::set_scrollback_limit(int limit)
     // Older output settles before the model changes: reached from inside a
     // drain that cannot settle it (an operation may hold a placement), the
     // setter changes nothing, configuration included.
-    if (!backend_output_settled(*m_input_frontier_epoch)) {
+    if (!input_frontier_ready(*m_input_frontier_epoch)) {
         return;
     }
 
@@ -3148,7 +3161,7 @@ void Terminal_session::set_retained_history_capacity_bytes(
     // Older output settles before the model changes: reached from inside a
     // drain that cannot settle it (an operation may hold a placement), the
     // setter changes nothing, configuration included.
-    if (!backend_output_settled(*m_input_frontier_epoch)) {
+    if (!input_frontier_ready(*m_input_frontier_epoch)) {
         return;
     }
 
@@ -3197,7 +3210,7 @@ void Terminal_session::set_color_state(Terminal_color_state state)
     // Older output settles before the model changes: reached from inside a
     // drain that cannot settle it (an operation may hold a placement), the
     // setter changes nothing, configuration included.
-    if (!backend_output_settled(*m_input_frontier_epoch)) {
+    if (!input_frontier_ready(*m_input_frontier_epoch)) {
         return;
     }
 
@@ -3248,7 +3261,7 @@ void Terminal_session::set_cell_pixel_size(terminal_cell_pixel_size_t size)
     // Older output settles before the model changes: reached from inside a
     // drain that cannot settle it (an operation may hold a placement), the
     // setter changes nothing, configuration included.
-    if (!backend_output_settled(*m_input_frontier_epoch)) {
+    if (!input_frontier_ready(*m_input_frontier_epoch)) {
         return;
     }
 
@@ -3598,6 +3611,25 @@ bool Terminal_session::output_operation_open() const
 bool Terminal_session::backend_output_settled(std::uint64_t epoch) const
 {
     return !output_operation_open() && m_last_processed_backend_callback_epoch >= epoch;
+}
+
+bool Terminal_session::input_frontier_ready(std::uint64_t epoch) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (output_operation_open() ||
+        (m_operation.has_value() &&
+            m_operation->command.backend_callback_epoch != 0U &&
+            m_operation->command.backend_callback_epoch <= epoch))
+    {
+        return false;
+    }
+    for (const Terminal_session_command& command : m_pending_commands) {
+        if (command.backend_callback_epoch != 0U && command.backend_callback_epoch <= epoch) {
+            return false;
+        }
+    }
+    return !m_callback_lifetime->has_pending_callbacks_through(epoch);
 }
 
 bool Terminal_session::has_pending_backend_callback_events() const
@@ -4636,7 +4668,7 @@ Terminal_session_result Terminal_session::enqueue_and_process_synchronous_comman
 {
     if (drain_policy == Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED &&
         m_input_frontier_epoch.has_value() &&
-        !backend_output_settled(*m_input_frontier_epoch))
+        !input_frontier_ready(*m_input_frontier_epoch))
     {
         return make_rejected_result(
             command.sequence,
@@ -6774,7 +6806,10 @@ bool Terminal_session::scan_backend_output_span(
                 scanner.state = Text_area_resize_scan_state::PARAMETERS;
             }
             else {
-                const qsizetype left = flush_text_area_resize_candidate(sequence, false);
+                const qsizetype left = flush_text_area_resize_candidate(
+                    sequence,
+                    false,
+                    !tail_already_owned && offset + 1 == bytes.size());
                 if (m_backend_output_stopped) {
                     stop_in_candidate(offset + 1, left);
                     return false;
@@ -7803,7 +7838,7 @@ std::optional<Terminal_session_result>
 Terminal_session::reject_unsettled_input_frontier()
 {
     if (!m_input_frontier_epoch.has_value() ||
-        backend_output_settled(*m_input_frontier_epoch))
+        input_frontier_ready(*m_input_frontier_epoch))
     {
         return std::nullopt;
     }
