@@ -21,9 +21,15 @@ env:
 
 jobs:
   build-and-test:
-    name: Qt Quick Terminal Surface (macOS)
+    name: Qt Quick Terminal Surface (macOS, ${{ matrix.test_group }})
     runs-on: macos-15-intel
+    strategy:
+      # A lost native-test runner must not cancel the independent test groups.
+      fail-fast: false
+      matrix:
+        test_group: ${{ fromJSON(inputs.focused_units && '["focused"]' || '["custody", "native", "remaining"]') }}
     env:
+      TEST_GROUP: ${{ matrix.test_group }}
       CCACHE_MAXSIZE: 2GiB
       CCACHE_COMPILERCHECK: content
       # Nested package builds inherit the launchers without caching their trees.
@@ -54,7 +60,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.run_id }}-${{ github.run_attempt }}-build
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.test_group }}-build
           restore-keys: ${{ steps.compiler_cache.outputs.key_prefix }}
 
       - name: Install Qt
@@ -111,32 +117,105 @@ jobs:
         if: ${{ !cancelled() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
         uses: actions/upload-artifact@v6
         with:
-          name: macos-compiler-cache-${{ github.run_attempt }}
+          name: macos-compiler-cache-${{ matrix.test_group }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/compiler-cache-*.txt
           if-no-files-found: error
 
-      - name: Run tests
-        working-directory: build
+      - name: Verify and record test groups
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          custody = '^vnm_process_custody_tests$'
+          native = '^(vnm_process_custody_|vnm_terminal_posix_|vnm_terminal_native_backend_cleanup_owner_tests$)'
+          filters = {
+              'custody': ['-R', custody],
+              'native': ['-R', native, '-E', custody],
+              'remaining': ['-E', native],
+              'focused': ['-R', '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session|surface_host)$'],
+          }
+          evidence = Path(os.environ['RUNNER_TEMP'])
+
+          def inventory(group, arguments):
+              result = subprocess.run(
+                  ['ctest', '--test-dir', 'build', '--show-only=json-v1', *arguments],
+                  check=True, capture_output=True, text=True)
+              (evidence / f'ctest-inventory-{group}.json').write_text(result.stdout)
+              return [test['name'] for test in json.loads(result.stdout)['tests']]
+
+          all_tests = inventory('all', [])
+          selected_group = os.environ['TEST_GROUP']
+          groups = ['focused'] if selected_group == 'focused' else ['custody', 'native', 'remaining']
+          selected_tests = []
+          for group in groups:
+              names = inventory(group, filters[group])
+              if not names:
+                  raise SystemExit(f'No tests selected for {group}')
+              print(f'{group}: {len(names)} tests', flush=True)
+              selected_tests.extend(names)
+          # CTest includes required fixtures in its inventory, so this also
+          # rejects a fixture accidentally shared across independent runners.
+          if selected_group != 'focused' and collections.Counter(selected_tests) != collections.Counter(all_tests):
+              raise SystemExit('Test groups must cover every registered test exactly once')
+          (evidence / 'ctest-arguments.json').write_text(json.dumps(filters[selected_group]))
+          PY
+
+      - name: Upload test inventory before execution
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-test-inventory-${{ matrix.test_group }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ctest-inventory-*.json
+            ${{ runner.temp }}/ctest-arguments.json
+          if-no-files-found: error
+
+      - name: Run tests (${{ matrix.test_group }})
+        id: tests
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          tests=()
-          if [[ "${{ inputs.focused_units }}" == "true" ]]; then
-            tests=(-R '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session|surface_host)$')
-          fi
-          ctest --output-on-failure --parallel 1 --no-tests=error "${tests[@]}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ['RUNNER_TEMP'])
+          arguments = json.loads((evidence / 'ctest-arguments.json').read_text())
+          os.execvp('ctest', [
+              'ctest', '--test-dir', 'build', '--verbose', '--output-on-failure',
+              '--parallel', '1', '--no-tests=error',
+              '--output-log', str(evidence / 'ctest-output.log'),
+              '--output-junit', str(evidence / 'ctest-results.xml'),
+              *arguments,
+          ])
+          PY
+
+      - name: Upload test results
+        if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-test-results-${{ matrix.test_group }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ctest-output.log
+            ${{ runner.temp }}/ctest-results.xml
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: error
 
       # The package fixture builds a real LCD-only provider and a separate
       # atlas-disabled surface against it. Reuse that producer for distribution;
       # the main source-atlas build remains a development configuration.
       - name: Install package
-        if: ${{ !inputs.focused_units }}
+        if: ${{ matrix.test_group == 'remaining' }}
         run: |
           cmake --install build/package_smoke/source_package/surface-build \
             --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
 
       - name: Configure package smoke
-        if: ${{ !inputs.focused_units }}
+        if: ${{ matrix.test_group == 'remaining' }}
         run: |
           cmake -B package-smoke -S tests/package_smoke -G Ninja \
             -C build/package_smoke/source_package/dependencies.cmake \
@@ -144,16 +223,16 @@ jobs:
             -DCMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/install"
 
       - name: Build package smoke
-        if: ${{ !inputs.focused_units }}
+        if: ${{ matrix.test_group == 'remaining' }}
         run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel 2
 
       - name: Report package compiler cache
-        if: ${{ !inputs.focused_units }}
+        if: ${{ matrix.test_group == 'remaining' }}
         run: ccache --show-stats --verbose
 
       - name: Save package compiler cache
-        if: ${{ !inputs.focused_units }}
+        if: ${{ matrix.test_group == 'remaining' }}
         uses: actions/cache/save@v5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.run_id }}-${{ github.run_attempt }}-package
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.test_group }}-package
