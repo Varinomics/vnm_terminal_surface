@@ -25,6 +25,14 @@ unsure which standard applies, read all four before proceeding.
 Local path: `C:\plms\varinomics\varinomics-standards\`
 Canonical repo: `https://github.com/Varinomics/varinomics-standards`
 
+## Documentation
+
+The README introduces the library to Qt Quick hosts; build and packaging
+reference lives in `docs/repository_guide.md`. Follow the
+[release guide](docs/releasing.md) for coordinated surface and terminal releases,
+including their shared version. Follow the shared governance rules for README
+scope.
+
 ## Review and Plan Artifacts
 
 Default rule: do not stage or commit review reports, review plans,

@@ -51,6 +51,8 @@ the repository without reading every implementation detail.
   public API, and Scene Graph constraints.
 - [Repository guide](repository_guide.md) records supported platforms, build
   options, fixture formats, generated artifacts, and operational entry points.
+- [Release guide](releasing.md) describes coordinated surface and terminal
+  releases, version selection, validation, and source publication.
 - [Render snapshot contract](render_snapshot_contract.md) records the
   validated shape of `Terminal_render_snapshot`: cell order, wide cells,
   dirty-row semantics, basis/purpose, provenance, and lifetime.

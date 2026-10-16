@@ -111,7 +111,9 @@ for local runs.
   legitimately breaks the application's `master` until the matching application
   commit is pushed. A red result means the canonical pair does not configure,
   build, or test clean. The application requires the narrow embedded-surface
-  target and API, while the two projects version their releases independently.
+  target and API. Coordinated surface and application releases use the same
+  version as described in the [release guide](releasing.md); matching release
+  numbers do not establish build compatibility.
   A red result can therefore mean the application has not adopted a semantic API
   change, the required capability target is absent, or the selected pair
   genuinely fails to configure, build, or test. Read the job log to distinguish
