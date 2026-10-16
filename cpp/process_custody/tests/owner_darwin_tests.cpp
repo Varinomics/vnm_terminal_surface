@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -959,6 +960,217 @@ bool command_failed_birth(const std::string& helper)
     return check(false, "failed command settlement deadline");
 }
 
+bool confirmed_command(const std::string& helper, const std::string& executable,
+    const std::vector<custody::Spawn_argument>& arguments, bool expect_execution, int exit_code)
+{
+    Run run;
+    if (!run.launch(helper)) {
+        return false;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::COMMAND_EXEC;
+    request.process.executable = executable;
+    request.process.argv = arguments;
+    std::string error;
+    if (!check(custody::send_owner_start(run.channel, request, &error), error.c_str())) {
+        return false;
+    }
+    std::int64_t root = 0;
+    bool executed = false;
+    bool exited = false;
+    bool rejected = false;
+    bool ok = true;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < deadline) {
+        custody::Owner_event event;
+        const auto status = custody::receive_owner_event(run.channel, &event, 100, &error);
+        if (status == custody::Receive_status::TIMEOUT) {
+            continue;
+        }
+        if (!check(status == custody::Receive_status::MESSAGE, error.c_str())) {
+            return false;
+        }
+        custody::close_native_handle(event.root_reference);
+        custody::close_native_handle(event.pty_master);
+        ok &= check(event.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS,
+            "confirmed command receipts retain their explicit cleanup scope");
+        if (event.kind == custody::Owner_event_kind::STARTED) {
+            ok &= check(root == 0 && event.root_exit.process_id > 1 && event.root_birth_token != 0,
+                "command native birth precedes execution confirmation");
+            root = event.root_exit.process_id;
+        }
+        if (event.kind == custody::Owner_event_kind::EXECUTION_STARTED) {
+            ok &= check(root > 1 && event.root_exit.process_id == root && !executed && !exited &&
+                    event.root_birth_token == 0 && event.root_reference == custody::k_invalid_handle &&
+                    event.pty_master == custody::k_invalid_handle && expect_execution,
+                "only successful exec emits a separate ordered confirmation for the original root");
+            executed = true;
+        }
+        if (event.kind == custody::Owner_event_kind::ROOT_EXITED) {
+            ok &= check(root > 1 && event.root_exit.process_id == root && !exited &&
+                    event.root_exit.exit_code == exit_code && event.root_exit.signal == 0 &&
+                    executed == expect_execution,
+                "fast command exit preserves exec evidence and its exact status");
+            exited = true;
+        }
+        if (event.kind == custody::Owner_event_kind::START_REJECTED) {
+            ok &= check(root > 1 && exited && !executed && !rejected,
+                "failed exec is rejected after the retained root exit receipt");
+            rejected = true;
+        }
+        if (event.kind == custody::Owner_event_kind::TREE_SETTLEMENT &&
+            event.settlement != custody::Tree_settlement::PENDING)
+        {
+            ok &= check(root > 1 && exited && executed == expect_execution && rejected != expect_execution &&
+                    event.settlement == custody::Tree_settlement::CONFIRMED,
+                "execution outcome remains separate from confirmed native cleanup");
+            return ok;
+        }
+    }
+    return check(false, "confirmed command receipt deadline");
+}
+
+bool unsupported_command_exec(const std::string& helper)
+{
+    Run run;
+    if (!run.launch(helper)) {
+        return false;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::COMMAND_EXEC;
+    request.process.executable = "/bin/sh";
+    request.process.argv = {"sh", "-c", "exit 23"};
+    std::string error;
+    if (!check(custody::send_owner_start(run.channel, request, &error), error.c_str())) {
+        return false;
+    }
+    bool rejected = false;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < deadline) {
+        custody::Owner_event event;
+        const auto status = custody::receive_owner_event(run.channel, &event, 100, &error);
+        if (status == custody::Receive_status::TIMEOUT) {
+            continue;
+        }
+        if (!check(status == custody::Receive_status::MESSAGE, error.c_str())) {
+            return false;
+        }
+        custody::close_native_handle(event.root_reference);
+        custody::close_native_handle(event.pty_master);
+        if (!check(event.kind != custody::Owner_event_kind::STARTED &&
+                event.kind != custody::Owner_event_kind::EXECUTION_STARTED,
+            "unsupported execution mode is refused before native birth without retry"))
+        {
+            return false;
+        }
+        rejected |= event.kind == custody::Owner_event_kind::START_REJECTED;
+        if (event.kind == custody::Owner_event_kind::TREE_SETTLEMENT) {
+            return check(rejected && event.settlement == custody::Tree_settlement::CONFIRMED,
+                "unsupported-mode refusal leaves no admitted workload");
+        }
+    }
+    return check(false, "unsupported execution mode refusal deadline");
+}
+
+bool unconfirmed_execution(const std::string& self, bool kill_before_release)
+{
+    custody::Process_tree_owner tree;
+    std::string error;
+    if (!check(tree.establish(&error), error.c_str())) {
+        return false;
+    }
+    auto request = command(self, "pause");
+    tree.configure_root_spawn(request);
+    request.execution_deadline = Clock::now() + std::chrono::seconds(5);
+    bool killed = false;
+    if (kill_before_release) {
+        request.admit_execution = [&]() {
+            pid_t children[2]{};
+            const int bytes = proc_listpids(PROC_PPID_ONLY, getpid(), children, sizeof(children));
+            killed = bytes == sizeof(pid_t) && kill(children[0], SIGKILL) == 0;
+            return killed;
+        };
+    }
+    else {
+        request.execution_deadline = Clock::now();
+    }
+    auto child = custody::spawn(request);
+    bool ok = check(!child.ok && !child.execution_confirmed && (!kill_before_release || killed),
+        "pre-exec death or expired confirmation budget never proves execution");
+    if (child.ok) {
+        tree.record_root(child);
+    }
+    else if (child.failed_birth) {
+        ok &= check(child.failed_birth->process_id > 1 && child.failed_birth->birth_token != 0,
+            "unconfirmed execution retains the original admitted birth identity");
+        tree.record_failed_root(*child.failed_birth);
+    }
+    else {
+        ok &= check(child.no_workload_admitted,
+            "missing execution confirmation must retain birth or prove no workload admission");
+    }
+    const auto outcome = tree.terminate_and_reap(std::chrono::milliseconds(10), std::chrono::seconds(3));
+    bool retired = child.no_workload_admitted;
+    bool status_recorded = child.no_workload_admitted;
+    const auto root = child.failed_birth ? child.failed_birth->process_id : child.process_id;
+    if (root > 1) {
+        int matching_exits = 0;
+        for (const auto& exit : outcome.exits) {
+            if (exit.process_id == root && (exit.exit_code >= 0 || exit.signal > 0)) {
+                ++matching_exits;
+            }
+        }
+        status_recorded = matching_exits == 1;
+        pid_t waited;
+        do { waited = waitpid(static_cast<pid_t>(root), nullptr, WNOHANG); }
+        while (waited < 0 && errno == EINTR);
+        retired = waited < 0 && errno == ECHILD;
+        if (waited == 0) {
+            // A failing fixture still owns this unreaped direct child.
+            (void)kill(static_cast<pid_t>(root), SIGKILL);
+            do { waited = waitpid(static_cast<pid_t>(root), nullptr, 0); }
+            while (waited < 0 && errno == EINTR);
+        }
+    }
+    std::printf("unconfirmed execution: killed=%d complete=%d terminal_unconfirmed=%d "
+        "retired=%d status=%d detail=%s\n", kill_before_release, outcome.complete,
+        outcome.terminal_unconfirmed, retired, status_recorded, outcome.error.c_str());
+    // Before setsid there may be no original group to prove empty. Its absence
+    // cannot upgrade the exact child's retirement to confirmed group cleanup.
+    return check(retired && status_recorded && (outcome.complete || outcome.terminal_unconfirmed) &&
+            outcome.cleanup_scope == custody::Cleanup_scope::OWNED_PROCESS_GROUPS,
+        "unconfirmed execution retires the exact child and preserves honest group scope") && ok;
+}
+
+bool command_execution_confirmation(const std::string& helper, const std::string& self)
+{
+    bool ok = confirmed_command(helper, "/bin/sh", {"sh", "-c", "exit 23"}, true, 23);
+    ok &= confirmed_command(helper, "/bin/sh", {"sh", "-c", "exit 127"}, true, 127);
+    ok &= confirmed_command(helper, "/vnm-no-such-command", {"/vnm-no-such-command"}, false, 127);
+    char script[] = "/tmp/vnm-command-exec-XXXXXX";
+    const int descriptor = mkstemp(script);
+    if (!check(descriptor >= 0, "invalid-interpreter fixture created")) {
+        return false;
+    }
+    constexpr char contents[] = "#!/vnm-no-such-interpreter\n";
+    const bool written = write(descriptor, contents, sizeof(contents) - 1) == sizeof(contents) - 1 &&
+        fchmod(descriptor, 0700) == 0;
+    close(descriptor);
+    if (check(written, "invalid-interpreter fixture is executable")) {
+        ok &= confirmed_command(helper, script, {script}, false, 127);
+    }
+    else {
+        ok = false;
+    }
+    unlink(script);
+    ok &= unconfirmed_execution(self, true);
+    ok &= unconfirmed_execution(self, false);
+    ok &= command_owner(helper);
+    ok &= command_failed_birth(helper);
+    ok &= command_owner(helper, custody::Owner_mode::PTY);
+    return ok;
+}
+
 bool stop_or_lose_owner(const std::string& helper, const std::string& self, const std::string& mode)
 {
     using namespace std::chrono_literals;
@@ -1183,6 +1395,14 @@ int fixture(const std::string& mode)
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string(argv[1]) == "--command-exec") {
+        std::string error;
+        return custody::prepare_parent_process(&error) && command_execution_confirmation(argv[2], argv[0]) ? 0 : 1;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--unsupported-command-exec") {
+        std::string error;
+        return custody::prepare_parent_process(&error) && unsupported_command_exec(argv[2]) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--command-failed-birth") {
         std::string error;
         return custody::prepare_parent_process(&error) && command_failed_birth(argv[2]) ? 0 : 1;

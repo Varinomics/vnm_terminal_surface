@@ -16,9 +16,24 @@ namespace vnm::process_custody {
 
 // Darwin PTY requests require the explicit outcome contract below. COMMAND
 // retains its independent root/process-group cleanup and ordinary exit codes.
-enum class Owner_mode : std::uint32_t { COMMAND, PTY };
+enum class Owner_mode : std::uint32_t { COMMAND, PTY, COMMAND_EXEC };
 enum class Tree_settlement : std::uint32_t { PENDING, CONFIRMED, UNCONFIRMED };
-enum class Owner_event_kind : std::uint32_t { STARTED, START_REJECTED, ROOT_EXITED, TREE_SETTLEMENT };
+enum class Owner_event_kind : std::uint32_t
+{
+    STARTED,
+    START_REJECTED,
+    ROOT_EXITED,
+    TREE_SETTLEMENT,
+    EXECUTION_STARTED
+};
+
+#if defined(__APPLE__)
+#define VNM_PROCESS_CUSTODY_HAS_COMMAND_EXEC_CONFIRMATION 1
+// COMMAND_EXEC opts into native exec confirmation. STARTED still records only
+// birth; EXECUTION_STARTED follows only a retained NOTE_EXEC for that child.
+// An owner that does not support this mode rejects it before workload admission.
+inline constexpr auto k_command_exec_confirmation_timeout = std::chrono::seconds(10);
+#endif
 
 // These normal exit codes carry a scoped result only for a helper admitted
 // with this exact Darwin PTY mode contract before workload START. Generic
@@ -41,7 +56,7 @@ struct Pty_dimensions
 struct Owner_start_request
 {
     Owner_mode mode = Owner_mode::COMMAND;
-    bool use_owner_standard_streams = false; // COMMAND only; explicit use of helper's inherited 0/1/2
+    bool use_owner_standard_streams = false; // command modes; explicit use of helper's inherited 0/1/2
     Spawn_request process;
     Pty_dimensions dimensions;
 };

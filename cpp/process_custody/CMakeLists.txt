@@ -38,6 +38,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         VNM_PROCESS_CUSTODY_OWNER_START_DEADLINE 1)
     set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
         VNM_PROCESS_CUSTODY_OWNER_START_DEADLINE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set_property(TARGET vnm_process_custody PROPERTY
+            VNM_PROCESS_CUSTODY_COMMAND_EXEC_CONFIRMATION 1)
+        set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
+            VNM_PROCESS_CUSTODY_COMMAND_EXEC_CONFIRMATION)
+    endif()
     target_sources(vnm_process_custody PRIVATE src/owner_protocol.cpp)
     add_executable(vnm_process_custody_owner src/owner_main_posix.cpp)
     target_link_libraries(vnm_process_custody_owner PRIVATE vnm_process_custody)
@@ -64,6 +70,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             COMMAND vnm_process_custody_tests $<TARGET_FILE:vnm_process_custody_owner>)
         set_tests_properties(vnm_process_custody_tests PROPERTIES TIMEOUT 60)
         if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+            add_test(NAME vnm_process_custody_command_exec_tests
+                COMMAND vnm_process_custody_tests --command-exec $<TARGET_FILE:vnm_process_custody_owner>)
+            set_tests_properties(vnm_process_custody_command_exec_tests PROPERTIES TIMEOUT 30)
             add_executable(vnm_process_custody_darwin_pty_tests tests/owner_darwin_pty_tests.cpp)
             target_link_libraries(vnm_process_custody_darwin_pty_tests PRIVATE vnm_process_custody)
             set_target_properties(vnm_process_custody_darwin_pty_tests PROPERTIES

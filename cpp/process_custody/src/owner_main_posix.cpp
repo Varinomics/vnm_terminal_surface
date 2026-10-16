@@ -120,6 +120,12 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
         for (const auto& descriptor : inherited_standard_streams) spawn.inherited.push_back(descriptor);
     }
     tree.configure_root_spawn(spawn);
+#if defined(__APPLE__)
+    if (request.mode == custody::Owner_mode::COMMAND_EXEC) {
+        spawn.execution_deadline = std::chrono::steady_clock::now() +
+            custody::k_command_exec_confirmation_timeout;
+    }
+#endif
     spawn.admit_execution = [&]() {
         detail::Owner_message pending;
         const auto status = detail::receive_message(channel, &pending, 0, &error);
@@ -167,6 +173,14 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
 #endif
     started.pty_master = failed_admitted_birth ? -1 : master;
     bool stopping = !emit(started) || failed_admitted_birth;
+#if defined(__APPLE__)
+    if (!stopping && request.mode == custody::Owner_mode::COMMAND_EXEC) {
+        custody::Owner_event executed;
+        executed.kind = custody::Owner_event_kind::EXECUTION_STARTED;
+        executed.root_exit.process_id = root.process_id;
+        stopping = !emit(executed);
+    }
+#endif
     int grace_ms = 250;
     bool root_reported = false;
     const auto report = [&](const std::vector<custody::Exit_status>& exits) {

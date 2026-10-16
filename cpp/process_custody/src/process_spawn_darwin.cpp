@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <libproc.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/event.h>
@@ -26,8 +27,10 @@ std::uint64_t process_birth_token(pid_t pid)
     return info.pbi_start_tvsec * 1'000'000 + info.pbi_start_tvusec;
 }
 
+enum class Observation { EXIT, EXIT_STATUS, EXECUTION };
+
 Native_handle open_occurrence_observer(std::int64_t process_id, std::uint64_t birth_token,
-    bool include_status, std::string* error)
+    Observation observation, std::string* error)
 {
     if (process_id <= 0 || process_id > std::numeric_limits<pid_t>::max() || birth_token == 0 ||
         process_birth_token((pid_t)process_id) != birth_token)
@@ -40,8 +43,9 @@ Native_handle open_occurrence_observer(std::int64_t process_id, std::uint64_t bi
     const int observer = kqueue();
     struct kevent event;
     EV_SET(&event, (pid_t)process_id, EVFILT_PROC,
-        EV_ADD | EV_ENABLE | (include_status ? EV_CLEAR : 0),
-        NOTE_EXIT | (include_status ? NOTE_EXITSTATUS : 0), 0, nullptr);
+        EV_ADD | EV_ENABLE | (observation == Observation::EXIT_STATUS ? EV_CLEAR : 0),
+        NOTE_EXIT | (observation == Observation::EXIT_STATUS ? NOTE_EXITSTATUS : 0) |
+            (observation == Observation::EXECUTION ? NOTE_EXEC : 0), 0, nullptr);
     if (observer < 0 || fcntl(observer, F_SETFD, FD_CLOEXEC) != 0 ||
         kevent(observer, &event, 1, nullptr, 0, nullptr) != 0 ||
         process_birth_token((pid_t)process_id) != birth_token)
@@ -53,6 +57,26 @@ Native_handle open_occurrence_observer(std::int64_t process_id, std::uint64_t bi
         return k_invalid_handle;
     }
     return observer;
+}
+
+bool observe_execution(int observer, pid_t pid, std::chrono::steady_clock::time_point deadline)
+{
+    while (true) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            return false;
+        }
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+        const timespec timeout{seconds.count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(remaining - seconds).count()};
+        struct kevent event{};
+        const int count = kevent(observer, nullptr, 0, &event, 1, &timeout);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        return count == 1 && (event.flags & EV_ERROR) == 0 && event.filter == EVFILT_PROC &&
+            event.ident == static_cast<std::uintptr_t>(pid) && (event.fflags & NOTE_EXEC) != 0;
+    }
 }
 
 bool cloexec_pipe(int descriptors[2])
@@ -245,7 +269,7 @@ struct Child_failure
 
 Native_handle open_process_observer(std::int64_t process_id, std::uint64_t birth_token, std::string* error)
 {
-    return open_occurrence_observer(process_id, birth_token, false, error);
+    return open_occurrence_observer(process_id, birth_token, Observation::EXIT, error);
 }
 
 struct Native_process_status_observer::Impl
@@ -276,7 +300,7 @@ bool Native_process_status_observer::open(
         return false;
     }
     m_impl->attempted = true;
-    m_impl->observer = open_occurrence_observer(process_id, birth_token, true, error);
+    m_impl->observer = open_occurrence_observer(process_id, birth_token, Observation::EXIT_STATUS, error);
     if (m_impl->observer < 0) {
         return false;
     }
@@ -432,7 +456,9 @@ Spawn_result spawn(const Spawn_request& in_request)
     const std::uint64_t birth_token = process_birth_token(pid);
     std::string observer_error;
     const int observer = open_process_observer(pid, birth_token, &observer_error);
-    const bool observed = observer >= 0;
+    const int execution_observer = in_request.execution_deadline ?
+        open_occurrence_observer(pid, birth_token, Observation::EXECUTION, &observer_error) : -1;
+    const bool observed = observer >= 0 && (!in_request.execution_deadline || execution_observer >= 0);
     const bool admitted = observed && (!in_request.admit_execution || in_request.admit_execution());
     ssize_t released = -1;
     if (admitted) {
@@ -440,6 +466,7 @@ Spawn_result spawn(const Spawn_request& in_request)
     }
     close(admission_pipe[1]);
     if (!admitted || released != 1) {
+        close_native_handle(execution_observer);
         // Still our unreaped child: no workload instruction passed the gate.
         (void)kill(pid, SIGKILL);
         int status = 0;
@@ -461,7 +488,24 @@ Spawn_result spawn(const Spawn_request& in_request)
     Child_failure failure;
     std::uint8_t* bytes  = reinterpret_cast<std::uint8_t*>(&failure);
     std::size_t   filled = 0;
+    bool pipe_complete = false;
     while (filled < sizeof(failure)) {
+        if (in_request.execution_deadline) {
+            const auto remaining = *in_request.execution_deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                break;
+            }
+            pollfd readiness{error_pipe[0], POLLIN, 0};
+            const auto wait_ms = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+            const int ready = poll(&readiness, 1,
+                static_cast<int>(std::min<std::int64_t>(wait_ms, std::numeric_limits<int>::max())));
+            if (ready < 0 && errno == EINTR) {
+                continue;
+            }
+            if (ready != 1 || (readiness.revents & (POLLIN | POLLHUP)) == 0) {
+                break;
+            }
+        }
         const ssize_t count = read(error_pipe[0], bytes + filled, sizeof(failure) - filled);
         if (count < 0) {
             if (errno == EINTR) {
@@ -470,6 +514,7 @@ Spawn_result spawn(const Spawn_request& in_request)
             break;
         }
         if (count == 0) {
+            pipe_complete = true;
             break;
         }
         filled += static_cast<std::size_t>(count);
@@ -477,11 +522,13 @@ Spawn_result spawn(const Spawn_request& in_request)
     close(error_pipe[0]);
 
     if (filled != 0) {
+        close_native_handle(execution_observer);
         // The child never reached exec and has exited (or is about to); it is
         // this process's direct child and no other owner waits it.
         int status = 0;
         pid_t waited;
-        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        do { waited = waitpid(pid, &status, in_request.execution_deadline ? WNOHANG : 0); }
+        while (waited < 0 && errno == EINTR);
         result.failed_birth = Darwin_spawn_failure{
             pid, birth_token, waited == pid ? k_invalid_handle : observer, true, waited == pid, status};
         if (waited == pid) close_native_handle(observer);
@@ -493,6 +540,19 @@ Spawn_result spawn(const Spawn_request& in_request)
             result.error = "spawn: the child reported a truncated failure record";
         }
         return result;
+    }
+
+    if (in_request.execution_deadline) {
+        result.execution_confirmed = pipe_complete &&
+            observe_execution(execution_observer, pid, *in_request.execution_deadline);
+        close_native_handle(execution_observer);
+        if (!result.execution_confirmed) {
+            // Execution may have happened. Keep the original child and exit
+            // observer under the sole parent's normal cleanup protocol.
+            result.failed_birth = Darwin_spawn_failure{pid, birth_token, observer, true, false, 0};
+            result.error = "spawn: command execution was not confirmed";
+            return result;
+        }
     }
 
     result.ok             = true;

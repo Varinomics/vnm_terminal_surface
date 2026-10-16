@@ -345,7 +345,11 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
             const auto use_standard_streams = input.number();
             if (use_standard_streams > 1) input.valid = false;
             request.use_owner_standard_streams = use_standard_streams != 0;
-            if (request.mode != Owner_mode::COMMAND && request.mode != Owner_mode::PTY) input.valid = false;
+            if (request.mode != Owner_mode::COMMAND && request.mode != Owner_mode::PTY
+#if defined(__APPLE__)
+                && request.mode != Owner_mode::COMMAND_EXEC
+#endif
+                ) input.valid = false;
             request.dimensions = input.dimensions();
             request.process.executable = input.text();
             request.process.working_directory = input.text();
@@ -418,7 +422,7 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
                     input.position += length;
                 }
             }
-            if (event.kind > Owner_event_kind::TREE_SETTLEMENT || event.settlement > Tree_settlement::UNCONFIRMED)
+            if (event.kind > Owner_event_kind::EXECUTION_STARTED || event.settlement > Tree_settlement::UNCONFIRMED)
                 input.valid = false;
             expected_descriptors = received.descriptors.size();
             if (local_observer_record) {

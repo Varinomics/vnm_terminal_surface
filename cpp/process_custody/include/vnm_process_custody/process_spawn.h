@@ -2,6 +2,7 @@
 
 #include <vnm_process_custody/process_pipe.h>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -66,6 +67,9 @@ struct Spawn_request
 #if defined(__APPLE__)
     bool                              new_process_group = false; // same retained session, distinct shell group
     bool                              foreground_terminal = false; // mapped stdin; after group creation
+    // Local opt-in only, never serialized. One deadline covers the exec error
+    // pipe and a separately retained native NOTE_EXEC observation.
+    std::optional<std::chrono::steady_clock::time_point> execution_deadline;
 #endif
 #if defined(_WIN32)
     void*                             generation_job = nullptr; // nested after the process-wide family Job
@@ -94,6 +98,7 @@ struct Spawn_result
     Native_handle process_handle = k_invalid_handle;   // Linux: pidfd; Darwin: local kqueue; Windows: process handle.
 #if defined(__APPLE__)
     std::uint64_t process_birth_token = 0; // original PROC_PIDTBSDINFO birth time, in microseconds
+    bool execution_confirmed = false; // only a registered-before-release NOTE_EXEC proves this
     // Failure alone is not no-birth evidence. This is true only before native
     // birth, or after the still-gated child was positively collected without
     // admitting execution. Admitted/uncertain failures retain their identity
