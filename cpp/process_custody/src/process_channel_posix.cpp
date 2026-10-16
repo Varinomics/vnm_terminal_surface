@@ -212,6 +212,35 @@ void Duplex_channel::close()
     }
 }
 
+bool Duplex_channel::finish_receiving(int* out_error)
+{
+    // Linux resets a SEQPACKET peer when close discards unread records. Seal
+    // input first so a late command cannot race the drain and erase our reply.
+    if (::shutdown(m_impl->fd, SHUT_RD) != 0) {
+        if (out_error) {
+            *out_error = errno;
+        }
+        return false;
+    }
+    while (true) {
+        std::uint8_t byte;
+        // Each channel record has a nonempty length prefix. recv discards the
+        // rest of the packet and its ancillary descriptors without installing
+        // them, including when the packet's framing was malformed.
+        const auto received = ::recv(m_impl->fd, &byte, sizeof(byte), MSG_DONTWAIT);
+        if (received > 0 || (received < 0 && errno == EINTR)) {
+            continue;
+        }
+        if (received == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        }
+        if (out_error) {
+            *out_error = errno;
+        }
+        return false;
+    }
+}
+
 Io_status Duplex_channel::send(const std::uint8_t* in_payload, std::size_t in_size, int* out_error)
 {
     return send_descriptors(in_payload, in_size, {}, out_error);

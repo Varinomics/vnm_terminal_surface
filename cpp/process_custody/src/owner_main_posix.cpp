@@ -245,5 +245,13 @@ int main(int argc, char** argv)
     if (!custody::prepare_parent_process(&error)) return 2;
     custody::Duplex_channel channel(control, custody::k_owner_message_bytes);
     if (!channel.prepare_for_owner(&error)) return 2;
-    return run_owner(channel, darwin_pty_contract);
+    const int result = run_owner(channel, darwin_pty_contract);
+#if defined(__linux__)
+    // The final receipt is already sent. No further command can change the
+    // settled tree; retire input without resetting that queued receipt.
+    if (!channel.finish_receiving()) {
+        return 2;
+    }
+#endif
+    return result;
 }

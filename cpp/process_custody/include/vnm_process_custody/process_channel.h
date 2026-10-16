@@ -87,6 +87,13 @@ public:
         const std::vector<Native_handle>& in_descriptors,
         int*                              out_error = nullptr);
 
+#if defined(__linux__)
+    /// Seals the receiving direction and discards accepted records and their
+    /// descriptors, preserving sent records across the final close. Call only
+    /// when this process owns the endpoint, never on an inherited duplicate.
+    bool finish_receiving(int* out_error = nullptr);
+#endif
+
 #if defined(__APPLE__)
     /// Sends EOF while keeping the receiving direction open. Retains the native
     /// descriptor across concurrent retirement; an already retired channel is done.

@@ -110,6 +110,42 @@ bool native_receive_error_contract(bool fragmented)
         "owner protocol retains the native receive error");
 }
 
+bool terminal_channel_retirement()
+{
+    custody::Duplex_channel owner, client;
+    std::string error;
+    if (!check(custody::Duplex_channel::create_pair(64, &owner, &client, &error),
+        "terminal channel fixture opens its endpoints"))
+    {
+        return false;
+    }
+    int pipe[2];
+    if (!check(pipe2(pipe, O_CLOEXEC | O_NONBLOCK) == 0, "terminal channel descriptor canary")) {
+        return false;
+    }
+    const std::uint8_t reply[] = {7, 11};
+    const std::uint8_t pending[] = {13};
+    bool ok = check(owner.send(reply, sizeof(reply)) == custody::Io_status::TRANSFERRED,
+        "final reply is queued before input retirement");
+    ok &= check(client.send_descriptors(pending, sizeof(pending), {pipe[1]}) == custody::Io_status::TRANSFERRED,
+        "late input carries a descriptor into the retiring endpoint");
+    close(pipe[1]);
+    ok &= check(owner.finish_receiving(), "terminal input is sealed and drained");
+    ok &= check(client.send(pending, sizeof(pending)) == custody::Io_status::CLOSED,
+        "no command can arrive after input retirement");
+    owner.close();
+
+    std::uint8_t received[64];
+    const auto result = client.receive(received, sizeof(received), 1000);
+    ok &= check(result.status == custody::Receive_status::MESSAGE && result.size == sizeof(reply) &&
+            received[0] == reply[0] && received[1] == reply[1],
+        "failed late send and owner close preserve the real queued reply");
+    char byte;
+    ok &= check(read(pipe[0], &byte, 1) == 0, "discarded input retains no transferred descriptor");
+    close(pipe[0]);
+    return ok;
+}
+
 struct Run
 {
     custody::Duplex_channel control;
@@ -401,7 +437,9 @@ int main(int argc, char** argv)
     if (argc == 3 && std::string(argv[1]) == "--late-stop") {
         std::string error;
         if (!custody::prepare_parent_process(&error)) return 2;
-        return exercise(argv[2], argv[0], "late-stop") ? 0 : 1;
+        bool ok = terminal_channel_retirement();
+        ok &= exercise(argv[2], argv[0], "late-stop");
+        return ok ? 0 : 1;
     }
     if (argc == 3 && std::string(argv[1]) == "--fixture") return fixture(argv[2]);
     if (argc != 2) return 2;
