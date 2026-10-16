@@ -8841,6 +8841,15 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         }
     }
 
+    if (render_snapshot_installed && installed_render_snapshot != nullptr &&
+        installed_render_snapshot_still_current())
+    {
+        emit render_snapshot_changed();
+        if (!active_session_still_matches()) {
+            return;
+        }
+    }
+
     if (deliver_notifications && !m_private->delivering_session_notifications) {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::notifications");
 

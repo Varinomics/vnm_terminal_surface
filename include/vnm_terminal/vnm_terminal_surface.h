@@ -872,6 +872,10 @@ signals:
     void process_exited(Exit_reason reason, int exit_code);
     void termination_requested(Termination_initiator initiator);
     void backend_error(Backend_error_code code, QString message);
+    // A coherent render snapshot is installed on the GUI thread. This is
+    // independent of rendering and coalesced session-notification delivery;
+    // the session's synchronized-output visibility rules still govern it.
+    void render_snapshot_changed();
     void output_activity();
     void output_backpressure_changed(bool active);
     void bell_requested();
