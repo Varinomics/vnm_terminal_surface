@@ -70,6 +70,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             COMMAND vnm_process_custody_tests $<TARGET_FILE:vnm_process_custody_owner>)
         set_tests_properties(vnm_process_custody_tests PROPERTIES TIMEOUT 60)
         if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+            add_test(NAME vnm_process_custody_truncated_rights_tests
+                COMMAND vnm_process_custody_tests --truncated-rights)
+            set_tests_properties(vnm_process_custody_truncated_rights_tests PROPERTIES TIMEOUT 10)
             add_test(NAME vnm_process_custody_command_exec_tests
                 COMMAND vnm_process_custody_tests --command-exec $<TARGET_FILE:vnm_process_custody_owner>)
             set_tests_properties(vnm_process_custody_command_exec_tests PROPERTIES TIMEOUT 30)

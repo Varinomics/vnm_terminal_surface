@@ -1421,6 +1421,9 @@ int main(int argc, char** argv)
     if (!custody::prepare_parent_process(&error)) {
         return 2;
     }
+    if (std::string(argv[1]) == "--truncated-rights") {
+        return rejected_record_releases_descriptors(Rejected_record::TRUNCATED_RIGHTS) ? 0 : 1;
+    }
     if (std::string(argv[1]) == "--finite-send") {
         return finite_send_requires_nonblocking() ? 0 : 1;
     }
@@ -1436,8 +1439,8 @@ int main(int argc, char** argv)
     ok &= directional_channel_eof();
     ok &= rejected_record_releases_descriptors(Rejected_record::OVERSIZE);
     ok &= rejected_record_releases_descriptors(Rejected_record::LATE_RIGHTS);
-    ok &= rejected_record_releases_descriptors(Rejected_record::TRUNCATED_RIGHTS);
     if (std::string(argv[1]) == "--framing") {
+        ok &= rejected_record_releases_descriptors(Rejected_record::TRUNCATED_RIGHTS);
         return ok ? 0 : 1;
     }
     ok &= spawn_contract(argv[0]);
