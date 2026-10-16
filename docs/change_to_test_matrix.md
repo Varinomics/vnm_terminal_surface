@@ -5,7 +5,11 @@ it to choose what to run locally before pushing. The target names are the
 `ctest` test names registered in the surface `tests/CMakeLists.txt` and the
 application `tests/CMakeLists.txt`.
 
-Tests run offscreen: set `QT_QPA_PLATFORM=offscreen`. `ctest` runs without the
+Most tests run offscreen (`QT_QPA_PLATFORM=offscreen`). On Windows, the render
+readback tests, for example `vnm_terminal_qt_render_smoke` and
+`vnm_terminal_canvas_renderer`, instead run on the `windows` platform with the
+D3D11 RHI backend, so they need a native graphics session. `ctest` sets each
+test's platform itself and runs without the
 Visual Studio developer shell; configuring and building native MSVC targets does
 require it.
 

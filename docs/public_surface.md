@@ -195,7 +195,12 @@ boundary and starts one native terminal backend:
 The request carries ordered argv, a caller-chosen absolute working directory,
 a policy-sanitized explicit base environment, and a separate optional
 capability contribution. `argv[0]` names the executable; the surface never
-parses a shell command string. The surface reads no ambient environment. It
+parses a shell command string. The one exception is the optional
+`windows_native_arguments`: on Windows, with exactly one `argv` entry, its text
+is appended to the command line verbatim, without argv escaping; it is rejected
+on other platforms and when it contains NUL. The request also carries
+`native_receipt_hook`, which the macOS backend requires: a launch without a
+retained handler is rejected before dispatch. The surface reads no ambient environment. It
 validates platform name identity and collisions, composes the final child
 environment, resolves a bare executable from that environment, revalidates the
 working directory immediately at the native boundary, and makes at most one

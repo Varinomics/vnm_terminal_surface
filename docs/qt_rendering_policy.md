@@ -77,10 +77,12 @@ Hardware and vendor names are not denylisted for MSDF ownership.
 
 The MSDF path may use LCD subpixel sampling when the surface resolves an RGB,
 BGR, VRGB, or VBGR subpixel order for the current window screen. `AUTO` uses
-Qt's `QPlatformScreen` hint first; on Windows, if Qt reports no order, the
-surface falls back to the system ClearType orientation. The shader samples the
-MSDF at filtered horizontal or vertical subpixel positions. The LCD branch uses
-the text run background to derive straight-alpha output for normal blending, so
+Qt's `QPlatformScreen` hint first, so an explicit Qt environment hint takes
+precedence. On Windows, absent that hint, it uses the identified monitor's layout
+and physical rotation, and falls back to the system ClearType setting only when
+the monitor has no layout of its own. The shader samples the MSDF at filtered
+horizontal or vertical subpixel positions. The LCD branch uses the text run
+background to derive straight-alpha output for normal blending, so
 distance-field padding from one glyph does not clear neighboring glyph ink.
 Unknown, none, or non-opaque foreground/background cases use grayscale MSDF
 coverage.
