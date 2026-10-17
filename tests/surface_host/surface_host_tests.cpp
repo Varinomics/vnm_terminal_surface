@@ -8,8 +8,6 @@
 #include "helpers/test_check.h"
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
-#include <qt_windows.h>
-#undef ALTERNATE
 #endif
 
 #include <QClipboard>
@@ -2451,15 +2449,25 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
     int ime_notifications = 0;
     int completed_frames = 0;
     Surface_fixture fixture;
+#if defined(Q_OS_WIN)
+    // cmake -E env starts Windows children with SW_HIDE. The first show in the
+    // fixture consumes that override; a real visibility transition shows it.
+    fixture.window.hide();
+    fixture.window.show();
+#endif
     fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
     fixture.surface.set_cursor_blink_enabled(false);
     pump_events(app);
     const auto metrics = current_cell_metrics(fixture.surface);
+    const auto geometry_for_rows = [&](int rows) {
+        // Stay inside each floor-based cell bin when DPI makes metrics fractional.
+        return QSizeF(20.5 * metrics.width, (rows + 0.5) * metrics.height);
+    };
     const auto resize_rows = [&](int rows) {
-        fixture.surface.setSize(QSizeF(20 * metrics.width, rows * metrics.height));
+        fixture.surface.setSize(geometry_for_rows(rows));
         return pump_until(app, [&] { return fixture.surface.rows() == rows; });
     };
-    fixture.surface.setSize(QSizeF(20 * metrics.width, 6 * metrics.height));
+    fixture.surface.setSize(geometry_for_rows(6));
     auto backend = std::make_unique<Scripted_backend>();
     backend->outputs_during_start = {QByteArrayLiteral(
         "\x1b]8;;https://example.test/header\x1b\\header\x1b]8;;\x1b\\\r\n"
@@ -2504,19 +2512,31 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
         notified_cursor_rect = fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF();
     });
     fixture.surface.set_content_tail_presentation_enabled(true);
-#if defined(Q_OS_WIN)
-    // Hosted Windows may omit the initial paint. Request it through the native
-    // window so Qt exposes and presents a real frame; grabWindow skips frame-end.
-    if (!check(RedrawWindow(reinterpret_cast<HWND>(fixture.window.winId()), nullptr, nullptr,
-            RDW_INVALIDATE | RDW_UPDATENOW) != FALSE, "the fixture requests a native window paint"))
-    {
-        return false;
-    }
-#endif
     bool ok = check(focus_ready, "the IME notification fixture has active input focus");
-    ok &= check(pump_until(app, [&] {
+    const bool normal_frame_ready = pump_until(app, [&] {
             return fixture.window.isExposed() && completed_frames > 0 && render_matches_current();
-        }), "the desktop commits the content-tail projection through a normal frame");
+        });
+    if (!normal_frame_ready) {
+        const auto latest_report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+        const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        std::cerr << "content-tail frame platform=" << QGuiApplication::platformName().toStdString()
+                  << " active_focus=" << fixture.surface.hasActiveFocus()
+                  << " focus_window=" << (QGuiApplication::focusWindow() == &fixture.window)
+                  << " active_window=" << fixture.window.isActive()
+                  << " visible=" << fixture.window.isVisible()
+                  << " exposed=" << fixture.window.isExposed()
+                  << " scene_graph=" << fixture.window.isSceneGraphInitialized()
+                  << " completed_frames=" << completed_frames
+                  << " render_count=" << latest_report.render_count
+                  << " drew=" << latest_report.drew
+                  << " native_sequence=" << (latest ? latest->metadata.sequence : 0)
+                  << " rendered_sequence=" << (latest_report.rendered_snapshot
+                      ? latest_report.rendered_snapshot->metadata.sequence : 0)
+                  << " rendered_projection=" << (latest_report.rendered_snapshot &&
+                      latest_report.rendered_snapshot->display_source) << '\n';
+    }
+    ok &= check(normal_frame_ready,
+        "the desktop commits the content-tail projection through a normal frame");
     const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
     if (!check(report.rendered_snapshot && report.rendered_snapshot->display_source,
             "the committed draw owns its separate projection"))
