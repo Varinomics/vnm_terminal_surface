@@ -8,6 +8,7 @@
 #include "helpers/test_check.h"
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
+#include <qt_windows.h>
 #endif
 
 #include <QClipboard>
@@ -2478,17 +2479,18 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
     {
         return false;
     }
+    const auto render_matches_current = [&] {
+        const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+        const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool projected = latest && fixture.surface.content_tail_presentation_enabled() &&
+            latest->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            latest->native_content_bottom_row_exclusive < latest->grid_size.rows;
+        return report.drew && report.rendered_snapshot && latest &&
+            report.rendered_snapshot->metadata.sequence == latest->metadata.sequence &&
+            static_cast<bool>(report.rendered_snapshot->display_source) == projected;
+    };
     const auto draw_current = [&] {
-        return window_render_matches(app, fixture.window, fixture.surface, [&] {
-            const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
-            const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-            const bool projected = latest && fixture.surface.content_tail_presentation_enabled() &&
-                latest->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
-                latest->native_content_bottom_row_exclusive < latest->grid_size.rows;
-            return report.drew && report.rendered_snapshot && latest &&
-                report.rendered_snapshot->metadata.sequence == latest->metadata.sequence &&
-                static_cast<bool>(report.rendered_snapshot->display_source) == projected;
-        });
+        return window_render_matches(app, fixture.window, fixture.surface, render_matches_current);
     };
     fixture.window.requestActivate();
     fixture.surface.forceActiveFocus();
@@ -2501,8 +2503,19 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
         notified_cursor_rect = fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF();
     });
     fixture.surface.set_content_tail_presentation_enabled(true);
+#if defined(Q_OS_WIN)
+    // Hosted Windows may omit the initial paint. Request it through the native
+    // window so Qt exposes and presents a real frame; grabWindow skips frame-end.
+    if (!check(RedrawWindow(reinterpret_cast<HWND>(fixture.window.winId()), nullptr, nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW) != FALSE, "the fixture requests a native window paint"))
+    {
+        return false;
+    }
+#endif
     bool ok = check(focus_ready, "the IME notification fixture has active input focus");
-    ok &= check(draw_current(), "the desktop commits the content-tail projection");
+    ok &= check(pump_until(app, [&] {
+            return fixture.window.isExposed() && completed_frames > 0 && render_matches_current();
+        }), "the desktop commits the content-tail projection through a normal frame");
     const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
     if (!check(report.rendered_snapshot && report.rendered_snapshot->display_source,
             "the committed draw owns its separate projection"))
