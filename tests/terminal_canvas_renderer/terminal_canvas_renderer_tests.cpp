@@ -15,12 +15,14 @@
 #include <QSGRendererInterface>
 #include <QScopeGuard>
 #include <QThread>
+#include <QTest>
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -212,6 +214,156 @@ bool recorder_distinguishes_failed_candidate(
         recovered.render_publication_generation == recovered.prepared_publication_generation &&
         recovered.render_canvas_frame_generation == canvas.frame_generation(),
         "recorder advances to the recovered committed frame");
+    return ok;
+}
+
+bool rendered_composition_handle_contract(
+    QGuiApplication& application, QQuickWindow& window, VNM_TerminalCanvas& canvas)
+{
+    namespace touch = vnm_terminal;
+    namespace renderer = vnm_terminal::internal;
+    auto frame = make_frame(801U);
+    frame->rows = 6;
+    frame->columns = 20;
+    frame->content_width = 200;
+    frame->content_height = 120;
+    touch::Terminal_canvas_selection selection;
+    selection.source = {1U, touch::Terminal_selection_buffer::PRIMARY_SCREEN, 1U, 6, 20};
+    selection.selection_generation = 1U;
+    selection.has_selection = true;
+    selection.touch_handles_visible = true;
+    selection.start = {2, 3, true};
+    selection.end = {2, 10, true};
+    selection.spans = {{2, 3, 7}};
+    selection.composition = touch::terminal_touch_selection_composition_t{1, 1};
+    for (int row = 0; row < 6; ++row) {
+        selection.visible_rows.push_back({100U + (std::uint64_t)row, 1U, 0});
+    }
+    frame->selection = selection;
+    window.resize(200, 150);
+    canvas.setSize(QSizeF(200, 150));
+    canvas.set_authoritative_cell_metrics_enabled(true);
+    canvas.set_touch_selection_enabled(true);
+    // A partial first row remains touchable. Its visible prefix must use the
+    // same floor boundary as the controller's retained-row hit testing.
+    canvas.set_touch_viewport(QRectF(0, 5, 200, 90));
+    std::vector<touch::Terminal_touch_selection_request> requests;
+    const auto connection = QObject::connect(&canvas, &VNM_TerminalCanvas::touch_selection_requested,
+        &canvas, [&](const auto& request) { requests.push_back(request); });
+    const auto cleanup = qScopeGuard([&] {
+        canvas.set_touch_selection_enabled(false);
+        QObject::disconnect(connection);
+        renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    });
+    QImage rendered;
+    if (!check(canvas.set_canvas_frame(frame) && pump_until_rendered(application, window, canvas, rendered),
+            "the initial composition reaches a real committed canvas draw"))
+    {
+        return false;
+    }
+    const auto recorder = renderer::VNM_TerminalCanvas_render_bridge::qsg_atlas_recorder(canvas);
+    const auto complete = [&] {
+        const auto request = requests.back();
+        canvas.complete_touch_selection_request({request.request_id, request.action,
+            touch::Terminal_touch_selection_status::OK, 1U, {}, {}});
+    };
+    const auto expect_scroll = [&](int padding, int native_rows, std::uint64_t row_id, const char* message) {
+        const auto& request = requests.back();
+        return check(request.action == touch::Terminal_touch_selection_action::SCROLL_EXTEND &&
+            request.target.row.retained_line_id == row_id && request.presentation &&
+            request.presentation->top_padding_rows == padding &&
+            request.presentation->visible_native_rows == native_rows, message);
+    };
+    const auto next_scroll = [&] {
+        const auto before = requests.size();
+        complete();
+        return check(QTest::qWaitFor([&] { return requests.size() > before; }, 1000),
+            "the held handle requests its next edge scroll after acknowledgement");
+    };
+    const auto install_held = [&](const std::shared_ptr<touch::Terminal_canvas_frame>& candidate) {
+        renderer::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(candidate->sequence);
+        if (!canvas.set_canvas_frame(candidate)) {
+            return false;
+        }
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            canvas.update();
+            window.requestUpdate();
+            application.processEvents(QEventLoop::AllEvents, 50);
+            QThread::msleep(20);
+            (void)window.grabWindow();
+            const auto report = recorder->snapshot();
+            if (report.prepared_snapshot_sequence == candidate->sequence &&
+                !report.prepared_generation_committed && report.rendered_touch_selection &&
+                report.render_canvas_frame_generation != canvas.frame_generation())
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto* device = QTest::createTouchDevice();
+    QTest::touchEvent(&window, device).press(0, QPoint(100, 67), &window);
+    if (!check(!requests.empty() && requests.back().action == touch::Terminal_touch_selection_action::BEGIN_HANDLE,
+            "a touch on the drawn handle enters the real canvas selection request path"))
+    {
+        return false;
+    }
+    complete();
+    auto increased = std::make_shared<touch::Terminal_canvas_frame>(*frame);
+    increased->sequence = 802U;
+    increased->cell_height = 25;
+    increased->content_height = 150;
+    increased->selection->composition = touch::terminal_touch_selection_composition_t{4, 3};
+    for (auto& row : increased->selection->visible_rows) { row.retained_line_id += 100U; }
+    if (!check(install_held(increased), "an installed capacity increase remains behind the last committed draw")) {
+        return false;
+    }
+    QTest::touchEvent(&window, device).move(0, QPoint(100, 8), &window);
+    if (!check(QTest::qWaitFor([&] {
+                return requests.back().action == touch::Terminal_touch_selection_action::SCROLL_EXTEND;
+            }, 1000), "dragging the actual handle reaches the clipped top edge"))
+    {
+        return false;
+    }
+    bool ok = expect_scroll(1, 4, 100U,
+        "pending increase uses the last drawn row identity, metrics and prefix context");
+    renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    ++increased->sequence;
+    if (!check(canvas.set_canvas_frame(increased) && pump_until_rendered(application, window, canvas, rendered),
+            "the increased composition reaches a real committed successor draw"))
+    {
+        return false;
+    }
+    ok &= next_scroll();
+    ok &= expect_scroll(3, 1, 200U,
+        "committed increase adopts context and metrics together while retaining the partial first row");
+    auto reduced = std::make_shared<touch::Terminal_canvas_frame>(*frame);
+    reduced->sequence = 804U;
+    for (auto& row : reduced->selection->visible_rows) { row.retained_line_id += 200U; }
+    if (!check(install_held(reduced), "an installed capacity decrease remains behind the last committed draw")) {
+        return false;
+    }
+    ok &= next_scroll();
+    ok &= expect_scroll(3, 1, 200U,
+        "pending decrease also uses the last drawn row identity, metrics and prefix context");
+    renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    ++reduced->sequence;
+    if (!check(canvas.set_canvas_frame(reduced) && pump_until_rendered(application, window, canvas, rendered),
+            "the reduced composition reaches a real committed successor draw"))
+    {
+        return false;
+    }
+    ok &= next_scroll();
+    ok &= expect_scroll(1, 4, 300U,
+        "committed decrease adopts the reduced context and row identity together");
+    auto metadata_only = std::make_shared<touch::Terminal_canvas_frame>(*reduced);
+    metadata_only->selection->composition->leading_capacity = 2;
+    ok &= check(canvas.set_canvas_frame(metadata_only) &&
+            pump_until_rendered(application, window, canvas, rendered) &&
+            recorder->snapshot().rendered_touch_selection->composition == metadata_only->selection->composition,
+        "a composition-only replacement reaches the renderer even with unchanged source sequence and cells");
+    canvas.set_touch_selection_enabled(false);
+    QTest::touchEvent(&window, device).release(0, QPoint(100, 8), &window);
     return ok;
 }
 
@@ -408,6 +560,7 @@ int main(int argc, char** argv)
         ok &= recorder_distinguishes_failed_candidate(application, window, canvas);
         ok &= authoritative_grid_glyph_positions(application, window, canvas);
         ok &= row_images_follow_pixels_placement_and_lifecycle(application, window, canvas);
+        ok &= rendered_composition_handle_contract(application, window, canvas);
     }
 
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");

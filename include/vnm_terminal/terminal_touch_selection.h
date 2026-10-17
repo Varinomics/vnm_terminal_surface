@@ -84,6 +84,17 @@ struct terminal_touch_selection_presentation_t
     bool operator==(const terminal_touch_selection_presentation_t&) const = default;
 };
 
+// Local canvas composition only; selection codecs deliberately omit this.
+// Keep it with the rendered row identities so a newer installed frame cannot
+// supply the padding or row shift for an older frame's touch request.
+struct terminal_touch_selection_composition_t
+{
+    int leading_capacity = 0;
+    int leading_rows = 0;
+
+    bool operator==(const terminal_touch_selection_composition_t&) const = default;
+};
+
 struct Terminal_touch_selection_request
 {
     std::uint64_t request_id = 0U;
@@ -152,6 +163,7 @@ struct Terminal_canvas_selection
     // A separate optional capability attachment carries this on the wire.
     // The existing selection record remains version 1 and keeps its shape.
     std::optional<std::uint16_t> word_query_version;
+    std::optional<terminal_touch_selection_composition_t> composition;
 
     bool operator==(const Terminal_canvas_selection&) const = default;
 };
@@ -168,6 +180,13 @@ inline bool terminal_canvas_selection_is_valid(
         (selection.source.buffer != Terminal_selection_buffer::PRIMARY_SCREEN &&
             selection.source.buffer != Terminal_selection_buffer::ALTERNATE_SCREEN) ||
         (!selection.has_selection && (selection.touch_handles_visible || !selection.spans.empty())))
+    {
+        return false;
+    }
+    if (selection.composition &&
+        (selection.composition->leading_capacity < 0 || selection.composition->leading_capacity > 32'768 ||
+            selection.composition->leading_rows < 0 || selection.composition->leading_rows >= rows ||
+            selection.composition->leading_rows > selection.composition->leading_capacity))
     {
         return false;
     }

@@ -809,12 +809,14 @@ set_tests_properties(vnm_terminal_canvas_contract PROPERTIES
     TIMEOUT 30
 )
 
+find_package(Qt6 6.12 REQUIRED COMPONENTS Test)
 add_executable(vnm_terminal_canvas_renderer
     terminal_canvas_renderer/terminal_canvas_renderer_tests.cpp
 )
 
 target_link_libraries(vnm_terminal_canvas_renderer PRIVATE
     vnm_terminal_surface::vnm_terminal_surface_renderer
+    Qt6::Test
 )
 
 set_target_properties(vnm_terminal_canvas_renderer PROPERTIES
@@ -2212,7 +2214,6 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_viewport>"
 )
 
-find_package(Qt6 6.12 REQUIRED COMPONENTS Test)
 add_executable(vnm_terminal_touch_selection touch_selection/touch_selection_tests.cpp)
 target_link_libraries(vnm_terminal_touch_selection PRIVATE
     vnm_terminal_surface::vnm_terminal_surface Qt6::Test)

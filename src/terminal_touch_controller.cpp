@@ -405,6 +405,18 @@ void Terminal_touch_controller::send(Terminal_touch_selection_action action, int
     request.handle     = m_handle;
     request.expected_selection_generation = m_generation;
     request.scroll_lines = scroll_lines;
+    if (presentation && presentation->selection.composition) {
+        const auto& composition = *presentation->selection.composition;
+        const qreal row_height = presentation->cell_metrics.height;
+        const QRectF visible = viewport();
+        request.presentation = terminal_touch_selection_presentation_t{
+            k_terminal_touch_selection_presentation_version,
+            (int)std::clamp(composition.leading_rows - std::floor(visible.top() / row_height),
+                0.0, (qreal)composition.leading_capacity),
+            (int)std::clamp(std::ceil(visible.bottom() / row_height) - composition.leading_rows,
+                1.0, (qreal)request.source.rows),
+        };
+    }
     if (!pinned_target && (action == Terminal_touch_selection_action::SELECT_WORD ||
         action == Terminal_touch_selection_action::INSPECT_WORD))
     {

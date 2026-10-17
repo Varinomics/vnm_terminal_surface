@@ -1035,6 +1035,19 @@ bool optional_projection_contract()
     frame->selection = initial;
     ok &= check(canvas.set_canvas_frame(frame) && canvas.canvas_frame()->selection.has_value(),
         "valid optional source installs before any selection exists");
+    auto composed = initial;
+    composed.composition = touch::terminal_touch_selection_composition_t{1, 1};
+    ok &= check(composed != initial &&
+            touch::touch_selection_codec::encode_frame(composed) == touch::touch_selection_codec::encode_frame(initial),
+        "local composition participates in selection equality without changing the selection wire record");
+    const auto installed_generation = canvas.frame_generation();
+    frame->selection = composed;
+    ok &= check(canvas.set_canvas_frame(frame) && canvas.frame_generation() != installed_generation &&
+            canvas.canvas_frame()->selection && canvas.canvas_frame()->selection->composition == composed.composition,
+        "composition-only changes install a new canvas generation even when source identity and sequence are unchanged");
+    composed.composition->leading_capacity = 0;
+    ok &= check(!touch::terminal_canvas_selection_is_valid(composed, 2, 12),
+        "local composition cannot claim more displayed leading rows than its capacity");
     for (int defect = 0; defect < 4; ++defect) {
         auto malformed = initial;
         if (defect == 0) { malformed.visible_rows[0].retained_line_id = 0U; }
