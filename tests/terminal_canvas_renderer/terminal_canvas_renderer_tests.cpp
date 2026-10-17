@@ -616,6 +616,9 @@ bool row_images_follow_pixels_placement_and_lifecycle(
 
 int main(int argc, char** argv)
 {
+    // Hosted windows can render via grabWindow() while unexposed, so their
+    // normal render loop cannot flush Qt Quick's deferred touch updates.
+    qputenv("QML_NO_TOUCH_COMPRESSION", "1");
 #if defined(Q_OS_WIN)
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11Rhi);
 #endif
