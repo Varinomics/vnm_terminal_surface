@@ -11,6 +11,10 @@ on:
         description: 'Run only screen, Unicode width, backend session and surface host units'
         type: boolean
         default: false
+      diagnose_content_tail:
+        description: 'Capture a backtrace for the content-tail projection test'
+        type: boolean
+        default: false
 
 defaults:
   run:
@@ -27,7 +31,7 @@ jobs:
       # A lost native-test runner must not cancel the independent test groups.
       fail-fast: false
       matrix:
-        test_group: ${{ fromJSON(inputs.focused_units && '["focused"]' || '["custody", "custody-rights", "native", "remaining"]') }}
+        test_group: ${{ fromJSON(inputs.diagnose_content_tail && '["content-tail"]' || inputs.focused_units && '["focused"]' || '["custody", "custody-rights", "native", "remaining"]') }}
     env:
       TEST_GROUP: ${{ matrix.test_group }}
       CCACHE_MAXSIZE: 2GiB
@@ -77,17 +81,23 @@ jobs:
       - name: Configure CMake
         run: |
           ccache --zero-stats
+          diagnostics=()
+          if [[ "${TEST_GROUP}" == "content-tail" ]]; then
+            diagnostics=(-DCMAKE_C_FLAGS=-g -DCMAKE_CXX_FLAGS=-g)
+          fi
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
             -DVNM_TERMINAL_BUILD_BENCHMARKS=OFF \
             -DVNM_TERMINAL_ENABLE_PROFILING=OFF \
-            -DBUILD_TESTING=ON
+            -DBUILD_TESTING=ON "${diagnostics[@]}"
 
       - name: Build
         id: build
         run: |
           targets=()
-          if [[ "${{ inputs.focused_units }}" == "true" ]]; then
+          if [[ "${TEST_GROUP}" == "content-tail" ]]; then
+            targets=(--target vnm_terminal_content_tail_projection)
+          elif [[ "${{ inputs.focused_units }}" == "true" ]]; then
             targets=(--target
               vnm_terminal_screen_basic
               vnm_terminal_screen_operations
@@ -141,6 +151,7 @@ jobs:
               'native': ['-R', native, '-E', custody],
               'remaining': ['-E', native],
               'focused': ['-R', '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session|surface_host)$'],
+              'content-tail': ['-R', '^vnm_terminal_content_tail_projection$'],
           }
           evidence = Path(os.environ['RUNNER_TEMP'])
 
@@ -153,7 +164,8 @@ jobs:
 
           all_tests = inventory('all', [])
           selected_group = os.environ['TEST_GROUP']
-          groups = ['focused'] if selected_group == 'focused' else ['custody', 'custody-rights', 'native', 'remaining']
+          focused = selected_group in ('focused', 'content-tail')
+          groups = [selected_group] if focused else ['custody', 'custody-rights', 'native', 'remaining']
           selected_tests = []
           for group in groups:
               names = inventory(group, filters[group])
@@ -163,7 +175,7 @@ jobs:
               selected_tests.extend(names)
           # CTest includes required fixtures in its inventory, so this also
           # rejects a fixture accidentally shared across independent runners.
-          if selected_group != 'focused' and collections.Counter(selected_tests) != collections.Counter(all_tests):
+          if not focused and collections.Counter(selected_tests) != collections.Counter(all_tests):
               raise SystemExit('Test groups must cover every registered test exactly once')
           (evidence / 'ctest-arguments.json').write_text(json.dumps(filters[selected_group]))
           PY
@@ -198,6 +210,35 @@ jobs:
           ])
           PY
 
+      - name: Capture content-tail crash backtrace
+        if: ${{ !cancelled() && matrix.test_group == 'content-tail' && steps.tests.outcome == 'failure' }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shlex
+          import subprocess
+
+          evidence = Path(os.environ['RUNNER_TEMP'])
+          inventory = json.loads((evidence / 'ctest-inventory-content-tail.json').read_text())
+          command = inventory['tests'][0]['command']
+          if command[1:3] != ['-E', 'env']:
+              raise SystemExit('Unexpected content-tail test command')
+          target_environment = ' '.join(shlex.quote(value) for value in command[3:-1])
+          with (evidence / 'content-tail-backtrace.log').open('w') as output:
+              result = subprocess.run([
+                  'xcrun', 'lldb', '--batch',
+                  '-o', 'settings set target.disable-aslr false',
+                  '-o', 'settings set target.env-vars ' + target_environment,
+                  '-o', 'run', '-k', 'thread backtrace all', '--', command[-1],
+              ], stdout=output, stderr=subprocess.STDOUT, timeout=60)
+          print((evidence / 'content-tail-backtrace.log').read_text(), flush=True)
+          raise SystemExit(result.returncode)
+          PY
+
       - name: Upload test results
         if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
         uses: actions/upload-artifact@v6
@@ -206,6 +247,7 @@ jobs:
           path: |
             ${{ runner.temp }}/ctest-output.log
             ${{ runner.temp }}/ctest-results.xml
+            ${{ runner.temp }}/content-tail-backtrace.log
             build/Testing/Temporary/LastTest.log
           if-no-files-found: error
 
