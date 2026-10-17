@@ -2446,6 +2446,8 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
 bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
 {
     QRectF notified_cursor_rect;
+    int ime_notifications = 0;
+    int completed_frames = 0;
     Surface_fixture fixture;
     fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
     fixture.surface.set_cursor_blink_enabled(false);
@@ -2490,11 +2492,17 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
     };
     fixture.window.requestActivate();
     fixture.surface.forceActiveFocus();
+    const bool focus_ready = pump_until(app, [&] { return fixture.surface.hasActiveFocus(); });
+    QObject::connect(&fixture.window, &QQuickWindow::afterFrameEnd, &fixture.surface, [&] {
+        ++completed_frames;
+    }, Qt::QueuedConnection);
     QObject::connect(QGuiApplication::inputMethod(), &QInputMethod::cursorRectangleChanged, &fixture.surface, [&] {
+        ++ime_notifications;
         notified_cursor_rect = fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF();
     });
     fixture.surface.set_content_tail_presentation_enabled(true);
-    bool ok = check(draw_current(), "the desktop commits the content-tail projection");
+    bool ok = check(focus_ready, "the IME notification fixture has active input focus");
+    ok &= check(draw_current(), "the desktop commits the content-tail projection");
     const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
     if (!check(report.rendered_snapshot && report.rendered_snapshot->display_source,
             "the committed draw owns its separate projection"))
@@ -2514,9 +2522,26 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
     ok &= check(std::abs(fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF().top() -
             5 * report.rendered_touch_cell_metrics.height) < 0.001,
         "IME placement follows the committed displayed cursor");
-    ok &= check(pump_until(app, [&] {
+    const bool ime_notified = pump_until(app, [&] {
             return std::abs(notified_cursor_rect.top() - 5 * report.rendered_touch_cell_metrics.height) < 0.001;
-        }), "the committed projection notifies the platform IME of its changed cursor rectangle");
+        });
+    if (!ime_notified) {
+        const auto latest_report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+        std::cerr << "content-tail IME focus_ready=" << focus_ready
+                  << " active_focus=" << fixture.surface.hasActiveFocus()
+                  << " focus_window=" << (QGuiApplication::focusWindow() == &fixture.window)
+                  << " active_window=" << fixture.window.isActive()
+                  << " visible=" << fixture.window.isVisible()
+                  << " exposed=" << fixture.window.isExposed()
+                  << " completed_frames=" << completed_frames
+                  << " notifications=" << ime_notifications
+                  << " notified_top=" << notified_cursor_rect.top()
+                  << " expected_top=" << 5 * report.rendered_touch_cell_metrics.height
+                  << " render_count=" << latest_report.render_count
+                  << " drew=" << latest_report.drew << '\n';
+    }
+    ok &= check(ime_notified,
+        "the committed projection notifies the platform IME of its changed cursor rectangle");
     const QPointF header = point_in_grid_cell(fixture.surface, 2, 0);
     ok &= check(fixture.surface.explicit_hyperlink_at(header.x(), header.y()) ==
             QByteArrayLiteral("https://example.test/header") &&
@@ -2526,10 +2551,10 @@ bool test_content_tail_presentation_render_and_input(QGuiApplication& app)
         Qt::LeftButton, Qt::LeftButton, Qt::ShiftModifier, true,
         "selection begins on the displayed retained header");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
-        point_in_grid_cell(fixture.surface, 2, 6), Qt::NoButton, Qt::LeftButton,
+        point_in_grid_cell(fixture.surface, 2, 5), Qt::NoButton, Qt::LeftButton,
         Qt::ShiftModifier, true, "selection extends on the same retained row");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
-        point_in_grid_cell(fixture.surface, 2, 6), Qt::LeftButton, Qt::NoButton,
+        point_in_grid_cell(fixture.surface, 2, 5), Qt::LeftButton, Qt::NoButton,
         Qt::ShiftModifier, true, "selection finishes on the displayed retained header");
     ok &= check(fixture.surface.selected_text() == QStringLiteral("header"),
         "desktop selection copies the displayed prefix text");
