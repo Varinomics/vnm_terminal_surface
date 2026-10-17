@@ -2581,6 +2581,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_parser_ir
     vnm_terminal_sixel_decoder
     vnm_terminal_sixel_placement
+    vnm_terminal_content_tail_projection
     vnm_terminal_unicode_width
     vnm_terminal_unicode_width_tables
     vnm_terminal_history_ring
