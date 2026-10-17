@@ -16,6 +16,7 @@
 #include <QScopeGuard>
 #include <QThread>
 #include <QTest>
+#include <QTouchEvent>
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
@@ -27,6 +28,50 @@
 namespace {
 
 using vnm_terminal::test_helpers::check;
+
+class Touch_route_observer final : public QObject
+{
+public:
+    struct observation_t
+    {
+        bool canvas = false;
+        QEvent::Type type = QEvent::None;
+        int point_id = -1;
+        QEventPoint::State state = QEventPoint::State::Unknown;
+        QPointF position;
+        QPointF scene_position;
+    };
+
+    explicit Touch_route_observer(QObject& window, QObject& canvas)
+    :
+        m_canvas(&canvas)
+    {
+        window.installEventFilter(this);
+        canvas.installEventFilter(this);
+    }
+    std::vector<observation_t> observations;
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() == QEvent::TouchBegin || event->type() == QEvent::TouchUpdate ||
+            event->type() == QEvent::TouchEnd || event->type() == QEvent::TouchCancel)
+        {
+            const auto* touch = static_cast<QTouchEvent*>(event);
+            if (touch->points().isEmpty()) {
+                observations.push_back({watched == m_canvas, event->type()});
+            }
+            for (const auto& point : touch->points()) {
+                observations.push_back({watched == m_canvas, event->type(), point.id(), point.state(),
+                    point.position(), point.scenePosition()});
+            }
+        }
+        return false;
+    }
+
+private:
+    QObject* m_canvas;
+};
 
 std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_frame(
     std::uint64_t sequence)
@@ -248,6 +293,7 @@ bool rendered_composition_handle_contract(
     // same floor boundary as the controller's retained-row hit testing.
     canvas.set_touch_viewport(QRectF(0, 5, 200, 90));
     std::vector<touch::Terminal_touch_selection_request> requests;
+    Touch_route_observer touch_route(window, canvas);
     const auto connection = QObject::connect(&canvas, &VNM_TerminalCanvas::touch_selection_requested,
         &canvas, [&](const auto& request) { requests.push_back(request); });
     const auto cleanup = qScopeGuard([&] {
@@ -262,8 +308,10 @@ bool rendered_composition_handle_contract(
         return false;
     }
     const auto recorder = renderer::VNM_TerminalCanvas_render_bridge::qsg_atlas_recorder(canvas);
+    std::uint64_t completed_request_id = 0U;
     const auto complete = [&] {
         const auto request = requests.back();
+        completed_request_id = request.request_id;
         canvas.complete_touch_selection_request({request.request_id, request.action,
             touch::Terminal_touch_selection_status::OK, 1U, {}, {}});
     };
@@ -337,6 +385,35 @@ bool rendered_composition_handle_contract(
                 return requests.back().action == touch::Terminal_touch_selection_action::SCROLL_EXTEND;
             }, 1000), "dragging the actual handle reaches the clipped top edge"))
     {
+        const auto report = recorder->snapshot();
+        const auto viewport = canvas.touch_viewport();
+        std::fprintf(stderr,
+            "handle edge: requests=%zu completed=%llu keep_grab=%d active=%d visible=%d exposed=%d "
+            "viewport=%.3f,%.3f,%.3f,%.3f item_y=%.3f prepared=%llu committed=%d drew=%d "
+            "prepare_count=%llu render_count=%llu prepared_owner=%llu render_owner=%llu "
+            "installed=%llu retained_touch=%d metrics=%.3f,%.3f\n",
+            requests.size(), static_cast<unsigned long long>(completed_request_id),
+            int(canvas.keepTouchGrab()), int(canvas.touch_selection_active()),
+            int(window.isVisible()), int(window.isExposed()),
+            double(viewport.x()), double(viewport.y()), double(viewport.width()), double(viewport.height()),
+            double(canvas.y()), static_cast<unsigned long long>(report.prepared_snapshot_sequence),
+            int(report.prepared_generation_committed), int(report.drew),
+            static_cast<unsigned long long>(report.prepare_count), static_cast<unsigned long long>(report.render_count),
+            static_cast<unsigned long long>(report.prepared_ownership_generation),
+            static_cast<unsigned long long>(report.render_ownership_generation),
+            static_cast<unsigned long long>(canvas.frame_generation()), int(report.rendered_touch_selection.has_value()),
+            double(report.rendered_touch_cell_metrics.width), double(report.rendered_touch_cell_metrics.height));
+        for (const auto& event : touch_route.observations) {
+            std::fprintf(stderr, "touch route: receiver=%s type=%d point=%d state=%d local=%.3f,%.3f scene=%.3f,%.3f\n",
+                event.canvas ? "canvas" : "window", int(event.type), event.point_id, int(event.state),
+                double(event.position.x()), double(event.position.y()),
+                double(event.scene_position.x()), double(event.scene_position.y()));
+        }
+        for (const auto& request : requests) {
+            std::fprintf(stderr, "touch request: id=%llu action=%d row=%llu scroll=%d\n",
+                static_cast<unsigned long long>(request.request_id), int(request.action),
+                static_cast<unsigned long long>(request.target.row.retained_line_id), request.scroll_lines);
+        }
         return false;
     }
     bool ok = expect_scroll(1, 4, 100U,
