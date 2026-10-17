@@ -9,6 +9,7 @@
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 #include <qt_windows.h>
+#undef ALTERNATE
 #endif
 
 #include <QClipboard>
