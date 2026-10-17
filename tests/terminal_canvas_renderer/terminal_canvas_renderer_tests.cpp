@@ -281,6 +281,7 @@ bool rendered_composition_handle_contract(
             "the held handle requests its next edge scroll after acknowledgement");
     };
     const auto install_held = [&](const std::shared_ptr<touch::Terminal_canvas_frame>& candidate) {
+        const auto committed = recorder->snapshot();
         renderer::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(candidate->sequence);
         if (!canvas.set_canvas_frame(candidate)) {
             return false;
@@ -294,11 +295,24 @@ bool rendered_composition_handle_contract(
             const auto report = recorder->snapshot();
             if (report.prepared_snapshot_sequence == candidate->sequence &&
                 !report.prepared_generation_committed && report.rendered_touch_selection &&
-                report.render_canvas_frame_generation != canvas.frame_generation())
+                report.rendered_touch_selection == committed.rendered_touch_selection &&
+                report.rendered_touch_cell_metrics.width == committed.rendered_touch_cell_metrics.width &&
+                report.rendered_touch_cell_metrics.height == committed.rendered_touch_cell_metrics.height &&
+                report.rendered_touch_cell_metrics.ascent == committed.rendered_touch_cell_metrics.ascent &&
+                report.rendered_touch_cell_metrics.descent == committed.rendered_touch_cell_metrics.descent)
             {
                 return true;
             }
         }
+        const auto report = recorder->snapshot();
+        std::fprintf(stderr,
+            "held composition: candidate=%llu prepared=%llu committed=%d drew=%d retained_selection=%d "
+            "retained_cell_height=%.3f previous_cell_height=%.3f\n",
+            static_cast<unsigned long long>(candidate->sequence),
+            static_cast<unsigned long long>(report.prepared_snapshot_sequence),
+            int(report.prepared_generation_committed), int(report.drew),
+            int(report.rendered_touch_selection == committed.rendered_touch_selection),
+            double(report.rendered_touch_cell_metrics.height), double(committed.rendered_touch_cell_metrics.height));
         return false;
     };
     auto* device = QTest::createTouchDevice();
