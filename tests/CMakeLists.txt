@@ -370,6 +370,15 @@ add_executable(vnm_terminal_sixel_placement
     sixel_placement/sixel_placement_tests.cpp
 )
 
+add_executable(vnm_terminal_content_tail_projection
+    terminal_content_tail_projection/terminal_content_tail_projection_tests.cpp)
+target_link_libraries(vnm_terminal_content_tail_projection PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface)
+set_target_properties(vnm_terminal_content_tail_projection PROPERTIES AUTOMOC OFF)
+add_test(NAME vnm_terminal_content_tail_projection COMMAND
+    "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+    "$<TARGET_FILE:vnm_terminal_content_tail_projection>")
+
 target_link_libraries(vnm_terminal_sixel_placement PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
 )
@@ -1539,6 +1548,23 @@ set_tests_properties(vnm_terminal_surface_host PROPERTIES
     LABELS "conformance;input;mouse;paste;focus"
     TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
+
+if(WIN32)
+    add_test(
+        NAME vnm_terminal_surface_content_tail_presentation
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_readback_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --content-tail-presentation
+    )
+    set_tests_properties(vnm_terminal_surface_content_tail_presentation PROPERTIES
+        LABELS "renderer;surface;input;presentation"
+        TIMEOUT 60
+    )
+endif()
 
 add_test(
     NAME vnm_terminal_surface_host_async_resize_metadata

@@ -10260,6 +10260,11 @@ void Terminal_session::apply_search_matches_to_snapshot(
     Terminal_render_snapshot& snapshot,
     std::uint64_t             active_buffer_epoch) const
 {
+    if (snapshot.leading_rows_snapshot) {
+        auto leading = std::make_shared<Terminal_render_snapshot>(*snapshot.leading_rows_snapshot);
+        apply_search_matches_to_snapshot(*leading, active_buffer_epoch);
+        snapshot.leading_rows_snapshot = std::move(leading);
+    }
     snapshot.search_match_spans =
         m_search.spans_for_snapshot(snapshot, active_buffer_epoch);
     suppress_search_match_spans_without_valid_line_provenance(snapshot);

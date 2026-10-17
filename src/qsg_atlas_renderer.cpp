@@ -8489,6 +8489,7 @@ void Qsg_atlas_recorder::record_render(
     m_report.viewport_rect                  = viewport_rect;
     m_report.drew                           = drew;
     if (drew) {
+        m_report.rendered_snapshot = frame.snapshot;
         m_report.rendered_touch_selection = frame.snapshot != nullptr
             ? frame.snapshot->touch_selection : std::nullopt;
         m_report.rendered_touch_cell_metrics = frame.cell_metrics;

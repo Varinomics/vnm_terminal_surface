@@ -222,7 +222,8 @@ public:
 
     void clear_selection();
     Terminal_touch_selection_result apply_touch_selection(
-        const Terminal_touch_selection_request& request);
+        const Terminal_touch_selection_request& request,
+        bool content_tail_presentation = false);
     void set_scrollback_limit(int limit);
     void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
     void set_color_state(Terminal_color_state state);

@@ -850,6 +850,7 @@ struct Qsg_atlas_frame_report
     // The touch basis follows the frame actually drawn, including while a
     // newer publication is still being prepared. It never freezes rendering.
     std::optional<Terminal_canvas_selection> rendered_touch_selection;
+    std::shared_ptr<const Terminal_render_snapshot> rendered_snapshot;
     terminal_cell_metrics_t rendered_touch_cell_metrics;
     QRectF rendered_touch_block_cursor;
     bool          captured_light_options          = false;

@@ -591,8 +591,14 @@ struct Terminal_render_snapshot
     Terminal_render_metadata                           metadata;
     Terminal_mode_state                                modes;
     std::optional<Terminal_canvas_selection>            touch_selection;
+    int                                                native_content_bottom_row_exclusive = 0;
+    int                                                resize_displaced_scrollback_rows = 0;
     int                                                leading_row_count = 0;
     std::shared_ptr<const Terminal_render_snapshot>     leading_rows_snapshot;
+    // Local desktop presentation only. The source remains authoritative;
+    // -1 identifies padding without a retained/native row.
+    std::shared_ptr<const Terminal_render_snapshot>     display_source;
+    std::vector<int>                                   display_row_logical_rows;
 };
 
 struct Terminal_render_snapshot_validation
@@ -771,11 +777,61 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
 
     const std::int64_t first_visible_logical_row =
         render_snapshot_first_visible_logical_row(snapshot);
+    if (!snapshot.display_source && !snapshot.display_row_logical_rows.empty()) {
+        return false;
+    }
+    if (snapshot.display_source &&
+        (snapshot.display_source->display_source ||
+            !snapshots_share_row_identity_space(snapshot, *snapshot.display_source) ||
+            snapshot.metadata.sequence != snapshot.display_source->metadata.sequence ||
+            snapshot.native_content_bottom_row_exclusive != snapshot.display_source->native_content_bottom_row_exclusive ||
+            snapshot.resize_displaced_scrollback_rows != snapshot.display_source->resize_displaced_scrollback_rows ||
+            snapshot.viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
+            snapshot.native_content_bottom_row_exclusive < 1 ||
+            snapshot.native_content_bottom_row_exclusive > snapshot.grid_size.rows ||
+            snapshot.resize_displaced_scrollback_rows < 0 ||
+            snapshot.resize_displaced_scrollback_rows > snapshot.viewport.scrollback_rows ||
+            snapshot.display_row_logical_rows.size() != static_cast<std::size_t>(snapshot.grid_size.rows) ||
+            !render_snapshot_visible_line_provenance_is_valid(*snapshot.display_source)))
+    {
+        return false;
+    }
     for (int row = 0; row < snapshot.grid_size.rows; ++row) {
         const Terminal_render_line_provenance& provenance =
             snapshot.visible_line_provenance[static_cast<std::size_t>(row)];
-        const std::int64_t expected_logical_row =
-            first_visible_logical_row + static_cast<std::int64_t>(row);
+        const std::int64_t expected_logical_row = snapshot.display_source
+            ? snapshot.display_row_logical_rows[static_cast<std::size_t>(row)]
+            : first_visible_logical_row + static_cast<std::int64_t>(row);
+        if (snapshot.display_source) {
+            const auto& source = *snapshot.display_source;
+            const int stream_row = static_cast<int>(first_visible_logical_row) + row;
+            const int insertion = source.viewport.scrollback_rows - source.resize_displaced_scrollback_rows;
+            const int padding = source.grid_size.rows - source.native_content_bottom_row_exclusive;
+            const int mapped = stream_row < insertion ? stream_row
+                : stream_row < insertion + padding ? -1 : stream_row - padding;
+            if (expected_logical_row != mapped) {
+                return false;
+            }
+            if (mapped >= 0) {
+                const auto* row_source = &source;
+                int source_row = mapped - render_snapshot_first_visible_logical_row(source);
+                if (source_row < 0 && source.leading_rows_snapshot) {
+                    row_source = source.leading_rows_snapshot.get();
+                    source_row = mapped - render_snapshot_first_visible_logical_row(*row_source);
+                }
+                if (source_row < 0 || source_row >= static_cast<int>(row_source->visible_line_provenance.size()) ||
+                    provenance != row_source->visible_line_provenance[static_cast<std::size_t>(source_row)])
+                {
+                    return false;
+                }
+            }
+        }
+        if (snapshot.display_source && expected_logical_row == -1) {
+            if (provenance.logical_row != -1 || provenance.retained_line_id != 0U) {
+                return false;
+            }
+            continue;
+        }
         if (provenance.logical_row != expected_logical_row ||
             provenance.retained_line_id == 0U              ||
             !retained_line_provenance_source_is_valid(provenance.source))
@@ -1381,7 +1437,8 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_metadata(
         return {Terminal_render_snapshot_status::INVALID_DIRTY_ROW_RANGE};
     }
 
-    if (!snapshot.visible_line_provenance.empty() &&
+    if ((!snapshot.visible_line_provenance.empty() || snapshot.display_source ||
+            !snapshot.display_row_logical_rows.empty()) &&
         !render_snapshot_visible_line_provenance_is_valid(snapshot))
     {
         return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};

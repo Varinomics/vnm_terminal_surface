@@ -199,6 +199,8 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/terminal_canvas_appearance.h
     src/terminal_canvas_appearance.cpp
     src/terminal_color_scheme.cpp
+    src/terminal_content_tail_projection.cpp
+    include/vnm_terminal/internal/terminal_content_tail_projection.h
     include/vnm_terminal/internal/cell_stable_shaping.h
     include/vnm_terminal/internal/hierarchical_profiler.h
     include/vnm_terminal/internal/ime_contract.h

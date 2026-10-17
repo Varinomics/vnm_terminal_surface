@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/terminal_canvas_content_extent.h"
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 
 #include <QByteArray>
@@ -128,6 +129,26 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
     snapshot.basis                     = request.basis;
     snapshot.purpose                   = request.purpose;
     snapshot.public_scroll_diagnostics = request.public_scroll_diagnostics;
+    if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
+        int occupied_bottom = 0;
+        const auto& active_rows = primary_active_grid_rows();
+        std::vector<Cell> projected;
+        for (int row = m_config.grid_size.rows - 1; row >= 0; --row) {
+            const auto& active = active_rows[static_cast<std::size_t>(row)];
+            const auto& cells = row_cells_for_current_geometry(active.cells, projected);
+            if ((active.image_slice && active.image_slice->first_column < m_config.grid_size.columns) ||
+                std::any_of(cells.begin(), cells.end(), [](const Cell& cell) {
+                    return cell.occupied && !cell.wide_continuation;
+                }))
+            {
+                occupied_bottom = row + 1;
+                break;
+            }
+        }
+        snapshot.native_content_bottom_row_exclusive = terminal_canvas_content_bottom_row_exclusive(
+            m_config.grid_size.rows, occupied_bottom, m_modes.cursor_visible, m_cursor.row);
+        snapshot.resize_displaced_scrollback_rows = resize_displaced_scrollback_rows();
+    }
     {
         VNM_TERMINAL_PROFILE_SCOPE(
             "Terminal_screen_model::render_snapshot::metadata");

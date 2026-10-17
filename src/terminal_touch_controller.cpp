@@ -360,8 +360,26 @@ terminal_selection_point_t Terminal_touch_controller::point_for_position(
     const QPointF local_position = position() - m_handle_offset;
     const qreal row_position = local_position.y() -
         (m_gesture == Gesture::HANDLE ? presentation.cell_metrics.height * 0.5 : 0.0);
-    const int row = std::clamp((int)std::floor(row_position / presentation.cell_metrics.height),
+    int row = std::clamp((int)std::floor(row_position / presentation.cell_metrics.height),
         0, presentation.selection.source.rows - 1);
+    if (m_gesture == Gesture::HANDLE &&
+        presentation.selection.visible_rows[static_cast<std::size_t>(row)].retained_line_id == 0U)
+    {
+        for (int distance = 1; distance < presentation.selection.source.rows; ++distance) {
+            const int before = row - distance;
+            const int after = row + distance;
+            if (before >= 0 && presentation.selection.visible_rows[static_cast<std::size_t>(before)].retained_line_id != 0U) {
+                row = before;
+                break;
+            }
+            if (after < presentation.selection.source.rows &&
+                presentation.selection.visible_rows[static_cast<std::size_t>(after)].retained_line_id != 0U)
+            {
+                row = after;
+                break;
+            }
+        }
+    }
     const int column = std::clamp((int)std::round(local_position.x() / presentation.cell_metrics.width),
         0, presentation.selection.source.columns);
     return {presentation.selection.visible_rows[(std::size_t)row], column};

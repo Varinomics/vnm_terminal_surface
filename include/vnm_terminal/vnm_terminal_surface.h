@@ -654,6 +654,9 @@ public:
     int viewport_visible_rows() const;
     int viewport_offset_from_tail() const;
     bool viewport_at_tail() const;
+    // Presentation only: retain native terminal geometry and viewport offsets.
+    bool content_tail_presentation_enabled() const;
+    void set_content_tail_presentation_enabled(bool enabled);
     Selection_state selection_state() const;
     QString search_query() const;
     Search_result_state search_result_state() const;

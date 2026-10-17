@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_session.h"
 
 #include "vnm_terminal/internal/terminal_search_row_text.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include <QTextBoundaryFinder>
 #include <algorithm>
 #include <mutex>
@@ -148,7 +149,8 @@ void Terminal_session::populate_touch_selection_projection(Terminal_render_snaps
 }
 
 Terminal_touch_selection_result Terminal_session::apply_touch_selection(
-    const Terminal_touch_selection_request& request)
+    const Terminal_touch_selection_request& request,
+    bool content_tail_presentation)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
@@ -241,7 +243,9 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
     }
     int logical_row = -1;
     int visual_row = -1;
-    const Terminal_render_snapshot* snapshot = m_latest_render_snapshot.get();
+    auto display_snapshot = content_tail_presentation
+        ? make_content_tail_display_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
+    const Terminal_render_snapshot* snapshot = display_snapshot.get();
     if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
             (std::size_t)snapshot->grid_size.rows)
     {
@@ -257,7 +261,9 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
         }
         const auto before = snapshot->viewport.offset_from_tail;
         (void)scroll_published_viewport_lines(request.scroll_lines);
-        snapshot = m_latest_render_snapshot.get();
+        display_snapshot = content_tail_presentation
+            ? make_content_tail_display_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
+        snapshot = display_snapshot.get();
         if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
                 (std::size_t)snapshot->grid_size.rows)
         {
@@ -279,6 +285,17 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
                 ? std::min(snapshot->grid_size.rows - 1,
                     leading_rows + request.presentation->visible_native_rows - 1)
                 : snapshot->grid_size.rows - 1;
+        if (content_tail_presentation) {
+            const int direction = request.scroll_lines > 0 ? 1 : -1;
+            while (visual_row >= 0 && visual_row < snapshot->grid_size.rows &&
+                snapshot->visible_line_provenance[static_cast<std::size_t>(visual_row)].retained_line_id == 0U)
+            {
+                visual_row += direction;
+            }
+            if (visual_row < 0 || visual_row >= snapshot->grid_size.rows) {
+                return fail(Terminal_touch_selection_status::UNAVAILABLE, "The displayed terminal rows are unavailable.");
+            }
+        }
         logical_row = (int)snapshot->visible_line_provenance[(std::size_t)visual_row].logical_row;
     }
     else {

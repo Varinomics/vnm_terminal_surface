@@ -11,6 +11,7 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include <QGuiApplication>
 #include <QColor>
 #include <QCoreApplication>
@@ -161,6 +162,54 @@ bool resize_leading_rows_selection_contract()
     session.process_backend_callback_events();
     ok &= check(session.apply_touch_selection(stale).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
         "cleared resize presentation cannot authorize selection from an obsolete leading frame");
+    return ok;
+}
+
+bool desktop_content_tail_selection_contract()
+{
+    auto backend = std::make_unique<Touch_backend>();
+    auto* output = backend.get();
+    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+    config.selection_viewport_projection_enabled = true;
+    term::Terminal_session session(std::move(backend), config);
+    term::Terminal_launch_config launch;
+    launch.argv = {QStringLiteral("desktop-content-tail-selection")};
+    launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
+    bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+        "desktop content-tail selection fixture starts");
+    output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
+    session.process_backend_callback_events();
+    session.resize(QSizeF(200.0, 40.0), {2, 20});
+    session.resize(QSizeF(200.0, 120.0), {6, 20});
+    auto shown = term::make_content_tail_display_snapshot(session.latest_render_snapshot_handle());
+    if (!check(shown && shown->touch_selection && shown->display_row_logical_rows.front() == -1,
+            "the desktop projection carries padding and retained touch rows"))
+    {
+        return false;
+    }
+    auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 1, 2, 201U);
+    ok &= check(session.apply_touch_selection(word, true).status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text == QStringLiteral("header") && !word.presentation,
+        "desktop touch selects the displayed prefix without a phone presentation request");
+    shown = term::make_content_tail_display_snapshot(session.latest_render_snapshot_handle());
+    auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 1, 6, 202U);
+    begin.handle = touch::Terminal_selection_handle::END;
+    ok &= check(session.apply_touch_selection(begin, true).status == touch::Terminal_touch_selection_status::OK,
+        "the desktop selection begins its end-handle gesture");
+    auto scroll = begin;
+    scroll.request_id = 203U;
+    scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
+    scroll.scroll_lines = 1;
+    ok &= check(session.apply_touch_selection(scroll, true).status == touch::Terminal_touch_selection_status::OK &&
+            session.viewport_state().offset_from_tail == 1 && session.selected_text().text == QStringLiteral("header"),
+        "desktop upward extension skips the relocated padding band");
+    scroll.request_id = 204U;
+    scroll.expected_selection_generation = session.latest_render_snapshot_handle()->touch_selection->selection_generation;
+    scroll.scroll_lines = -1;
+    scroll.target.column = 7;
+    ok &= check(session.apply_touch_selection(scroll, true).status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text == QStringLiteral("header alpha\nsecond beta\nthird gamma\nfourth delta\nprompt>"),
+        "desktop downward extension reaches the last written row without selecting the unwritten suffix");
     return ok;
 }
 
@@ -1252,6 +1301,7 @@ int main(int argc, char** argv)
     QGuiApplication app(argc, argv);
     bool ok = owner_selection_contract();
     ok &= resize_leading_rows_selection_contract();
+    ok &= desktop_content_tail_selection_contract();
     ok &= touch_intent_contract();
     ok &= direct_word_hold_contract();
     ok &= cursor_hold_contract();

@@ -11,6 +11,7 @@
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
@@ -804,6 +805,11 @@ std::optional<term::terminal_grid_position_t> grid_position_for_local_point(
     {
         return std::nullopt;
     }
+    if (snapshot->display_source &&
+        snapshot->display_row_logical_rows[static_cast<std::size_t>(row_index)] < 0)
+    {
+        return std::nullopt;
+    }
 
     return term::terminal_grid_position_t{
         static_cast<int>(row_index),
@@ -887,10 +893,24 @@ std::optional<term::terminal_grid_position_t> clamped_grid_position_for_local_po
         std::floor(point.x() / metrics.width),
         0.0,
         static_cast<qreal>(snapshot->grid_size.columns - 1));
-    const qreal row_index = std::clamp(
+    int row_index = static_cast<int>(std::clamp(
         std::floor(point.y() / metrics.height),
         0.0,
-        static_cast<qreal>(snapshot->grid_size.rows - 1));
+        static_cast<qreal>(snapshot->grid_size.rows - 1)));
+    if (snapshot->display_source) {
+        int nearest = -1;
+        for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+            if (snapshot->display_row_logical_rows[static_cast<std::size_t>(row)] >= 0 &&
+                (nearest < 0 || std::abs(row - row_index) < std::abs(nearest - row_index)))
+            {
+                nearest = row;
+            }
+        }
+        if (nearest < 0) {
+            return std::nullopt;
+        }
+        row_index = nearest;
+    }
     return term::terminal_grid_position_t{
         static_cast<int>(row_index),
         static_cast<int>(column_index)};
@@ -914,10 +934,36 @@ std::optional<term::terminal_grid_position_t> logical_grid_position_for_viewport
         snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE
             ? 0
             : snapshot->viewport.scrollback_rows - snapshot->viewport.offset_from_tail;
+    if (snapshot->display_source) {
+        const int logical = snapshot->display_row_logical_rows[static_cast<std::size_t>(viewport_position.row)];
+        return logical >= 0 ? std::optional(term::terminal_grid_position_t{logical, viewport_position.column}) : std::nullopt;
+    }
     return term::terminal_grid_position_t{
         first_visible_logical_row + viewport_position.row,
         viewport_position.column,
     };
+}
+
+std::optional<term::terminal_grid_position_t> native_mouse_position(
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+    term::terminal_grid_position_t position,
+    bool content_tail_presentation)
+{
+    if (!snapshot) {
+        return std::nullopt;
+    }
+    if (!content_tail_presentation || snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE) {
+        return position;
+    }
+    const auto logical = logical_grid_position_for_viewport_cell(snapshot, position);
+    if (!logical) {
+        return std::nullopt;
+    }
+    const int row = logical->row - snapshot->viewport.scrollback_rows;
+    if (row < 0 || row >= snapshot->grid_size.rows) {
+        return std::nullopt;
+    }
+    return term::terminal_grid_position_t{row, position.column};
 }
 
 bool position_is_before(
@@ -2376,6 +2422,23 @@ struct VNM_TerminalSurface::Private
                 if (!surface_private.shutting_down.load()) {
                     surface_private.reconcile_atlas_completion(surface);
                     surface.m_touch_controller->presentation_changed();
+                    if (surface_ptr == nullptr) {
+                        return;
+                    }
+                    if (surface_private.content_tail_presentation_enabled ||
+                        surface_private.content_tail_presentation_retiring)
+                    {
+                        surface.updateInputMethod(Qt::ImCursorRectangle);
+                        if (surface_ptr == nullptr) {
+                            return;
+                        }
+                        const auto report = surface_private.qsg_atlas_recorder->snapshot();
+                        if (!surface_private.content_tail_presentation_enabled && report.rendered_snapshot &&
+                            !report.rendered_snapshot->display_source)
+                        {
+                            surface_private.content_tail_presentation_retiring = false;
+                        }
+                    }
                 }
             };
         (void)QObject::connect(
@@ -2489,29 +2552,35 @@ struct VNM_TerminalSurface::Private
 
     QRectF input_method_cursor_rectangle(const VNM_TerminalSurface& surface) const
     {
-        const qreal cell_width = term::is_valid_cell_metrics(cell_metrics)
-            ? cell_metrics.width
+        const auto report = (content_tail_presentation_enabled || content_tail_presentation_retiring) && qsg_atlas_recorder
+            ? qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
+        const bool projected = content_tail_presentation_enabled ||
+            (content_tail_presentation_retiring && report.rendered_snapshot && report.rendered_snapshot->display_source);
+        const auto snapshot = projected ? report.rendered_snapshot : render_snapshot;
+        const auto metrics = projected ? report.rendered_touch_cell_metrics : cell_metrics;
+        const qreal cell_width = term::is_valid_cell_metrics(metrics)
+            ? metrics.width
             : 1.0;
-        const qreal cell_height = term::is_valid_cell_metrics(cell_metrics)
-            ? cell_metrics.height
+        const qreal cell_height = term::is_valid_cell_metrics(metrics)
+            ? metrics.height
             : 1.0;
 
         int row = 0;
         int column = 0;
-        if (render_snapshot != nullptr && term::is_valid_grid_size(render_snapshot->grid_size)) {
+        if (snapshot != nullptr && term::is_valid_grid_size(snapshot->grid_size)) {
             row    = std::clamp(
-                render_snapshot->cursor.position.row,
+                snapshot->cursor.position.row,
                 0,
-                render_snapshot->grid_size.rows - 1);
+                snapshot->grid_size.rows - 1);
             column = std::clamp(
-                render_snapshot->cursor.position.column,
+                snapshot->cursor.position.column,
                 0,
-                render_snapshot->grid_size.columns - 1);
+                snapshot->grid_size.columns - 1);
             if (ime_preedit.active) {
                 column = std::clamp(
                     column + display_width_for_preedit_cursor(ime_preedit.text, ime_preedit.cursor_position),
                     0,
-                    render_snapshot->grid_size.columns - 1);
+                    snapshot->grid_size.columns - 1);
             }
         }
 
@@ -2595,17 +2664,23 @@ struct VNM_TerminalSurface::Private
         term::Terminal_mouse_button                                  button,
         term::terminal_grid_position_t                               position,
         Qt::KeyboardModifiers                                        modifiers,
-        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot) const
+        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+        bool position_is_native = false) const
     {
         if (snapshot == nullptr) {
             return {};
         }
 
+        const auto native_position = position_is_native ? std::optional(position)
+            : native_mouse_position(snapshot, position, display_input_projected);
+        if (!native_position) {
+            return {};
+        }
         const term::Terminal_mouse_event mouse_event{
             kind,
             button,
-            position.row,
-            position.column,
+            native_position->row,
+            native_position->column,
             modifiers,
         };
         const QByteArray bytes = term::encode_terminal_mouse_event(
@@ -2615,7 +2690,7 @@ struct VNM_TerminalSurface::Private
             return {};
         }
 
-        return {std::nullopt, position, bytes, true};
+        return {std::nullopt, native_position, bytes, true};
     }
 
     Pending_published_mouse_report pending_published_mouse_report(
@@ -3041,6 +3116,113 @@ struct VNM_TerminalSurface::Private
     qreal                                                  render_logical_dpi                    =
                                                            term::k_vnm_terminal_default_logical_dpi;
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
+    std::shared_ptr<const term::Terminal_render_snapshot>  display_snapshot;
+    bool                                                   content_tail_presentation_enabled = false;
+    bool                                                   content_tail_presentation_retiring = false;
+    int                                                    display_input_depth = 0;
+    bool                                                   display_input_projected = false;
+    std::shared_ptr<const term::Terminal_render_snapshot>  display_input_snapshot;
+    term::terminal_cell_metrics_t                          display_input_metrics;
+
+    void sample_display_input()
+    {
+        if (!content_tail_presentation_enabled && !content_tail_presentation_retiring) {
+            return;
+        }
+        const auto report = qsg_atlas_recorder ? qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
+        display_input_projected = content_tail_presentation_enabled ||
+            (report.rendered_snapshot && report.rendered_snapshot->display_source);
+        display_input_snapshot = report.rendered_snapshot;
+        display_input_metrics = report.rendered_touch_cell_metrics;
+    }
+
+    std::shared_ptr<const term::Terminal_render_snapshot> input_snapshot() const
+    {
+        if (!display_input_projected) {
+            return render_snapshot;
+        }
+        if (!display_input_snapshot || !render_snapshot ||
+            !term::snapshots_share_row_identity_space(*display_input_snapshot, *render_snapshot) ||
+            (display_input_snapshot->touch_selection && render_snapshot->touch_selection &&
+                display_input_snapshot->touch_selection->source != render_snapshot->touch_selection->source))
+        {
+            return {};
+        }
+        return display_input_snapshot;
+    }
+
+    bool input_row_is_current(int display_row) const
+    {
+        if (!display_input_projected) {
+            return true;
+        }
+        const auto shown = input_snapshot();
+        if (!shown || display_row < 0 || display_row >= static_cast<int>(shown->visible_line_provenance.size())) {
+            return false;
+        }
+        // A backend overwrite can retain the same viewport and logical row.
+        // Do not lease its newer text for a pointer action on the prior draw.
+        const auto& row = shown->visible_line_provenance[static_cast<std::size_t>(display_row)];
+        const auto* current = render_snapshot.get();
+        int index = static_cast<int>(row.logical_row) - term::render_snapshot_first_visible_logical_row(*current);
+        if (index < 0 && current->leading_rows_snapshot) {
+            current = current->leading_rows_snapshot.get();
+            index = static_cast<int>(row.logical_row) - term::render_snapshot_first_visible_logical_row(*current);
+        }
+        if (row.retained_line_id == 0U || index < 0 || index >= static_cast<int>(current->visible_line_provenance.size())) {
+            return false;
+        }
+        const auto& latest = current->visible_line_provenance[static_cast<std::size_t>(index)];
+        return row.retained_line_id == latest.retained_line_id && row.content_generation == latest.content_generation;
+    }
+
+    term::terminal_cell_metrics_t input_metrics() const
+    {
+        return display_input_projected ? display_input_metrics : cell_metrics;
+    }
+
+    bool input_range_is_current(const term::Terminal_selection_range& range) const
+    {
+        if (!display_input_projected) {
+            return true;
+        }
+        const auto shown = input_snapshot();
+        if (!shown) {
+            return false;
+        }
+        const int first = term::normalized_selection_start(range).row;
+        const int last = term::normalized_selection_end(range).row;
+        for (int row = 0; row < static_cast<int>(shown->visible_line_provenance.size()); ++row) {
+            const auto logical = shown->visible_line_provenance[static_cast<std::size_t>(row)].logical_row;
+            if (logical >= first && logical <= last && !input_row_is_current(row)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void reveal_current_search_in_display(VNM_TerminalSurface& surface)
+    {
+        if (!content_tail_presentation_enabled || !render_snapshot || !session) {
+            return;
+        }
+        for (const auto& span : render_snapshot->search_match_spans) {
+            if (!span.current) {
+                continue;
+            }
+            const int logical = term::render_snapshot_first_visible_logical_row(*render_snapshot) + span.row;
+            const int row = term::content_tail_logical_row_to_display_row(*render_snapshot, logical);
+            const int rows = render_snapshot->grid_size.rows;
+            if (row >= 0 && row < rows) {
+                return;
+            }
+            const int offset = render_snapshot->viewport.offset_from_tail -
+                (row < 0 ? row : row - rows + 1);
+            (void)session->scroll_published_viewport_to_offset_from_tail(offset);
+            surface.sync_from_session();
+            return;
+        }
+    }
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
     QTimer                                                 cursor_settle_timer;
@@ -3235,7 +3417,11 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
                 };
             },
             [this](const vnm_terminal::Terminal_touch_selection_request& request) {
-                const auto result = apply_touch_selection(request);
+                Input_frontier_scope input_frontier(*this);
+                const auto result = m_private->session && m_private->content_tail_presentation_enabled
+                    ? m_private->session->apply_touch_selection(request, true)
+                    : apply_touch_selection(request);
+                sync_from_session();
                 m_touch_controller->complete(result);
                 emit touch_selection_completed(result);
             },
@@ -3355,6 +3541,9 @@ VNM_TerminalSurface::Input_frontier_scope::Input_frontier_scope(
     bool                 fresh_ingress)
     : m_surface(surface)
 {
+    if (m_surface.m_private != nullptr && m_surface.m_private->display_input_depth++ == 0) {
+        m_surface.m_private->sample_display_input();
+    }
     if (m_surface.m_private == nullptr || m_surface.m_private->session == nullptr) {
         return;
     }
@@ -3372,6 +3561,10 @@ VNM_TerminalSurface::Input_frontier_scope::~Input_frontier_scope()
         m_surface.m_private->active_session_matches(m_session, m_generation))
     {
         m_session->end_input_frontier();
+    }
+    if (m_surface.m_private != nullptr && --m_surface.m_private->display_input_depth == 0) {
+        m_surface.m_private->display_input_snapshot.reset();
+        m_surface.m_private->display_input_projected = false;
     }
 }
 
@@ -4424,11 +4617,12 @@ bool VNM_TerminalSurface::row_timestamp_tooltip_pointer_moved(const QPointF& pos
 
 void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
 {
+    Input_frontier_scope input_frontier(*this, false, false);
     const QPointF pointer_position = *m_private->row_timestamp_tooltip_pointer_position;
     const std::optional<term::terminal_grid_position_t> position =
         grid_position_for_local_point(
-            m_private->render_snapshot,
-            m_private->cell_metrics,
+            m_private->input_snapshot(),
+            m_private->input_metrics(),
             pointer_position);
     if (!position.has_value()) {
         return;
@@ -4438,7 +4632,7 @@ void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
     // visible_line_provenance vector. The contract is full-and-valid or
     // absent, so require the validated per-row vector instead of a bare size
     // check; a partial vector must not yield a wrong-row timestamp.
-    const term::Terminal_render_snapshot& snapshot = *m_private->render_snapshot;
+    const term::Terminal_render_snapshot& snapshot = *m_private->input_snapshot();
     if (!term::render_snapshot_visible_line_provenance_is_valid(snapshot)) {
         return;
     }
@@ -4453,7 +4647,7 @@ void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
     }
 
     m_private->row_timestamp_tooltip_request_active = true;
-    const term::terminal_cell_metrics_t metrics = m_private->cell_metrics;
+    const term::terminal_cell_metrics_t metrics = m_private->input_metrics();
     emit row_timestamp_tooltip_requested(
         QRectF(
             0.0,
@@ -4588,6 +4782,27 @@ void VNM_TerminalSurface::set_clipboard_text_reader(
 int VNM_TerminalSurface::scrollback_rows() const
 {
     return m_scrollback_rows;
+}
+
+bool VNM_TerminalSurface::content_tail_presentation_enabled() const
+{
+    return m_private->content_tail_presentation_enabled;
+}
+
+void VNM_TerminalSurface::set_content_tail_presentation_enabled(bool enabled)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    if (m_private->content_tail_presentation_enabled == enabled) {
+        return;
+    }
+    cancel_pointer_gesture();
+    dismiss_row_timestamp_tooltip();
+    m_private->content_tail_presentation_enabled = enabled;
+    m_private->content_tail_presentation_retiring = !enabled;
+    m_private->display_snapshot = enabled
+        ? term::make_content_tail_display_snapshot(m_private->render_snapshot) : m_private->render_snapshot;
+    m_private->request_render_update(*this);
+    updateInputMethod(Qt::ImCursorRectangle);
 }
 
 int VNM_TerminalSurface::viewport_visible_rows() const
@@ -4732,11 +4947,15 @@ void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
 QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const
 {
     Q_ASSERT(thread() == QThread::currentThread());
-
+    const auto report = (m_private->content_tail_presentation_enabled || m_private->content_tail_presentation_retiring) &&
+            m_private->qsg_atlas_recorder
+        ? m_private->qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
+    const bool projected = m_private->content_tail_presentation_enabled ||
+        (report.rendered_snapshot && report.rendered_snapshot->display_source);
     const std::optional<Surface_hyperlink_target> hyperlink =
         explicit_hyperlink_for_local_point(
-            m_private->render_snapshot,
-            m_private->cell_metrics,
+            projected ? report.rendered_snapshot : m_private->render_snapshot,
+            projected ? report.rendered_touch_cell_metrics : m_private->cell_metrics,
             QPointF(x, y));
     return hyperlink.has_value() ? hyperlink->uri : QByteArray{};
 }
@@ -4750,12 +4969,13 @@ void VNM_TerminalSurface::set_hyperlink_hover_position(std::optional<QPointF> po
 void VNM_TerminalSurface::refresh_hyperlink_hover_feedback()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this, false, false);
 
     const bool cursor_active =
         m_private->hyperlink_hover_position.has_value() &&
         explicit_hyperlink_for_local_point(
-            m_private->render_snapshot,
-            m_private->cell_metrics,
+            m_private->input_snapshot(),
+            m_private->input_metrics(),
             *m_private->hyperlink_hover_position).has_value();
     if (cursor_active == m_private->hyperlink_cursor_active) {
         return;
@@ -5035,6 +5255,7 @@ bool VNM_TerminalSurface::search_next()
 
     const bool selected = m_private->session->search_next();
     sync_from_session();
+    m_private->reveal_current_search_in_display(*this);
     return selected;
 }
 
@@ -5050,6 +5271,7 @@ bool VNM_TerminalSurface::search_previous()
 
     const bool selected = m_private->session->search_previous();
     sync_from_session();
+    m_private->reveal_current_search_in_display(*this);
     return selected;
 }
 
@@ -5686,6 +5908,10 @@ bool VNM_TerminalSurface::event(QEvent* event)
     if (input_event) {
         input_frontier.emplace(*this);
     }
+    else
+    if (event->type() == QEvent::HoverMove || event->type() == QEvent::HoverLeave) {
+        input_frontier.emplace(*this, false, false);
+    }
     if (event->type() == QEvent::KeyRelease &&
         static_cast<QKeyEvent*>(event)->key() == Qt::Key_C && m_private->copy_key_suppressed)
     {
@@ -5883,7 +6109,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 .arg(static_cast<int>(event->buttons()))
                 .arg(static_cast<int>(event->modifiers()))
                 .arg(keepMouseGrab())
-                .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot)));
+                .arg(snapshot_has_terminal_mouse_tracking(m_private->input_snapshot())));
     }
     event->ignore();
     set_hyperlink_hover_position(event->position());
@@ -5894,10 +6120,10 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 
     const term::Terminal_mouse_button button = terminal_mouse_button(event->button());
     std::shared_ptr<const term::Terminal_render_snapshot> published_snapshot =
-        m_private->render_snapshot;
+        m_private->input_snapshot();
     std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
         published_snapshot,
-        m_private->cell_metrics,
+        m_private->input_metrics(),
         event->position());
     const bool force_local_selection = local_selection_override(event->modifiers());
     std::optional<term::terminal_grid_position_t> logical_position;
@@ -5932,7 +6158,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         const std::optional<Surface_hyperlink_target> hyperlink =
             explicit_hyperlink_for_local_point(
                 published_snapshot,
-                m_private->cell_metrics,
+                m_private->input_metrics(),
                 event->position());
         if (hyperlink.has_value()) {
             const QPointer<VNM_TerminalSurface> alive(this);
@@ -6025,11 +6251,13 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         if (m_private->session != nullptr &&
             m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
             snapshot_has_terminal_mouse_tracking(published_snapshot) &&
-            !snapshot_has_sgr_mouse_reporting(published_snapshot))
+            !snapshot_has_sgr_mouse_reporting(published_snapshot) &&
+            native_mouse_position(published_snapshot, *position, m_private->display_input_projected).has_value())
         {
             m_private->mouse_reporting_pressed_buttons |= event->button();
             m_private->mouse_reporting_drag_button      = button;
-            m_private->mouse_reporting_last_position    = *position;
+            m_private->mouse_reporting_last_position    = native_mouse_position(
+                published_snapshot, *position, m_private->display_input_projected);
             m_private->clear_selection_drag_state();
             record_surface_selection_drag_transcript(
                 m_private->transcript_recorder,
@@ -6069,13 +6297,13 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         return;
     }
 
-    if (!position.has_value()) {
+    if (!position.has_value() || !m_private->input_row_is_current(position->row)) {
         trace_decision(QStringLiteral("out-of-grid"));
         return;
     }
 
     logical_position = logical_grid_position_for_viewport_cell(
-        m_private->render_snapshot,
+        m_private->input_snapshot(),
         *position);
     if (!logical_position.has_value()) {
         trace_decision(QStringLiteral("viewport-mapping"));
@@ -6084,8 +6312,8 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 
     const std::optional<term::terminal_selection_source_identity_t> source =
         m_private->session->published_selection_source_identity();
-    if (!source.has_value() || m_private->render_snapshot == nullptr ||
-        !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
+    if (!source.has_value() || m_private->input_snapshot() == nullptr ||
+        !selection_source_matches_snapshot(*source, *m_private->input_snapshot()))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             term::write_selection_trace(m_selection_trace_enabled,
@@ -6093,9 +6321,9 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                     "surface mouse-press source-mismatch reason=%1 anchor=source{none} current=%2 %3")
                     .arg(selection_trace_source_snapshot_mismatch_reason(
                         source,
-                        m_private->render_snapshot))
+                        m_private->input_snapshot()))
                     .arg(selection_trace_source_identity(source))
-                    .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
+                    .arg(selection_trace_snapshot_identity(m_private->input_snapshot())));
         }
         trace_decision(QStringLiteral("source-mismatch"));
         return;
@@ -6131,7 +6359,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 .arg(selection_trace_source_identity(
                     m_private->selection_drag_press_provenance->source))
                 .arg(selection_trace_source_identity(source))
-                .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
+                .arg(selection_trace_snapshot_identity(m_private->input_snapshot())));
     }
     trace_decision(QStringLiteral("clear-on-click"));
 }
@@ -6147,7 +6375,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 .arg(static_cast<int>(event->buttons()))
                 .arg(static_cast<int>(event->modifiers()))
                 .arg(keepMouseGrab())
-                .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot))
+                .arg(snapshot_has_terminal_mouse_tracking(m_private->input_snapshot()))
                 .arg(m_private->selection_drag_active));
     }
     event->ignore();
@@ -6158,8 +6386,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         dismiss_row_timestamp_tooltip();
     }
     std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
-        m_private->render_snapshot,
-        m_private->cell_metrics,
+        m_private->input_snapshot(),
+        m_private->input_metrics(),
         event->position());
     std::optional<term::terminal_grid_position_t> viewport_position = position;
     std::optional<term::terminal_grid_position_t> logical_position;
@@ -6167,7 +6395,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     const bool terminal_mouse_grab_active =
         m_private->mouse_reporting_pressed_buttons != Qt::NoButton;
     const bool published_mouse_tracking =
-        snapshot_has_terminal_mouse_tracking(m_private->render_snapshot);
+        snapshot_has_terminal_mouse_tracking(m_private->input_snapshot());
     const auto trace_decision = [&](const QString& reason) {
         trace_surface_mouse_decision(
             m_selection_trace_enabled || term::interaction_trace_enabled(),
@@ -6191,8 +6419,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     {
         const std::optional<Surface_hyperlink_target> current_hyperlink =
             explicit_hyperlink_for_local_point(
-                m_private->render_snapshot,
-                m_private->cell_metrics,
+                m_private->input_snapshot(),
+                m_private->input_metrics(),
                 event->position());
         if (!m_private->hyperlink_activation_target.has_value()          ||
             !current_hyperlink.has_value()                               ||
@@ -6226,14 +6454,10 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             return;
         }
 
-        std::optional<term::terminal_grid_position_t> report_position = position;
+        std::optional<term::terminal_grid_position_t> report_position = position
+            ? native_mouse_position(m_private->input_snapshot(), *position, m_private->display_input_projected) : std::nullopt;
         if (!report_position.has_value() && terminal_mouse_grab_active) {
-            report_position = m_private->mouse_reporting_last_position.has_value()
-                ? m_private->mouse_reporting_last_position
-                : clamped_grid_position_for_local_point(
-                    m_private->render_snapshot,
-                    m_private->cell_metrics,
-                    event->position());
+            report_position = m_private->mouse_reporting_last_position;
         }
 
         if (report_position.has_value()) {
@@ -6286,8 +6510,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 return;
             }
             if (m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
-                snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
-                !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot))
+                snapshot_has_terminal_mouse_tracking(m_private->input_snapshot()) &&
+                !snapshot_has_sgr_mouse_reporting(m_private->input_snapshot()))
             {
                 m_private->mouse_reporting_last_position = *report_position;
                 event->accept();
@@ -6315,8 +6539,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     }
 
     position = grid_position_for_local_point(
-        m_private->render_snapshot,
-        m_private->cell_metrics,
+        m_private->input_snapshot(),
+        m_private->input_metrics(),
         event->position());
     viewport_position = position;
 
@@ -6340,11 +6564,11 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 .arg(selection_trace_source_identity(
                     m_private->selection_drag_press_provenance->source))
                 .arg(selection_trace_source_identity(source))
-                .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
+                .arg(selection_trace_snapshot_identity(m_private->input_snapshot())));
     }
     if (!source.has_value() ||
-        m_private->render_snapshot == nullptr ||
-        !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
+        m_private->input_snapshot() == nullptr ||
+        !selection_source_matches_snapshot(*source, *m_private->input_snapshot()))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             term::write_selection_trace(m_selection_trace_enabled,
@@ -6352,7 +6576,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                     "surface mouse-move source-mismatch snapshot_reason=%1 anchor_reason=%2")
                     .arg(selection_trace_source_snapshot_mismatch_reason(
                         source,
-                        m_private->render_snapshot))
+                        m_private->input_snapshot()))
                     .arg(QStringLiteral("resolver-owned")));
         }
         m_private->selection_drag_cancelled = true;
@@ -6373,16 +6597,16 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     viewport_position = position.has_value()
         ? position
         : clamped_grid_position_for_local_point(
-            m_private->render_snapshot,
-            m_private->cell_metrics,
+            m_private->input_snapshot(),
+            m_private->input_metrics(),
             event->position());
-    if (!viewport_position.has_value()) {
+    if (!viewport_position.has_value() || !m_private->input_row_is_current(viewport_position->row)) {
         trace_decision(QStringLiteral("out-of-grid"));
         return;
     }
 
     logical_position = logical_grid_position_for_viewport_cell(
-        m_private->render_snapshot,
+        m_private->input_snapshot(),
         *viewport_position);
     if (!logical_position.has_value()) {
         trace_decision(QStringLiteral("viewport-mapping"));
@@ -6435,6 +6659,11 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     m_private->selection_anchor = *proof.resolved_position;
     const term::Terminal_selection_range range =
         selection_range_for_drag(*proof.resolved_position, *logical_position);
+    if (!m_private->input_range_is_current(range)) {
+        event->accept();
+        trace_decision(QStringLiteral("rendered-range-changed"));
+        return;
+    }
     m_private->selection_drag_moved = true;
     record_surface_selection_drag_transcript(
         m_private->transcript_recorder,
@@ -6470,7 +6699,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 .arg(static_cast<int>(event->buttons()))
                 .arg(static_cast<int>(event->modifiers()))
                 .arg(keepMouseGrab())
-                .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot))
+                .arg(snapshot_has_terminal_mouse_tracking(m_private->input_snapshot()))
                 .arg(m_private->selection_drag_active));
     }
     event->ignore();
@@ -6502,13 +6731,13 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         event->button() == Qt::LeftButton)
     {
         viewport_position = grid_position_for_local_point(
-            m_private->render_snapshot,
-            m_private->cell_metrics,
+            m_private->input_snapshot(),
+            m_private->input_metrics(),
             event->position());
         const std::optional<Surface_hyperlink_target> current_hyperlink =
             explicit_hyperlink_for_local_point(
-                m_private->render_snapshot,
-                m_private->cell_metrics,
+                m_private->input_snapshot(),
+                m_private->input_metrics(),
                 event->position());
         const bool request_activation =
             m_private->hyperlink_activation_target.has_value()          &&
@@ -6576,11 +6805,11 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                     .arg(selection_trace_source_identity(
                         m_private->selection_drag_press_provenance->source))
                     .arg(selection_trace_source_identity(source))
-                    .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
+                    .arg(selection_trace_snapshot_identity(m_private->input_snapshot())));
         }
         if (!source.has_value() ||
-            m_private->render_snapshot == nullptr ||
-            !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
+            m_private->input_snapshot() == nullptr ||
+            !selection_source_matches_snapshot(*source, *m_private->input_snapshot()))
         {
             if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                 term::write_selection_trace(m_selection_trace_enabled,
@@ -6588,7 +6817,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                         "surface mouse-release source-mismatch snapshot_reason=%1 anchor_reason=%2")
                         .arg(selection_trace_source_snapshot_mismatch_reason(
                             source,
-                            m_private->render_snapshot))
+                            m_private->input_snapshot()))
                         .arg(QStringLiteral("resolver-owned")));
             }
             record_surface_selection_drag_transcript(
@@ -6607,18 +6836,18 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         }
 
         viewport_position = grid_position_for_local_point(
-            m_private->render_snapshot,
-            m_private->cell_metrics,
+            m_private->input_snapshot(),
+            m_private->input_metrics(),
             event->position());
         viewport_position = viewport_position.has_value()
             ? viewport_position
             : clamped_grid_position_for_local_point(
-                m_private->render_snapshot,
-                m_private->cell_metrics,
+                m_private->input_snapshot(),
+                m_private->input_metrics(),
                 event->position());
-        if (viewport_position.has_value()) {
+        if (viewport_position.has_value() && m_private->input_row_is_current(viewport_position->row)) {
             logical_position = logical_grid_position_for_viewport_cell(
-                m_private->render_snapshot,
+                m_private->input_snapshot(),
                 *viewport_position);
         }
         QString decision_reason = QStringLiteral("out-of-grid");
@@ -6669,6 +6898,12 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
             m_private->selection_anchor = *proof.resolved_position;
             const term::Terminal_selection_range range =
                 selection_range_for_drag(*proof.resolved_position, *logical_position);
+            if (!m_private->input_range_is_current(range)) {
+                m_private->clear_selection_drag_state();
+                event->accept();
+                trace_decision(QStringLiteral("rendered-range-changed"));
+                return;
+            }
             const bool selection_range_needed =
                 m_private->selection_drag_moved ||
                 *logical_position != *proof.resolved_position;
@@ -6771,22 +7006,21 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
     button = terminal_mouse_button(released_qt_button);
 
     std::shared_ptr<const term::Terminal_render_snapshot> published_snapshot =
-        m_private->render_snapshot;
+        m_private->input_snapshot();
     std::optional<term::terminal_grid_position_t> report_position;
     const auto refresh_report_position = [&] {
-        published_snapshot = m_private->render_snapshot;
+        published_snapshot = m_private->input_snapshot();
         viewport_position = grid_position_for_local_point(
             published_snapshot,
-            m_private->cell_metrics,
+            m_private->input_metrics(),
             event->position());
-        report_position = viewport_position;
+        report_position = viewport_position
+            ? native_mouse_position(published_snapshot, *viewport_position, m_private->display_input_projected) : std::nullopt;
         if (!report_position.has_value() && terminal_mouse_grab_active) {
-            report_position = m_private->mouse_reporting_last_position.has_value()
-                ? m_private->mouse_reporting_last_position
-                : clamped_grid_position_for_local_point(
-                    published_snapshot,
-                    m_private->cell_metrics,
-                    event->position());
+            report_position = m_private->mouse_reporting_last_position;
+            if (!published_snapshot) {
+                published_snapshot = m_private->render_snapshot;
+            }
         }
         viewport_position = report_position;
     };
@@ -6815,7 +7049,8 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
             button,
             *report_position,
             event->modifiers(),
-            published_snapshot);
+            published_snapshot,
+            true);
     std::optional<VNM_TerminalSurface::Private::Pending_published_mouse_report> report;
     if (encoded.encoded) {
         report = m_private->pending_published_mouse_report(
@@ -6906,15 +7141,18 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
         return;
     }
 
-    const std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
-        m_private->render_snapshot,
-        m_private->cell_metrics,
+    auto position = grid_position_for_local_point(
+        m_private->input_snapshot(),
+        m_private->input_metrics(),
         event->position());
+    if (position) {
+        position = native_mouse_position(m_private->input_snapshot(), *position, m_private->display_input_projected);
+    }
     if (!position.has_value()) {
         return;
     }
 
-    if (!snapshot_has_terminal_mouse_tracking(m_private->render_snapshot)) {
+    if (!snapshot_has_terminal_mouse_tracking(m_private->input_snapshot())) {
         return;
     }
 
@@ -6939,8 +7177,8 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
     }
     if (!mouse_result->handled) {
         if (m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
-            snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
-            !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot))
+            snapshot_has_terminal_mouse_tracking(m_private->input_snapshot()) &&
+            !snapshot_has_sgr_mouse_reporting(m_private->input_snapshot()))
         {
             event->accept();
         }
@@ -7038,8 +7276,8 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 render_publication_blocked);
             object.insert(
                 QStringLiteral("published_synchronized_output"),
-                m_private->render_snapshot != nullptr &&
-                    m_private->render_snapshot->modes.synchronized_output);
+                m_private->input_snapshot() != nullptr &&
+                    m_private->input_snapshot()->modes.synchronized_output);
             object.insert(QStringLiteral("backend_drain_calls"), backend_drain_calls);
             object.insert(QStringLiteral("backend_drain_elapsed_ns"), backend_drain_elapsed_ns);
             object.insert(
@@ -7051,13 +7289,13 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
             published_sgr_mouse_reporting =
                 published_sgr_mouse_reporting ||
-                snapshot_has_sgr_mouse_reporting(m_private->render_snapshot);
+                snapshot_has_sgr_mouse_reporting(m_private->input_snapshot());
             published_mouse_tracking =
                 published_mouse_tracking ||
-                snapshot_has_terminal_mouse_tracking(m_private->render_snapshot);
-            if (m_private->render_snapshot != nullptr) {
+                snapshot_has_terminal_mouse_tracking(m_private->input_snapshot());
+            if (m_private->input_snapshot() != nullptr) {
                 const term::Terminal_viewport_state& published_viewport =
-                    m_private->render_snapshot->viewport;
+                    m_private->input_snapshot()->viewport;
                 trace_alternate_screen =
                     trace_alternate_screen ||
                     published_viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE;
@@ -7192,7 +7430,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
     }
 
     const std::shared_ptr<const term::Terminal_render_snapshot> wheel_snapshot =
-        m_private->render_snapshot;
+        m_private->input_snapshot();
     const bool protocol_state_stale =
         m_private->session != nullptr &&
         protocol_callbacks_before_input_frontier_pending(*m_private->session);
@@ -7216,10 +7454,13 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             return true;
         }
 
-        const std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
+        auto position = grid_position_for_local_point(
             wheel_snapshot,
-            m_private->cell_metrics,
+            m_private->input_metrics(),
             event->position());
+        if (position) {
+            position = native_mouse_position(wheel_snapshot, *position, m_private->display_input_projected);
+        }
         alternate_screen =
             wheel_snapshot != nullptr &&
             wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE;
@@ -7239,7 +7480,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
             const int steps = term::vertical_wheel_steps(
                 *event,
-                m_private->cell_metrics.height,
+                m_private->input_metrics().height,
                 m_private->wheel_mouse_angle_remainder,
                 m_private->wheel_mouse_pixel_remainder);
             wheel_steps           = steps;
@@ -7340,7 +7581,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
             const int steps = term::vertical_wheel_steps(
                 *event,
-                m_private->cell_metrics.height,
+                m_private->input_metrics().height,
                 m_private->wheel_mouse_angle_remainder,
                 m_private->wheel_mouse_pixel_remainder);
             wheel_steps           = steps;
@@ -7489,7 +7730,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
         const int line_delta = term::vertical_wheel_steps(
             *event,
-            m_private->cell_metrics.height,
+            m_private->input_metrics().height,
             m_private->wheel_scroll_angle_remainder,
             m_private->wheel_scroll_pixel_remainder);
         wheel_steps = line_delta;
@@ -7532,8 +7773,8 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         {
             sync_from_session();
             trace_viewport_after =
-                m_private->render_snapshot != nullptr
-                    ? m_private->render_snapshot->viewport
+                m_private->input_snapshot() != nullptr
+                    ? m_private->input_snapshot()->viewport
                     : m_private->session->viewport_state();
             has_viewport_after   = true;
             local_scroll_applied =
@@ -7551,12 +7792,12 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 m_private->session->render_publication_blocked();
             const bool public_projection_scroll_visible =
                 render_publication_blocked_after_scroll &&
-                m_private->render_snapshot != nullptr &&
-                m_private->render_snapshot->basis ==
+                m_private->input_snapshot() != nullptr &&
+                m_private->input_snapshot()->basis ==
                     term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
-                m_private->render_snapshot->purpose ==
+                m_private->input_snapshot()->purpose ==
                     term::Terminal_render_snapshot_purpose::SCROLL &&
-                m_private->render_snapshot->public_scroll_diagnostics.visible_scroll_applied;
+                m_private->input_snapshot()->public_scroll_diagnostics.visible_scroll_applied;
             const bool visible_scroll_applied =
                 local_scroll_applied &&
                 (!render_publication_blocked_after_scroll || public_projection_scroll_visible);
@@ -8118,6 +8359,7 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
     set_backend_geometry_in_sync(false);
     m_private->clear_hyperlink_activation_state();
     m_private->render_snapshot.reset();
+    m_private->display_snapshot.reset();
     m_private->reset_cursor_presentation(*this);
     refresh_hyperlink_hover_feedback();
     m_private->set_ime_preedit_state(*this, {});
@@ -8706,6 +8948,7 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
     };
 
     bool render_snapshot_installed = false;
+    bool search_selection_changed = false;
     std::shared_ptr<const term::Terminal_render_snapshot> installed_render_snapshot;
     const auto installed_render_snapshot_still_current = [&] {
         return m_private->render_snapshot == installed_render_snapshot;
@@ -8766,6 +9009,9 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         }
         const term::terminal_search_result_state_t search_state =
             session->search_result_state();
+        search_selection_changed = m_search_query != session->search_query() ||
+            m_search_result_state != surface_search_result_state(search_state.status) ||
+            m_current_search_match != search_state.current_match;
         set_search_state(
             session->search_query(),
             surface_search_result_state(search_state.status),
@@ -8913,6 +9159,9 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::recovery_timer");
 
         sync_synchronized_output_recovery_timer();
+    }
+    if (search_selection_changed && active_session_still_matches()) {
+        m_private->reveal_current_search_in_display(*this);
     }
 }
 
@@ -9299,7 +9548,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->cursor_presentation_suppressed;
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(
-                m_private->render_snapshot,
+                m_private->display_snapshot,
                 m_private->ime_preedit,
                 options,
                 m_private->cell_metrics,
@@ -9375,6 +9624,8 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->observe_cursor_publication(surface, snapshot);
     surface.m_private->render_snapshot = std::move(snapshot);
+    surface.m_private->display_snapshot = surface.m_private->content_tail_presentation_enabled
+        ? make_content_tail_display_snapshot(surface.m_private->render_snapshot) : surface.m_private->render_snapshot;
     surface.refresh_hyperlink_hover_feedback();
     surface.updateInputMethod(Qt::ImCursorRectangle);
     surface.m_private->request_render_update(surface);
