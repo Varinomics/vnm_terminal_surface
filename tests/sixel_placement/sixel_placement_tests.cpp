@@ -2156,9 +2156,107 @@ bool test_horizontal_scroll_over_cap_keeps_stationary_image()
     return ok;
 }
 
+bool test_short_image_rotation_preserves_native_rows_and_resize_history()
+{
+    auto model = make_model(29, 51);
+    QByteArray image = QByteArrayLiteral("\"1;1;160;96#1;2;0;0;100#1");
+    image += QByteArrayLiteral("!160~-").repeated(15) + QByteArrayLiteral("!160~");
+    model.ingest(QByteArrayLiteral("\x1b[H\x1b[2JRelay production frame 21/21\r\n") +
+        sixel("0;1;0", image) + cursor_to(11, 0) +
+        QByteArrayLiteral("Final image: blue rectangle, 160 by 96 pixels.\r\n"
+            "Type relay-production-input from Companion: "));
+    const auto original = model.render_snapshot(1U);
+    // The observed native Console trace is 51x29 cursor 44/12, then 104x8
+    // and 51x29 both cursor 44/7. This checks that boundary, not phone layout.
+    bool ok = check(model.cursor_position() == term::terminal_grid_position_t{12, 44},
+        "the static image fixture matches the recorded pre-rotation cursor");
+    model.resize({8, 104});
+    model.resize({29, 51});
+    const auto returned = model.render_snapshot(2U);
+    ok &= check(model.cursor_position() == term::terminal_grid_position_t{7, 44} &&
+            model.scrollback_size() == 5 && returned.viewport.offset_from_tail == 0 &&
+            returned.cursor.position.row == 7,
+        "portrait return preserves the recorded native cursor and shared viewport");
+    ok &= check(returned.leading_row_count == 5 && returned.leading_rows_snapshot,
+        "the five resize-displaced rows remain available as a separate projection");
+    if (!returned.leading_rows_snapshot) {
+        return false;
+    }
+    const auto& combined = *returned.leading_rows_snapshot;
+    if (!check(original.visible_row_images.size() == 29U && combined.visible_row_images.size() == 29U,
+            "both source projections carry the static image slices"))
+    {
+        return false;
+    }
+    for (int row = 0; row <= 12; ++row) {
+        ok &= check(combined.visible_line_provenance[(std::size_t)row].retained_line_id ==
+                original.visible_line_provenance[(std::size_t)row].retained_line_id,
+            "the supplemental projection keeps the original retained row identity");
+    }
+    int original_image_height = 0;
+    int returned_image_height = 0;
+    for (int row = 0; row < 29; ++row) {
+        const auto& before = original.visible_row_images[(std::size_t)row];
+        const auto& after  = combined.visible_row_images[(std::size_t)row];
+        if (before) {
+            original_image_height += before->pixels.height();
+            ok &= check(after && before->pixels == after->pixels && before->revision == after->revision,
+                "archived and active image slices preserve exact pixels and revision");
+        }
+        if (after) {
+            returned_image_height += after->pixels.height();
+        }
+    }
+    ok &= check(original_image_height == 96 && returned_image_height == 96,
+        "the complete static Sixel is present across the retained and active boundary");
+    term::Terminal_render_snapshot_request request;
+    request.sequence = 3U;
+    request.viewport.offset_from_tail = 1;
+    const auto scrolled = model.render_snapshot(request);
+    ok &= check(scrolled.leading_row_count == 4 && scrolled.leading_rows_snapshot &&
+            scrolled.leading_rows_snapshot->visible_line_provenance.front().retained_line_id ==
+                combined.visible_line_provenance.front().retained_line_id,
+        "one history step transfers one supplemental row into the ordinary viewport");
+    model.ingest(QByteArrayLiteral("\x1b[8;45HX"));
+    ok &= check(model.row_text(7).startsWith(QStringLiteral("Type relay-production-input from Companion: X")) &&
+            model.cursor_position() == term::terminal_grid_position_t{7, 45},
+        "absolute native input after portrait growth writes beside its unchanged prompt");
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    ok &= check(!model.render_snapshot(4U).leading_rows_snapshot,
+        "alternate-screen output does not expose primary resize history");
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(model.render_snapshot(5U).leading_row_count == 5,
+        "returning to unchanged primary output retains its resize history");
+    model.set_scrollback_limit(3);
+    ok &= check(model.render_snapshot(6U).leading_row_count == 3,
+        "retained-history eviction bounds the available resize suffix");
+    model.ingest(QByteArrayLiteral("\x1b[2J"));
+    ok &= check(!model.render_snapshot(7U).leading_rows_snapshot && model.scrollback_size() == 3,
+        "an explicit screen clear removes resize presentation eligibility without deleting history");
+    for (const auto& clear : {
+            QByteArrayLiteral("\x1b[H\x1b[J"),
+            QByteArrayLiteral("\x1b[6;20H\x1b[1J\x1b[H"),
+            QByteArrayLiteral("\x1b[3J"),
+            QByteArrayLiteral("\x1b" "c"),
+            QByteArrayLiteral("\x1b[6;1H\r\n")})
+    {
+        auto cleared = make_model(6, 20);
+        cleared.ingest(QByteArrayLiteral("old\r\nsecond\r\nthird\r\nfourth\r\nprompt> "));
+        cleared.resize({2, 20});
+        cleared.resize({6, 20});
+        ok &= check(cleared.render_snapshot(8U).leading_row_count == 3,
+            "clear and output invalidation fixtures begin with resize-displaced rows");
+        cleared.ingest(clear);
+        ok &= check(!cleared.render_snapshot(9U).leading_rows_snapshot,
+            "whole-screen erasure, reset, history clear and ordinary scrolling end resize-prefix eligibility");
+    }
+    return ok;
+}
+
 int main()
 {
     bool ok = true;
+    ok &= test_short_image_rotation_preserves_native_rows_and_resize_history();
     ok &= test_horizontal_margins_preserve_outside_sixel_cells();
     ok &= test_rectangular_scroll_keeps_off_grid_image_columns_on_their_row();
     ok &= test_character_edits_keep_off_grid_image_columns_stationary();

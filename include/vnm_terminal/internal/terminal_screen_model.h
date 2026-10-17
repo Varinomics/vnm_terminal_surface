@@ -19,6 +19,7 @@
 #include <QString>
 #include <QStringView>
 #include <QtGlobal>
+#include <algorithm>
 #include <chrono>
 #include <array>
 #include <cstddef>
@@ -674,6 +675,11 @@ public:
 
     Terminal_render_snapshot render_snapshot(
         const Terminal_render_snapshot_request&        request) const;
+
+    int resize_displaced_scrollback_rows() const
+    {
+        return std::min(m_resize_displaced_scrollback_rows, scrollback_size());
+    }
 
     Terminal_selection_result selected_text(
         const Terminal_selection_range&                selection) const;
@@ -1446,7 +1452,8 @@ private:
         const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys =
             nullptr,
         const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id =
-            nullptr);
+            nullptr,
+        bool resize_displaced = false);
     void scroll_up_region(int top, int bottom, bool append_scrollback, int count = 1);
     void scroll_down_region(int top, int bottom, int count = 1);
     void replace_row_segment(int target_row, const Terminal_screen_row* source_row);
@@ -1820,6 +1827,7 @@ private:
                                     m_recovery_attempts;
     std::uint64_t                   m_dropped_recovery_attempts = 0U;
     int                             m_last_dirty_row = -1;
+    int                             m_resize_displaced_scrollback_rows = 0;
     std::vector<bool>               m_tab_stops;
     saved_cursor_state_t            m_saved_cursor;
     terminal_grid_position_t        m_cursor;

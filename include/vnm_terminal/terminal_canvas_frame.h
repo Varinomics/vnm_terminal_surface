@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/terminal_touch_selection.h"
 
+#include <QByteArray>
 #include <QImage>
 #include <QString>
 #include <QtGlobal>
@@ -110,6 +111,7 @@ struct Terminal_canvas_style
     quint32       foreground_rgba = 0xffffffffU;
     quint32       background_rgba = 0xff000000U;
     std::uint16_t attributes      = 0U;
+    bool operator==(const Terminal_canvas_style&) const = default;
 };
 
 inline constexpr std::uint16_t k_terminal_canvas_color_references_version = 1U;
@@ -146,6 +148,7 @@ struct Terminal_canvas_color_references
 struct Terminal_canvas_wide_styles
 {
     std::uint16_t record_version = k_terminal_canvas_wide_styles_version;
+    bool operator==(const Terminal_canvas_wide_styles&) const = default;
 };
 
 struct Terminal_canvas_cell
@@ -155,6 +158,7 @@ struct Terminal_canvas_cell
     int           display_width = 1;
     std::uint16_t style_index   = 0U;
     QString       text;
+    bool operator==(const Terminal_canvas_cell&) const = default;
 };
 
 struct Terminal_canvas_cursor
@@ -188,6 +192,7 @@ struct Terminal_canvas_image_slice
     int           cell_pixel_height = 0;
     std::uint64_t revision          = 0U;
     QImage        pixels;
+    bool operator==(const Terminal_canvas_image_slice&) const = default;
 };
 
 // The record shares the enclosing frame's identity and is installed or cleared
@@ -199,6 +204,7 @@ struct Terminal_canvas_images
     std::uint16_t record_version = k_terminal_canvas_images_version;
     Terminal_canvas_images_status status = Terminal_canvas_images_status::AVAILABLE;
     std::vector<Terminal_canvas_image_slice> rows;
+    bool operator==(const Terminal_canvas_images&) const = default;
 };
 
 inline bool terminal_canvas_images_are_valid(
@@ -239,6 +245,129 @@ inline bool terminal_canvas_images_are_valid(
     return true;
 }
 
+inline constexpr std::uint16_t k_terminal_canvas_leading_rows_version = 1U;
+
+enum class Terminal_canvas_leading_rows_status
+{
+    AVAILABLE,
+    INVALID,
+    OVER_LIMIT,
+};
+
+// These retained rows precede the unchanged frame. A receiving presentation
+// may fit their suffix into its unused top padding without moving the native
+// screen. Selection describes the full frame with all leading rows prepended;
+// its source geometry and retained row identities remain those of this frame.
+struct Terminal_canvas_leading_rows
+{
+    std::uint16_t record_version = k_terminal_canvas_leading_rows_version;
+    Terminal_canvas_leading_rows_status status = Terminal_canvas_leading_rows_status::AVAILABLE;
+    int rows = 0;
+    std::vector<Terminal_canvas_style> styles;
+    std::optional<Terminal_canvas_color_references> color_references;
+    std::vector<Terminal_canvas_cell> cells;
+    std::optional<Terminal_canvas_images> images;
+    std::optional<Terminal_canvas_selection> selection;
+    std::optional<Terminal_canvas_wide_styles> wide_styles;
+    bool operator==(const Terminal_canvas_leading_rows&) const = default;
+};
+
+inline bool terminal_canvas_leading_rows_are_valid(
+    const Terminal_canvas_leading_rows& leading,
+    int                                frame_rows,
+    int                                frame_columns)
+{
+    if (leading.record_version != k_terminal_canvas_leading_rows_version) {
+        return true;
+    }
+    switch (leading.status) {
+        case Terminal_canvas_leading_rows_status::INVALID:
+        case Terminal_canvas_leading_rows_status::OVER_LIMIT:
+            return leading.rows == 0 && leading.styles.empty() && leading.cells.empty() &&
+                !leading.color_references && !leading.images && !leading.selection && !leading.wide_styles;
+        case Terminal_canvas_leading_rows_status::AVAILABLE:
+            break;
+        default:
+            return false;
+    }
+    if (leading.rows <= 0 || leading.rows >= frame_rows ||
+        !terminal_canvas_grid_fits_cell_budget(leading.rows, frame_columns) ||
+        leading.cells.size() > (std::size_t)leading.rows * (std::size_t)frame_columns ||
+        leading.styles.empty() || leading.styles.size() > k_terminal_canvas_max_wide_styles)
+    {
+        return false;
+    }
+    if (leading.wide_styles) {
+        if (leading.wide_styles->record_version == k_terminal_canvas_wide_styles_version &&
+            (!leading.color_references ||
+                leading.color_references->record_version != k_terminal_canvas_color_references_version))
+        {
+            return false;
+        }
+    }
+    else
+    if (leading.styles.size() > k_terminal_canvas_max_styles) {
+        return false;
+    }
+    constexpr std::uint16_t known_attributes =
+        (std::uint16_t)Terminal_canvas_style_attribute::BOLD |
+        (std::uint16_t)Terminal_canvas_style_attribute::FAINT |
+        (std::uint16_t)Terminal_canvas_style_attribute::ITALIC |
+        (std::uint16_t)Terminal_canvas_style_attribute::UNDERLINE |
+        (std::uint16_t)Terminal_canvas_style_attribute::BLINK |
+        (std::uint16_t)Terminal_canvas_style_attribute::INVERSE |
+        (std::uint16_t)Terminal_canvas_style_attribute::INVISIBLE |
+        (std::uint16_t)Terminal_canvas_style_attribute::STRIKE;
+    if (leading.styles.front().attributes != 0U) {
+        return false;
+    }
+    for (const auto& style : leading.styles) {
+        if ((style.attributes & ~known_attributes) != 0U) {
+            return false;
+        }
+    }
+    if (leading.color_references &&
+        leading.color_references->record_version == k_terminal_canvas_color_references_version)
+    {
+        if (leading.color_references->styles.size() != leading.styles.size()) {
+            return false;
+        }
+        for (const auto& refs : leading.color_references->styles) {
+            if (refs.foreground > k_terminal_canvas_color_rgba || refs.background > k_terminal_canvas_color_rgba) {
+                return false;
+            }
+        }
+        const auto& defaults = leading.color_references->styles.front();
+        if (defaults.foreground != k_terminal_canvas_color_default ||
+            defaults.background != k_terminal_canvas_color_default)
+        {
+            return false;
+        }
+    }
+    int previous_row = -1;
+    int previous_end = 0;
+    qsizetype text_bytes = 0;
+    for (const auto& cell : leading.cells) {
+        if (cell.row < 0 || cell.row >= leading.rows || cell.row < previous_row ||
+            cell.column < 0 || cell.display_width < 1 ||
+            cell.display_width > frame_columns || cell.column > frame_columns - cell.display_width ||
+            (cell.row == previous_row && cell.column < previous_end) ||
+            cell.style_index >= leading.styles.size() ||
+            cell.text.size() > k_terminal_canvas_max_cell_text_utf16_code_units)
+        {
+            return false;
+        }
+        text_bytes += cell.text.toUtf8().size();
+        if (text_bytes > k_terminal_canvas_max_frame_text_utf8_bytes) {
+            return false;
+        }
+        previous_row = cell.row;
+        previous_end = cell.column + cell.display_width;
+    }
+    return (!leading.images || terminal_canvas_images_are_valid(*leading.images, leading.rows)) &&
+        (!leading.selection || terminal_canvas_selection_is_valid(*leading.selection, frame_rows, frame_columns));
+}
+
 struct Terminal_canvas_frame
 {
     std::uint32_t                    api_version = k_terminal_canvas_frame_api_version;
@@ -271,6 +400,7 @@ struct Terminal_canvas_frame
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;
     std::optional<Terminal_canvas_wide_styles> wide_styles;
+    std::optional<Terminal_canvas_leading_rows> leading_rows;
 };
 
 // Zero rejects an unsupported marker instead of interpreting it as the

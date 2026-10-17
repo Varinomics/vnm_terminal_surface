@@ -380,6 +380,21 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         }
     }
 
+    if (request.include_resize_leading_rows && viewport.active_buffer == Terminal_buffer_id::PRIMARY) {
+        const int leading_rows = std::min(
+            std::max(0, resize_displaced_scrollback_rows() - viewport.offset_from_tail),
+            m_config.grid_size.rows - 1);
+        if (leading_rows > 0) {
+            Terminal_render_snapshot_request leading_request = request;
+            leading_request.include_resize_leading_rows = false;
+            leading_request.viewport = viewport;
+            leading_request.viewport.offset_from_tail += leading_rows;
+            leading_request.viewport_changed = true;
+            snapshot.leading_row_count = leading_rows;
+            snapshot.leading_rows_snapshot = std::make_shared<const Terminal_render_snapshot>(
+                render_snapshot(leading_request));
+        }
+    }
     return snapshot;
 }
 

@@ -96,6 +96,42 @@ inline std::optional<vnm_terminal::terminal_selection_row_t> decode_row(const QJ
 }
 
 inline constexpr auto k_word_query_presence = "terminal.selection.word_query";
+inline constexpr auto k_presentation_presence = "terminal.selection.presentation";
+
+inline QJsonObject encode_presentation(const terminal_touch_selection_presentation_t& presentation)
+{
+    return {
+        {QStringLiteral("presence"), QLatin1String(k_presentation_presence)},
+        {QStringLiteral("version"), presentation.record_version},
+        {QStringLiteral("top_padding_rows"), presentation.top_padding_rows},
+        {QStringLiteral("visible_native_rows"), presentation.visible_native_rows},
+    };
+}
+
+inline std::optional<terminal_touch_selection_presentation_t> decode_presentation(const QJsonValue& value)
+{
+    if (!value.isObject()) {
+        return std::nullopt;
+    }
+    const auto object = value.toObject();
+    const auto version = integer(object.value(QStringLiteral("version")), 1, 65'535);
+    if (!version || object.value(QStringLiteral("presence")).toString() != QLatin1String(k_presentation_presence)) {
+        return std::nullopt;
+    }
+    terminal_touch_selection_presentation_t result;
+    result.record_version = (std::uint16_t)*version;
+    if (result.record_version != k_terminal_touch_selection_presentation_version) {
+        return result;
+    }
+    const auto padding = integer(object.value(QStringLiteral("top_padding_rows")), 0, 32'768);
+    const auto visible = integer(object.value(QStringLiteral("visible_native_rows")), 1, 32'768);
+    if (object.size() != 4 || !padding || !visible) {
+        return std::nullopt;
+    }
+    result.top_padding_rows = *padding;
+    result.visible_native_rows = *visible;
+    return result;
+}
 
 inline QJsonObject word_query_marker(std::uint16_t version = k_terminal_word_query_version)
 {
@@ -155,6 +191,9 @@ inline QJsonObject encode_request(const vnm_terminal::Terminal_touch_selection_r
     if (request.action == Terminal_touch_selection_action::INSPECT_WORD) {
         object.insert(QStringLiteral("word_query"), word_query_marker());
     }
+    if (request.presentation) {
+        object.insert(QStringLiteral("presentation"), encode_presentation(*request.presentation));
+    }
     return object;
 }
 
@@ -174,7 +213,12 @@ inline std::optional<vnm_terminal::Terminal_touch_selection_request> decode_requ
     const auto scroll = integer(object.value(QStringLiteral("scroll_lines")), -64, 64);
     const auto gesture = object.value(QStringLiteral("gesture_id"));
     const bool query = action && *action == static_cast<int>(Terminal_touch_selection_action::INSPECT_WORD);
-    if (object.size() != (query ? 10 : 9) ||
+    const bool has_presentation = object.contains(QStringLiteral("presentation"));
+    const auto presentation = has_presentation
+        ? decode_presentation(object.value(QStringLiteral("presentation")))
+        : std::nullopt;
+    if (object.size() != (query ? 10 : 9) + (has_presentation ? 1 : 0) ||
+        (has_presentation && !presentation) ||
         (query && decode_word_query_marker(object.value(QStringLiteral("word_query"))) != k_terminal_word_query_version) ||
         !id || !*id || !generation || !source || !row || !action ||
         !column || !handle || !scroll || !gesture.isString() || gesture.toString().isEmpty() ||
@@ -184,7 +228,8 @@ inline std::optional<vnm_terminal::Terminal_touch_selection_request> decode_requ
     }
     return vnm_terminal::Terminal_touch_selection_request{
         *id, gesture.toString(), static_cast<vnm_terminal::Terminal_touch_selection_action>(*action),
-        *source, {*row, *column}, static_cast<vnm_terminal::Terminal_selection_handle>(*handle), *generation, *scroll};
+        *source, {*row, *column}, static_cast<vnm_terminal::Terminal_selection_handle>(*handle),
+        *generation, *scroll, presentation};
 }
 
 inline QJsonObject encode_result(vnm_terminal::Terminal_touch_selection_result result)

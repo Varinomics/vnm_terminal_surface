@@ -562,6 +562,7 @@ struct Terminal_render_snapshot_request
     bool                                  backend_geometry_in_sync = true;
     bool                                  visual_bell_active = false;
     bool                                  mouse_reporting_mode_changed = false;
+    bool                                  include_resize_leading_rows = true;
 };
 
 struct Terminal_render_snapshot;
@@ -590,6 +591,8 @@ struct Terminal_render_snapshot
     Terminal_render_metadata                           metadata;
     Terminal_mode_state                                modes;
     std::optional<Terminal_canvas_selection>            touch_selection;
+    int                                                leading_row_count = 0;
+    std::shared_ptr<const Terminal_render_snapshot>     leading_rows_snapshot;
 };
 
 struct Terminal_render_snapshot_validation

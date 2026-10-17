@@ -69,6 +69,101 @@ touch::Terminal_touch_selection_request request_at(
     return request;
 }
 
+bool resize_leading_rows_selection_contract()
+{
+    auto backend = std::make_unique<Touch_backend>();
+    auto* output = backend.get();
+    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+    config.selection_viewport_projection_enabled = true;
+    term::Terminal_session session(std::move(backend), config);
+    term::Terminal_launch_config launch;
+    launch.argv = {QStringLiteral("resize-history-selection-fixture")};
+    launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
+    bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+        "resize history selection fixture starts");
+    output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
+    session.process_backend_callback_events();
+    session.resize(QSizeF(200.0, 40.0), {2, 20});
+    session.resize(QSizeF(200.0, 120.0), {6, 20});
+    auto snapshot = session.latest_render_snapshot_handle();
+    ok &= check(snapshot && snapshot->leading_row_count == 3 && snapshot->leading_rows_snapshot &&
+            snapshot->leading_rows_snapshot->touch_selection,
+        "resize history and ordinary rows share one published selection source");
+    if (!ok) {
+        return false;
+    }
+    auto word = request_at(*snapshot->leading_rows_snapshot,
+        touch::Terminal_touch_selection_action::SELECT_WORD, 0, 2, 101U);
+    word.presentation = touch::terminal_touch_selection_presentation_t{
+        touch::k_terminal_touch_selection_presentation_version, 4, 2};
+    ok &= check(touch::touch_selection_codec::decode_request(
+            touch::touch_selection_codec::encode_request(word)) == word,
+        "selection presentation is an independently versioned optional request record");
+    auto unsupported = word;
+    unsupported.presentation->record_version = 99U;
+    const auto decoded_unsupported = touch::touch_selection_codec::decode_request(
+        touch::touch_selection_codec::encode_request(unsupported));
+    ok &= check(decoded_unsupported &&
+            session.apply_touch_selection(*decoded_unsupported).status == touch::Terminal_touch_selection_status::UNAVAILABLE,
+        "an unknown presentation version leaves ordinary selection available without guessing its geometry");
+    auto undisplayed = word;
+    undisplayed.presentation->top_padding_rows = 1;
+    ok &= check(session.apply_touch_selection(undisplayed).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
+        "a retained word outside the displayed prefix cannot be selected through the supplemental projection");
+    const auto native_cursor = snapshot->cursor.position;
+    const auto selected = session.apply_touch_selection(word);
+    ok &= check(selected.status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text == QStringLiteral("header") &&
+            session.viewport_state().offset_from_tail == 0 &&
+            session.latest_render_snapshot_handle()->cursor.position == native_cursor,
+        "a displayed resize-history word selects without moving the shared viewport or native cursor");
+    snapshot = session.latest_render_snapshot_handle();
+    if (!check(snapshot && snapshot->leading_rows_snapshot && snapshot->leading_rows_snapshot->touch_selection,
+            "selecting retained content preserves its separate projection"))
+    {
+        return false;
+    }
+    const auto& selection = *snapshot->leading_rows_snapshot->touch_selection;
+    ok &= check(selection.has_selection && selection.touch_handles_visible &&
+            selection.spans == std::vector<touch::terminal_canvas_selection_span_t>{{0, 0, 6}},
+        "the same selection engine projects its highlight onto retained leading content");
+    auto begin = request_at(*snapshot->leading_rows_snapshot,
+        touch::Terminal_touch_selection_action::BEGIN_HANDLE, 0, 6, 102U);
+    begin.presentation = word.presentation;
+    begin.handle = touch::Terminal_selection_handle::END;
+    ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
+        "a leading-row selection accepts ordinary handle extension");
+    auto scroll = begin;
+    scroll.request_id = 103U;
+    scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
+    scroll.scroll_lines = 1;
+    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
+            session.viewport_state().offset_from_tail == 1 &&
+            session.selected_text().text == QStringLiteral("header"),
+        "older-history extension follows the displayed leading edge instead of native frame row zero");
+    snapshot = session.latest_render_snapshot_handle();
+    scroll.request_id = 104U;
+    scroll.expected_selection_generation = snapshot->touch_selection->selection_generation;
+    scroll.scroll_lines = -1;
+    scroll.target.column = 7;
+    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text ==
+                QStringLiteral("header alpha\nsecond beta\nthird gamma\nfourth delta\nprompt>"),
+        "newer-history extension reaches the phone's actual visible native edge");
+    snapshot = session.latest_render_snapshot_handle();
+    auto copy = request_at(*snapshot, touch::Terminal_touch_selection_action::COPY, 0, 0, 105U);
+    copy.presentation = word.presentation;
+    ok &= check(session.apply_touch_selection(copy).text == session.selected_text().text,
+        "copy uses original retained text across the supplemental and native rows");
+    auto stale = word;
+    stale.request_id = 106U;
+    output->output(QByteArrayLiteral("\x1b[2J"));
+    session.process_backend_callback_events();
+    ok &= check(session.apply_touch_selection(stale).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
+        "cleared resize presentation cannot authorize selection from an obsolete leading frame");
+    return ok;
+}
+
 bool owner_selection_contract()
 {
     auto backend = std::make_unique<Touch_backend>();
@@ -1143,6 +1238,7 @@ int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
     bool ok = owner_selection_contract();
+    ok &= resize_leading_rows_selection_contract();
     ok &= touch_intent_contract();
     ok &= direct_word_hold_contract();
     ok &= cursor_hold_contract();

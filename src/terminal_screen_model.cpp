@@ -4482,7 +4482,10 @@ void Terminal_screen_model::resize_buffer_state(
     const int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
     for (int row = 0; row < prefix_rows; ++row) {
         if (primary) {
-            append_scrollback_row(state.rows[(std::size_t)row]);
+            append_scrollback_row(
+                state.rows[(std::size_t)row],
+                Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+                nullptr, nullptr, true);
         }
     }
     if (prefix_rows > 0) {
@@ -4872,6 +4875,7 @@ std::vector<bool> Terminal_screen_model::default_tab_stops(int column_count) con
 
 void Terminal_screen_model::reset_grid()
 {
+    m_resize_displaced_scrollback_rows = 0;
     cancel_primary_repaint_recovery_candidate();
     cancel_primary_repaint_recovery_resize_guard();
     m_primary_backing.active_grid_state()     = make_empty_buffer_state();
@@ -5960,6 +5964,11 @@ void Terminal_screen_model::erase_row_range(int row, int first_column, int last_
 
 void Terminal_screen_model::clear_screen_before_cursor()
 {
+    if (m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
+        m_cursor.row == m_config.grid_size.rows - 1 && m_cursor.column == m_config.grid_size.columns - 1)
+    {
+        m_resize_displaced_scrollback_rows = 0;
+    }
     for (int row = 0; row < m_cursor.row; ++row) {
         erase_row_range(row, 0, m_config.grid_size.columns - 1);
     }
@@ -5968,6 +5977,9 @@ void Terminal_screen_model::clear_screen_before_cursor()
 
 void Terminal_screen_model::clear_screen_after_cursor()
 {
+    if (m_active_buffer_id == Terminal_buffer_id::PRIMARY && m_cursor.row == 0 && m_cursor.column == 0) {
+        m_resize_displaced_scrollback_rows = 0;
+    }
     erase_row_range(m_cursor.row, m_cursor.column, m_config.grid_size.columns - 1);
     for (int row = m_cursor.row + 1; row < m_config.grid_size.rows; ++row) {
         erase_row_range(row, 0, m_config.grid_size.columns - 1);
@@ -5976,6 +5988,9 @@ void Terminal_screen_model::clear_screen_after_cursor()
 
 void Terminal_screen_model::erase_visible_screen()
 {
+    if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
+        m_resize_displaced_scrollback_rows = 0;
+    }
     mark_terminal_content_changed();
     const bool primary_repaint_rebuild =
         m_primary_repaint_recovery_candidate.active;
@@ -6015,6 +6030,7 @@ void Terminal_screen_model::erase_in_display(int mode)
         case 2:  erase_visible_screen();       break;
         case 3:
         {
+            m_resize_displaced_scrollback_rows = 0;
             cancel_primary_repaint_recovery_candidate();
             if (m_primary_backing.retained_history_empty()) {
                 record_primary_history_delta(
@@ -7083,8 +7099,11 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
     const Terminal_screen_row&               row,
     Terminal_retained_line_provenance_source source,
     const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
-    const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id)
+    const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id,
+    bool                                    resize_displaced)
 {
+    const int previous_resize_rows = resize_displaced_scrollback_rows();
+    m_resize_displaced_scrollback_rows = 0;
     std::optional<terminal_history_handle_t> appended_handle;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
@@ -7191,6 +7210,9 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
             1);
     }
     mark_viewport_changed();
+    if (resize_displaced && appended_handle.has_value()) {
+        m_resize_displaced_scrollback_rows = std::min(previous_resize_rows, scrollback_size() - 1) + 1;
+    }
     return appended_handle;
 }
 
@@ -9386,6 +9408,11 @@ void Terminal_screen_model::record_primary_history_delta(
     int                            evicted_scrollback_rows,
     int                            discarded_scrollback_rows)
 {
+    if (kind == Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED ||
+        kind == Terminal_backing_delta_kind::PRIMARY_HISTORY_REWRITTEN)
+    {
+        m_resize_displaced_scrollback_rows = 0;
+    }
     terminal_backing_delta_t delta;
     delta.kind                       = kind;
     delta.buffer_id                  = Terminal_buffer_id::PRIMARY;

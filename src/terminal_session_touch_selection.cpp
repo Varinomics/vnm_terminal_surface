@@ -83,6 +83,27 @@ std::optional<Terminal_selection_range> word_range(
 
 void Terminal_session::populate_touch_selection_projection(Terminal_render_snapshot& snapshot) const
 {
+    if (snapshot.leading_rows_snapshot) {
+        const auto& leading = *snapshot.leading_rows_snapshot;
+        if (leading.grid_size.rows != snapshot.grid_size.rows ||
+            leading.grid_size.columns != snapshot.grid_size.columns ||
+            leading.viewport.active_buffer != snapshot.viewport.active_buffer ||
+            leading.viewport.scrollback_rows != snapshot.viewport.scrollback_rows ||
+            leading.viewport.offset_from_tail != snapshot.viewport.offset_from_tail + snapshot.leading_row_count)
+        {
+            snapshot.leading_rows_snapshot.reset();
+            snapshot.leading_row_count = 0;
+        }
+        else {
+            Terminal_render_snapshot updated = leading;
+            updated.metadata = snapshot.metadata;
+            if (!m_selection.has_selection() || !m_selection.visual_lease()) {
+                updated.selection_spans.clear();
+            }
+            populate_touch_selection_projection(updated);
+            snapshot.leading_rows_snapshot = std::make_shared<const Terminal_render_snapshot>(std::move(updated));
+        }
+    }
     if (snapshot.visible_line_provenance.size() != (std::size_t)snapshot.grid_size.rows) {
         snapshot.touch_selection.reset();
         return;
@@ -150,6 +171,17 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
     const auto source = published_selection_source_identity_unlocked();
     if (!source || !m_screen_model || touch_source(*source) != request.source) {
         return fail(Terminal_touch_selection_status::STALE_SOURCE, "The terminal display changed.");
+    }
+    if (request.presentation) {
+        const auto& presentation = *request.presentation;
+        if (presentation.record_version != k_terminal_touch_selection_presentation_version) {
+            return fail(Terminal_touch_selection_status::UNAVAILABLE, "Terminal selection is unavailable.");
+        }
+        if (presentation.top_padding_rows < 0 || presentation.top_padding_rows > 32'768 ||
+            presentation.visible_native_rows < 1 || presentation.visible_native_rows > source->grid_size.rows)
+        {
+            return fail(Terminal_touch_selection_status::INVALID_REQUEST, "Invalid terminal presentation.");
+        }
     }
     using Action = Terminal_touch_selection_action;
     if (request.action != Action::SELECT_WORD && request.action != Action::CANCEL_GESTURE &&
@@ -234,7 +266,19 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
         if (snapshot->viewport.offset_from_tail == before && render_publication_blocked()) {
             return fail(Terminal_touch_selection_status::UNAVAILABLE, "Terminal scrolling is temporarily unavailable.");
         }
-        visual_row = request.scroll_lines > 0 ? 0 : snapshot->grid_size.rows - 1;
+        int leading_rows = 0;
+        int displayed_leading_rows = 0;
+        if (request.presentation && snapshot->leading_rows_snapshot) {
+            leading_rows = snapshot->leading_row_count;
+            displayed_leading_rows = std::min(leading_rows, request.presentation->top_padding_rows);
+            snapshot = snapshot->leading_rows_snapshot.get();
+        }
+        visual_row = request.scroll_lines > 0
+            ? leading_rows - displayed_leading_rows
+            : request.presentation
+                ? std::min(snapshot->grid_size.rows - 1,
+                    leading_rows + request.presentation->visible_native_rows - 1)
+                : snapshot->grid_size.rows - 1;
         logical_row = (int)snapshot->visible_line_provenance[(std::size_t)visual_row].logical_row;
     }
     else {
@@ -246,6 +290,22 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
                 visual_row = row;
                 logical_row = (int)candidate.logical_row;
                 break;
+            }
+        }
+        if (visual_row < 0 && request.presentation && snapshot->leading_rows_snapshot) {
+            const auto& leading = *snapshot->leading_rows_snapshot;
+            const int first_visible = snapshot->leading_row_count -
+                std::min(snapshot->leading_row_count, request.presentation->top_padding_rows);
+            for (int row = first_visible; row < snapshot->leading_row_count; ++row) {
+                const auto& candidate = leading.visible_line_provenance[(std::size_t)row];
+                if (candidate.retained_line_id == request.target.row.retained_line_id &&
+                    candidate.content_generation == request.target.row.content_generation)
+                {
+                    visual_row = row;
+                    logical_row = (int)candidate.logical_row;
+                    snapshot = &leading;
+                    break;
+                }
             }
         }
         if (logical_row < 0 && !render_publication_blocked()) {

@@ -886,6 +886,70 @@ bool test_row_images_export_with_publication()
     return ok;
 }
 
+bool test_leading_rows_preserve_base_frame_and_bound_the_attachment()
+{
+    VNM_TerminalSurface surface;
+    auto base = make_snapshot(6, 8);
+    base->viewport.scrollback_rows = 2;
+    base->cells.push_back(make_cell(0, 0, QStringLiteral("live")));
+    base->cursor.position = {1, 4};
+    base->cursor.visible = true;
+    const auto plain = export_snapshot(surface, base);
+    auto combined = make_snapshot(6, 8);
+    combined->viewport.scrollback_rows = 2;
+    combined->viewport.offset_from_tail = 2;
+    combined->viewport.follow_tail = false;
+    combined->cells.push_back(make_cell(0, 0, QStringLiteral("old")));
+    combined->cells.push_back(make_cell(2, 0, QStringLiteral("live")));
+    QImage pixels(10, 20, QImage::Format_ARGB32_Premultiplied);
+    pixels.fill(QColor(20, 40, 200));
+    term::set_render_snapshot_row_image(*combined, 1,
+        std::make_shared<const term::Terminal_image_slice>(
+            term::Terminal_image_slice{pixels, 0, {10, 20}, 9U}));
+    base->leading_row_count = 2;
+    base->leading_rows_snapshot = combined;
+    const auto exported = export_snapshot(surface, base);
+    if (!check(plain.frame && exported.frame && exported.frame->leading_rows,
+            "a separate retained-row projection exports an optional attachment"))
+    {
+        return false;
+    }
+    const auto& leading = *exported.frame->leading_rows;
+    bool ok = check(exported.frame->rows == plain.frame->rows &&
+            exported.frame->cells == plain.frame->cells && exported.frame->styles == plain.frame->styles &&
+            exported.frame->cursor.row == plain.frame->cursor.row &&
+            exported.frame->content_extent->offset_from_tail == plain.frame->content_extent->offset_from_tail &&
+            exported.frame->content_extent->content_bottom_row_exclusive ==
+                plain.frame->content_extent->content_bottom_row_exclusive,
+        "the optional prefix leaves native cells, cursor, geometry and viewport metadata unchanged");
+    ok &= check(leading.rows == 2 && leading.cells.size() == 1U &&
+            leading.cells.front().text == QStringLiteral("old") && leading.images &&
+            leading.images->rows.size() == 1U && leading.images->rows.front().row == 1 &&
+            leading.images->rows.front().pixels == pixels &&
+            vnm_terminal::terminal_canvas_leading_rows_are_valid(leading, 6, 8),
+        "the attachment contains only preceding cells and exact image slices within its own bounds");
+    auto invalid = leading;
+    invalid.cells.front().row = invalid.rows;
+    ok &= check(!vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),
+        "a prefix cannot smuggle active rows beyond its declared extent");
+    invalid = leading;
+    invalid.images->rows.front().row = invalid.rows;
+    ok &= check(!vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),
+        "prefix image rows obey the same declared extent");
+    invalid = leading;
+    invalid.record_version = 99U;
+    ok &= check(vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),
+        "an unknown optional prefix version does not invalidate ordinary terminal data");
+    base->leading_row_count = 6;
+    const auto malformed = export_snapshot(surface, base);
+    ok &= check(malformed.frame && malformed.frame->leading_rows &&
+            malformed.frame->leading_rows->status == vnm_terminal::Terminal_canvas_leading_rows_status::INVALID &&
+            malformed.frame->cells == plain.frame->cells &&
+            exported.frame->leading_rows->rows == 2,
+        "an incoherent prefix becomes unavailable without damaging the base or prior immutable export");
+    return ok;
+}
+
 bool test_historical_styles_do_not_prevent_small_visible_frame_export()
 {
     bool                        ok = true;
@@ -986,5 +1050,6 @@ int main(int argc, char** argv)
     ok &= test_historical_styles_do_not_prevent_small_visible_frame_export();
     ok &= test_text_bounds_fail_closed_without_truncation();
     ok &= test_row_images_export_with_publication();
+    ok &= test_leading_rows_preserve_base_frame_and_bound_the_attachment();
     return ok ? 0 : 1;
 }

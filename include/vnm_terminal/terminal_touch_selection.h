@@ -71,6 +71,19 @@ struct terminal_selection_point_t
     bool operator==(const terminal_selection_point_t&) const = default;
 };
 
+inline constexpr std::uint16_t k_terminal_touch_selection_presentation_version = 1U;
+
+// Phone padding and clipping are independent of the native terminal geometry.
+// Carry their row extents so selection autoscroll uses the edges actually shown.
+struct terminal_touch_selection_presentation_t
+{
+    std::uint16_t record_version = k_terminal_touch_selection_presentation_version;
+    int top_padding_rows = 0;
+    int visible_native_rows = 1;
+
+    bool operator==(const terminal_touch_selection_presentation_t&) const = default;
+};
+
 struct Terminal_touch_selection_request
 {
     std::uint64_t request_id = 0U;
@@ -81,6 +94,7 @@ struct Terminal_touch_selection_request
     Terminal_selection_handle handle = Terminal_selection_handle::END;
     std::uint64_t expected_selection_generation = 0U;
     int scroll_lines = 0;
+    std::optional<terminal_touch_selection_presentation_t> presentation;
 
     bool operator==(const Terminal_touch_selection_request&) const = default;
 };

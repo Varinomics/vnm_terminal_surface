@@ -51,29 +51,13 @@ vnm_terminal::Terminal_canvas_cursor_shape canvas_cursor_shape(
     return Canvas_shape::BLOCK;
 }
 
-} // namespace
-
-vnm_terminal::Terminal_canvas_export_result
-vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
-{
-    return export_terminal_canvas_frame(surface, false);
-}
-
-vnm_terminal::Terminal_canvas_export_result
-vnm_terminal::export_terminal_canvas_frame(
+vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
     const VNM_TerminalSurface& surface,
-    bool allow_wide_styles)
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+    bool allow_wide_styles,
+    int exported_rows)
 {
-    if (surface.thread() != QThread::currentThread()) {
-        return {Terminal_canvas_export_status::WRONG_THREAD, {}};
-    }
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
-    if (snapshot == nullptr) {
-        return {Terminal_canvas_export_status::NO_FRAME, {}};
-    }
-
+    using namespace vnm_terminal;
     if (term::validate_render_snapshot(*snapshot).status !=
         term::Terminal_render_snapshot_status::OK)
     {
@@ -104,7 +88,7 @@ vnm_terminal::export_terminal_canvas_frame(
         ? k_terminal_canvas_max_wide_styles
         : k_terminal_canvas_max_styles;
     for (const term::Terminal_render_cell& source_cell : snapshot->cells) {
-        if (source_cell.wide_continuation) {
+        if (source_cell.wide_continuation || source_cell.position.row >= exported_rows) {
             continue;
         }
         int& exported_style_id = exported_style_ids[source_cell.style_id];
@@ -163,7 +147,10 @@ vnm_terminal::export_terminal_canvas_frame(
     frame->cursor.visible               = snapshot->cursor.visible;
     frame->cursor.blink_enabled         = snapshot->cursor.blink_enabled;
     if (snapshot->touch_selection) {
-        frame->selection = surface.touch_selection_projection();
+        frame->selection = *snapshot->touch_selection;
+        const auto colors = surface.touch_selection_projection();
+        frame->selection->background_rgba = colors.background_rgba;
+        frame->selection->foreground_rgba = colors.foreground_rgba;
     }
 
     if (referenced_styles.size() > k_terminal_canvas_max_styles) {
@@ -195,7 +182,7 @@ vnm_terminal::export_terminal_canvas_frame(
     int         occupied_bottom       = 0;
     frame->cells.reserve(snapshot->cells.size());
     for (const term::Terminal_render_cell& source_cell : snapshot->cells) {
-        if (source_cell.wide_continuation) {
+        if (source_cell.wide_continuation || source_cell.position.row >= exported_rows) {
             continue;
         }
 
@@ -254,7 +241,7 @@ vnm_terminal::export_terminal_canvas_frame(
             frame->images->status = Terminal_canvas_images_status::INVALID;
         }
         else {
-            for (int row = 0; row < frame->rows; ++row) {
+            for (int row = 0; row < exported_rows; ++row) {
                 const auto& slice = snapshot->visible_row_images[static_cast<std::size_t>(row)];
                 if (slice == nullptr) {
                     continue;
@@ -279,4 +266,65 @@ vnm_terminal::export_terminal_canvas_frame(
         Terminal_canvas_export_status::OK,
         std::move(frame),
     };
+}
+
+} // namespace
+
+vnm_terminal::Terminal_canvas_export_result
+vnm_terminal::export_terminal_canvas_frame(const VNM_TerminalSurface& surface)
+{
+    return export_terminal_canvas_frame(surface, false);
+}
+
+vnm_terminal::Terminal_canvas_export_result
+vnm_terminal::export_terminal_canvas_frame(
+    const VNM_TerminalSurface& surface,
+    bool allow_wide_styles)
+{
+    if (surface.thread() != QThread::currentThread()) {
+        return {Terminal_canvas_export_status::WRONG_THREAD, {}};
+    }
+    const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+    if (snapshot == nullptr) {
+        return {Terminal_canvas_export_status::NO_FRAME, {}};
+    }
+    auto result = export_snapshot_frame(surface, snapshot, allow_wide_styles, snapshot->grid_size.rows);
+    if (result.status != Terminal_canvas_export_status::OK || !snapshot->leading_rows_snapshot) {
+        return result;
+    }
+    Terminal_canvas_leading_rows leading;
+    const auto& leading_snapshot = *snapshot->leading_rows_snapshot;
+    const bool coherent_prefix = snapshot->leading_row_count > 0 &&
+        snapshot->leading_row_count < snapshot->grid_size.rows &&
+        term::grid_sizes_match(leading_snapshot.grid_size, snapshot->grid_size) &&
+        leading_snapshot.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        leading_snapshot.viewport.scrollback_rows == snapshot->viewport.scrollback_rows &&
+        leading_snapshot.viewport.offset_from_tail ==
+            snapshot->viewport.offset_from_tail + snapshot->leading_row_count;
+    const auto prefix = coherent_prefix
+        ? export_snapshot_frame(surface, snapshot->leading_rows_snapshot, allow_wide_styles, snapshot->leading_row_count)
+        : Terminal_canvas_export_result{Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
+    if (prefix.status == Terminal_canvas_export_status::OK) {
+        leading.rows = snapshot->leading_row_count;
+        leading.styles = prefix.frame->styles;
+        leading.color_references = prefix.frame->color_references;
+        leading.cells = prefix.frame->cells;
+        leading.images = prefix.frame->images;
+        leading.selection = prefix.frame->selection;
+        leading.wide_styles = prefix.frame->wide_styles;
+        if (!terminal_canvas_leading_rows_are_valid(leading, result.frame->rows, result.frame->columns)) {
+            leading = {};
+            leading.status = Terminal_canvas_leading_rows_status::INVALID;
+        }
+    }
+    else {
+        leading.status = prefix.status == Terminal_canvas_export_status::INVALID_SOURCE_FRAME
+            ? Terminal_canvas_leading_rows_status::INVALID
+            : Terminal_canvas_leading_rows_status::OVER_LIMIT;
+    }
+    auto frame = std::make_shared<Terminal_canvas_frame>(*result.frame);
+    frame->leading_rows = std::move(leading);
+    result.frame = std::move(frame);
+    return result;
 }
