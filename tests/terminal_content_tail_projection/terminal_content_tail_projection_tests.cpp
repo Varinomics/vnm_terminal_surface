@@ -312,8 +312,13 @@ bool test_model_tail_and_resize_prefix()
 
     auto long_prefix = make_model(10);
     for (int row = 0; row < 14; ++row) {
-        long_prefix.ingest((row > 0 ? QByteArrayLiteral("\r\n") : QByteArray()) +
-            QByteArrayLiteral("line-") + QByteArray::number(row));
+        QByteArray line;
+        if (row > 0) {
+            line.append("\r\n");
+        }
+        line.append("line-");
+        line.append(QByteArray::number(row));
+        long_prefix.ingest(line);
     }
     long_prefix.resize({2, 20});
     long_prefix.resize({6, 20});
