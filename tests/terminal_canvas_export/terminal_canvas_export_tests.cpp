@@ -901,7 +901,7 @@ bool test_leading_rows_preserve_base_frame_and_bound_the_attachment()
     combined->viewport.follow_tail = false;
     combined->cells.push_back(make_cell(0, 0, QStringLiteral("old")));
     combined->cells.push_back(make_cell(2, 0, QStringLiteral("live")));
-    QImage pixels(10, 20, QImage::Format_ARGB32_Premultiplied);
+    QImage pixels(10, 20, QImage::Format_RGBA8888_Premultiplied);
     pixels.fill(QColor(20, 40, 200));
     term::set_render_snapshot_row_image(*combined, 1,
         std::make_shared<const term::Terminal_image_slice>(
@@ -922,12 +922,15 @@ bool test_leading_rows_preserve_base_frame_and_bound_the_attachment()
             exported.frame->content_extent->content_bottom_row_exclusive ==
                 plain.frame->content_extent->content_bottom_row_exclusive,
         "the optional prefix leaves native cells, cursor, geometry and viewport metadata unchanged");
-    ok &= check(leading.rows == 2 && leading.cells.size() == 1U &&
+    if (!check(leading.rows == 2 && leading.cells.size() == 1U &&
             leading.cells.front().text == QStringLiteral("old") && leading.images &&
             leading.images->rows.size() == 1U && leading.images->rows.front().row == 1 &&
             leading.images->rows.front().pixels == pixels &&
             vnm_terminal::terminal_canvas_leading_rows_are_valid(leading, 6, 8),
-        "the attachment contains only preceding cells and exact image slices within its own bounds");
+        "the attachment contains only preceding cells and exact image slices within its own bounds"))
+    {
+        return false;
+    }
     auto invalid = leading;
     invalid.cells.front().row = invalid.rows;
     ok &= check(!vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),

@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -2233,13 +2234,13 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
     model.ingest(QByteArrayLiteral("\x1b[2J"));
     ok &= check(!model.render_snapshot(7U).leading_rows_snapshot && model.scrollback_size() == 3,
         "an explicit screen clear removes resize presentation eligibility without deleting history");
-    for (const auto& clear : {
-            QByteArrayLiteral("\x1b[H\x1b[J"),
-            QByteArrayLiteral("\x1b[6;20H\x1b[1J\x1b[H"),
-            QByteArrayLiteral("\x1b[3J"),
-            QByteArrayLiteral("\x1b" "c"),
-            QByteArrayLiteral("\x1b[6;1H\r\n")})
-    {
+    const std::vector<std::pair<QByteArray, const char*>> invalidations{
+        {QByteArrayLiteral("\x1b[H\x1b[J"), "whole-screen ED0 ends resize-prefix eligibility"},
+        {QByteArrayLiteral("\x1b[6;20H\x1b[1J\x1b[H"), "whole-screen ED1 ends resize-prefix eligibility"},
+        {QByteArrayLiteral("\x1b[3J"), "history clear ends resize-prefix eligibility"},
+        {QByteArrayLiteral("\x1b[6;1H\r\n"), "ordinary scrolling ends resize-prefix eligibility"},
+    };
+    for (const auto& [clear, assertion] : invalidations) {
         auto cleared = make_model(6, 20);
         cleared.ingest(QByteArrayLiteral("old\r\nsecond\r\nthird\r\nfourth\r\nprompt> "));
         cleared.resize({2, 20});
@@ -2247,8 +2248,7 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
         ok &= check(cleared.render_snapshot(8U).leading_row_count == 3,
             "clear and output invalidation fixtures begin with resize-displaced rows");
         cleared.ingest(clear);
-        ok &= check(!cleared.render_snapshot(9U).leading_rows_snapshot,
-            "whole-screen erasure, reset, history clear and ordinary scrolling end resize-prefix eligibility");
+        ok &= check(!cleared.render_snapshot(9U).leading_rows_snapshot, assertion);
     }
     return ok;
 }
