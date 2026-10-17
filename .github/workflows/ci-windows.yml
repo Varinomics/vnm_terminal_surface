@@ -5,12 +5,6 @@ on:
     branches: [ master, main, dev ]
   pull_request:
     branches: [ master, main, dev ]
-  workflow_dispatch:
-    inputs:
-      diagnose_content_tail:
-        description: 'Run only the desktop content-tail presentation fixture'
-        type: boolean
-        default: false
 
 defaults:
   run:
@@ -93,44 +87,31 @@ jobs:
           }
 
       - name: Build
-        env:
-          VNM_DIAGNOSE_CONTENT_TAIL: ${{ inputs.diagnose_content_tail }}
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
-          if "%VNM_DIAGNOSE_CONTENT_TAIL%"=="true" (
-            cmake --build build --config %CMAKE_BUILD_TYPE% --parallel 4 --target vnm_terminal_surface_host
-          ) else (
-            cmake --build build --config %CMAKE_BUILD_TYPE% --parallel 4
-          )
+          cmake --build build --config %CMAKE_BUILD_TYPE% --parallel 4
 
       - name: Run tests
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
-          VNM_DIAGNOSE_CONTENT_TAIL: ${{ inputs.diagnose_content_tail }}
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
-          if "%VNM_DIAGNOSE_CONTENT_TAIL%"=="true" (
-            ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -R "^vnm_terminal_surface_content_tail_presentation$"
-          ) else (
-            ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -E "^vnm_terminal_compat_smoke$"
-          )
+          ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -E "^vnm_terminal_compat_smoke$"
 
       # The package fixture builds a real LCD-only provider and a separate
       # atlas-disabled surface against it. Reuse that producer for distribution;
       # the main source-atlas build remains a development configuration.
       - name: Install package
-        if: ${{ !inputs.diagnose_content_tail }}
         run: |
           cmake --install build/package_smoke/source_package/surface-build \
             --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
 
       - name: Configure package smoke
-        if: ${{ !inputs.diagnose_content_tail }}
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
@@ -143,7 +124,6 @@ jobs:
             -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/install"
 
       - name: Verify configured MSVC compiler (package-smoke)
-        if: ${{ !inputs.diagnose_content_tail }}
         shell: pwsh
         run: |
           $compiler_files = @(Get-ChildItem -Path 'package-smoke/CMakeFiles' -Recurse -Filter CMakeCXXCompiler.cmake)
@@ -163,7 +143,6 @@ jobs:
           }
 
       - name: Build package smoke
-        if: ${{ !inputs.diagnose_content_tail }}
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
@@ -171,7 +150,6 @@ jobs:
           cmake --build package-smoke --config %CMAKE_BUILD_TYPE% --parallel 4
 
   conpty-asan:
-    if: ${{ !inputs.diagnose_content_tail }}
     name: Qt Quick Terminal Surface ConPTY ASan (Windows)
     runs-on: windows-2025-vs2026
 
