@@ -12,10 +12,15 @@ defaults:
 
 env:
   CMAKE_BUILD_TYPE: Release
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CCACHE_MAXSIZE: 2GiB
+  CCACHE_COMPILERCHECK: content
   LINUX_SYSTEM_DEPS: >-
     libgl-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev
     libxi-dev libxext-dev libwayland-dev libxkbcommon-dev libvulkan-dev
-    fontconfig fonts-dejavu-core fonts-liberation
+    fontconfig fonts-dejavu-core fonts-liberation ccache
 
 jobs:
   build-and-test:
@@ -30,6 +35,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${LINUX_SYSTEM_DEPS}
+
+      - name: Identify compiler cache
+        id: compiler_cache
+        run: |
+          echo "CCACHE_DIR=${RUNNER_TEMP}/vnm-terminal-surface-ccache" >> "${GITHUB_ENV}"
+          {
+            ccache --version
+            gcc --version
+            g++ --version
+            sha256sum "$(command -v gcc)" "$(command -v g++)" "$(command -v ccache)" \
+              "$(gcc -print-prog-name=cc1)" "$(g++ -print-prog-name=cc1plus)"
+          } | tee "${RUNNER_TEMP}/compiler-cache-toolchain.txt"
+          toolchain_hash=$(sha256sum "${RUNNER_TEMP}/compiler-cache-toolchain.txt" | cut -d ' ' -f 1)
+          echo "key_prefix=${RUNNER_OS}-${RUNNER_ARCH}-surface-ccache-${CMAKE_BUILD_TYPE}-${toolchain_hash}-" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore compiler cache
+        id: restore_compiler_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.job }}-
+            ${{ steps.compiler_cache.outputs.key_prefix }}
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
@@ -48,7 +80,7 @@ jobs:
             -DBUILD_TESTING=ON
 
       - name: Build
-        run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel
+        run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel 4
 
       - name: Run tests
         working-directory: build
@@ -72,7 +104,18 @@ jobs:
             -DCMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/install"
 
       - name: Build package smoke
-        run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel
+        run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel 4
+
+      - name: Report compiler cache usage
+        if: always() && steps.restore_compiler_cache.outcome == 'success'
+        run: ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        if: always() && steps.restore_compiler_cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore_compiler_cache.outputs.cache-primary-key }}
 
   transcript-build-and-test:
     name: Qt Quick Terminal Surface Transcript (Linux)
@@ -86,6 +129,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${LINUX_SYSTEM_DEPS}
+
+      - name: Identify compiler cache
+        id: compiler_cache
+        run: |
+          echo "CCACHE_DIR=${RUNNER_TEMP}/vnm-terminal-surface-ccache" >> "${GITHUB_ENV}"
+          {
+            ccache --version
+            gcc --version
+            g++ --version
+            sha256sum "$(command -v gcc)" "$(command -v g++)" "$(command -v ccache)" \
+              "$(gcc -print-prog-name=cc1)" "$(g++ -print-prog-name=cc1plus)"
+          } | tee "${RUNNER_TEMP}/compiler-cache-toolchain.txt"
+          toolchain_hash=$(sha256sum "${RUNNER_TEMP}/compiler-cache-toolchain.txt" | cut -d ' ' -f 1)
+          echo "key_prefix=${RUNNER_OS}-${RUNNER_ARCH}-surface-ccache-${CMAKE_BUILD_TYPE}-${toolchain_hash}-" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore compiler cache
+        id: restore_compiler_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.job }}-
+            ${{ steps.compiler_cache.outputs.key_prefix }}
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
@@ -105,13 +175,24 @@ jobs:
             -DBUILD_TESTING=ON
 
       - name: Build
-        run: cmake --build build-transcript --config ${CMAKE_BUILD_TYPE} --parallel
+        run: cmake --build build-transcript --config ${CMAKE_BUILD_TYPE} --parallel 4
 
       - name: Run tests
         working-directory: build-transcript
         env:
           QT_QPA_PLATFORM: offscreen
         run: ctest --output-on-failure
+
+      - name: Report compiler cache usage
+        if: always() && steps.restore_compiler_cache.outcome == 'success'
+        run: ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        if: always() && steps.restore_compiler_cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore_compiler_cache.outputs.cache-primary-key }}
 
   profiling-build-and-test:
     name: Qt Quick Terminal Surface Profiling (Linux)
@@ -125,6 +206,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${LINUX_SYSTEM_DEPS}
+
+      - name: Identify compiler cache
+        id: compiler_cache
+        run: |
+          echo "CCACHE_DIR=${RUNNER_TEMP}/vnm-terminal-surface-ccache" >> "${GITHUB_ENV}"
+          {
+            ccache --version
+            gcc --version
+            g++ --version
+            sha256sum "$(command -v gcc)" "$(command -v g++)" "$(command -v ccache)" \
+              "$(gcc -print-prog-name=cc1)" "$(g++ -print-prog-name=cc1plus)"
+          } | tee "${RUNNER_TEMP}/compiler-cache-toolchain.txt"
+          toolchain_hash=$(sha256sum "${RUNNER_TEMP}/compiler-cache-toolchain.txt" | cut -d ' ' -f 1)
+          echo "key_prefix=${RUNNER_OS}-${RUNNER_ARCH}-surface-ccache-${CMAKE_BUILD_TYPE}-${toolchain_hash}-" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore compiler cache
+        id: restore_compiler_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.compiler_cache.outputs.key_prefix }}${{ github.job }}-
+            ${{ steps.compiler_cache.outputs.key_prefix }}
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
@@ -143,10 +251,21 @@ jobs:
             -DBUILD_TESTING=ON
 
       - name: Build
-        run: cmake --build build-profiling --config ${CMAKE_BUILD_TYPE} --parallel
+        run: cmake --build build-profiling --config ${CMAKE_BUILD_TYPE} --parallel 4
 
       - name: Run tests
         working-directory: build-profiling
         env:
           QT_QPA_PLATFORM: offscreen
         run: ctest --output-on-failure
+
+      - name: Report compiler cache usage
+        if: always() && steps.restore_compiler_cache.outcome == 'success'
+        run: ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        if: always() && steps.restore_compiler_cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore_compiler_cache.outputs.cache-primary-key }}
