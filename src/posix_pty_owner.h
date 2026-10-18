@@ -7,6 +7,9 @@
 #ifndef VNM_PROCESS_CUSTODY_HAS_OWNER_START_DEADLINE
 #error "Selected process_custody provider must expose send_owner_start_until; update the maintained provider"
 #endif
+#if defined(__APPLE__) && !defined(VNM_PROCESS_CUSTODY_HAS_DARWIN_PTY_OUTPUT_RETIREMENT)
+#error "Selected process_custody provider must retain Darwin PTY output until client EOF; update the provider"
+#endif
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -293,6 +296,12 @@ public:
         // It never turns its eventual exit into a tree-empty receipt.
         {
             const std::lock_guard lock(m_send_mutex);
+#if defined(__APPLE__)
+            // Settlement precedes output retirement. The retained PTY owner
+            // may now release its terminal, even if a duplicate client endpoint
+            // survives elsewhere in this process or an inherited descriptor.
+            (void)close_sending_direction(&error);
+#endif
             m_channel.close();
         }
         if (m_helper.process_id > 0 && !m_helper_reaped) {

@@ -4,7 +4,9 @@
 #include <libproc.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -160,6 +162,8 @@ public:
             "preregistered helper status and sole parent wait agree on the exact typed outcome");
     }
 
+    bool live() { return m_status.observe().state == custody::Native_process_observation::LIVE; }
+
     bool expect_signal_death()
     {
         const auto observed = await_status(m_status);
@@ -278,7 +282,7 @@ custody::Owner_start_request fixture_request(const std::string& self, const char
 }
 
 bool start_root(Owner_run& run, const custody::Owner_start_request& request,
-    Process_observer& root, std::int64_t& root_pid)
+    Process_observer& root, std::int64_t& root_pid, int* retained_master = nullptr)
 {
     std::string error;
     if (!check(custody::send_owner_start(run.channel, request, &error), error.c_str())) {
@@ -293,7 +297,8 @@ bool start_root(Owner_run& run, const custody::Owner_start_request& request,
     const bool observed = started && root.open(event.root_exit.process_id, event.root_birth_token, &error);
     root_pid = event.root_exit.process_id;
     custody::close_native_handle(event.root_reference);
-    custody::close_native_handle(event.pty_master);
+    if (retained_master) *retained_master = event.pty_master;
+    else custody::close_native_handle(event.pty_master);
     return check(observed, "STARTED supplies exact original root identity and a live local observer");
 }
 
@@ -389,9 +394,60 @@ bool held_zombie_unconfirmed(const std::string& helper, const std::string& self)
         }
     }
     ok &= check(terminal, "held-zombie cleanup reaches a bounded terminal outcome");
+    ok &= check(run.channel.shutdown_send(), "client retires PTY output after terminal settlement");
     ok &= run.expect_exit(custody::Darwin_pty_owner_exit::UNCONFIRMED);
     ok &= check(fixture.holding(), "typed unconfirmed outcome leaves fixture holder under its own authority");
     ok &= fixture.release_held_zombie();
+    return ok;
+}
+
+bool retained_output(const std::string& helper, const std::string& self, bool abandon)
+{
+    Owner_run run;
+    Fixture_control fixture;
+    auto request = fixture_request(self, "retained-tail");
+    if (!fixture.prepare(request.process) || !run.launch(helper)) return false;
+    Process_observer root;
+    std::int64_t root_pid = 0;
+    int master = -1;
+    if (!start_root(run, request, root, root_pid, &master) || !fixture.ready(root_pid, false)) return false;
+    fixture.release();
+    bool settled = false;
+    bool root_ended = false;
+    std::string error;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (!settled && Clock::now() < deadline) {
+        custody::Owner_event event;
+        const auto received = custody::receive_owner_event(run.channel, &event, 100, &error);
+        custody::close_native_handle(event.root_reference);
+        custody::close_native_handle(event.pty_master);
+        if (received == custody::Receive_status::TIMEOUT) continue;
+        if (received != custody::Receive_status::MESSAGE) break;
+        if (event.kind == custody::Owner_event_kind::ROOT_EXITED) {
+            root_ended = event.root_exit.exit_code == 23 && event.root_exit.signal == 0;
+        }
+        settled = event.kind == custody::Owner_event_kind::TREE_SETTLEMENT &&
+            event.settlement == custody::Tree_settlement::CONFIRMED;
+    }
+    int queued = -1;
+    bool ok = check(settled && root_ended && run.live() &&
+        ioctl(master, TIOCOUTQ, &queued) == 0 && queued == 512,
+        "settled helper stays alive with accepted stopped output until client retirement");
+    if (abandon) {
+        run.channel.close();
+    }
+    else {
+        char output[512];
+        ok &= check(ioctl(master, TIOCSTART) == 0 && read_exact(master, output, sizeof(output)) &&
+            std::string(output, sizeof(output)) == std::string(sizeof(output), 'R'),
+            "master resumes and delivers the retained accepted queue after settlement");
+        const int duplicate = dup(run.channel.native());
+        ok &= check(duplicate >= 0 && run.channel.shutdown_send(), "half-close retires all client endpoint copies");
+        ok &= run.expect_exit(custody::Darwin_pty_owner_exit::CONFIRMED);
+        if (duplicate >= 0) close(duplicate);
+    }
+    if (abandon) ok &= run.expect_exit(custody::Darwin_pty_owner_exit::CONFIRMED);
+    close(master);
     return ok;
 }
 
@@ -400,13 +456,19 @@ int run_fixture(const std::string& mode)
     (void)signal(SIGHUP, SIG_IGN);
     (void)alarm(12);
     const pid_t root = getpid();
-    if (mode == "release") {
+    if (mode == "release" || mode == "retained-tail") {
         const fixture_ready_t ready{root, 0, 0, getpgrp(), 0};
         if (write(10, &ready, sizeof(ready)) != sizeof(ready)) {
             return 31;
         }
         char byte = 0;
-        return read(9, &byte, 1) == 0 ? 23 : 32;
+        if (read(9, &byte, 1) != 0) return 32;
+        if (mode == "retained-tail") {
+            const std::string tail(512, 'R');
+            if (tcflow(STDOUT_FILENO, TCOOFF) != 0 ||
+                write(STDOUT_FILENO, tail.data(), tail.size()) != static_cast<ssize_t>(tail.size())) return 40;
+        }
+        return 23;
     }
     if (mode != "held-zombie") {
         return 33;
@@ -468,5 +530,7 @@ int main(int argc, char** argv)
     ok &= eof_or_helper_death(argv[1], argv[0], false);
     ok &= eof_or_helper_death(argv[1], argv[0], true);
     ok &= held_zombie_unconfirmed(argv[1], argv[0]);
+    ok &= retained_output(argv[1], argv[0], false);
+    ok &= retained_output(argv[1], argv[0], true);
     return ok ? 0 : 1;
 }

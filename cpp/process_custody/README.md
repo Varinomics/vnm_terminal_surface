@@ -53,6 +53,12 @@ only the helper establishes scoped settlement after the original root's sole
 reap. Truncated or failed observations never establish emptiness. Ordinary
 foreground and background jobs remain in scope after shell exit.
 
+After a terminal settlement receipt, an admitted PTY helper retains its terminal
+until control-channel EOF so the client can finish delivering accepted output.
+Clients retire that output by half-closing their sending direction, then collect
+the helper's native exit. Late commands do not change settlement. A rejected
+start without a transferred master does not wait for output retirement.
+
 Before sending START, the backend requires an accepted native receipt hook:
 the receiver must retain a local exact-helper status observer and persist its
 identity and `darwin-pty-owner-v1` contract. Root birth and exact root exit are

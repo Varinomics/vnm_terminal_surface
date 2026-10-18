@@ -22,9 +22,12 @@ find_dependency(Qt6
     COMPONENTS Core Gui Quick QuickPrivate GuiPrivate)
 if(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE)
     find_dependency(vnm_qt_dispatch 2 CONFIG REQUIRED)
-    if(@vnm_terminal_surface_process_custody_required@ AND
-       NOT TARGET vnm_process_custody::vnm_process_custody)
-        find_dependency(vnm_process_custody CONFIG REQUIRED)
+    if(@vnm_terminal_surface_process_custody_required@)
+        if(NOT TARGET vnm_process_custody::vnm_process_custody)
+            find_dependency(vnm_process_custody CONFIG REQUIRED)
+        endif()
+        include("${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_process_custody_contract.cmake")
+        vnm_terminal_require_process_custody()
     endif()
 endif()
 

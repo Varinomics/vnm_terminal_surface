@@ -28,6 +28,10 @@ enum class Owner_event_kind : std::uint32_t
 };
 
 #if defined(__APPLE__)
+// An admitted PTY helper retains its terminal after settlement until control
+// EOF. Clients retire output before collecting the helper's native exit.
+#define VNM_PROCESS_CUSTODY_HAS_DARWIN_PTY_OUTPUT_RETIREMENT 1
+
 #define VNM_PROCESS_CUSTODY_HAS_COMMAND_EXEC_CONFIRMATION 1
 // COMMAND_EXEC opts into native exec confirmation. STARTED still records only
 // birth; EXECUTION_STARTED follows only a retained NOTE_EXEC for that child.

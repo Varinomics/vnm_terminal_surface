@@ -2527,6 +2527,25 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         posix_pty_backend/posix_pty_backend_tests.cpp
     )
 
+    add_executable(vnm_terminal_posix_pty_exit_output
+        posix_pty_backend/exit_output_tests.cpp)
+    target_link_libraries(vnm_terminal_posix_pty_exit_output PRIVATE
+        vnm_terminal_surface::vnm_terminal_surface
+        vnm_process_custody::vnm_process_custody)
+    target_include_directories(vnm_terminal_posix_pty_exit_output PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    set_target_properties(vnm_terminal_posix_pty_exit_output PROPERTIES AUTOMOC OFF)
+    set(vnm_terminal_exit_output_cases finite small flow external detached detached_tail silent reset cleanup_tail)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND vnm_terminal_exit_output_cases peer_failure)
+    endif()
+    foreach(scenario IN LISTS vnm_terminal_exit_output_cases)
+        add_test(NAME vnm_terminal_posix_pty_exit_output_${scenario}
+            COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_posix_pty_exit_output>" "${scenario}")
+        set_tests_properties(vnm_terminal_posix_pty_exit_output_${scenario} PROPERTIES
+            LABELS "conformance;posix;pty" TIMEOUT 45)
+    endforeach()
+
     add_dependencies(vnm_terminal_posix_pty_backend
         vnm_terminal_canvas_fixture
     )
@@ -2639,6 +2658,7 @@ endif()
 if(TARGET vnm_terminal_posix_pty_backend)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_posix_pty_backend
+        vnm_terminal_posix_pty_exit_output
         vnm_terminal_posix_pty_foreground_interrupt
     )
 endif()

@@ -603,6 +603,7 @@ write_basic_package_version_file(
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surfaceConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surfaceConfigVersion.cmake"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_terminal_process_custody_contract.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vnm_terminal_surface"
 )
 

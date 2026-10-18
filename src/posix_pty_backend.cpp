@@ -38,6 +38,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 namespace vnm_terminal::internal {
@@ -599,12 +600,34 @@ public:
             request_deferred_cleanup();
             return result;
         }
-
+#if defined(__linux__)
+        // Retain the exact slave without reopening a pathname or acquiring a
+        // controlling terminal. It lets the reader close output admission at
+        // root exit while preserving bytes already accepted by the PTY.
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::DRAIN_PEER_OPEN, master.get());
+#endif
+        Unique_fd drain_peer(::ioctl(master.get(), TIOCGPTPEER,
+            O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC));
+        if (!drain_peer) {
+            auto result = reject_start(Terminal_backend_error_code::START_FAILED,
+                posix_error_message(QStringLiteral("open PTY drain peer"), errno), true);
+            result.start_outcome_determinate = false;
+            request_deferred_cleanup();
+            return result;
+        }
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::DRAIN_PEER_READY, drain_peer.get());
+#endif
+#endif
 
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_callbacks                          = std::move(callbacks);
             m_master                             = std::move(master);
+#if defined(__linux__)
+            m_drain_peer                         = std::move(drain_peer);
+#endif
             m_read_wake_read                     = std::move(read_wake_read);
             m_read_wake_write                    = std::move(read_wake_write);
             m_write_wake_read                    = std::move(write_wake_read);
@@ -955,10 +978,22 @@ public:
             m_writer_thread,
             m_wait_thread,
             m_termination_thread);
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_BEGIN, m_master.get());
+#endif
         m_owner.finish();
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_END, m_master.get());
+#endif
 
         std::lock_guard<std::mutex> lock(m_mutex);
+#if defined(__linux__)
+        m_drain_peer.reset();
+#endif
         m_master.reset();
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::MASTER_CLOSED, -1);
+#endif
         m_read_wake_read.reset();
         m_read_wake_write.reset();
         m_write_wake_read.reset();
@@ -1194,6 +1229,17 @@ private:
     {
         std::vector<char> buffer(k_native_backend_output_read_chunk_bytes);
         std::optional<std::chrono::steady_clock::time_point> final_drain_deadline;
+        bool output_admission_closed = false;
+#if defined(__APPLE__)
+        std::size_t remaining_output = 0;
+#endif
+        const auto report_drain_error = [&](QStringView operation) {
+            const int error = errno;
+            if (!is_native_backend_stopping(m_mutex, m_stopping)) {
+                report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                    Terminal_backend_error_code::READ_FAILED, posix_error_message(operation, error));
+            }
+        };
 
         for (;;) {
             int         master        = -1;
@@ -1251,26 +1297,58 @@ private:
                 { wake_read, POLLIN, 0 },
             };
 
-            if (final_drain_deadline.has_value() &&
+            if (!output_admission_closed && final_drain_deadline.has_value() &&
                 std::chrono::steady_clock::now() >= *final_drain_deadline)
             {
-                break;
+#if defined(__linux__)
+                // FIONREAD excludes accepted bytes still in the flip buffer.
+                // Stop new writes, then let read/poll flush that buffer before
+                // using their no-input result as the end of the finite drain.
+                if (::tcflow(m_drain_peer.get(), TCOOFF) != 0) {
+                    report_drain_error(u"freeze PTY output");
+                    break;
+                }
+#else
+                // Darwin's output queue includes accepted flow-stopped bytes.
+                // Resume them and retain only this FIFO prefix: a detached
+                // producer must not extend the drain by continually refilling it.
+                int queued = 0;
+                if (::ioctl(master, TIOCSTART) != 0 || ::ioctl(master, TIOCOUTQ, &queued) != 0) {
+                    report_drain_error(u"snapshot PTY output");
+                    break;
+                }
+                remaining_output = static_cast<std::size_t>(queued);
+#endif
+                output_admission_closed = true;
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+                observe_pty_io_for_testing(Posix_pty_io_point_for_testing::OUTPUT_BOUNDARY, master);
+#endif
             }
+#if defined(__APPLE__)
+            if (output_admission_closed) {
+                if (remaining_output == 0) {
+                    break;
+                }
+                bytes_to_read = std::min(bytes_to_read, remaining_output);
+            }
+#endif
 
             // Bound the wait: when a drain deadline is armed it caps the poll;
             // otherwise fall back to the heartbeat so the reader re-checks its
             // stop flags rather than trusting the wake pipe to interrupt a poll
             // on the PTY master (unreliable on macOS). A heartbeat tick with no
             // deadline just means no master/wake activity yet -- keep waiting.
-            const int poll_timeout = final_drain_deadline.has_value()
+            const int poll_timeout = output_admission_closed ? 0 : final_drain_deadline.has_value()
                 ? poll_timeout_until(final_drain_deadline)
                 : static_cast<int>(k_native_master_poll_interval.count());
             const int poll_result = ::poll(fds, 2, poll_timeout);
             if (poll_result == 0) {
-                if (!final_drain_deadline.has_value()) {
+                if (!output_admission_closed) {
                     continue;
                 }
+#if defined(__linux__)
                 break;
+#endif
             }
 
             if (poll_result < 0) {
@@ -1296,6 +1374,25 @@ private:
             }
 
             if ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+#if defined(__APPLE__)
+                if (output_admission_closed) {
+                    int queued = 0;
+                    if (::ioctl(master, TIOCOUTQ, &queued) != 0) {
+                        report_drain_error(u"inspect PTY output");
+                        break;
+                    }
+                    if (queued == 0) {
+                        break;
+                    }
+                    if (::ioctl(master, TIOCSTART) != 0) {
+                        report_drain_error(u"resume PTY output");
+                        break;
+                    }
+                    // A concurrent flow stop must not turn this into a busy
+                    // loop. Reset still interrupts through the wake descriptor.
+                    (void)::poll(fds + 1, 1, static_cast<int>(k_native_master_poll_interval.count()));
+                }
+#endif
                 continue;
             }
 
@@ -1304,7 +1401,15 @@ private:
 #endif
             const ssize_t bytes_read = ::read(master, buffer.data(), bytes_to_read);
             if (bytes_read < 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#if defined(__linux__)
+                    if (output_admission_closed) {
+                        break;
+                    }
+#endif
                     continue;
                 }
 
@@ -1321,6 +1426,11 @@ private:
             if (bytes_read == 0) {
                 break;
             }
+#if defined(__APPLE__)
+            if (output_admission_closed) {
+                remaining_output -= static_cast<std::size_t>(bytes_read);
+            }
+#endif
 
             deliver_or_buffer_output(QByteArray(
                 buffer.data(),
@@ -1547,6 +1657,9 @@ private:
                     take_paused_output_for_delivery_locked(paused_output);
             }
         }
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::ROOT_EXIT, m_master.get());
+#endif
         if (!paused_output.isEmpty()) {
             deliver_native_backend_output_with_snapshot(
                 m_mutex,
@@ -1576,7 +1689,13 @@ private:
             m_child_pid = -1;
         }
         report_exit_once(status);
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_BEGIN, m_master.get());
+#endif
         m_owner.finish();
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_END, m_master.get());
+#endif
         if (!m_owner.confirmed()) {
             report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
@@ -1603,6 +1722,9 @@ private:
     std::shared_ptr<Native_backend_callback_gate> m_callback_gate =
         std::make_shared<Native_backend_callback_gate>();
     Unique_fd                           m_master;
+#if defined(__linux__)
+    Unique_fd                           m_drain_peer;
+#endif
     Unique_fd                           m_read_wake_read;
     Unique_fd                           m_read_wake_write;
     Unique_fd                           m_write_wake_read;

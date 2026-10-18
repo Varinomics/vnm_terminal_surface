@@ -232,6 +232,21 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
         if (outcome.complete || outcome.terminal_unconfirmed || !pending_reported) (void)emit(event);
         if (outcome.complete || outcome.terminal_unconfirmed) {
             if (darwin_pty_contract) {
+#if defined(__APPLE__)
+                if (!failed_admitted_birth) {
+                    // The client owns output delivery. Retain the controlling
+                    // terminal after settlement until it retires that output by
+                    // closing its sending direction (also EOF on client death).
+                    // Late commands cannot change the already-settled tree.
+                    for (;;) {
+                        detail::Owner_message pending;
+                        const auto status = detail::receive_message(channel, &pending, -1, &error);
+                        detail::close_start_descriptors(pending.start);
+                        if (status != custody::Receive_status::MESSAGE &&
+                            status != custody::Receive_status::TIMEOUT) break;
+                    }
+                }
+#endif
                 return static_cast<int>(outcome.complete
                     ? custody::Darwin_pty_owner_exit::CONFIRMED : custody::Darwin_pty_owner_exit::UNCONFIRMED);
             }

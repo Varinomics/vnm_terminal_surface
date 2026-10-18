@@ -43,6 +43,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             VNM_PROCESS_CUSTODY_COMMAND_EXEC_CONFIRMATION 1)
         set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
             VNM_PROCESS_CUSTODY_COMMAND_EXEC_CONFIRMATION)
+        set_property(TARGET vnm_process_custody PROPERTY
+            VNM_PROCESS_CUSTODY_DARWIN_PTY_OUTPUT_RETIREMENT 1)
+        set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
+            VNM_PROCESS_CUSTODY_DARWIN_PTY_OUTPUT_RETIREMENT)
     endif()
     target_sources(vnm_process_custody PRIVATE src/owner_protocol.cpp)
     add_executable(vnm_process_custody_owner src/owner_main_posix.cpp)

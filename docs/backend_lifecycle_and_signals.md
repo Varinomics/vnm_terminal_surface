@@ -44,6 +44,9 @@ Linux gives the shell a new session and uses the helper's subreaper for tree
 cleanup. On macOS, the persistent helper retains the controlling PTY session
 and places the shell in its own foreground process group within that session.
 Both `Terminal_process_group_policy` values use this isolated terminal session.
+Linux also retains a nonblocking, close-on-exec slave obtained through
+`TIOCGPTPEER` without acquiring a controlling terminal. Failure to obtain that
+peer rejects startup through the existing deferred native-cleanup path.
 
 Darwin workload START requires `Terminal_native_receipt_hook` to acknowledge
 retention and persistence of the original helper's identity and status observer.
@@ -327,9 +330,23 @@ delivers buffered paused output before reporting exit. Delivery remains FIFO:
 reader tail bytes append behind existing paused bytes, and deferred-session
 backpressure can pause running-state drain between bounded chunks. Exit drain
 does not latch new pause requests, so the exit callback cannot remain trapped
-behind a callback re-pause. The POSIX backend honors
-`k_exit_output_drain_timeout` even if PTY EOF finishes the reader early. Shutdown
-can interrupt the drain without interrupting the helper's native cleanup.
+behind a callback re-pause. The POSIX backend honors the 250 ms
+`k_exit_output_drain_timeout` even if PTY EOF finishes the reader early. At that
+boundary it stops admitting additional output to the final drain, then delivers
+the accepted tail in the existing bounded chunks. Linux stops slave output and
+drains until native read/poll reports no input, including pending flip-buffer
+bytes. Darwin resumes flow-stopped output and snapshots the queued FIFO prefix;
+later producer writes cannot extend that prefix. Synchronous callback duration
+still contributes to delivery time. Shutdown can interrupt delivery without
+interrupting the helper's native cleanup.
+
+After macOS cleanup settlement the helper retains its controlling terminal until
+the client retires output through control-channel EOF. `finish()` half-closes the
+client's sending direction before closing and collecting the helper, so a
+duplicate client endpoint cannot delay normal retirement. Client abandonment
+also retires the terminal when its last endpoint closes; an endpoint leaked to
+another live process can postpone that EOF. Unexpected drain-control failures
+use the existing `READ_FAILED` path and do not establish complete delivery.
 
 ## Teardown
 
@@ -342,8 +359,9 @@ from inside a callback. No cleanup thread allocation is required after birth.
 On POSIX, shutdown sends forced STOP to the helper and joins the reader/writer/wait
 workers while retaining the presentation's master descriptor. It drains the
 helper's remaining receipts and collects that helper's sole wait before closing
-the master. Retaining the descriptor until workers finish prevents their pending
-I/O from reaching an unrelated file that reuses its number. The helper retains
+the master and any Linux drain peer. Retaining the descriptors until workers
+finish prevents their pending I/O from reaching an unrelated file that reuses
+its number. The helper retains
 its own PTY descriptors throughout native cleanup. Bounded I/O polling allows
 presentation threads to re-check their stop flags even when the slave remains
 open. Helper death without an admitted terminal outcome leaves native cleanup
