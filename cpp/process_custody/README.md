@@ -58,6 +58,9 @@ until control-channel EOF so the client can finish delivering accepted output.
 Clients retire that output by half-closing their sending direction, then collect
 the helper's native exit. Late commands do not change settlement. A rejected
 start without a transferred master does not wait for output retirement.
+Once output is retired, the helper revokes its retained terminal before exiting;
+post-retirement writes cannot keep the session leader's exit drain pending.
+Failure to retire the original terminal supplies no successful native outcome.
 
 Before sending START, the backend requires an accepted native receipt hook:
 the receiver must retain a local exact-helper status observer and persist its

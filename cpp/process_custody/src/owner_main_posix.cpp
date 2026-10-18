@@ -8,6 +8,8 @@
 #include <thread>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <limits.h>
+#include <sys/stat.h>
 #include <util.h>
 #endif
 
@@ -26,6 +28,22 @@ bool resize_pty(int master, custody::Pty_dimensions dimensions)
     size.ws_ypixel = dimensions.pixel_height;
     return ioctl(master, TIOCSWINSZ, &size) == 0;
 }
+
+#if defined(__APPLE__)
+bool retire_pty(int slave)
+{
+    char path[PATH_MAX];
+    struct stat retained{};
+    struct stat named{};
+    // The retained master and slave pin this allocation. Check the named
+    // device against that slave before revoking the terminal we own.
+    return ttyname_r(slave, path, sizeof(path)) == 0 &&
+        fstat(slave, &retained) == 0 && stat(path, &named) == 0 &&
+        S_ISCHR(named.st_mode) && retained.st_dev == named.st_dev &&
+        retained.st_ino == named.st_ino && retained.st_rdev == named.st_rdev &&
+        revoke(path) == 0;
+}
+#endif
 
 int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
 {
@@ -246,6 +264,12 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
                             status != custody::Receive_status::TIMEOUT) break;
                     }
                 }
+                // Session-leader exit drains before revoking its terminal.
+                // An outside slave writer can leave post-retirement output
+                // queued forever while the client waits for this helper.
+                // Delivery is finished or abandoned now: revoke first so that
+                // late writes cannot keep the native exit pending.
+                if (!retire_pty(slave)) return 2;
 #endif
                 return static_cast<int>(outcome.complete
                     ? custody::Darwin_pty_owner_exit::CONFIRMED : custody::Darwin_pty_owner_exit::UNCONFIRMED);

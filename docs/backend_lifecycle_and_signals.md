@@ -345,7 +345,9 @@ the client retires output through control-channel EOF. `finish()` half-closes th
 client's sending direction before closing and collecting the helper, so a
 duplicate client endpoint cannot delay normal retirement. Client abandonment
 also retires the terminal when its last endpoint closes; an endpoint leaked to
-another live process can postpone that EOF. Unexpected drain-control failures
+another live process can postpone that EOF. The helper then revokes its retained
+terminal so later producer output cannot block the session leader's native exit.
+Unexpected drain-control failures
 use the existing `READ_FAILED` path and do not establish complete delivery.
 
 ## Teardown
