@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.21)
 include("${VNM_TOOLCHAIN_CONTEXT}")
 include("${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
 
+set(package_parallel_level "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}")
+if(package_parallel_level STREQUAL "")
+    set(package_parallel_level 1)
+elseif(NOT package_parallel_level MATCHES "^[1-8]$")
+    message(FATAL_ERROR "CMAKE_BUILD_PARALLEL_LEVEL must be an integer from 1 through 8")
+endif()
+message(STATUS "Source package build parallel level: ${package_parallel_level}")
+
 set(configure_args -C "${VNM_PACKAGE_DEPENDENCY_CONTEXT}")
 vnm_append_toolchain_args(configure_args)
 if(NOT VNM_NESTED_CONFIGURATION_TYPES)
@@ -11,7 +19,8 @@ endif()
 function(run_package_step description command_variable)
     # Keep escaped list elements intact until their final command boundary.
     execute_process(COMMAND "${CMAKE_COMMAND}" ${${command_variable}}
-        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error
+        COMMAND_ECHO STDOUT ECHO_OUTPUT_VARIABLE ECHO_ERROR_VARIABLE)
     if(NOT result EQUAL 0)
         message(FATAL_ERROR "${description} failed.\n${output}${error}")
     endif()
@@ -32,7 +41,8 @@ list(APPEND command
     -DCMAKE_INSTALL_LIBDIR=lib
     "-DCMAKE_INSTALL_PREFIX=${lcd_prefix}")
 run_package_step("LCD provider configure" command)
-set(command --build "${package_root}/lcd-build" --config "${install_config}" --parallel 1)
+set(command --build "${package_root}/lcd-build" --config "${install_config}"
+    --parallel "${package_parallel_level}")
 run_package_step("LCD provider build" command)
 set(command --install "${package_root}/lcd-build" --config "${install_config}")
 run_package_step("LCD provider install" command)
@@ -51,5 +61,6 @@ list(APPEND command -C "${package_context}"
     -DVNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER=OFF
     -DVNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON)
 run_package_step("Package producer configure" command)
-set(command --build "${package_binary_dir}" --config "${install_config}" --parallel 1)
+set(command --build "${package_binary_dir}" --config "${install_config}"
+    --parallel "${package_parallel_level}")
 run_package_step("Package producer build" command)

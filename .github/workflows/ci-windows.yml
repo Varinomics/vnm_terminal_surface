@@ -12,6 +12,7 @@ defaults:
 
 env:
   CMAKE_BUILD_TYPE: Release
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
 
 jobs:
   build-and-test:
