@@ -6,12 +6,16 @@
 #include "native_backend_cleanup_owner.h"
 #include "posix_process_group_custody.h"
 #include "posix_pty_owner.h"
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+#include "posix_pty_io_test_hook.h"
+#endif
 #include <QDir>
 #include <QFile>
 #include <QProcessEnvironment>
 #include <QStringList>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -39,6 +43,17 @@
 namespace vnm_terminal::internal {
 
 namespace {
+
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+std::atomic<Posix_pty_io_hook_for_testing> s_pty_io_hook{nullptr};
+
+void observe_pty_io_for_testing(Posix_pty_io_point_for_testing point, int descriptor)
+{
+    if (const auto hook = s_pty_io_hook.load(std::memory_order_acquire)) {
+        hook(point, descriptor);
+    }
+}
+#endif
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
 // Upper bound on how long an I/O thread blocks in a single poll() before it
@@ -126,11 +141,6 @@ public:
     int get() const
     {
         return m_fd;
-    }
-
-    int release()
-    {
-        return std::exchange(m_fd, -1);
     }
 
     void reset(int value = -1)
@@ -388,6 +398,13 @@ int poll_timeout_until(std::optional<std::chrono::steady_clock::time_point> dead
 
 
 }
+
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+void set_posix_pty_io_hook_for_testing(Posix_pty_io_hook_for_testing hook)
+{
+    s_pty_io_hook.store(hook, std::memory_order_release);
+}
+#endif
 
 class Posix_pty_backend::Impl
 {
@@ -907,7 +924,6 @@ public:
 
     void shutdown()
     {
-        int master = -1;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
@@ -919,9 +935,6 @@ public:
             m_output_paused = false;
             m_paused_output_delivery_in_progress = false;
             m_callbacks = {};
-            if (m_master) {
-                master = m_master.release();
-            }
         }
 
         m_output_cv.notify_all();
@@ -931,13 +944,12 @@ public:
         std::string owner_error;
         (void)m_owner.stop(0, &owner_error);
 
-        // The helper retains its own PTY and cleanup authority. Public calls
-        // have drained before shutdown; wake the I/O threads before closing
-        // this presentation's descriptor and joining them.
-        if (master >= 0) {
-            ::close(master);
-        }
-
+        // Workers can still hold raw descriptor snapshots taken before the
+        // stop flags. Keep the owning master open until every worker has
+        // joined, so an ordinary open cannot reuse their descriptor number.
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        observe_pty_io_for_testing(Posix_pty_io_point_for_testing::SHUTDOWN_JOIN, m_master.get());
+#endif
         join_native_backend_threads(
             m_reader_thread,
             m_writer_thread,
@@ -1287,6 +1299,9 @@ private:
                 continue;
             }
 
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+            observe_pty_io_for_testing(Posix_pty_io_point_for_testing::READ, master);
+#endif
             const ssize_t bytes_read = ::read(master, buffer.data(), bytes_to_read);
             if (bytes_read < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1417,6 +1432,9 @@ private:
             // wait_for_write_capacity). This keeps the writer off the unreliable
             // macOS PTY-master POLLOUT path entirely.
             const qsizetype remaining = bytes.size() - offset;
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+            observe_pty_io_for_testing(Posix_pty_io_point_for_testing::WRITE, master);
+#endif
             const ssize_t count = ::write(
                 master,
                 bytes.constData() + offset,

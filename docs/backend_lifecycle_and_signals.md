@@ -339,9 +339,11 @@ A cleanup reservation created before native birth retains the implementation
 until active public calls and worker threads have drained, including destruction
 from inside a callback. No cleanup thread allocation is required after birth.
 
-On POSIX, shutdown sends forced STOP to the helper, closes the presentation's
-master descriptor, joins the reader/writer/wait workers, and drains the helper's
-remaining receipts before collecting that helper's sole wait. The helper retains
+On POSIX, shutdown sends forced STOP to the helper and joins the reader/writer/wait
+workers while retaining the presentation's master descriptor. It drains the
+helper's remaining receipts and collects that helper's sole wait before closing
+the master. Retaining the descriptor until workers finish prevents their pending
+I/O from reaching an unrelated file that reuses its number. The helper retains
 its own PTY descriptors throughout native cleanup. Bounded I/O polling allows
 presentation threads to re-check their stop flags even when the slave remains
 open. Helper death without an admitted terminal outcome leaves native cleanup

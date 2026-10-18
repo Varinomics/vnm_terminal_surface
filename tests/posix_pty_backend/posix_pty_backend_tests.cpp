@@ -1,6 +1,7 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
 #include "callback_lifetime_checks.h"
+#include "descriptor_lifetime_checks.h"
 #include "foreground_cleanup_checks.h"
 #include "native_session_checks.h"
 #include "native_receipt_capture.h"
@@ -1750,5 +1751,12 @@ int main(int argc, char** argv)
     ok &= test_terminate(fixture_path);
     ok &= test_terminate_accepts_zero_grace_policy(fixture_path);
     ok &= test_destructor_returns_with_running_process(fixture_path);
+    for (const auto point : {
+             term::Posix_pty_io_point_for_testing::READ,
+             term::Posix_pty_io_point_for_testing::WRITE})
+    {
+        ok &= vnm_terminal::test_helpers::check_pty_descriptor_lifetime(
+            launch_config(fixture_path, {QStringLiteral("--hold-open-no-read")}), point);
+    }
     return ok ? 0 : 1;
 }
