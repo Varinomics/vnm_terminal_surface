@@ -2531,6 +2531,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         posix_pty_backend/executable_lookup_tests.cpp)
     target_link_libraries(vnm_terminal_posix_executable_lookup PRIVATE
         vnm_terminal_surface::vnm_terminal_surface)
+    if(APPLE)
+        target_link_libraries(vnm_terminal_posix_executable_lookup PRIVATE
+            vnm_process_custody::vnm_process_custody)
+    endif()
     set_target_properties(vnm_terminal_posix_executable_lookup PROPERTIES AUTOMOC OFF)
     add_test(NAME vnm_terminal_posix_executable_lookup
         COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
