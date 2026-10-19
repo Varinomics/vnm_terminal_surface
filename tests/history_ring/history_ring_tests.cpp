@@ -209,6 +209,59 @@ bool test_read_scope_boundaries()
     return ok;
 }
 
+bool test_capacity_resize_preserves_wrapped_records()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    constexpr std::string_view records[] = {
+        "record-00-abcdef",
+        "record-01-abcdef",
+        "record-02-abcdef",
+        "record-03-abcdef",
+        "record-04-abcdef",
+        "record-05-abcdef",
+        "record-06-abcdef",
+        "record-07-abcdef",
+        "record-08-abcdef",
+        "record-09-abcdef",
+    };
+    std::vector<term::terminal_history_ring_commit_result_t> commits;
+    for (std::string_view record : records) {
+        commits.push_back(append_record(ring, record));
+        ok &= check(commits.back().status == term::Terminal_history_ring_status::OK,
+            "resize fixture commits each record");
+    }
+    const std::uint64_t tail = ring.oldest_live_byte_sequence();
+    const std::uint64_t head = ring.head_byte_sequence();
+    ok &= check(
+        commits.back().byte_sequence % ring.capacity_bytes() + commits.back().record_bytes >
+            ring.capacity_bytes(),
+        "resize fixture has a record wrapping the storage boundary");
+
+    for (const std::size_t capacity : {1024U, 512U}) {
+        const auto resized = ring.resize_capacity(capacity, 512U);
+        ok &= check(resized.status == term::Terminal_history_ring_status::OK &&
+                resized.discarded_records == 0U && ring.capacity_bytes() == capacity,
+            "growth and shrink preserve records that fit in both capacities");
+        ok &= check(ring.oldest_live_byte_sequence() == tail && ring.head_byte_sequence() == head,
+            "capacity resize preserves absolute byte sequences");
+        for (std::size_t index = 0U; index < commits.size(); ++index) {
+            const auto read = ring.read_record(commits[index].byte_sequence);
+            if (commits[index].byte_sequence < tail) {
+                ok &= check(read.status() == term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+                    "capacity resize keeps evicted records outside the live range");
+            }
+            else {
+                ok &= check(read.ok() && payload_equal(read, records[index]),
+                    "capacity resize preserves every byte of contiguous and wrapped records");
+            }
+        }
+    }
+
+    return ok;
+}
+
 bool test_explicit_discard_advances_live_bounds()
 {
     bool ok = true;
@@ -380,6 +433,7 @@ int main()
     ok &= test_partial_records_are_invisible();
     ok &= test_wrap_traversal_tail_boundaries();
     ok &= test_read_scope_boundaries();
+    ok &= test_capacity_resize_preserves_wrapped_records();
     ok &= test_explicit_discard_advances_live_bounds();
     ok &= test_live_index_read_validates_lockstep_identity();
     ok &= test_clear_preserves_capacity_and_sequence();

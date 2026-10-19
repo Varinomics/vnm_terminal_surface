@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -243,7 +244,7 @@ private:
         std::uint32_t record_bytes) const;
 
     std::size_t                    m_capacity_bytes = 0U;
-    std::vector<std::byte>         m_storage;
+    std::unique_ptr<std::byte[]>   m_storage;
     std::deque<terminal_history_ring_record_descriptor_t>
                                    m_records;
     std::atomic<std::uint64_t>     m_oldest_live_byte_sequence{0U};
