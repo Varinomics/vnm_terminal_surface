@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <numeric>
 #include <utility>
@@ -294,7 +295,9 @@ Terminal_history_ring::Terminal_history_ring(terminal_history_ring_config_t conf
         return;
     }
 
-    m_storage.resize(m_capacity_bytes);
+    // Only committed records are read. Leave unused history capacity untouched
+    // so the first saved row does not make the full allocation resident.
+    m_storage = std::make_unique_for_overwrite<std::byte[]>(m_capacity_bytes);
     m_status = Terminal_history_ring_status::OK;
 }
 
@@ -535,7 +538,7 @@ terminal_history_ring_resize_result_t Terminal_history_ring::resize_capacity(
     }
     std::reverse(retained_records.begin(), retained_records.end());
 
-    std::vector<std::byte> new_storage(new_capacity);
+    auto new_storage = std::make_unique_for_overwrite<std::byte[]>(new_capacity);
     std::deque<terminal_history_ring_record_descriptor_t> new_records;
     const auto write_new_record = [
         &new_storage,
@@ -549,12 +552,12 @@ terminal_history_ring_resize_result_t Terminal_history_ring::resize_capacity(
         const std::size_t first_count = std::min(
             bytes.size(),
             new_capacity - offset);
-        std::copy_n(bytes.begin(), first_count, new_storage.begin() + offset);
+        std::copy_n(bytes.begin(), first_count, new_storage.get() + offset);
         if (first_count < bytes.size()) {
             std::copy(
                 bytes.begin() + static_cast<std::ptrdiff_t>(first_count),
                 bytes.end(),
-                new_storage.begin());
+                new_storage.get());
         }
     };
 
@@ -643,7 +646,7 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_live_record(
     terminal_history_ring_record_descriptor_t descriptor;
     const std::size_t start = static_cast<std::size_t>(byte_sequence % m_capacity_bytes);
     if (record_bytes <= m_capacity_bytes - start) {
-        const std::span<const std::byte> stored_bytes(m_storage.data() + start, record_bytes);
+        const std::span<const std::byte> stored_bytes(m_storage.get() + start, record_bytes);
         const Terminal_history_ring_status validation_status =
             validate_record_bytes(stored_bytes, byte_sequence, &descriptor);
         if (validation_status != Terminal_history_ring_status::OK) {
@@ -756,9 +759,9 @@ void Terminal_history_ring::write_record_bytes(
     const std::size_t start = static_cast<std::size_t>(byte_sequence % m_capacity_bytes);
     const std::size_t first = std::min(bytes.size(), m_capacity_bytes - start);
 
-    std::memcpy(m_storage.data() + start, bytes.data(), first);
+    std::memcpy(m_storage.get() + start, bytes.data(), first);
     if (first < bytes.size()) {
-        std::memcpy(m_storage.data(), bytes.data() + first, bytes.size() - first);
+        std::memcpy(m_storage.get(), bytes.data() + first, bytes.size() - first);
     }
 }
 
@@ -772,9 +775,9 @@ std::vector<std::byte> Terminal_history_ring::copy_record_bytes(
     const std::size_t start = static_cast<std::size_t>(byte_sequence % m_capacity_bytes);
     const std::size_t first = std::min<std::size_t>(record_bytes, m_capacity_bytes - start);
 
-    std::memcpy(bytes.data(), m_storage.data() + start, first);
+    std::memcpy(bytes.data(), m_storage.get() + start, first);
     if (first < record_bytes) {
-        std::memcpy(bytes.data() + first, m_storage.data(), record_bytes - first);
+        std::memcpy(bytes.data() + first, m_storage.get(), record_bytes - first);
     }
 
     return bytes;
