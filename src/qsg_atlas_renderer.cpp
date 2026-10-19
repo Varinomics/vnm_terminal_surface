@@ -4908,9 +4908,14 @@ private:
             m_dual_source_blend_factors_available;
 
         Atlas_prepare_commit& commit = result.commit;
+        // Snapshot dirty ranges describe a publication, so reusing that immutable
+        // snapshot for a blink or host transform must not repeat its full upload.
+        // Slot seeding and other state/resource invalidations remain independent.
+        const bool snapshot_already_committed = m_have_committed_frame &&
+            qsg_atlas_same_snapshot_publication(m_frame, m_committed_frame);
         commit.render_force_full_reupload =
             m_force_next_render_full_upload ||
-            result.frame_build.full_repaint_fallback;
+            (result.frame_build.full_repaint_fallback && !snapshot_already_committed);
         commit.render_non_dirty_state_invalidation =
             selection_changed    ||
             preedit_changed      ||
@@ -6612,6 +6617,10 @@ private:
         const bool glyph_buffer_recreated =
             m_glyph_instance_buffer == nullptr ||
             m_glyph_instance_buffer_size < glyph_buffer_size;
+        const quint32 rect_buffer_capacity = qsg_atlas_instance_buffer_capacity(
+            m_rect_instance_buffer_size, rect_buffer_size);
+        const quint32 glyph_buffer_capacity = qsg_atlas_instance_buffer_capacity(
+            m_glyph_instance_buffer_size, glyph_buffer_size);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         const bool msdf_text_buffer_needed = has_msdf_text_draw_passes();
         const std::uint64_t snapshot_sequence =
@@ -6624,11 +6633,13 @@ private:
         const bool msdf_text_buffer_recreated = msdf_text_buffer_needed &&
             (m_msdf_text_instance_buffer == nullptr ||
                 m_msdf_text_instance_buffer_size < msdf_text_buffer_size);
+        const quint32 msdf_text_buffer_capacity = qsg_atlas_instance_buffer_capacity(
+            m_msdf_text_instance_buffer_size, msdf_text_buffer_size);
 #endif
         QRhiBuffer* pending_rect_buffer = rect_buffer_recreated
             ? create_dynamic_buffer(
                 rhi,
-                rect_buffer_size,
+                rect_buffer_capacity,
                 QRhiBuffer::VertexBuffer)
             : nullptr;
         if (rect_buffer_recreated && pending_rect_buffer == nullptr) {
@@ -6638,7 +6649,7 @@ private:
         QRhiBuffer* pending_glyph_buffer = glyph_buffer_recreated
             ? create_dynamic_buffer(
                 rhi,
-                glyph_buffer_size,
+                glyph_buffer_capacity,
                 QRhiBuffer::VertexBuffer)
             : nullptr;
         if (glyph_buffer_recreated && pending_glyph_buffer == nullptr) {
@@ -6656,7 +6667,7 @@ private:
                 (msdf_text_buffer_recreated &&
                     (pending_msdf_text_buffer = create_dynamic_buffer(
                         rhi,
-                        msdf_text_buffer_size,
+                        msdf_text_buffer_capacity,
                         QRhiBuffer::VertexBuffer)) == nullptr))
             {
                 delete_resource(pending_rect_buffer);
@@ -6670,13 +6681,13 @@ private:
         if (pending_rect_buffer != nullptr) {
             delete_resource(m_rect_instance_buffer);
             m_rect_instance_buffer = std::exchange(pending_rect_buffer, nullptr);
-            m_rect_instance_buffer_size = rect_buffer_size;
+            m_rect_instance_buffer_size = rect_buffer_capacity;
             m_rect_upload_planner.reset();
         }
         if (pending_glyph_buffer != nullptr) {
             delete_resource(m_glyph_instance_buffer);
             m_glyph_instance_buffer = std::exchange(pending_glyph_buffer, nullptr);
-            m_glyph_instance_buffer_size = glyph_buffer_size;
+            m_glyph_instance_buffer_size = glyph_buffer_capacity;
             m_glyph_upload_planner.reset();
         }
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -6684,7 +6695,7 @@ private:
             delete_resource(m_msdf_text_instance_buffer);
             m_msdf_text_instance_buffer =
                 std::exchange(pending_msdf_text_buffer, nullptr);
-            m_msdf_text_instance_buffer_size = msdf_text_buffer_size;
+            m_msdf_text_instance_buffer_size = msdf_text_buffer_capacity;
             m_msdf_text_upload_planner.reset();
         }
 #endif
@@ -7647,6 +7658,19 @@ void qsg_atlas_merge_msdf_text_failure_diagnostics(
     }
 }
 
+quint32 qsg_atlas_instance_buffer_capacity(quint32 current_capacity, quint32 required_size)
+{
+    if (required_size <= current_capacity) {
+        return current_capacity;
+    }
+
+    // Gradual terminal growth must not replace the GPU buffer and reseed every
+    // rotating slot for each extra instance. Draw and upload sizes stay live-sized.
+    const quint64 grown_capacity = (quint64)current_capacity + current_capacity / 2U;
+    return std::max(required_size, (quint32)std::min(
+        grown_capacity, (quint64)std::numeric_limits<quint32>::max()));
+}
+
 void Qsg_atlas_buffer_upload_planner::reset()
 {
     m_frames_in_flight = 0;
@@ -7860,10 +7884,6 @@ Qsg_atlas_buffer_upload_planner::plan(
             for (const Qsg_atlas_row_stable_range& range :
                 *input.row_stable_ranges)
             {
-                if (!atlas_row_is_dirty(dirty_rows, range.row)) {
-                    continue;
-                }
-
                 const int first_instance = std::clamp(
                     range.first_instance,
                     0,
@@ -7895,14 +7915,6 @@ Qsg_atlas_buffer_upload_planner::plan(
         }
         else {
             for (int instance = 0; instance < common_instance_count; ++instance) {
-                const std::size_t row_index = static_cast<std::size_t>(instance);
-                const int row = row_index < input.instance_rows->size()
-                    ? input.instance_rows->at(row_index)
-                    : k_qsg_atlas_non_row;
-                if (!atlas_row_is_dirty(dirty_rows, row)) {
-                    continue;
-                }
-
                 if (!instance_bytes_changed(instance)) {
                     continue;
                 }
@@ -7911,23 +7923,26 @@ Qsg_atlas_buffer_upload_planner::plan(
             }
         }
 
-        bool full_required_for_clean_slot_change = false;
+        // Dirty rows describe the latest snapshot; a rotating slot can be older.
+        // Its other row spans need the same byte comparison. Non-row primitives
+        // retain the conservative fallback because the spans do not cover them.
+        bool full_required_for_non_row_change = false;
         for (int instance = 0; instance < common_instance_count; ++instance) {
             const std::size_t row_index = static_cast<std::size_t>(instance);
             const int row = row_index < input.instance_rows->size()
                 ? input.instance_rows->at(row_index)
                 : k_qsg_atlas_non_row;
-            if (atlas_row_is_dirty(dirty_rows, row) ||
+            if ((row >= 0 && row < input.row_count) ||
                 !instance_bytes_changed(instance))
             {
                 continue;
             }
 
-            full_required_for_clean_slot_change = true;
+            full_required_for_non_row_change = true;
             break;
         }
 
-        if (full_required_for_clean_slot_change) {
+        if (full_required_for_non_row_change) {
             plan.ranges.clear();
             summary.non_dirty_state_upload = true;
             if (!record_full_upload()) {
@@ -7945,9 +7960,11 @@ Qsg_atlas_buffer_upload_planner::plan(
     bool full_required_for_non_dirty_change = false;
     const std::vector<int> current_rows = make_current_rows();
     const auto record_instance_upload = [&](int instance) {
-        if (!atlas_row_is_dirty(
+        const int row = current_rows[static_cast<std::size_t>(instance)];
+        if ((layout_changed || row < 0 || row >= input.row_count) &&
+            !atlas_row_is_dirty(
                 dirty_rows,
-                current_rows[static_cast<std::size_t>(instance)]))
+                row))
         {
             full_required_for_non_dirty_change = true;
             return;
@@ -9278,6 +9295,17 @@ Qsg_atlas_shaped_text_run_result qsg_atlas_shape_text_run(
     }
 
     return result;
+}
+
+bool qsg_atlas_same_snapshot_publication(
+    const Captured_atlas_frame& left,
+    const Captured_atlas_frame& right)
+{
+    return
+        left.snapshot                 == right.snapshot                 &&
+        publication_generation(left)  == publication_generation(right)  &&
+        left.ownership_generation     == right.ownership_generation     &&
+        left.canvas_frame_generation  == right.canvas_frame_generation;
 }
 
 Captured_atlas_frame capture_qsg_atlas_frame(

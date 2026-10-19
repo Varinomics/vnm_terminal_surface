@@ -9116,6 +9116,39 @@ bool test_shaped_glyph_records()
     return ok;
 }
 
+bool test_atlas_snapshot_publication_identity()
+{
+    term::Captured_atlas_frame committed;
+    committed.snapshot = std::make_shared<const term::Terminal_render_snapshot>();
+    committed.publication_generation  = 5U;
+    committed.ownership_generation    = 2U;
+    committed.canvas_frame_generation = 3U;
+
+    term::Captured_atlas_frame repeated = committed;
+    ++repeated.capture_sequence;
+    repeated.cursor_blink_visible = !committed.cursor_blink_visible;
+    bool ok = check(term::qsg_atlas_same_snapshot_publication(repeated, committed),
+        "recapturing or blinking preserves an immutable snapshot publication");
+
+    term::Captured_atlas_frame replaced = committed;
+    replaced.snapshot = std::make_shared<const term::Terminal_render_snapshot>(*committed.snapshot);
+    ok &= check(!term::qsg_atlas_same_snapshot_publication(replaced, committed),
+        "a new snapshot object has its own publication dirty ranges");
+    replaced = committed;
+    ++replaced.publication_generation;
+    ok &= check(!term::qsg_atlas_same_snapshot_publication(replaced, committed),
+        "an explicit publication generation starts a new repaint");
+    replaced = committed;
+    ++replaced.ownership_generation;
+    ok &= check(!term::qsg_atlas_same_snapshot_publication(replaced, committed),
+        "a new owner does not inherit a committed publication");
+    replaced = committed;
+    ++replaced.canvas_frame_generation;
+    ok &= check(!term::qsg_atlas_same_snapshot_publication(replaced, committed),
+        "a new canvas frame does not inherit a committed publication");
+    return ok;
+}
+
 bool test_epoch_invalidation()
 {
     const term::Glyph_rgba_tile tile = test_rgba_tile(
@@ -9408,6 +9441,115 @@ bool test_atlas_rotating_buffer_planner()
     return ok;
 }
 
+bool test_atlas_instance_buffer_capacity()
+{
+    bool ok = true;
+    for (quint32 instance_bytes : {32U, 64U, 96U}) {
+        quint32 capacity = term::qsg_atlas_instance_buffer_capacity(0U, 256U * instance_bytes);
+        int replacements = 0;
+        for (quint32 count = 257U; count <= 1280U; ++count) {
+            const quint32 required = count * instance_bytes;
+            const quint32 next = term::qsg_atlas_instance_buffer_capacity(capacity, required);
+            replacements += next != capacity;
+            ok &= check(next >= required && next >= capacity,
+                "atlas instance buffer capacity covers live bytes without shrinking");
+            ok &= check(next <= required + required / 2U,
+                "atlas instance buffer growth keeps spare capacity bounded");
+            capacity = next;
+        }
+        ok &= check(replacements <= 4,
+            "gradual terminal growth reuses GPU capacity across extra instances");
+        ok &= check(term::qsg_atlas_instance_buffer_capacity(capacity, instance_bytes) == capacity,
+            "shorter frames retain allocated instance buffer capacity");
+        ok &= check(term::qsg_atlas_instance_buffer_capacity(capacity, capacity * 2U) == capacity * 2U,
+            "large instance buffer growth covers the complete new frame");
+    }
+    constexpr quint32 maximum_capacity = std::numeric_limits<quint32>::max();
+    ok &= check(term::qsg_atlas_instance_buffer_capacity(
+            maximum_capacity - 1U, maximum_capacity) == maximum_capacity,
+        "instance buffer growth saturates at the QRhi size limit");
+    return ok;
+}
+
+bool test_atlas_rotating_sparse_buffer_planner()
+{
+    constexpr int row_count    = 8;
+    constexpr int row_capacity = 2;
+    constexpr int instance_bytes = sizeof(Buffer_update_test_instance);
+    bool ok = true;
+    for (int frames_in_flight : {1, 2, 3}) {
+        for (int layout_kind : {0, 1, 2}) {
+            term::Qsg_atlas_buffer_upload_planner planner;
+            std::vector<Buffer_update_test_instance> instances;
+            std::vector<int> rows;
+            std::vector<term::Qsg_atlas_row_stable_range> row_ranges;
+            for (int row = 0; row < row_count; ++row) {
+                row_ranges.push_back({row, row * row_capacity, row_capacity});
+                for (int column = 0; column < row_capacity; ++column) {
+                    instances.push_back({row, 0});
+                    rows.push_back(row);
+                }
+            }
+            std::vector<QByteArray> gpu_slots(frames_in_flight);
+            term::Qsg_atlas_buffer_update_input input;
+            input.frames_in_flight = frames_in_flight;
+            input.row_count        = row_count;
+            input.instance_size    = instance_bytes;
+            input.instance_rows    = &rows;
+            input.layout_key       = QByteArrayLiteral("rotating-sparse-layout");
+            input.row_stable_layout = layout_kind != 0;
+            input.row_stable_ranges = layout_kind == 2 ? &row_ranges : nullptr;
+            for (int frame = 0; frame < frames_in_flight + 24; ++frame) {
+                const bool seed = frame < frames_in_flight;
+                const int dirty_row = (frame - frames_in_flight + row_count) % row_count;
+                if (!seed) {
+                    for (int column = 0; column < row_capacity; ++column) {
+                        ++instances[dirty_row * row_capacity + column].value;
+                    }
+                }
+                const QByteArray bytes = buffer_update_instance_bytes(instances);
+                input.frame_slot       = frame % frames_in_flight;
+                input.bytes            = bytes.constData();
+                input.byte_count       = (int)bytes.size();
+                input.dirty_row_ranges = {{dirty_row, 1}};
+                const term::Qsg_atlas_buffer_update_plan plan = planner.plan(input);
+                QByteArray& gpu = gpu_slots[input.frame_slot];
+                if (seed) {
+                    gpu.resize(bytes.size());
+                    ok &= check(plan.summary.full_upload && plan.summary.rotating_slot_seed_upload,
+                        "each rotating GPU slot receives its own initial complete frame");
+                }
+                else {
+                    ok &= check(plan.summary.partial_upload && !plan.summary.full_upload,
+                        "sparse edits catch up an older GPU slot with partial uploads");
+                    ok &= check(plan.summary.uploaded_bytes <=
+                            frames_in_flight * row_capacity * instance_bytes,
+                        "rotating slot uploads are bounded by rows changed since that slot was used");
+                }
+                for (const term::Qsg_atlas_buffer_update_range& range : plan.ranges) {
+                    const bool in_bounds = range.byte_offset >= 0 && range.byte_count >= 0 &&
+                        range.byte_offset + range.byte_count <= bytes.size();
+                    if (!check(in_bounds, "rotating slot upload ranges stay inside the frame")) {
+                        return false;
+                    }
+                    std::memcpy(gpu.data() + range.byte_offset,
+                        bytes.constData() + range.byte_offset, (std::size_t)range.byte_count);
+                }
+                ok &= check(gpu == bytes,
+                    "applying emitted ranges reconstructs every byte of the current GPU slot");
+                planner.commit(plan);
+            }
+            input.dirty_row_ranges.clear();
+            const QByteArray bytes = buffer_update_instance_bytes(instances);
+            input.bytes = bytes.constData();
+            const term::Qsg_atlas_buffer_update_plan unchanged = planner.plan(input);
+            ok &= check(unchanged.summary.skipped_upload && unchanged.ranges.empty(),
+                "an already current slot needs no repeated upload");
+        }
+    }
+    return ok;
+}
+
 bool test_atlas_row_stable_glyph_planner()
 {
     term::Qsg_atlas_buffer_upload_planner planner;
@@ -9520,8 +9662,8 @@ bool test_atlas_row_stable_glyph_planner()
             true,
         });
 
-    term::Qsg_atlas_buffer_upload_planner fallback_planner;
-    (void)committed_buffer_update_plan(fallback_planner, {
+    term::Qsg_atlas_buffer_upload_planner stale_row_planner;
+    (void)committed_buffer_update_plan(stale_row_planner, {
         1,
         0,
         row_count,
@@ -9537,8 +9679,8 @@ bool test_atlas_row_stable_glyph_planner()
         5,
         true,
     });
-    const term::Qsg_atlas_buffer_update_plan clean_slot_fallback =
-        committed_buffer_update_plan(fallback_planner, {
+    const term::Qsg_atlas_buffer_update_plan stale_row_update =
+        committed_buffer_update_plan(stale_row_planner, {
             1,
             0,
             row_count,
@@ -9629,17 +9771,43 @@ bool test_atlas_row_stable_glyph_planner()
                 static_cast<int>(row_capacity * sizeof(Buffer_update_test_instance)),
         "atlas row-stable glyph planner uploads the whole dirty row slot span "
         "when production row ranges are available");
-    ok &= check(clean_slot_fallback.summary.row_stable_layout &&
-            clean_slot_fallback.summary.full_upload &&
-            !clean_slot_fallback.summary.partial_upload &&
-            clean_slot_fallback.summary.non_dirty_state_upload &&
-            clean_slot_fallback.ranges.size() == 1U &&
-            clean_slot_fallback.ranges.front().byte_offset == 0 &&
-            clean_slot_fallback.ranges.front().byte_count ==
-                static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
-        "atlas row-stable glyph planner full-uploads when a clean-row slot "
-        "changes beside dirty-row content");
+    ok &= check(stale_row_update.summary.row_stable_layout &&
+            stale_row_update.summary.partial_upload &&
+            !stale_row_update.summary.full_upload &&
+            !stale_row_update.summary.non_dirty_state_upload &&
+            stale_row_update.ranges.size() == 2U &&
+            stale_row_update.summary.uploaded_bytes ==
+                static_cast<int>(2U * sizeof(Buffer_update_test_instance)),
+        "atlas row-stable glyph planner patches stale row bytes beside the latest dirty row");
     return ok;
+}
+
+bool test_atlas_row_stable_non_row_fallback()
+{
+    term::Qsg_atlas_buffer_upload_planner planner;
+    const std::vector<int> rows = {term::k_qsg_atlas_all_rows, 0, 1};
+    const std::vector<term::Qsg_atlas_row_stable_range> row_ranges = {{0, 1, 1}, {1, 2, 1}};
+    std::vector<Buffer_update_test_instance> instances = {{-1, 10}, {0, 20}, {1, 30}};
+    QByteArray bytes = buffer_update_instance_bytes(instances);
+    term::Qsg_atlas_buffer_update_input input;
+    input.row_count         = 2;
+    input.instance_size     = sizeof(Buffer_update_test_instance);
+    input.bytes             = bytes.constData();
+    input.byte_count        = (int)bytes.size();
+    input.instance_rows     = &rows;
+    input.layout_key        = QByteArrayLiteral("non-row-prefix");
+    input.row_stable_layout = true;
+    input.row_stable_ranges = &row_ranges;
+    (void)committed_buffer_update_plan(planner, input);
+
+    ++instances.front().value;
+    bytes = buffer_update_instance_bytes(instances);
+    input.bytes = bytes.constData();
+    input.dirty_row_ranges = {{0, 2}};
+    const term::Qsg_atlas_buffer_update_plan changed = planner.plan(input);
+    return check(changed.summary.full_upload && changed.summary.non_dirty_state_upload &&
+            changed.summary.uploaded_bytes == bytes.size(),
+        "a changed non-row primitive outside row spans retains the complete-upload fallback");
 }
 
 bool test_atlas_non_dirty_and_full_reupload_planner()
@@ -14287,6 +14455,58 @@ bool seed_atlas_prepare_transaction_baseline(
             << '\n';
     }
     return seeded;
+}
+
+bool test_atlas_repeated_snapshot_skips_upload(QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_surface(window, surface);
+    surface.set_cursor_blink_enabled(false);
+
+    term::Terminal_render_snapshot snapshot = make_atlas_row_stable_text_snapshot(
+        19820U, QStringLiteral("B"), {{0, 3}});
+    snapshot.basis   = term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    snapshot.purpose = term::Terminal_render_snapshot_purpose::SCROLL;
+    term::Qsg_atlas_frame_report report;
+    if (!seed_atlas_prepare_transaction_baseline(
+            app, window, surface, snapshot, "repeated snapshot", report))
+    {
+        return false;
+    }
+
+    bool ok = true;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        surface.setX(surface.x() + 1.0);
+        const std::uint64_t previous_prepare_count = report.prepare_count;
+        if (!check(pump_next_atlas_report(
+                app, window, surface, previous_prepare_count, report),
+            "host movement prepares the same snapshot again"))
+        {
+            return false;
+        }
+        ok &= check(report.frame_build.full_repaint_fallback &&
+                report.prepared_generation_committed && report.drew,
+            "a repeated full-dirty snapshot still renders a committed frame");
+        ok &= check(report.render.rect_buffer.skipped_upload &&
+                report.render.glyph_buffer.skipped_upload &&
+                report.render.rect_buffer.uploaded_bytes == 0 &&
+                report.render.glyph_buffer.uploaded_bytes == 0,
+            "host movement reuses seeded instance buffers for unchanged snapshot content");
+    }
+
+    ++snapshot.metadata.sequence;
+    term::Qsg_atlas_frame_report published;
+    ok &= check(capture_atlas_snapshot_report(
+            app, window, surface, snapshot, report.prepare_count, published),
+        "a new full-dirty publication reaches its first prepare");
+    ok &= check(published.prepared_generation_committed &&
+            published.render.rect_buffer.full_repaint_upload &&
+            published.render.rect_buffer.full_upload &&
+            published.render.glyph_buffer.full_repaint_upload &&
+            published.render.glyph_buffer.full_upload,
+        "a new publication still uploads its complete rect and text buffers");
+    return ok;
 }
 
 // Pumps frames until the predicate holds. An MSDF atlas bake runs on the global
@@ -22348,6 +22568,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_promoted(app);
     ok &= test_atlas_prepared_text_reuse(app);
+    ok &= test_atlas_repeated_snapshot_skips_upload(app);
     ok &= test_atlas_persistent_rect_failure_is_bounded(app);
     ok &= test_atlas_failed_first_text_prepare_retries_glyph_resolutions(app);
     ok &= test_atlas_failed_prepare_forces_next_sparse_full_upload(app);
@@ -22410,17 +22631,6 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= check(
         render_summary.text_renderer_fallback_used == !public_scroll_msdf_active,
         "atlas report records default text renderer fallback use");
-    ok &= check(
-        render_summary.rect_buffer.full_repaint_upload &&
-            render_summary.rect_buffer.full_upload,
-        "atlas report routes PUBLIC_PROJECTION/SCROLL geometry through full rect upload");
-    ok &= check(
-        public_scroll_msdf_active
-            ? render_summary.msdf_text_buffer.full_repaint_upload &&
-                render_summary.msdf_text_buffer.full_upload
-            : render_summary.glyph_buffer.full_repaint_upload &&
-                render_summary.glyph_buffer.full_upload,
-        "atlas report routes PUBLIC_PROJECTION/SCROLL text through full text upload");
     ok &= check(render_summary.background_rects_before_coalescing >
             render_summary.background_rects_after_coalescing,
         "atlas report records background coalescing");
@@ -22642,7 +22852,10 @@ bool run_unit_tests()
     ok &= test_epoch_invalidation();
     ok &= test_lcd_policy_platform_changes_invalidate_auto_surface();
     ok &= test_atlas_rotating_buffer_planner();
+    ok &= test_atlas_instance_buffer_capacity();
+    ok &= test_atlas_rotating_sparse_buffer_planner();
     ok &= test_atlas_row_stable_glyph_planner();
+    ok &= test_atlas_row_stable_non_row_fallback();
     ok &= test_atlas_non_dirty_and_full_reupload_planner();
     ok &= test_msdf_text_buffer_fallback_retry_decision();
     ok &= test_msdf_text_prepare_fallback_retry_decision();
@@ -22650,6 +22863,7 @@ bool run_unit_tests()
     ok &= test_atlas_msdf_text_path_adapter_skip_predicate();
     ok &= test_text_renderer_report_names();
     ok &= test_atlas_recorder_accumulates_elapsed_counters();
+    ok &= test_atlas_snapshot_publication_identity();
     ok &= test_atlas_budget_stats();
     ok &= test_atlas_warm_set_table_and_shaping();
     ok &= test_atlas_warm_set_representative_family_coverage();
