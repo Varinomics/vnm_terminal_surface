@@ -355,6 +355,8 @@ struct Qsg_atlas_buffer_update_summary
     int  instance_bytes                = 0;
     int  buffer_bytes                  = 0;
     int  dirty_rows                    = 0;
+    // QRhi schedules logical buffer updates for all native slots. This reports
+    // initialization scheduled by the plan, not completion of native writes.
     int  seeded_slots                  = 0;
     int  full_uploads                  = 0;
     int  partial_uploads               = 0;
@@ -362,7 +364,7 @@ struct Qsg_atlas_buffer_update_summary
     bool full_upload                   = false;
     bool partial_upload                = false;
     bool skipped_upload                = false;
-    bool rotating_slot_seed_upload     = false;
+    bool rotating_slot_seed_upload     = false; // No committed logical image yet.
     bool buffer_recreated_upload       = false;
     bool instance_layout_changed_upload = false;
     bool full_repaint_upload           = false;
@@ -400,11 +402,10 @@ struct Qsg_atlas_buffer_update_input
 
 struct Qsg_atlas_buffer_upload_commit
 {
-    int                         frames_in_flight = 0;
-    std::vector<QByteArray>     slot_bytes;
-    std::vector<QByteArray>     slot_layout_keys;
-    std::vector<unsigned char>  seeded_slots;
-    bool                        valid = false;
+    QByteArray bytes;
+    QByteArray layout_key;
+    bool       initialized = false;
+    bool       valid       = false;
 };
 
 struct Qsg_atlas_buffer_update_plan
@@ -447,8 +448,6 @@ struct Qsg_atlas_shaped_text_run_result
     int                 invalid_string_indexes = 0;
 };
 
-quint32 qsg_atlas_instance_buffer_capacity(quint32 current_capacity, quint32 required_size);
-
 class Qsg_atlas_buffer_upload_planner final
 {
 public:
@@ -459,12 +458,11 @@ public:
     void commit(const Qsg_atlas_buffer_update_plan& plan);
 
 private:
-    Qsg_atlas_buffer_upload_commit commit_for_frames(int frames_in_flight) const;
-
-    int                         m_frames_in_flight = 0;
-    std::vector<QByteArray>     m_slot_bytes;
-    std::vector<QByteArray>     m_slot_layout_keys;
-    std::vector<unsigned char>  m_seeded_slots;
+    // updateDynamicBuffer owns the propagation to native frame slots. Only the
+    // logical bytes submitted to QRhi belong to the renderer's upload history.
+    QByteArray m_bytes;
+    QByteArray m_layout_key;
+    bool       m_initialized = false;
 };
 
 // The image pass of one prepare. The cache fields describe the image textures

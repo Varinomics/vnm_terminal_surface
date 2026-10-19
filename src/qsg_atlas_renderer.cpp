@@ -6617,10 +6617,6 @@ private:
         const bool glyph_buffer_recreated =
             m_glyph_instance_buffer == nullptr ||
             m_glyph_instance_buffer_size < glyph_buffer_size;
-        const quint32 rect_buffer_capacity = qsg_atlas_instance_buffer_capacity(
-            m_rect_instance_buffer_size, rect_buffer_size);
-        const quint32 glyph_buffer_capacity = qsg_atlas_instance_buffer_capacity(
-            m_glyph_instance_buffer_size, glyph_buffer_size);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         const bool msdf_text_buffer_needed = has_msdf_text_draw_passes();
         const std::uint64_t snapshot_sequence =
@@ -6633,13 +6629,11 @@ private:
         const bool msdf_text_buffer_recreated = msdf_text_buffer_needed &&
             (m_msdf_text_instance_buffer == nullptr ||
                 m_msdf_text_instance_buffer_size < msdf_text_buffer_size);
-        const quint32 msdf_text_buffer_capacity = qsg_atlas_instance_buffer_capacity(
-            m_msdf_text_instance_buffer_size, msdf_text_buffer_size);
 #endif
         QRhiBuffer* pending_rect_buffer = rect_buffer_recreated
             ? create_dynamic_buffer(
                 rhi,
-                rect_buffer_capacity,
+                rect_buffer_size,
                 QRhiBuffer::VertexBuffer)
             : nullptr;
         if (rect_buffer_recreated && pending_rect_buffer == nullptr) {
@@ -6649,7 +6643,7 @@ private:
         QRhiBuffer* pending_glyph_buffer = glyph_buffer_recreated
             ? create_dynamic_buffer(
                 rhi,
-                glyph_buffer_capacity,
+                glyph_buffer_size,
                 QRhiBuffer::VertexBuffer)
             : nullptr;
         if (glyph_buffer_recreated && pending_glyph_buffer == nullptr) {
@@ -6667,7 +6661,7 @@ private:
                 (msdf_text_buffer_recreated &&
                     (pending_msdf_text_buffer = create_dynamic_buffer(
                         rhi,
-                        msdf_text_buffer_capacity,
+                        msdf_text_buffer_size,
                         QRhiBuffer::VertexBuffer)) == nullptr))
             {
                 delete_resource(pending_rect_buffer);
@@ -6681,13 +6675,13 @@ private:
         if (pending_rect_buffer != nullptr) {
             delete_resource(m_rect_instance_buffer);
             m_rect_instance_buffer = std::exchange(pending_rect_buffer, nullptr);
-            m_rect_instance_buffer_size = rect_buffer_capacity;
+            m_rect_instance_buffer_size = rect_buffer_size;
             m_rect_upload_planner.reset();
         }
         if (pending_glyph_buffer != nullptr) {
             delete_resource(m_glyph_instance_buffer);
             m_glyph_instance_buffer = std::exchange(pending_glyph_buffer, nullptr);
-            m_glyph_instance_buffer_size = glyph_buffer_capacity;
+            m_glyph_instance_buffer_size = glyph_buffer_size;
             m_glyph_upload_planner.reset();
         }
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -6695,7 +6689,7 @@ private:
             delete_resource(m_msdf_text_instance_buffer);
             m_msdf_text_instance_buffer =
                 std::exchange(pending_msdf_text_buffer, nullptr);
-            m_msdf_text_instance_buffer_size = msdf_text_buffer_capacity;
+            m_msdf_text_instance_buffer_size = msdf_text_buffer_size;
             m_msdf_text_upload_planner.reset();
         }
 #endif
@@ -7658,45 +7652,11 @@ void qsg_atlas_merge_msdf_text_failure_diagnostics(
     }
 }
 
-quint32 qsg_atlas_instance_buffer_capacity(quint32 current_capacity, quint32 required_size)
-{
-    if (required_size <= current_capacity) {
-        return current_capacity;
-    }
-
-    // Gradual terminal growth must not replace the GPU buffer and reseed every
-    // rotating slot for each extra instance. Draw and upload sizes stay live-sized.
-    const quint64 grown_capacity = (quint64)current_capacity + current_capacity / 2U;
-    return std::max(required_size, (quint32)std::min(
-        grown_capacity, (quint64)std::numeric_limits<quint32>::max()));
-}
-
 void Qsg_atlas_buffer_upload_planner::reset()
 {
-    m_frames_in_flight = 0;
-    m_slot_bytes.clear();
-    m_slot_layout_keys.clear();
-    m_seeded_slots.clear();
-}
-
-Qsg_atlas_buffer_upload_commit
-Qsg_atlas_buffer_upload_planner::commit_for_frames(int frames_in_flight) const
-{
-    const int normalized_frames = std::max(1, frames_in_flight);
-    Qsg_atlas_buffer_upload_commit commit;
-    commit.frames_in_flight = normalized_frames;
-    commit.valid            = true;
-    if (m_frames_in_flight == normalized_frames) {
-        commit.slot_bytes       = m_slot_bytes;
-        commit.slot_layout_keys = m_slot_layout_keys;
-        commit.seeded_slots     = m_seeded_slots;
-        return commit;
-    }
-
-    commit.slot_bytes.assign(static_cast<std::size_t>(normalized_frames), {});
-    commit.slot_layout_keys.assign(static_cast<std::size_t>(normalized_frames), {});
-    commit.seeded_slots.assign(static_cast<std::size_t>(normalized_frames), 0U);
-    return commit;
+    m_bytes.clear();
+    m_layout_key.clear();
+    m_initialized = false;
 }
 
 void Qsg_atlas_buffer_upload_planner::commit(
@@ -7706,10 +7666,9 @@ void Qsg_atlas_buffer_upload_planner::commit(
         return;
     }
 
-    m_frames_in_flight = plan.commit.frames_in_flight;
-    m_slot_bytes       = plan.commit.slot_bytes;
-    m_slot_layout_keys = plan.commit.slot_layout_keys;
-    m_seeded_slots     = plan.commit.seeded_slots;
+    m_bytes       = plan.commit.bytes;
+    m_layout_key  = plan.commit.layout_key;
+    m_initialized = plan.commit.initialized;
 }
 
 Qsg_atlas_buffer_update_plan
@@ -7718,8 +7677,9 @@ Qsg_atlas_buffer_upload_planner::plan(
 {
     const int frames_in_flight = std::max(1, input.frames_in_flight);
     const int frame_slot = std::clamp(input.frame_slot, 0, frames_in_flight - 1);
-    Qsg_atlas_buffer_upload_commit commit =
-        commit_for_frames(frames_in_flight);
+    Qsg_atlas_buffer_upload_commit commit{
+        m_bytes, m_layout_key, m_initialized, true,
+    };
 
     Qsg_atlas_buffer_update_plan plan;
     Qsg_atlas_buffer_update_summary& summary = plan.summary;
@@ -7741,7 +7701,6 @@ Qsg_atlas_buffer_upload_planner::plan(
         atlas_dirty_rows(input.dirty_row_ranges, input.row_count);
     summary.dirty_rows = dirty_rows.dirty_rows;
 
-    const std::size_t slot_index = static_cast<std::size_t>(frame_slot);
     if (input.bytes == nullptr && byte_count > 0) {
         summary.skipped_upload = true;
         return plan;
@@ -7762,20 +7721,20 @@ Qsg_atlas_buffer_upload_planner::plan(
         return rows;
     };
 
-    const bool slot_seeded = commit.seeded_slots[slot_index] != 0U;
+    const bool initialized = commit.initialized;
     const int previous_byte_count =
-        slot_seeded ? commit.slot_bytes[slot_index].size() : 0;
+        initialized ? commit.bytes.size() : 0;
     const bool layout_changed =
-        slot_seeded &&
+        initialized &&
         (previous_byte_count != byte_count ||
-            commit.slot_layout_keys[slot_index] != input.layout_key);
+            commit.layout_key != input.layout_key);
     const bool full_upload =
         input.buffer_recreated                ||
         input.force_full_reupload             ||
         input.non_dirty_state_invalidation    ||
-        !slot_seeded;
+        !initialized;
 
-    summary.rotating_slot_seed_upload      = !slot_seeded;
+    summary.rotating_slot_seed_upload      = !initialized;
     summary.buffer_recreated_upload        = input.buffer_recreated;
     summary.instance_layout_changed_upload = layout_changed;
     summary.full_repaint_upload            = input.force_full_reupload;
@@ -7793,26 +7752,20 @@ Qsg_atlas_buffer_upload_planner::plan(
         else {
             summary.skipped_upload = true;
         }
-        commit.slot_bytes[slot_index] =
+        commit.bytes =
             byte_count > 0 ? QByteArray(current, byte_count) : QByteArray();
-        commit.slot_layout_keys[slot_index] = input.layout_key;
-        commit.seeded_slots[slot_index]     = 1U;
-        return true;
+        commit.layout_key  = input.layout_key;
+        commit.initialized = true;
+        summary.seeded_slots = frames_in_flight;
     };
 
     if (full_upload) {
-        if (!record_full_upload()) {
-            return plan;
-        }
-        summary.seeded_slots = static_cast<int>(std::count(
-            commit.seeded_slots.begin(),
-            commit.seeded_slots.end(),
-            static_cast<unsigned char>(1U)));
+        record_full_upload();
         plan.commit = commit;
         return plan;
     }
 
-    const char* const previous = commit.slot_bytes[slot_index].constData();
+    const char* const previous = commit.bytes.constData();
     const int previous_instance_count =
         previous_byte_count / summary.instance_bytes;
     const int common_instance_count = std::min(
@@ -7849,27 +7802,20 @@ Qsg_atlas_buffer_upload_planner::plan(
             static_cast<std::size_t>(summary.instance_bytes)) != 0;
     };
 
-    const auto publish_seeded_slots = [&]() {
-        summary.seeded_slots = static_cast<int>(std::count(
-            commit.seeded_slots.begin(),
-            commit.seeded_slots.end(),
-            static_cast<unsigned char>(1U)));
-    };
-
     const auto finalize_partial_upload = [&]() {
         for (const Qsg_atlas_buffer_update_range& range : plan.ranges) {
             summary.uploaded_bytes += range.byte_count;
             std::memcpy(
-                commit.slot_bytes[slot_index].data() + range.byte_offset,
+                commit.bytes.data() + range.byte_offset,
                 current + range.byte_offset,
                 static_cast<std::size_t>(range.byte_count));
         }
         summary.partial_uploads = static_cast<int>(plan.ranges.size());
         summary.partial_upload  = !plan.ranges.empty();
         summary.skipped_upload  = plan.ranges.empty();
-        commit.slot_layout_keys[slot_index] = input.layout_key;
-        commit.seeded_slots[slot_index]     = 1U;
-        publish_seeded_slots();
+        commit.layout_key  = input.layout_key;
+        commit.initialized = true;
+        summary.seeded_slots = frames_in_flight;
         plan.commit = commit;
     };
 
@@ -7923,9 +7869,9 @@ Qsg_atlas_buffer_upload_planner::plan(
             }
         }
 
-        // Dirty rows describe the latest snapshot; a rotating slot can be older.
-        // Its other row spans need the same byte comparison. Non-row primitives
-        // retain the conservative fallback because the spans do not cover them.
+        // Compare all spans with the last submitted logical buffer, including
+        // changes outside the snapshot's dirty rows. Non-row primitives retain
+        // the conservative fallback because the spans do not cover them.
         bool full_required_for_non_row_change = false;
         for (int instance = 0; instance < common_instance_count; ++instance) {
             const std::size_t row_index = static_cast<std::size_t>(instance);
@@ -7945,10 +7891,7 @@ Qsg_atlas_buffer_upload_planner::plan(
         if (full_required_for_non_row_change) {
             plan.ranges.clear();
             summary.non_dirty_state_upload = true;
-            if (!record_full_upload()) {
-                return plan;
-            }
-            publish_seeded_slots();
+            record_full_upload();
             plan.commit = commit;
             return plan;
         }
@@ -8001,18 +7944,12 @@ Qsg_atlas_buffer_upload_planner::plan(
     if (full_required_for_non_dirty_change) {
         plan.ranges.clear();
         summary.non_dirty_state_upload = true;
-        if (!record_full_upload()) {
-            return plan;
-        }
-        summary.seeded_slots = static_cast<int>(std::count(
-            commit.seeded_slots.begin(),
-            commit.seeded_slots.end(),
-            static_cast<unsigned char>(1U)));
+        record_full_upload();
         plan.commit = commit;
         return plan;
     }
 
-    commit.slot_bytes[slot_index] =
+    commit.bytes =
         byte_count > 0 ? QByteArray(input.bytes, byte_count) : QByteArray();
     finalize_partial_upload();
     return plan;

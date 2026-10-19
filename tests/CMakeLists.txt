@@ -1056,6 +1056,28 @@ set_tests_properties(vnm_terminal_qsg_atlas PROPERTIES
     TIMEOUT 60
 )
 
+if(APPLE OR WIN32)
+    if(APPLE)
+        set(vnm_terminal_dynamic_buffer_backend metal)
+    else()
+        set(vnm_terminal_dynamic_buffer_backend d3d11)
+    endif()
+    add_test(
+        NAME vnm_terminal_qsg_atlas_dynamic_buffer
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--dynamic-buffer" "--backend" "${vnm_terminal_dynamic_buffer_backend}"
+    )
+    set_tests_properties(vnm_terminal_qsg_atlas_dynamic_buffer PROPERTIES
+        LABELS "qsg;hardware;atlas;buffer"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
 add_test(
     NAME vnm_terminal_qsg_atlas_post_verification_failure_contract
     COMMAND
