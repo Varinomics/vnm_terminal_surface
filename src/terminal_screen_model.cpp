@@ -4883,7 +4883,7 @@ void Terminal_screen_model::reset_grid()
     m_dec_1049_saved_primary_cursor = false;
     m_character_protected            = false;
     m_rectangular_attribute_extent   = false;
-    m_tab_stops                     = default_tab_stops(m_config.grid_size.columns);
+    reset_tab_stops();
     restore_buffer_state(m_primary_backing.active_grid_state());
 }
 
@@ -4908,11 +4908,6 @@ bool Terminal_screen_model::apply_grid_resize(
     m_config.grid_size = grid_size;
     resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
     resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size, false);
-    // Resizing preserves the programmed tab stops in surviving columns.
-    m_tab_stops.resize(static_cast<std::size_t>(grid_size.columns), false);
-    for (int column = grid_size_before.columns; column < grid_size.columns; ++column) {
-        m_tab_stops[static_cast<std::size_t>(column)] = column % m_config.tab_width == 0;
-    }
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
     if (guard_primary_repaint_recovery) {
@@ -5224,7 +5219,8 @@ void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)
 
 void Terminal_screen_model::reset_tab_stops()
 {
-    m_tab_stops = default_tab_stops(m_config.grid_size.columns);
+    // Tab programming survives resize, including columns outside the visible grid.
+    m_tab_stops = default_tab_stops(k_terminal_screen_model_max_columns);
 }
 
 void Terminal_screen_model::put_scalar(QString text)

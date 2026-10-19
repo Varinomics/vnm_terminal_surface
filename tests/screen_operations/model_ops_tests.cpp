@@ -4111,6 +4111,89 @@ bool test_tab_stops_survive_resize()
     return ok;
 }
 
+bool check_tab_column(
+    const term::Terminal_screen_model& model,
+    int                                expected_column,
+    const char*                        label)
+{
+    const int actual_column = model.cursor_position().column + 1;
+    const char* buffer = model.active_buffer_id() == term::Terminal_buffer_id::PRIMARY
+        ? "primary"
+        : "alternate";
+    return check(actual_column == expected_column,
+        std::string(buffer) + ": " + label + " (expected column " +
+        std::to_string(expected_column) + ", actual column " +
+        std::to_string(actual_column) + ")");
+}
+
+bool test_tab_stops_survive_hidden_columns()
+{
+    // oracle_id: independent-vnm-fixture
+    // Behavior reviewed against xterm-409-reference; no external fixture material.
+    // Tab programming applies to columns that later resizes expose.
+    bool ok = true;
+    for (const bool alternate : {false, true}) {
+        const QByteArray enter_buffer = alternate
+            ? QByteArrayLiteral("\x1b[?1049h")
+            : QByteArray();
+        const QByteArray switch_buffer = alternate
+            ? QByteArrayLiteral("\x1b[?1049l")
+            : QByteArrayLiteral("\x1b[?1049h");
+
+        term::Terminal_screen_model cleared({{4, 20}});
+        cleared.ingest(enter_buffer + QByteArrayLiteral("\x1b[3g"));
+        cleared.resize({4, 40});
+        cleared.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check_tab_column(cleared, 40, "TBC all survives first width growth");
+        cleared.ingest(switch_buffer + QByteArrayLiteral("\r\t"));
+        ok &= check_tab_column(cleared, 40, "TBC all remains shared after buffer switching");
+        cleared.resize({4, term::k_terminal_screen_model_max_columns});
+        cleared.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check_tab_column(cleared, term::k_terminal_screen_model_max_columns,
+            "TBC all covers the full supported column range");
+
+        term::Terminal_screen_model individual({{4, 40}});
+        individual.ingest(enter_buffer + QByteArrayLiteral("\x1b[25G\x1b[g"));
+        individual.resize({4, 20});
+        individual.resize({4, 40});
+        individual.ingest(QByteArrayLiteral("\x1b[21G\t"));
+        ok &= check_tab_column(individual, 33, "a cleared hidden stop survives shrink and growth");
+        individual.ingest(switch_buffer + QByteArrayLiteral("\x1b[21G\t"));
+        ok &= check_tab_column(individual, 33, "a cleared hidden stop remains shared across buffers");
+        individual.ingest(QByteArrayLiteral("\x1b[?69h\x1b[3;30s\x1b[1;21H\t"));
+        ok &= check_tab_column(individual, 30, "HT clamps to the active right margin after growth");
+
+        term::Terminal_screen_model narrowed({{4, 20}});
+        narrowed.ingest(enter_buffer);
+        narrowed.resize({4, 40});
+        narrowed.ingest(QByteArrayLiteral("\x1b[21G\t"));
+        ok &= check_tab_column(narrowed, 25, "ordinary growth exposes default tab stops");
+        narrowed.resize({4, 20});
+        narrowed.ingest(QByteArrayLiteral("\x1b[3g"));
+        narrowed.resize({4, 40});
+        narrowed.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check_tab_column(narrowed, 40, "TBC all while narrow clears previously exposed stops");
+        narrowed.resize({6, 40});
+        narrowed.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check_tab_column(narrowed, 40, "height growth preserves cleared hidden stops");
+
+        // Reconstruction exercises the full model initialization path after tab clearing.
+        narrowed = term::Terminal_screen_model({{4, 20}});
+        narrowed.ingest(enter_buffer + QByteArrayLiteral("\t"));
+        ok &= check_tab_column(narrowed, 9, "model reset restores visible default tab stops");
+        narrowed.resize({4, 40});
+        narrowed.ingest(QByteArrayLiteral("\x1b[21G\t"));
+        ok &= check_tab_column(narrowed, 25, "model reset restores defaults beyond the initial width");
+
+        term::Terminal_screen_model configured({{4, 20}, 8, 6});
+        configured.ingest(enter_buffer);
+        configured.resize({4, 40});
+        configured.ingest(QByteArrayLiteral("\x1b[27G\t"));
+        ok &= check_tab_column(configured, 31, "growth retains the configured tab spacing");
+    }
+    return ok;
+}
+
 bool test_line_edits_home_cursor_within_margins()
 {
     bool ok = true;
@@ -6675,6 +6758,7 @@ int main()
     ok &= test_blank_fill_operations_use_current_style();
     ok &= test_insert_delete_lines_cells_and_tabs();
     ok &= test_tab_stops_survive_resize();
+    ok &= test_tab_stops_survive_hidden_columns();
     ok &= test_line_edits_home_cursor_within_margins();
     ok &= test_retained_line_provenance_lifecycle();
     ok &= test_recovery_disabled_non_scroll_sources_do_not_grow_retained_history();
