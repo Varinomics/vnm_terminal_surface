@@ -3014,15 +3014,49 @@ void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
     Terminal_buffer_id buffer_id)
 {
     retained_lookup_index_t& index = mutable_retained_lookup_index(buffer_id);
+    const std::vector<Terminal_screen_row>& rows = buffer_id == Terminal_buffer_id::PRIMARY
+        ? primary_active_grid_rows()
+        : alternate_active_grid_rows();
+
+    // Ordinary writes change content generations without moving row identities.
+    // Reuse those nodes, including the unchanged inactive grid, and rebuild
+    // only when the row-to-identity mapping or its multiplicity changes.
+    if (index.active_grid_by_row_sequence.size() == rows.size()) {
+        bool same_identity_layout = true;
+        std::uint64_t visited = 0U;
+        for (int active_row = 0; active_row < static_cast<int>(rows.size()); ++active_row) {
+            const terminal_history_handle_t handle = retained_history_handle_from_provenance(
+                rows[static_cast<std::size_t>(active_row)].retained_line_provenance);
+            ++visited;
+            const auto found = index.active_grid_by_row_sequence.find(handle.row_sequence);
+            if (found != index.active_grid_by_row_sequence.end()) {
+                ++visited;
+            }
+            if (found == index.active_grid_by_row_sequence.end() ||
+                found->second.active_grid_row != active_row ||
+                found->second.active_grid_match_count != 1)
+            {
+                same_identity_layout = false;
+                break;
+            }
+            retained_lookup_index_entry_t& entry = found->second;
+            entry.history_handle     = handle;
+            entry.active_grid_handle = handle;
+        }
+        if (m_selection_reconciliation_counters.enabled) {
+            m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited += visited;
+        }
+        if (same_identity_layout) {
+            return;
+        }
+    }
+
     if (m_selection_reconciliation_counters.enabled) {
         m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited +=
             index.active_grid_by_row_sequence.size();
     }
     index.active_grid_by_row_sequence.clear();
 
-    const std::vector<Terminal_screen_row>& rows = buffer_id == Terminal_buffer_id::PRIMARY
-        ? primary_active_grid_rows()
-        : alternate_active_grid_rows();
     if (m_selection_reconciliation_counters.enabled) {
         m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited +=
             rows.size();

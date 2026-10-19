@@ -21156,6 +21156,76 @@ bool test_flat_ring_direct_retained_lookup_index_and_validation()
     return ok;
 }
 
+bool test_active_retained_lookup_tracks_edits_moves_and_duplicate_removal()
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size        = {3, 20};
+    config.scrollback_limit = 0;
+    term::Terminal_screen_model model(config);
+    model.ingest(QByteArrayLiteral("abc"));
+
+    const auto before = model.retained_history_handle_at_logical_row(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    const auto stationary = model.retained_history_handle_at_logical_row(
+        term::Terminal_buffer_id::PRIMARY, 1);
+    if (!check(before.has_value() && stationary.has_value(),
+        "active lookup fixture captures written and stationary row handles"))
+    {
+        return false;
+    }
+
+    model.ingest(QByteArrayLiteral("\rZ"));
+    const auto after = model.retained_history_handle_at_logical_row(
+        term::Terminal_buffer_id::PRIMARY, 0);
+    if (!check(after.has_value(), "ordinary write retains an active row handle")) {
+        return false;
+    }
+    const auto stale = model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *before);
+    const auto live = model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *after);
+    bool ok = check(
+        after->row_sequence == before->row_sequence &&
+            after->content_generation > before->content_generation &&
+            stale.resolution_status ==
+                term::Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH &&
+            live.exact_match && live.exact_logical_row == 0,
+        "same-identity index refresh publishes the changed content generation");
+    const auto unchanged = model.retained_line_lookup(
+        term::Terminal_buffer_id::PRIMARY, *stationary);
+    ok &= check(unchanged.exact_match && unchanged.exact_logical_row == 1,
+        "ordinary writes keep neighboring active rows resolvable");
+
+    model.ingest(QByteArrayLiteral("\x1b[2;1H\x1b[L"));
+    const auto moved = model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *stationary);
+    ok &= check(moved.exact_match && moved.exact_logical_row == 2,
+        "row insertion rebuilds the identity mapping for moved rows");
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    const auto alternate_provenance = model.retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::ALTERNATE, 0);
+    for (int row = 1; row < config.grid_size.rows; ++row) {
+        model.set_active_grid_retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::ALTERNATE, row, alternate_provenance);
+    }
+    const auto alternate_handle = term::terminal_history_handle_from_retained_identity(
+        alternate_provenance.retained_line_id, alternate_provenance.content_generation);
+    const auto duplicate = model.retained_line_lookup(
+        term::Terminal_buffer_id::ALTERNATE, alternate_handle);
+    ok &= check(duplicate.exact_match && duplicate.retained_line_id_match_count == 3,
+        "active index retains duplicate identity multiplicity");
+
+    model.resize({1, config.grid_size.columns});
+    const auto single = model.retained_line_lookup(
+        term::Terminal_buffer_id::ALTERNATE, alternate_handle);
+    ok &= check(single.exact_match && single.exact_logical_row == 0 &&
+        single.retained_line_id_match_count == 1,
+        "height shrink clears duplicate counts even when the remaining index size matches the grid");
+    model.ingest(QByteArrayView{});
+    const auto idle = model.retained_line_lookup(term::Terminal_buffer_id::ALTERNATE, alternate_handle);
+    ok &= check(idle.exact_match && idle.retained_line_id_match_count == 1,
+        "unchanged alternate-grid refresh keeps the rebuilt multiplicity");
+    return ok;
+}
+
 bool test_flat_ring_selection_handle_resolution_policy()
 {
     bool ok = true;
@@ -22977,6 +23047,7 @@ int main(int argc, char** argv)
     ok &= test_flat_ring_recovered_provenance_baseline();
     ok &= test_flat_ring_history_handle_resolution_statuses();
     ok &= test_flat_ring_direct_retained_lookup_index_and_validation();
+    ok &= test_active_retained_lookup_tracks_edits_moves_and_duplicate_removal();
     ok &= test_flat_ring_selection_handle_resolution_policy();
     ok &= test_flat_ring_viewport_handle_resolution_policy();
     ok &= test_flat_ring_public_projection_handle_resolution_policy();
