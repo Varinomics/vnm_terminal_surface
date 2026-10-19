@@ -6,7 +6,6 @@
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include <QByteArray>
-#include <QFontInfo>
 #include <QFontMetricsF>
 #include <QGlyphRun>
 #include <QLatin1Char>
@@ -88,210 +87,6 @@ std::size_t bounded_frame_reserve(
     const std::size_t row_bound = std::max(minimum, row_count * entries_per_row);
     return std::min(cell_count, row_bound);
 }
-
-#if VNM_TERMINAL_PROFILING_ENABLED
-constexpr std::uint64_t k_slow_text_layout_threshold_ns           = 10U * 1000U * 1000U;
-constexpr std::size_t   k_max_slow_text_layout_samples            = 16U;
-constexpr int           k_slow_text_layout_preview_utf16_units    = 96;
-constexpr int           k_slow_text_layout_codepoint_sample_count = 24;
-
-struct text_layout_diagnostic_context_t
-{
-    const QFont*                    font = nullptr;
-    const Terminal_render_text_run* run = nullptr;
-    bool                            clipped = false;
-    bool                            force_blended_order = false;
-    bool                            ascii_layout_font = false;
-};
-
-thread_local Terminal_text_layout_slow_diagnostics_recorder*
-    active_slow_text_layout_recorder = nullptr;
-thread_local const text_layout_diagnostic_context_t*
-    active_text_layout_diagnostic_context = nullptr;
-
-class Active_slow_text_layout_recorder_binding
-{
-public:
-    explicit Active_slow_text_layout_recorder_binding(
-        Terminal_text_layout_slow_diagnostics_recorder* recorder)
-    :
-        m_previous(active_slow_text_layout_recorder)
-    {
-        active_slow_text_layout_recorder = recorder;
-    }
-
-    ~Active_slow_text_layout_recorder_binding()
-    {
-        active_slow_text_layout_recorder = m_previous;
-    }
-
-    Active_slow_text_layout_recorder_binding(
-        const Active_slow_text_layout_recorder_binding&) = delete;
-    Active_slow_text_layout_recorder_binding& operator=(
-        const Active_slow_text_layout_recorder_binding&) = delete;
-
-private:
-    Terminal_text_layout_slow_diagnostics_recorder* m_previous = nullptr;
-};
-
-class Active_text_layout_diagnostic_context_binding
-{
-public:
-    explicit Active_text_layout_diagnostic_context_binding(
-        const text_layout_diagnostic_context_t* context)
-    :
-        m_previous(active_text_layout_diagnostic_context)
-    {
-        active_text_layout_diagnostic_context = context;
-    }
-
-    ~Active_text_layout_diagnostic_context_binding()
-    {
-        active_text_layout_diagnostic_context = m_previous;
-    }
-
-    Active_text_layout_diagnostic_context_binding(
-        const Active_text_layout_diagnostic_context_binding&) = delete;
-    Active_text_layout_diagnostic_context_binding& operator=(
-        const Active_text_layout_diagnostic_context_binding&) = delete;
-
-private:
-    const text_layout_diagnostic_context_t* m_previous = nullptr;
-};
-
-std::uint32_t codepoint_at(const QString& text, int& index)
-{
-    const QChar current = text.at(index);
-    if (current.isHighSurrogate() && index + 1 < text.size()) {
-        const QChar next = text.at(index + 1);
-        if (next.isLowSurrogate()) {
-            index += 2;
-            return 0x10000U +
-                (((static_cast<std::uint32_t>(current.unicode()) - 0xD800U) << 10U) |
-                    (static_cast<std::uint32_t>(next.unicode()) - 0xDC00U));
-        }
-    }
-
-    ++index;
-    return static_cast<std::uint32_t>(current.unicode());
-}
-
-int text_codepoint_count(const QString& text)
-{
-    int count = 0;
-    for (int index = 0; index < text.size();) {
-        (void)codepoint_at(text, index);
-        ++count;
-    }
-    return count;
-}
-
-std::uint64_t text_hash(const QString& text)
-{
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (const QChar character : text) {
-        hash ^= static_cast<std::uint64_t>(character.unicode());
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-QString text_codepoint_sample(const QString& text)
-{
-    QString sample;
-    int emitted = 0;
-    int index   = 0;
-    for (;
-        index < text.size() && emitted < k_slow_text_layout_codepoint_sample_count;)
-    {
-        const std::uint32_t codepoint = codepoint_at(text, index);
-        if (!sample.isEmpty()) {
-            sample += QLatin1Char(' ');
-        }
-        sample += QStringLiteral("U+%1")
-            .arg(
-                static_cast<qulonglong>(codepoint),
-                codepoint > 0xFFFFU ? 6 : 4,
-                16,
-                QLatin1Char('0'))
-            .toUpper();
-        ++emitted;
-    }
-    if (index < text.size()) {
-        sample += QStringLiteral(" ...");
-    }
-    return sample;
-}
-
-void classify_text(
-    const QString& text,
-    bool&          out_ascii_only,
-    bool&          out_printable_ascii_only,
-    bool&          out_has_control_codepoint)
-{
-    out_ascii_only            = true;
-    out_printable_ascii_only  = true;
-    out_has_control_codepoint = false;
-
-    for (const QChar character : text) {
-        const ushort value = character.unicode();
-        if (value > 0x7FU) {
-            out_ascii_only = false;
-            out_printable_ascii_only = false;
-        }
-        if (value < 0x20U || value == 0x7FU) {
-            out_has_control_codepoint = true;
-            out_printable_ascii_only = false;
-        }
-    }
-}
-
-terminal_text_layout_slow_diagnostic_t make_slow_text_layout_diagnostic(
-    std::uint64_t                      duration_ns,
-    const QFont&                       font,
-    const Terminal_render_text_run&    run,
-    bool                               clipped,
-    bool                               force_blended_order,
-    bool                               ascii_layout_font,
-    bool                               line_has_text)
-{
-    terminal_text_layout_slow_diagnostic_t diagnostic;
-    diagnostic.duration_ns              = duration_ns;
-    diagnostic.text_hash                = text_hash(run.text);
-    diagnostic.text_utf16_units         = run.text.size();
-    diagnostic.text_codepoints          = text_codepoint_count(run.text);
-    diagnostic.row                      = run.row;
-    diagnostic.logical_row              = run.logical_row;
-    diagnostic.column                   = run.column;
-    diagnostic.style_id                 = static_cast<int>(run.style_id);
-    diagnostic.hyperlink_id             = run.hyperlink_id;
-    diagnostic.rect_width               = run.rect.width();
-    diagnostic.rect_height              = run.rect.height();
-    diagnostic.font_point_size          = font.pointSizeF();
-    diagnostic.font_pixel_size          = font.pixelSize();
-    diagnostic.font_weight              = font.weight();
-    diagnostic.clipped                  = clipped;
-    diagnostic.force_blended_order      = force_blended_order;
-    diagnostic.ascii_layout_font        = ascii_layout_font;
-    diagnostic.line_has_text            = line_has_text;
-    diagnostic.font_italic              = font.italic();
-    diagnostic.font_family              = font.family();
-    diagnostic.font_style_name          = font.styleName();
-    const QFontInfo font_info(font);
-    diagnostic.resolved_font_family     = font_info.family();
-    diagnostic.resolved_font_style_name = font_info.styleName();
-    diagnostic.text_preview_truncated =
-        run.text.size() > k_slow_text_layout_preview_utf16_units;
-    diagnostic.text_preview     = run.text.left(k_slow_text_layout_preview_utf16_units);
-    diagnostic.codepoint_sample = text_codepoint_sample(run.text);
-    classify_text(
-        run.text,
-        diagnostic.ascii_only,
-        diagnostic.printable_ascii_only,
-        diagnostic.has_control_codepoint);
-    return diagnostic;
-}
-#endif
 
 QColor qcolor_from_rgba(quint32 rgba)
 {
@@ -678,75 +473,6 @@ Terminal_render_line_provenance line_provenance_for_viewport_row(
 }
 
 }
-
-#if VNM_TERMINAL_PROFILING_ENABLED
-void Terminal_text_layout_slow_diagnostics_recorder::reset()
-{
-    const std::lock_guard<std::mutex> lock(m_mutex);
-    m_slow_call_count = 0U;
-    m_samples.clear();
-}
-
-void Terminal_text_layout_slow_diagnostics_recorder::record_layout(
-    std::uint64_t                      duration_ns,
-    const QFont&                       font,
-    const Terminal_render_text_run&    run,
-    bool                               clipped,
-    bool                               force_blended_order,
-    bool                               ascii_layout_font,
-    bool                               line_has_text)
-{
-    if (duration_ns < k_slow_text_layout_threshold_ns) {
-        return;
-    }
-
-    terminal_text_layout_slow_diagnostic_t diagnostic = make_slow_text_layout_diagnostic(
-        duration_ns,
-        font,
-        run,
-        clipped,
-        force_blended_order,
-        ascii_layout_font,
-        line_has_text);
-
-    const std::lock_guard<std::mutex> lock(m_mutex);
-    ++m_slow_call_count;
-    if (m_samples.size() < k_max_slow_text_layout_samples) {
-        m_samples.push_back(std::move(diagnostic));
-    }
-    else {
-        const auto smallest = std::min_element(
-            m_samples.begin(),
-            m_samples.end(),
-            [](const auto& left, const auto& right) {
-                return left.duration_ns < right.duration_ns;
-            });
-        if (smallest               != m_samples.end() &&
-            diagnostic.duration_ns >  smallest->duration_ns)
-        {
-            *smallest = std::move(diagnostic);
-        }
-    }
-
-    std::sort(
-        m_samples.begin(),
-        m_samples.end(),
-        [](const auto& left, const auto& right) {
-            return left.duration_ns > right.duration_ns;
-        });
-}
-
-terminal_text_layout_slow_diagnostics_t
-Terminal_text_layout_slow_diagnostics_recorder::snapshot() const
-{
-    const std::lock_guard<std::mutex> lock(m_mutex);
-    return {
-        k_slow_text_layout_threshold_ns,
-        m_slow_call_count,
-        m_samples,
-    };
-}
-#endif
 
 terminal_renderer_lifecycle_stats_t Terminal_renderer_lifecycle_recorder::snapshot() const
 {
@@ -1228,21 +954,6 @@ void record_simple_content_classification(
         eligibility_flags);
 }
 
-bool cell_text_decoration_enabled(
-    const Terminal_render_cell&    cell,
-    std::size_t                    style_count,
-    Render_style_attribute_cache&  style_attributes)
-{
-    if (cell.wide_continuation ||
-        static_cast<std::size_t>(cell.style_id) >= style_count)
-    {
-        return false;
-    }
-
-    const render_style_attributes_t& style = style_attributes.attributes(cell.style_id);
-    return style.underline || style.strike;
-}
-
 bool cell_intersects_grid_columns(
     const Terminal_render_cell&    cell,
     int                            first_column,
@@ -1254,30 +965,6 @@ bool cell_intersects_grid_columns(
         column_count         > 0        &&
         cell.position.column < span_end &&
         first_column         < cell_end;
-}
-
-bool block_cursor_covers_cell(
-    const Terminal_render_cell&    cell,
-    const Terminal_render_cursor&  cursor,
-    bool                           block_cursor_visible)
-{
-    return
-        block_cursor_visible                     &&
-        cell.position.row == cursor.position.row &&
-        cell_intersects_grid_columns(cell, cursor.position.column, 1);
-}
-
-bool ime_preedit_covers_cell(
-    const Terminal_render_cell&    cell,
-    bool                           ime_preedit_visible,
-    int                            ime_preedit_row,
-    int                            ime_preedit_column,
-    int                            ime_preedit_columns)
-{
-    return
-        ime_preedit_visible                  &&
-        cell.position.row == ime_preedit_row &&
-        cell_intersects_grid_columns(cell, ime_preedit_column, ime_preedit_columns);
 }
 
 struct Snapshot_dirty_row_flags

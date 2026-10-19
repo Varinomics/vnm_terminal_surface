@@ -8,7 +8,6 @@
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/profile_text_writers.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
-#include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/terminal_session.h"
@@ -280,68 +279,6 @@ void append_session_profile_stats_section(
         });
 }
 
-void append_slow_text_layout_diagnostics_section(
-    QTextStream&           stream,
-    const term::terminal_text_layout_slow_diagnostics_t&
-                           diagnostics)
-{
-    stream
-        << "slow_text_layouts"
-        << " threshold_ns="   << static_cast<qulonglong>(diagnostics.threshold_ns)
-        << " slow_calls="     << static_cast<qulonglong>(diagnostics.slow_call_count)
-        << " stored_samples=" << static_cast<qulonglong>(diagnostics.samples.size())
-        << '\n';
-
-    int index = 0;
-    for (const term::terminal_text_layout_slow_diagnostic_t& sample :
-        diagnostics.samples)
-    {
-        stream
-            << "  sample index="    << index
-            << " duration_ns="      << static_cast<qulonglong>(sample.duration_ns)
-            << " text_utf16_units=" << sample.text_utf16_units
-            << " text_codepoints="  << sample.text_codepoints
-            << " text_hash="        << static_cast<qulonglong>(sample.text_hash)
-            << " row="              << sample.row
-            << " logical_row="      << sample.logical_row
-            << " column="           << sample.column
-            << " style_id="         << sample.style_id
-            << " hyperlink_id="     << static_cast<qulonglong>(sample.hyperlink_id)
-            << " rect_width="       << sample.rect_width
-            << " rect_height="      << sample.rect_height
-            << " ascii_only="       << (sample.ascii_only ? "true" : "false")
-            << " printable_ascii_only="
-            << (sample.printable_ascii_only ? "true" : "false")
-            << " has_control_codepoint="
-            << (sample.has_control_codepoint ? "true" : "false")
-            << " clipped="          << (sample.clipped ? "true" : "false")
-            << " force_blended_order="
-            << (sample.force_blended_order ? "true" : "false")
-            << " ascii_layout_font="
-            << (sample.ascii_layout_font ? "true" : "false")
-            << " line_has_text="    << (sample.line_has_text ? "true" : "false")
-            << " font_family="      << profile_string_literal(sample.font_family)
-            << " font_style_name="
-            << profile_string_literal(sample.font_style_name)
-            << " resolved_font_family="
-            << profile_string_literal(sample.resolved_font_family)
-            << " resolved_font_style_name="
-            << profile_string_literal(sample.resolved_font_style_name)
-            << " font_point_size="  << sample.font_point_size
-            << " font_pixel_size="  << sample.font_pixel_size
-            << " font_weight="      << sample.font_weight
-            << " font_italic="      << (sample.font_italic ? "true" : "false")
-            << " codepoints="
-            << profile_string_literal(sample.codepoint_sample)
-            << " text_preview_truncated="
-            << (sample.text_preview_truncated ? "true" : "false")
-            << " text_preview="
-            << profile_string_literal(sample.text_preview)
-            << '\n';
-        ++index;
-    }
-}
-
 void append_qsg_atlas_profile_section(
     QTextStream&                         stream,
     const term::Qsg_atlas_frame_report&  report)
@@ -354,30 +291,30 @@ void append_qsg_atlas_profile_section(
     stream << "  text_renderer_policy="
         << QString::fromLatin1(
             term::qsg_atlas_text_renderer_policy_name(
-                report.text_renderer_policy))
+                report.render.text_renderer_policy))
         << '\n';
     stream << "  effective_text_renderer="
         << QString::fromLatin1(
             term::qsg_atlas_text_renderer_kind_name(
-                report.effective_text_renderer))
+                report.render.effective_text_renderer))
         << '\n';
     stream << "  msdf_lcd_subpixel_order="
         << QString::fromLatin1(
             term::qsg_atlas_lcd_subpixel_order_name(
-                report.msdf_lcd_subpixel_order))
+                report.render.msdf_lcd_subpixel_order))
         << '\n';
     append_profile_bool(
         stream,
         "msdf_lcd_text_enabled",
-        report.msdf_lcd_text_enabled);
+        report.render.msdf_lcd_text_enabled);
     append_profile_bool(
         stream,
         "text_renderer_fallback_allowed",
-        report.text_renderer_fallback_allowed);
+        report.render.text_renderer_fallback_allowed);
     append_profile_bool(
         stream,
         "text_renderer_fallback_used",
-        report.text_renderer_fallback_used);
+        report.render.text_renderer_fallback_used);
     stream << "  sampler_mode="
         << QString::fromLatin1(
             term::qsg_atlas_sampler_mode_name(report.render.glyph_sampler_mode))
@@ -626,7 +563,12 @@ void append_slow_text_layout_diagnostics_text(
 {
     const term::Render_profile_snapshot_t render_profile =
         term::VNM_TerminalSurface_render_bridge::render_profiler_snapshot(surface);
-    append_slow_text_layout_diagnostics_section(out, render_profile.slow_text_layouts);
+    out
+        << "slow_text_layouts"
+        << " threshold_ns="   << static_cast<qulonglong>(render_profile.slow_text_layout_threshold_ns)
+        << " slow_calls="     << static_cast<qulonglong>(0U)
+        << " stored_samples=" << static_cast<qulonglong>(0U)
+        << '\n';
 }
 
 void append_surface_geometry_profile_text(

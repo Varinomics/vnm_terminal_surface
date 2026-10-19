@@ -110,6 +110,29 @@ std::shared_ptr<const term::Terminal_render_snapshot> make_smoke_snapshot(
     return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
 }
 
+bool test_slow_text_layout_section_tracks_profiler_state()
+{
+    VNM_TerminalSurface surface;
+
+    QString     text;
+    QTextStream stream(&text);
+
+    diag::append_slow_text_layout_diagnostics_text(surface, stream);
+    term::VNM_TerminalSurface_render_bridge::set_render_profiler(
+        surface,
+        std::make_shared<term::Hierarchical_profiler>());
+    diag::append_slow_text_layout_diagnostics_text(surface, stream);
+    term::VNM_TerminalSurface_render_bridge::set_render_profiler(surface, {});
+    diag::append_slow_text_layout_diagnostics_text(surface, stream);
+    stream.flush();
+
+    return check(text == QStringLiteral(
+        "slow_text_layouts threshold_ns=0 slow_calls=0 stored_samples=0\n"
+        "slow_text_layouts threshold_ns=10000000 slow_calls=0 stored_samples=0\n"
+        "slow_text_layouts threshold_ns=0 slow_calls=0 stored_samples=0\n"),
+        "slow-layout text preserves exact output before, during, and after profiling");
+}
+
 bool test_profile_text_sections(QGuiApplication& app)
 {
     bool ok = true;
@@ -266,6 +289,7 @@ int main(int argc, char** argv)
 
     bool ok = true;
     ok &= test_profile_text_sections(app);
+    ok &= test_slow_text_layout_section_tracks_profiler_state();
     return ok ? 0 : 1;
 }
 

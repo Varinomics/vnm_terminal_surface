@@ -334,26 +334,26 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
         QStringLiteral("text_renderer_policy"),
         QString::fromLatin1(
             internal::qsg_atlas_text_renderer_policy_name(
-                report.text_renderer_policy)));
+                report.render.text_renderer_policy)));
     object.insert(
         QStringLiteral("effective_text_renderer"),
         QString::fromLatin1(
             internal::qsg_atlas_text_renderer_kind_name(
-                report.effective_text_renderer)));
+                report.render.effective_text_renderer)));
     object.insert(
         QStringLiteral("text_renderer_fallback_allowed"),
-        report.text_renderer_fallback_allowed);
+        report.render.text_renderer_fallback_allowed);
     object.insert(
         QStringLiteral("text_renderer_fallback_used"),
-        report.text_renderer_fallback_used);
+        report.render.text_renderer_fallback_used);
     object.insert(
         QStringLiteral("msdf_lcd_subpixel_order"),
         QString::fromLatin1(
             internal::qsg_atlas_lcd_subpixel_order_name(
-                report.msdf_lcd_subpixel_order)));
+                report.render.msdf_lcd_subpixel_order)));
     object.insert(
         QStringLiteral("msdf_lcd_text_enabled"),
-        report.msdf_lcd_text_enabled);
+        report.render.msdf_lcd_text_enabled);
 
     detail::emit_metrics_json(object, report, detail::atlas_report_sequence_metrics());
     object.insert(QStringLiteral("command_buffer_non_null"), report.command_buffer_non_null);

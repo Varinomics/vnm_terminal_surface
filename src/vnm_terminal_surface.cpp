@@ -1099,31 +1099,6 @@ void append_selection_trace_reason(QString& reasons, const QString& reason)
     reasons += reason;
 }
 
-QString selection_trace_drag_coordinate_mismatch_reason(
-    const term::terminal_selection_source_identity_t& left,
-    const term::terminal_selection_source_identity_t& right)
-{
-    QString reasons;
-    if (left.source_content_basis.grid_reflow_generation !=
-        right.source_content_basis.grid_reflow_generation)
-    {
-        append_selection_trace_reason(reasons, QStringLiteral("content-reflow"));
-    }
-    if (left.session_epoch != right.session_epoch) {
-        append_selection_trace_reason(reasons, QStringLiteral("epoch"));
-    }
-    if (left.buffer_id != right.buffer_id) {
-        append_selection_trace_reason(reasons, QStringLiteral("buffer"));
-    }
-    if (left.grid_reflow_basis != right.grid_reflow_basis) {
-        append_selection_trace_reason(reasons, QStringLiteral("grid-reflow"));
-    }
-    if (!term::grid_sizes_match(left.grid_size, right.grid_size)) {
-        append_selection_trace_reason(reasons, QStringLiteral("grid-size"));
-    }
-    return reasons.isEmpty() ? QStringLiteral("none") : reasons;
-}
-
 QString selection_trace_source_snapshot_mismatch_reason(
     const std::optional<term::terminal_selection_source_identity_t>& source,
     const std::shared_ptr<const term::Terminal_render_snapshot>&     snapshot)
@@ -1910,41 +1885,15 @@ struct VNM_TerminalSurface::Private
         const std::lock_guard<std::mutex> lock(render_profiler_mutex);
         render_profiler = std::move(profiler);
         render_profiler_snapshot = {};
-        if (render_profiler != nullptr) {
-            if (slow_text_layout_recorder == nullptr) {
-                slow_text_layout_recorder =
-                    std::make_shared<term::Terminal_text_layout_slow_diagnostics_recorder>();
-            }
-            else {
-                slow_text_layout_recorder->reset();
-            }
-        }
-        else {
-            slow_text_layout_recorder.reset();
-        }
         render_profiler_enabled.store(render_profiler != nullptr, std::memory_order_release);
-    }
-
-    std::shared_ptr<term::Terminal_text_layout_slow_diagnostics_recorder>
-    slow_text_layout_recorder_handle() const
-    {
-        if (!render_profiler_enabled.load(std::memory_order_acquire)) {
-            return {};
-        }
-
-        const std::lock_guard<std::mutex> lock(render_profiler_mutex);
-        return slow_text_layout_recorder;
     }
 
     term::Render_profile_snapshot_t current_render_profiler_snapshot() const
     {
         std::shared_ptr<term::Hierarchical_profiler> profiler;
-        std::shared_ptr<term::Terminal_text_layout_slow_diagnostics_recorder>
-            slow_recorder;
         {
             const std::lock_guard<std::mutex> lock(render_profiler_mutex);
-            profiler      = render_profiler;
-            slow_recorder = slow_text_layout_recorder;
+            profiler = render_profiler;
         }
 
         if (profiler == nullptr) {
@@ -1962,9 +1911,7 @@ struct VNM_TerminalSurface::Private
         }
         snapshot.root     = profiler->root_snapshot();
         snapshot.timeline = profiler->timeline_snapshot();
-        if (slow_recorder != nullptr) {
-            snapshot.slow_text_layouts = slow_recorder->snapshot();
-        }
+        snapshot.slow_text_layout_threshold_ns = 10U * 1000U * 1000U;
 
         const std::lock_guard<std::mutex> lock(render_profiler_mutex);
         if (render_profiler == profiler) {
@@ -3238,8 +3185,6 @@ struct VNM_TerminalSurface::Private
     mutable std::mutex                                     render_profiler_mutex;
     std::shared_ptr<term::Hierarchical_profiler>           render_profiler;
     mutable term::Render_profile_snapshot_t                 render_profiler_snapshot;
-    std::shared_ptr<term::Terminal_text_layout_slow_diagnostics_recorder>
-                                                           slow_text_layout_recorder;
     std::atomic_bool                                       render_profiler_enabled               = false;
 #endif
     mutable std::mutex                                     renderer_lifecycle_recorder_mutex;

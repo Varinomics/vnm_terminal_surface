@@ -1,86 +1,10 @@
 #pragma once
 
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
-#include "vnm_terminal/internal/terminal_hyperlink.h"
-#include <QFont>
-#include <QString>
 #include <cstdint>
-#include <memory>
 #include <mutex>
-#include <vector>
-
-#if !defined(VNM_TERMINAL_PROFILING_ENABLED)
-#define VNM_TERMINAL_PROFILING_ENABLED 0
-#endif
 
 namespace vnm_terminal::internal {
-
-struct Terminal_render_text_run;
-
-#if VNM_TERMINAL_PROFILING_ENABLED
-struct terminal_text_layout_slow_diagnostic_t
-{
-    std::uint64_t  duration_ns                = 0U;
-    std::uint64_t  text_hash                  = 0U;
-    int            text_utf16_units           = 0;
-    int            text_codepoints            = 0;
-    int            row                        = 0;
-    int            logical_row                = 0;
-    int            column                     = 0;
-    int            style_id                   = 0;
-    Terminal_hyperlink_id hyperlink_id = k_no_terminal_hyperlink_id;
-    qreal          rect_width                 = 0.0;
-    qreal          rect_height                = 0.0;
-    qreal          font_point_size            = 0.0;
-    int            font_pixel_size            = 0;
-    int            font_weight                = 0;
-    bool           ascii_only                 = false;
-    bool           printable_ascii_only       = false;
-    bool           has_control_codepoint      = false;
-    bool           clipped                    = false;
-    bool           force_blended_order        = false;
-    bool           ascii_layout_font          = false;
-    bool           line_has_text              = false;
-    bool           text_preview_truncated     = false;
-    bool           font_italic                = false;
-    QString        font_family;
-    QString        font_style_name;
-    QString        resolved_font_family;
-    QString        resolved_font_style_name;
-    QString        text_preview;
-    QString        codepoint_sample;
-};
-
-struct terminal_text_layout_slow_diagnostics_t
-{
-    std::uint64_t  threshold_ns    = 0U;
-    std::uint64_t  slow_call_count = 0U;
-    std::vector<terminal_text_layout_slow_diagnostic_t>
-                   samples;
-};
-
-class Terminal_text_layout_slow_diagnostics_recorder final
-{
-public:
-    void reset();
-
-    void record_layout(
-        std::uint64_t                      duration_ns,
-        const QFont&                       font,
-        const Terminal_render_text_run&    run,
-        bool                               clipped,
-        bool                               force_blended_order,
-        bool                               ascii_layout_font,
-        bool                               line_has_text);
-
-    terminal_text_layout_slow_diagnostics_t snapshot() const;
-
-private:
-    mutable std::mutex                                  m_mutex;
-    std::uint64_t                                       m_slow_call_count = 0U;
-    std::vector<terminal_text_layout_slow_diagnostic_t> m_samples;
-};
-#endif
 
 struct terminal_renderer_lifecycle_stats_t
 {

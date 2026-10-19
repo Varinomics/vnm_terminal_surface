@@ -640,23 +640,6 @@ QString selection_trace_range(const Terminal_selection_range& range)
         .arg(static_cast<int>(range.mode));
 }
 
-template <typename ranges_t>
-QString selection_trace_ranges(const ranges_t& ranges)
-{
-    if (ranges.empty()) {
-        return QStringLiteral("none");
-    }
-
-    QString text;
-    for (const Terminal_selection_range& range : ranges) {
-        if (!text.isEmpty()) {
-            text += QLatin1Char(';');
-        }
-        text += selection_trace_range(range);
-    }
-    return text;
-}
-
 QString selection_trace_selection_requests(
     const std::vector<Terminal_render_selection_request>& requests)
 {
@@ -1076,15 +1059,6 @@ bool active_model_matches_published_selection_source(
         source.row_origin_generation == row_origin_generation        &&
         grid_sizes_match(source.grid_size, model.grid_size())        &&
         viewport_mappings_match(source.viewport_mapping, viewport);
-}
-
-bool model_should_publish_render_snapshot(
-    const Terminal_screen_model&           model,
-    const Terminal_screen_model_result&    result)
-{
-    return
-        model_result_warrants_render_snapshot(result) &&
-        model_allows_render_snapshot(model);
 }
 
 std::optional<Terminal_buffer_id> active_buffer_after_from_mode_transition_delta(

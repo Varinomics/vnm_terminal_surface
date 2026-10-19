@@ -18645,61 +18645,61 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
     capabilities.insert(QStringLiteral("rhi_non_null"), report.rhi_non_null);
     capabilities.insert(
         QStringLiteral("msdf_text_renderer_enabled"),
-        report.msdf_text_renderer_enabled);
+        report.render.msdf_text_renderer_enabled);
     capabilities.insert(
         QStringLiteral("msdf_text_renderer_compiled"),
-        report.msdf_text_renderer_compiled);
+        report.render.msdf_text_renderer_compiled);
     capabilities.insert(
         QStringLiteral("msdf_text_renderer_active"),
-        report.msdf_text_renderer_active);
+        report.render.msdf_text_renderer_active);
     capabilities.insert(
         QStringLiteral("msdf_text_shader_package_available"),
-        report.msdf_text_shader_package_available);
+        report.render.msdf_text_shader_package_available);
     capabilities.insert(
         QStringLiteral("msdf_text_atlas_built"),
-        report.msdf_text_atlas_built);
+        report.render.msdf_text_atlas_built);
     capabilities.insert(
         QStringLiteral("msdf_text_atlas_ready"),
-        report.msdf_text_atlas_ready);
+        report.render.msdf_text_atlas_ready);
     capabilities.insert(
         QStringLiteral("msdf_text_texture_ready"),
-        report.msdf_text_texture_ready);
+        report.render.msdf_text_texture_ready);
     capabilities.insert(
         QStringLiteral("msdf_text_resources_ready"),
-        report.msdf_text_resources_ready);
+        report.render.msdf_text_resources_ready);
     capabilities.insert(
         QStringLiteral("msdf_text_supported_runs"),
-        report.msdf_text_supported_runs);
+        report.render.msdf_text_supported_runs);
     capabilities.insert(
         QStringLiteral("msdf_text_runs"),
-        report.msdf_text_runs);
+        report.render.msdf_text_runs);
     capabilities.insert(
         QStringLiteral("msdf_text_glyph_instances"),
-        report.msdf_text_glyph_instances);
+        report.render.msdf_text_glyph_instances);
     capabilities.insert(
         QStringLiteral("msdf_text_draw_calls"),
-        report.msdf_text_draw_calls);
+        report.render.msdf_text_draw_calls);
     capabilities.insert(
         QStringLiteral("msdf_text_missed_supported_runs"),
-        report.msdf_text_missed_supported_runs);
+        report.render.msdf_text_missed_supported_runs);
     capabilities.insert(
         QStringLiteral("msdf_text_missed_supported_glyphs"),
-        report.msdf_text_missed_supported_glyphs);
+        report.render.msdf_text_missed_supported_glyphs);
     capabilities.insert(
         QStringLiteral("msdf_text_message"),
-        report.msdf_text_message);
+        report.render.msdf_text_message);
     capabilities.insert(
         QStringLiteral("msdf_text_font_data_bytes"),
-        report.msdf_text_font_data_bytes);
+        report.render.msdf_text_font_data_bytes);
     capabilities.insert(
         QStringLiteral("msdf_text_pixel_height"),
-        report.msdf_text_pixel_height);
+        report.render.msdf_text_pixel_height);
     capabilities.insert(
         QStringLiteral("msdf_text_atlas_size"),
-        report.msdf_text_atlas_size);
+        report.render.msdf_text_atlas_size);
     capabilities.insert(
         QStringLiteral("msdf_text_px_range"),
-        report.msdf_text_px_range);
+        report.render.msdf_text_px_range);
     capabilities.insert(
         QStringLiteral("coverage_texture_created"),
         report.coverage_texture_created);
