@@ -3,12 +3,15 @@
 #include "helpers/test_check.h"
 
 #include <QByteArray>
+#include <QSemaphore>
 #include <QString>
+#include <QThreadPool>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 namespace term = vnm_terminal::internal;
@@ -111,6 +114,62 @@ term::Terminal_search_source_row search_test_row(
     }
     return row;
 }
+
+term::Terminal_search_source_row retained_search_test_row(
+    std::uint64_t identity,
+    std::uint64_t ordinal,
+    QStringView   text)
+{
+    auto row = search_test_row(identity, -1, text);
+    row.retained_ordinal = ordinal;
+    return row;
+}
+
+class Search_worker_barrier
+{
+public:
+    Search_worker_barrier()
+
+    :
+        m_pool(QThreadPool::globalInstance()),
+        m_previous_width(m_pool->maxThreadCount())
+    {
+        m_pool->setMaxThreadCount(1);
+        m_pool->start([
+                this
+            ]()
+            {
+                m_started.release();
+                m_release.acquire();
+                m_finished.release();
+            });
+    }
+
+    ~Search_worker_barrier()
+    {
+        release();
+        m_finished.acquire();
+        m_pool->setMaxThreadCount(m_previous_width);
+    }
+
+    bool started() { return m_started.tryAcquire(1, 5000); }
+
+    void release()
+    {
+        if (!m_released) {
+            m_released = true;
+            m_release.release();
+        }
+    }
+
+private:
+    QThreadPool* m_pool;
+    int          m_previous_width;
+    QSemaphore   m_started;
+    QSemaphore   m_release;
+    QSemaphore   m_finished;
+    bool         m_released = false;
+};
 
 bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
 {
@@ -236,6 +295,165 @@ bool test_active_search_refresh_preserves_retained_prefix_and_navigation()
         "structural updates retain the asynchronous publication boundary");
     ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
         "structural refresh completes");
+    return ok;
+}
+
+bool test_active_reset_preserves_retained_matches_with_history_changes()
+{
+    term::Terminal_search_controller search;
+    term::Terminal_search_source_update initial;
+    initial.identity.grid_size           = {3, 20};
+    initial.identity.active_buffer_epoch = 1U;
+    initial.revision                     = 1U;
+    initial.end_retained_ordinal         = 3U;
+    initial.reset_retained_rows          = true;
+    initial.reset_active_rows            = true;
+    initial.retained_rows = {
+        retained_search_test_row(1U, 0U, u"a"),
+        retained_search_test_row(2U, 1U, u"a"),
+        retained_search_test_row(3U, 2U, u"-"),
+    };
+    initial.active_rows = {
+        search_test_row(4U, 0, u"a"),
+        search_test_row(5U, 1, u"aa"),
+        search_test_row(6U, 2, u"a"),
+    };
+    search.update_source(initial);
+    search.set_query(QStringLiteral("a"), 1);
+    bool ok = check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "search with retained and active matches completes");
+    ok &= check(search.result_state().match_count == 6 &&
+        search.result_state().current_match == 2,
+        "initial search selects the requested retained row");
+    const auto retained_anchor = search.current_match();
+
+    term::Terminal_search_source_update replacement;
+    replacement.identity               = initial.identity;
+    replacement.revision               = 2U;
+    replacement.first_retained_ordinal = 1U;
+    replacement.end_retained_ordinal   = 4U;
+    replacement.reset_active_rows      = true;
+    replacement.retained_rows.push_back(retained_search_test_row(7U, 3U, u"aa"));
+    replacement.active_rows = {
+        search_test_row(8U,  0, u"-"),
+        search_test_row(9U,  1, u"a"),
+        search_test_row(10U, 2, u"-"),
+    };
+    search.update_source(replacement);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "active replacement with retained append and eviction completes");
+    const auto current = search.current_match();
+    ok &= check(
+        retained_anchor && current && current->identity == retained_anchor->identity &&
+            current->public_row == 0 && search.result_state().match_count == 4 &&
+            search.result_state().current_match == 1,
+        "retained match identity survives eviction while counts include appended and replaced rows");
+    ok &= check(search.select_previous() && search.result_state().current_match == 4,
+        "navigation wraps to the final replacement active match");
+
+    {
+        Search_worker_barrier barrier;
+        if (!check(barrier.started(), "search worker barrier starts")) {
+            return false;
+        }
+
+        // A source-origin change queues the first update. The following reset
+        // supersedes that active row before the worker can consume either one.
+        term::Terminal_search_source_update queued;
+        queued.identity                      = replacement.identity;
+        queued.identity.row_origin_generation = 1U;
+        queued.revision                      = 3U;
+        queued.first_retained_ordinal        = 1U;
+        queued.end_retained_ordinal          = 4U;
+        queued.active_rows.push_back(search_test_row(11U, 2, u"aa"));
+        search.update_source(queued);
+
+        term::Terminal_search_source_update shorter;
+        shorter.identity               = queued.identity;
+        shorter.identity.grid_size.rows = 1;
+        shorter.revision               = 4U;
+        shorter.first_retained_ordinal = 1U;
+        shorter.end_retained_ordinal   = 4U;
+        shorter.reset_active_rows      = true;
+        shorter.active_rows.push_back(search_test_row(12U, 0, u"a"));
+        search.update_source(std::move(shorter));
+        barrier.release();
+        ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+            "queued active mutation followed by a shorter replacement completes");
+    }
+
+    ok &= check(search.result_state().match_count == 4 &&
+        search.result_state().current_match == 1,
+        "shorter active replacement removes obsolete rows and preserves the retained prefix");
+    ok &= check(search.select_previous(), "navigation reaches the shortened active grid");
+    const auto shortened_match = search.current_match();
+    ok &= check(shortened_match && shortened_match->identity.history_handle.row_sequence == 12U &&
+        shortened_match->public_row == 3 && search.result_state().current_match == 4,
+        "queued superseded rows cannot retain matches outside the replacement grid");
+    return ok;
+}
+
+bool test_active_reset_keeps_structural_search_invalidation()
+{
+    term::Terminal_search_controller search;
+    term::Terminal_search_source_update initial;
+    initial.identity.grid_size           = {2, 20};
+    initial.identity.active_buffer_epoch = 1U;
+    initial.revision                     = 1U;
+    initial.end_retained_ordinal         = 1U;
+    initial.reset_retained_rows          = true;
+    initial.reset_active_rows            = true;
+    initial.retained_rows.push_back(retained_search_test_row(1U, 0U, u"----a"));
+    initial.active_rows = {
+        search_test_row(2U, 0, u"-"),
+        search_test_row(3U, 1, u"-"),
+    };
+    search.update_source(initial);
+    search.set_query(QStringLiteral("a"), 0);
+    bool ok = check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "width-sensitive retained search completes");
+    ok &= check(search.result_state().match_count == 1,
+        "wide retained projection includes the rightmost match");
+
+    term::Terminal_search_source_update narrow;
+    narrow.identity                   = initial.identity;
+    narrow.identity.grid_size.columns = 3;
+    narrow.revision                   = 2U;
+    narrow.end_retained_ordinal       = 1U;
+    narrow.reset_active_rows          = true;
+    narrow.active_rows                = initial.active_rows;
+    search.update_source(narrow);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "active replacement at a narrower width completes");
+    ok &= check(search.result_state().match_count == 0,
+        "width changes rescan retained matches outside the new projection");
+
+    term::Terminal_search_source_update alternate;
+    alternate.identity                     = initial.identity;
+    alternate.identity.active_buffer       = term::Terminal_buffer_id::ALTERNATE;
+    alternate.identity.active_buffer_epoch = 2U;
+    alternate.revision                     = 3U;
+    alternate.end_retained_ordinal         = 1U;
+    alternate.reset_active_rows            = true;
+    alternate.active_rows = {
+        search_test_row(4U, 0, u"aa"),
+        search_test_row(5U, 1, u"-"),
+    };
+    search.update_source(alternate);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "alternate source replacement completes");
+    ok &= check(search.result_state().match_count == 2,
+        "alternate source contains only active matches");
+
+    alternate.revision             = 4U;
+    alternate.end_retained_ordinal = 2U;
+    alternate.retained_rows.push_back(retained_search_test_row(6U, 1U, u"aaaa"));
+    alternate.active_rows[0] = search_test_row(7U, 0, u"a");
+    search.update_source(std::move(alternate));
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "alternate reset with hidden primary history changes completes");
+    ok &= check(search.result_state().match_count == 1,
+        "retained primary rows cannot enter alternate search during active replacement");
     return ok;
 }
 
@@ -473,6 +691,8 @@ int main()
     ok &= test_identity_spans_stay_implicit_until_needed();
     ok &= test_case_mode_rescans_and_preserves_unicode_cell_spans();
     ok &= test_active_search_refresh_preserves_retained_prefix_and_navigation();
+    ok &= test_active_reset_preserves_retained_matches_with_history_changes();
+    ok &= test_active_reset_keeps_structural_search_invalidation();
     ok &= test_search_row_text_matches_published_snapshot_rows();
     ok &= test_retained_history_ordinal_range_tracks_appends_and_evictions();
 

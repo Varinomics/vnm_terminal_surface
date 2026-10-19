@@ -249,6 +249,7 @@ struct Terminal_search_controller::Shared_state
     {
         std::set<std::uint64_t> changed_retained_ordinals;
         std::set<int>           changed_active_rows;
+        bool                    reset_active_rows = false;
         bool                    rescan_all = false;
     };
 
@@ -751,7 +752,18 @@ private:
                 active_rows.clear();
                 active_rows.resize(static_cast<std::size_t>(
                     std::max(0, update.identity.grid_size.rows)));
-                changes.rescan_all = true;
+                changes.reset_active_rows = true;
+                changes.changed_active_rows.clear();
+
+                // Replacing the active grid does not change the surviving
+                // retained rows. Their matches remain valid at the same width
+                // and source epoch; alternate search has no history to reuse.
+                changes.rescan_all = changes.rescan_all ||
+                    update.identity.active_buffer != Terminal_buffer_id::PRIMARY ||
+                    corpus.identity.active_buffer_epoch != update.identity.active_buffer_epoch ||
+                    corpus.identity.grid_size.columns != update.identity.grid_size.columns ||
+                    corpus.identity.content_basis.grid_reflow_generation !=
+                        update.identity.content_basis.grid_reflow_generation;
             }
             for (Terminal_search_source_row& row : update.active_rows) {
                 if (row.active_grid_row < 0 ||
@@ -1005,8 +1017,9 @@ private:
                 changes.changed_retained_ordinals.contains(it->first.position);
             const bool changed_active =
                 it->first.active_grid &&
-                changes.changed_active_rows.contains(
-                    static_cast<int>(it->first.position));
+                (changes.reset_active_rows ||
+                    changes.changed_active_rows.contains(
+                        static_cast<int>(it->first.position)));
             if (changed_active || evicted_retained || changed_retained) {
                 it = completed.matches.erase(it);
             }
