@@ -1,5 +1,19 @@
 include_guard(GLOBAL)
 
+# Sources are configuration-resolved targets; destinations are relative to the
+# hosting process, whose enclosing bundle layout belongs to its application.
+function(vnm_process_custody_runtime_files output)
+    set(files)
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+        if(NOT TARGET vnm_process_custody::vnm_process_custody_owner)
+            message(FATAL_ERROR "The process custody provider has no POSIX owner executable")
+        endif()
+        list(APPEND files
+            "$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>|vnm_process_custody_owner")
+    endif()
+    set(${output} "${files}" PARENT_SCOPE)
+endfunction()
+
 # Runtime lookup is relative to the hosting executable. Target locations are
 # used only to assemble that runtime, including when the provider is imported.
 function(vnm_process_custody_deploy_owner target)
@@ -10,9 +24,7 @@ function(vnm_process_custody_deploy_owner target)
     if(arg_UNPARSED_ARGUMENTS OR arg_KEYWORDS_MISSING_VALUES)
         message(FATAL_ERROR "vnm_process_custody_deploy_owner: invalid arguments")
     endif()
-    if(NOT TARGET vnm_process_custody::vnm_process_custody_owner)
-        message(FATAL_ERROR "The process custody provider has no POSIX owner executable")
-    endif()
+    vnm_process_custody_runtime_files(files)
     set(destination "${arg_DESTINATION}")
     if(NOT destination)
         set(destination "$<TARGET_FILE_DIR:${target}>")
@@ -22,13 +34,19 @@ function(vnm_process_custody_deploy_owner target)
     # requiring the host to relink, and can be called across directory scopes.
     cmake_policy(PUSH)
     cmake_policy(SET CMP0112 NEW)
-    add_custom_target(${target}_process_owner_runtime
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${destination}"
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>"
-            "${destination}/vnm_process_custody_owner"
-        DEPENDS vnm_process_custody::vnm_process_custody_owner
-        VERBATIM)
+    set(commands)
+    set(sources)
+    foreach(file IN LISTS files)
+        string(REPLACE "|" ";" parts "${file}")
+        list(GET parts 0 source)
+        list(GET parts 1 relative)
+        get_filename_component(directory "${relative}" DIRECTORY)
+        list(APPEND commands
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${destination}/${directory}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${source}" "${destination}/${relative}")
+        list(APPEND sources "${source}")
+    endforeach()
+    add_custom_target(${target}_process_owner_runtime ${commands} DEPENDS ${sources} VERBATIM)
     cmake_policy(POP)
     add_dependencies(${target} ${target}_process_owner_runtime)
 endfunction()
@@ -45,8 +63,16 @@ function(vnm_process_custody_install_owner)
     if(arg_COMPONENT)
         list(APPEND options COMPONENT "${arg_COMPONENT}")
     endif()
-    install(PROGRAMS "$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>"
-        DESTINATION "${arg_DESTINATION}" ${options})
+    vnm_process_custody_runtime_files(files)
+    foreach(file IN LISTS files)
+        string(REPLACE "|" ";" parts "${file}")
+        list(GET parts 0 source)
+        list(GET parts 1 relative)
+        get_filename_component(directory "${relative}" DIRECTORY)
+        get_filename_component(name "${relative}" NAME)
+        install(PROGRAMS "${source}" DESTINATION "${arg_DESTINATION}/${directory}"
+            RENAME "${name}" ${options})
+    endforeach()
     get_property(license_files GLOBAL PROPERTY VNM_PROCESS_CUSTODY_LICENSE_FILES)
     if(NOT license_files)
         message(FATAL_ERROR "The process custody provider has no distribution license notices")

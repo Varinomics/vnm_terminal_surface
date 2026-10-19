@@ -2744,6 +2744,17 @@ math(EXPR vnm_terminal_surface_next_patch "${PROJECT_VERSION_PATCH} + 1")
 set(vnm_terminal_surface_next_version
     "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${vnm_terminal_surface_next_patch}")
 
+find_program(vnm_process_custody_test_ninja NAMES ninja)
+if(vnm_process_custody_test_ninja)
+    add_test(NAME vnm_terminal_process_custody_runtime_tests
+        COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/process_custody_runtime"
+            "-DRUNTIME_MODULE=${PROJECT_SOURCE_DIR}/cpp/process_custody/cmake/vnm_process_custody_runtime.cmake"
+            "-DNINJA_EXECUTABLE=${vnm_process_custody_test_ninja}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/process_custody_runtime/check_runtime.cmake")
+    set_tests_properties(vnm_terminal_process_custody_runtime_tests PROPERTIES TIMEOUT 120)
+endif()
+
 add_test(
     NAME vnm_terminal_process_custody_dependency_tests
     COMMAND "${CMAKE_COMMAND}"
