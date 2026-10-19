@@ -447,6 +447,8 @@ struct Qsg_atlas_shaped_text_run_result
     int                 invalid_string_indexes = 0;
 };
 
+quint32 qsg_atlas_instance_buffer_capacity(quint32 current_capacity, quint32 required_size);
+
 class Qsg_atlas_buffer_upload_planner final
 {
 public:
@@ -811,6 +813,10 @@ struct Captured_atlas_frame
     std::uint64_t                    canvas_frame_generation = 0U;
     bool                             cursor_blink_visible = true;
 };
+
+bool qsg_atlas_same_snapshot_publication(
+    const Captured_atlas_frame& left,
+    const Captured_atlas_frame& right);
 
 struct Qsg_atlas_frame_report
 {
