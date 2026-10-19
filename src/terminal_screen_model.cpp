@@ -6383,10 +6383,10 @@ void Terminal_screen_model::finalize_row_cell_mutation(
 
 void Terminal_screen_model::insert_cells(int count)
 {
-    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
-        m_cursor.column < active_left_margin() ||
+    if (m_cursor.column < active_left_margin() ||
         m_cursor.column > active_right_margin())
     {
+        m_pending_wrap = false;
         return;
     }
     mark_terminal_content_changed();
@@ -6419,8 +6419,7 @@ void Terminal_screen_model::insert_cells(int count)
 
 void Terminal_screen_model::delete_cells(int count)
 {
-    if (m_cursor.row < m_scroll_top || m_cursor.row > m_scroll_bottom ||
-        m_cursor.column < active_left_margin() ||
+    if (m_cursor.column < active_left_margin() ||
         m_cursor.column > active_right_margin())
     {
         return;

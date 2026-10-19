@@ -5923,15 +5923,6 @@ bool test_horizontal_margin_editing_and_cursor()
     ok &= check(model.row_text(1) == QStringLiteral("ijklm op"),
         "DCH restores the cursor row without changing outside columns");
 
-    auto outside_vertical = make_model(4, 8);
-    outside_vertical.ingest(QByteArrayLiteral(
-        "abcdefgh\x1b[2;3r\x1b[1;2H\x1b[1@"));
-    ok &= check(outside_vertical.row_text(0) == QStringLiteral("abcdefgh"),
-        "ICH leaves a cursor row outside vertical scroll margins unchanged");
-    outside_vertical.ingest(QByteArrayLiteral("\x1b[1P"));
-    ok &= check(outside_vertical.row_text(0) == QStringLiteral("abcdefgh"),
-        "DCH leaves a cursor row outside vertical scroll margins unchanged");
-
     model.ingest(QByteArrayLiteral("\x1b[1;2H\x1b[D"));
     ok &= check(model.cursor_position().column == 0,
         "CUB may cross the left margin when DECOM is reset");
@@ -5957,6 +5948,86 @@ bool test_horizontal_margin_editing_and_cursor()
         "DECFI at the right margin shifts the selected columns left");
     ok &= check(snapshot_valid(model, 151U),
         "column editing retains a valid render snapshot");
+    return ok;
+}
+
+// Independently authored for xterm-409-reference, util.c InsertChar/DeleteChar:
+// horizontal admission ignores DECSTBM; suppressed ICH clears pending wrap,
+// while suppressed DCH preserves it. Patch #316 corrects the manual exclusion.
+// https://invisible-island.net/xterm/xterm.log.html#xterm_316
+bool test_character_edits_outside_vertical_margins()
+{
+    struct character_edit_case_t
+    {
+        char        final_byte;
+        const char* full_width_result;
+        const char* margin_result;
+    };
+    constexpr character_edit_case_t cases[] = {
+        {'@', "a bcdefg", "a bcdegh"},
+        {'P', "acdefgh",  "acdef gh"},
+    };
+
+    bool ok = true;
+    for (const auto& test : cases) {
+        for (const bool horizontal_margins : {false, true}) {
+            for (const int row : {0, 3}) {
+                auto model = make_model(4, 8);
+                model.ingest(QByteArrayLiteral(
+                    "abcdefgh\x1b[2;1H22222222\x1b[3;1H33333333\x1b[4;1Habcdefgh"
+                    "\x1b[2;3r"));
+                if (horizontal_margins) {
+                    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[2;6s"));
+                }
+                const QByteArray position = QByteArrayLiteral("\x1b[") +
+                    QByteArray::number(row + 1) + QByteArrayLiteral(";2H");
+                const auto result = model.ingest(position + QByteArrayLiteral("\x1b[1") + test.final_byte);
+                const QString expected = QString::fromLatin1(
+                    horizontal_margins ? test.margin_result : test.full_width_result);
+                ok &= check(diagnostic_count(result) == 0 && model.row_text(row) == expected,
+                    "ICH and DCH edit header/footer rows within their horizontal bounds");
+                ok &= check(model.row_text(1) == QStringLiteral("22222222") &&
+                        model.row_text(2) == QStringLiteral("33333333") &&
+                        model.row_text(3 - row) == QStringLiteral("abcdefgh"),
+                    "character edits outside vertical margins leave every other row unchanged");
+                ok &= check(model.cursor_position().row == row && model.cursor_position().column == 1,
+                    "character edits do not move the cursor");
+                ok &= check(snapshot_valid(model, 158U),
+                    "character edits outside vertical margins preserve valid cell geometry");
+            }
+        }
+
+        for (const int column : {0, 7}) {
+            auto outside = make_model(4, 8);
+            outside.ingest(QByteArrayLiteral(
+                "abcdefgh\x1b[2;3r\x1b[?69h\x1b[2;6s"));
+            outside.ingest(QByteArrayLiteral("\x1b[1;") + QByteArray::number(column + 1) +
+                QByteArrayLiteral("H\x1b[1") + test.final_byte);
+            ok &= check(outside.row_text(0) == QStringLiteral("abcdefgh"),
+                "horizontal margins still suppress character edits outside their columns");
+        }
+
+        auto pending_inside = make_model(4, 8);
+        pending_inside.ingest(QByteArrayLiteral("\x1b[2;3r\x1b[1;8HZ"));
+        pending_inside.ingest(QByteArrayLiteral("\x1b[1") + test.final_byte + 'X');
+        ok &= check(pending_inside.row_text(0) == QStringLiteral("       X") &&
+                pending_inside.row_text(1).isEmpty() && pending_inside.cursor_position().row == 0,
+            "character edits above the scrolling region clear a pending wrap");
+    }
+
+    auto insert_outside = make_model(4, 8);
+    insert_outside.ingest(QByteArrayLiteral(
+        "\x1b[2;3r\x1b[?69h\x1b[2;6s\x1b[1;8HZ\x1b[1@X"));
+    ok &= check(insert_outside.row_text(0) == QStringLiteral("       X") &&
+            insert_outside.row_text(1).isEmpty() && insert_outside.cursor_position().row == 0,
+        "ICH outside horizontal margins clears pending wrap without shifting cells");
+
+    auto delete_outside = make_model(4, 8);
+    delete_outside.ingest(QByteArrayLiteral(
+        "\x1b[2;3r\x1b[?69h\x1b[2;6s\x1b[1;8HZ\x1b[1PX"));
+    ok &= check(delete_outside.row_text(0) == QStringLiteral("       Z") &&
+            delete_outside.row_text(1) == QStringLiteral(" X") && delete_outside.cursor_position().row == 1,
+        "DCH outside horizontal margins preserves pending wrap");
     return ok;
 }
 
@@ -6558,6 +6629,7 @@ int main()
     bool ok = true;
     ok &= test_horizontal_margins_and_rectangular_scroll();
     ok &= test_horizontal_margin_editing_and_cursor();
+    ok &= test_character_edits_outside_vertical_margins();
     ok &= test_horizontal_margin_wrap_and_reset();
     ok &= test_horizontal_margin_wide_cell_boundary();
     ok &= test_row_movement_severs_soft_wrap_neighbors();

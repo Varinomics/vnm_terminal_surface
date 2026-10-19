@@ -976,13 +976,13 @@ sequence: ICH / CSI Pn @ and DCH / CSI Pn P
 feature: insert and delete characters
 status: supported
 action_category: screen-mutation
-behavior: shifts cells and image pixels on the cursor row between the cursor and right scrolling margin, inserting blank cells for ICH or at the right edge for DCH; both have no effect when the cursor is outside the scrolling margins, including outside DECSTBM even when horizontal margin mode is reset; this follows the VT420 and VT510 descriptions, while xterm permits edits outside DECSTBM
+behavior: shifts cells and image pixels on the cursor row between the cursor and right scrolling margin, inserting blank cells for ICH or at the right edge for DCH; edits are admitted by the active left/right margins alone, regardless of DECSTBM, with page edges used when mode 69 is reset; ICH clears pending wrap even when horizontal margins suppress the edit, while DCH preserves pending wrap when suppressed and clears it when admitted; follows xterm-409 InsertChar/DeleteChar and [xterm patch #316](https://invisible-island.net/xterm/xterm.log.html#xterm_316), which corrects the VT420/VT520 manual claim that DCH has no effect outside the scrolling margins
 host_policy: character edits do not append scrollback
 payload_limit: none
 recovery: malformed sequence ignored with diagnostic
 reply: no-reply
 diagnostic: malformed sequence diagnostic
-oracle: dec-vt420-horizontal-scrolling
+oracle: xterm-409-reference
 
 ## dec-horizontal-column-editing
 
