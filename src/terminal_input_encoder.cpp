@@ -776,27 +776,6 @@ QByteArray function_key_bytes(const QKeyEvent& event)
         : csi_tilde(parameter);
 }
 
-bool is_application_keypad_key(int key)
-{
-    if (key >= Qt::Key_0 && key <= Qt::Key_9) {
-        return true;
-    }
-
-    switch (key) {
-        case Qt::Key_Period:
-        case Qt::Key_Minus:
-        case Qt::Key_Comma:
-        case Qt::Key_Plus:
-        case Qt::Key_Asterisk:
-        case Qt::Key_Slash:
-        case Qt::Key_Enter:
-        case Qt::Key_Equal:
-            return true;
-        default:
-            return false;
-    }
-}
-
 QByteArray application_keypad_bytes(const QKeyEvent& event)
 {
     if ((event.modifiers() & Qt::KeypadModifier) == Qt::NoModifier ||

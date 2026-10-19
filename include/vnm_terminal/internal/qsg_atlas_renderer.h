@@ -864,40 +864,6 @@ struct Qsg_atlas_frame_report
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;
-    Terminal_text_renderer_policy
-                  text_renderer_policy               =
-                      Terminal_text_renderer_policy::AUTO;
-    Terminal_text_renderer_kind
-                  effective_text_renderer            =
-                      Terminal_text_renderer_kind::NONE;
-    bool          text_renderer_fallback_allowed     = true;
-    bool          text_renderer_fallback_used        = false;
-    Resolved_lcd_subpixel_order
-                  msdf_lcd_subpixel_order            =
-                      Resolved_lcd_subpixel_order::NONE;
-    bool          msdf_lcd_text_enabled              = false;
-    bool          msdf_text_renderer_enabled =
-        k_qsg_atlas_msdf_text_renderer_enabled;
-    bool          msdf_text_renderer_compiled =
-        k_qsg_atlas_msdf_text_renderer_compiled;
-    bool          msdf_text_renderer_active =
-        k_qsg_atlas_msdf_text_renderer_active;
-    bool          msdf_text_shader_package_available = false;
-    bool          msdf_text_atlas_built              = false;
-    bool          msdf_text_atlas_ready              = false;
-    bool          msdf_text_texture_ready            = false;
-    bool          msdf_text_resources_ready          = false;
-    int           msdf_text_supported_runs           = 0;
-    int           msdf_text_runs                     = 0;
-    int           msdf_text_glyph_instances          = 0;
-    int           msdf_text_draw_calls               = 0;
-    int           msdf_text_missed_supported_runs    = 0;
-    int           msdf_text_missed_supported_glyphs  = 0;
-    int           msdf_text_font_data_bytes          = 0;
-    int           msdf_text_pixel_height             = 0;
-    int           msdf_text_atlas_size               = 0;
-    float         msdf_text_px_range                 = 0.0f;
-    QString       msdf_text_message;
     bool          coverage_texture_created        = false;
     bool          coverage_upload_recorded        = false;
     bool          raw_font_rasterized             = false;

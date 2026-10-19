@@ -70,7 +70,8 @@ struct Render_profile_snapshot_t
     Profile_node_snapshot                   root;
     Profile_timeline_snapshot               timeline;
 #if VNM_TERMINAL_PROFILING_ENABLED
-    terminal_text_layout_slow_diagnostics_t slow_text_layouts;
+    // Retained for the installed slow_text_layouts text section.
+    std::uint64_t slow_text_layout_threshold_ns = 0U;
 #endif
 };
 

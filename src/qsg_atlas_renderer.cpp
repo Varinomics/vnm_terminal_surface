@@ -1066,14 +1066,6 @@ void append_key_render_rect(
     append_key_bool(key, rect.antialias);
 }
 
-void append_key_arc(QByteArray& key, const Terminal_render_arc& arc)
-{
-    append_key_int(key, static_cast<int>(arc.kind));
-    append_key_rect(key, arc.rect);
-    append_key_color(key, arc.color);
-    append_key_qreal(key, arc.stroke);
-}
-
 void append_key_text_run(QByteArray& key, const Terminal_render_text_run& run)
 {
     append_key_int(key, run.row);
@@ -8397,56 +8389,6 @@ void Qsg_atlas_recorder::record_prepare(
     m_report.command_buffer_non_null        = command_buffer_non_null;
     m_report.render_target_non_null         = render_target_non_null;
     m_report.rhi_non_null                   = rhi_non_null;
-    m_report.text_renderer_policy =
-        render_summary.text_renderer_policy;
-    m_report.effective_text_renderer =
-        render_summary.effective_text_renderer;
-    m_report.text_renderer_fallback_allowed =
-        render_summary.text_renderer_fallback_allowed;
-    m_report.text_renderer_fallback_used =
-        render_summary.text_renderer_fallback_used;
-    m_report.msdf_lcd_subpixel_order =
-        render_summary.msdf_lcd_subpixel_order;
-    m_report.msdf_lcd_text_enabled =
-        render_summary.msdf_lcd_text_enabled;
-    m_report.msdf_text_renderer_enabled =
-        render_summary.msdf_text_renderer_enabled;
-    m_report.msdf_text_renderer_compiled =
-        render_summary.msdf_text_renderer_compiled;
-    m_report.msdf_text_renderer_active =
-        render_summary.msdf_text_renderer_active;
-    m_report.msdf_text_shader_package_available =
-        render_summary.msdf_text_shader_package_available;
-    m_report.msdf_text_atlas_built =
-        render_summary.msdf_text_atlas_built;
-    m_report.msdf_text_atlas_ready =
-        render_summary.msdf_text_atlas_ready;
-    m_report.msdf_text_texture_ready =
-        render_summary.msdf_text_texture_ready;
-    m_report.msdf_text_resources_ready =
-        render_summary.msdf_text_resources_ready;
-    m_report.msdf_text_supported_runs =
-        render_summary.msdf_text_supported_runs;
-    m_report.msdf_text_runs =
-        render_summary.msdf_text_runs;
-    m_report.msdf_text_glyph_instances =
-        render_summary.msdf_text_glyph_instances;
-    m_report.msdf_text_draw_calls =
-        render_summary.msdf_text_draw_calls;
-    m_report.msdf_text_missed_supported_runs =
-        render_summary.msdf_text_missed_supported_runs;
-    m_report.msdf_text_missed_supported_glyphs =
-        render_summary.msdf_text_missed_supported_glyphs;
-    m_report.msdf_text_font_data_bytes =
-        render_summary.msdf_text_font_data_bytes;
-    m_report.msdf_text_pixel_height =
-        render_summary.msdf_text_pixel_height;
-    m_report.msdf_text_atlas_size =
-        render_summary.msdf_text_atlas_size;
-    m_report.msdf_text_px_range =
-        render_summary.msdf_text_px_range;
-    m_report.msdf_text_message =
-        render_summary.msdf_text_message;
     m_report.coverage_texture_created       = coverage_texture_created;
     m_report.coverage_upload_recorded       = coverage_upload_recorded;
     m_report.raw_font_rasterized            = raw_font_rasterized;
