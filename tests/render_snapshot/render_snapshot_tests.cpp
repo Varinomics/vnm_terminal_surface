@@ -1,4 +1,5 @@
 #include "helpers/test_check.h"
+#include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/terminal_public_projection.h"
 #include "vnm_terminal/internal/terminal_session.h"
@@ -1579,8 +1580,29 @@ bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
         term::Terminal_render_snapshot_status::OK,
         "row-source primary snapshot validates");
 
-    const term::Terminal_render_snapshot retained_snapshot =
-        model.render_snapshot(request_for_model(model, 13U, 1));
+#if VNM_TERMINAL_PROFILING_ENABLED
+    term::Hierarchical_profiler retained_profiler;
+#endif
+    const term::Terminal_render_snapshot retained_snapshot = [&]() {
+#if VNM_TERMINAL_PROFILING_ENABLED
+        term::Active_profiler_binding binding(&retained_profiler);
+#endif
+        return model.render_snapshot(request_for_model(model, 13U, 1));
+    }();
+#if VNM_TERMINAL_PROFILING_ENABLED
+    std::uint64_t retained_materializations = 0U;
+    for (const auto& bucket : retained_profiler.timeline_snapshot().buckets) {
+        for (const auto& scope : bucket.scopes) {
+            if (scope.name ==
+                "Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_record")
+            {
+                retained_materializations += scope.call_count;
+            }
+        }
+    }
+    ok &= check(retained_materializations == 1U,
+        "one visible history row is decoded once for both its cells and provenance");
+#endif
     ok &= check(row_text(retained_snapshot, 0) == QStringLiteral("ONE") &&
         row_text(retained_snapshot, 1) == QStringLiteral("TWO"),
         "scrolled snapshot uses retained history and resident primary rows");

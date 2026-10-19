@@ -1,13 +1,16 @@
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
+#include "vnm_terminal/internal/terminal_ascii_cell_text.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
+#include <QChar>
 #include <QImage>
 #include <QString>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -388,6 +391,60 @@ term::Terminal_history_row_record_decode_result decode_mutated_payload(
         },
         term::Terminal_history_row_record_image_decode::DECODE_PIXELS,
         std::nullopt);
+}
+
+bool test_decoded_ascii_cells_share_immutable_text()
+{
+    bool ok = true;
+    constexpr std::size_t ascii_count = 95U;
+
+    for (bool leading_blank : {false, true}) {
+        term::Terminal_history_ring ring({4096U, 4096U});
+        const std::size_t first_ascii = leading_blank ? 1U : 0U;
+        term::Terminal_history_row_record record = make_base_record(
+            31U,
+            7U,
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+            static_cast<int>(first_ascii + 2U * ascii_count));
+        record.cells.resize(first_ascii);
+        for (int copy = 0; copy < 2; ++copy) {
+            for (ushort code_unit = 0x20U; code_unit <= 0x7eU; ++code_unit) {
+                record.cells.push_back(make_cell(QString(QChar(code_unit)), 1, true));
+            }
+        }
+
+        term::Terminal_history_row_record_append_result append;
+        auto decoded = append_and_decode(ring, record, make_identity(5U, 31U), append);
+        if (!check(decoded.status == term::Terminal_history_row_record_codec_status::OK &&
+                records_equal(decoded.record, record),
+            "every printable ASCII character round-trips through both history encodings"))
+        {
+            return false;
+        }
+        ok &= check(append.payload_kind ==
+                (leading_blank
+                    ? term::Terminal_history_row_record_payload_kind::GENERIC_COMPACT
+                    : term::Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII),
+            "a leading unoccupied cell selects the generic ASCII opcode path");
+
+        bool shared_text = true;
+        for (std::size_t index = 0U; index < ascii_count; ++index) {
+            const QString& first  = decoded.record.cells[first_ascii + index].text;
+            const QString& second = decoded.record.cells[first_ascii + ascii_count + index].text;
+            shared_text &= first.constData() == second.constData() &&
+                first.constData() == term::printable_ascii_cell_text(first.front()).constData();
+        }
+        ok &= check(shared_text,
+            "decoded ASCII cells share immutable strings instead of allocating per character");
+
+        decoded.record.cells[first_ascii].text.append(QChar('!'));
+        ok &= check(decoded.record.cells[first_ascii].text == QStringLiteral(" !") &&
+                decoded.record.cells[first_ascii + ascii_count].text == QStringLiteral(" ") &&
+                term::printable_ascii_cell_text(QChar(' ')) == QStringLiteral(" "),
+            "editing a decoded cell detaches its text without changing another cell or the shared literal");
+    }
+
+    return ok;
 }
 
 bool test_prefix_plain_ascii_rows_use_prefix_payload()
@@ -2420,6 +2477,7 @@ bool test_protection_sidecar_round_trip_and_version_isolation()
 int main()
 {
     bool ok = true;
+    ok &= test_decoded_ascii_cells_share_immutable_text();
     ok &= test_prefix_plain_ascii_rows_use_prefix_payload();
     ok &= test_extended_styles_hyperlinks_and_wide_cells_round_trip();
     ok &= test_generic_compact_default_ascii_after_blank_round_trip();

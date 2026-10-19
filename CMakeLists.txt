@@ -335,6 +335,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/render_snapshot.h
     include/vnm_terminal/internal/selection_contract.h
     include/vnm_terminal/internal/session_contract.h
+    include/vnm_terminal/internal/terminal_ascii_cell_text.h
     include/vnm_terminal/internal/terminal_canvas_fixture_contract.h
     include/vnm_terminal/internal/terminal_history_ring.h
     include/vnm_terminal/internal/terminal_history_row_record_codec.h

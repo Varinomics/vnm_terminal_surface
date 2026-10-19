@@ -264,14 +264,8 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                     std::move(row_cells->image_slice));
             }
 
-            std::optional<Terminal_retained_line_provenance> provenance;
-            {
-                VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::provenance::lookup");
-
-                provenance = viewport_row_provenance(viewport, row);
-            }
-            if (provenance.has_value()) {
+            if (row_cells.has_value()) {
+                const Terminal_retained_line_provenance& provenance = row_cells->provenance;
                 std::optional<primary_backing_row_t> backing_row;
                 {
                     VNM_TERMINAL_PROFILE_SCOPE(
@@ -287,10 +281,10 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                         backing_row.has_value() ? backing_row->value : row;
                     snapshot.visible_line_provenance.push_back({
                         static_cast<std::int64_t>(logical_row),
-                        provenance->retained_line_id,
-                        provenance->content_generation,
-                        provenance->content_stamp_ms,
-                        provenance->source,
+                        provenance.retained_line_id,
+                        provenance.content_generation,
+                        provenance.content_stamp_ms,
+                        provenance.source,
                     });
                 }
             }
@@ -417,50 +411,6 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         }
     }
     return snapshot;
-}
-
-std::optional<Terminal_retained_line_provenance>
-Terminal_screen_model::viewport_row_provenance(
-    const Terminal_viewport_state& viewport,
-    int                            viewport_row) const
-{
-    const viewport_row_t row{viewport_row};
-    if (!viewport_row_is_valid(row)) {
-        return std::nullopt;
-    }
-
-    if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
-        const Terminal_screen_row* active_row =
-            alternate_active_row(active_grid_row_t{row.value});
-        return active_row != nullptr
-            ? std::optional<Terminal_retained_line_provenance>(
-                active_row->retained_line_provenance)
-            : std::nullopt;
-    }
-
-    const std::optional<primary_backing_row_t> backing_row =
-        primary_backing_row_from_viewport(viewport, row);
-    if (!backing_row.has_value()) {
-        return std::nullopt;
-    }
-
-    if (backing_row->value < scrollback_size()) {
-        const std::optional<retained_row_record_t> retained_record =
-            m_primary_backing.materialize_retained_history_record(
-                static_cast<std::size_t>(backing_row->value),
-                Terminal_history_row_record_image_decode::SKIP_PIXELS);
-        return retained_record.has_value()
-            ? std::optional<Terminal_retained_line_provenance>(
-                retained_record->row.retained_line_provenance)
-            : std::nullopt;
-    }
-
-    const active_grid_row_t active_row{
-        backing_row->value - primary_backing_active_grid_first_row(),
-    };
-    const Terminal_screen_row& active =
-        primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
-    return active.retained_line_provenance;
 }
 
 Terminal_screen_model::snapshot_row_t
@@ -645,6 +595,7 @@ Terminal_screen_model::viewport_row_cells(
         return active_row != nullptr
             ? std::optional<Viewport_row_cells>(Viewport_row_cells{
                 .borrowed_cells = &active_row->cells,
+                .provenance     = active_row->retained_line_provenance,
                 .image_slice    = active_row->image_slice,
             })
             : std::nullopt;
@@ -677,6 +628,7 @@ Terminal_screen_model::viewport_row_cells(
             std::move(retained_record->style_table);
         result.owned_hyperlink_identity_keys =
             std::move(retained_record->hyperlink_identity_keys);
+        result.provenance  = retained_record->row.retained_line_provenance;
         result.image_slice = std::move(retained_record->row.image_slice);
         return result;
     }
@@ -688,6 +640,7 @@ Terminal_screen_model::viewport_row_cells(
         primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
     return Viewport_row_cells{
         .borrowed_cells = &active.cells,
+        .provenance     = active.retained_line_provenance,
         .image_slice    = active.image_slice,
     };
 }
