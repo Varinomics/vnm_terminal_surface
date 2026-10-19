@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/terminal_ascii_cell_text.h"
 #include "vnm_terminal/internal/unicode_width.h"
 
 #include <QByteArrayView>
@@ -2194,7 +2195,7 @@ Terminal_history_row_record_codec_status read_prefix_plain_ascii_stream(
         }
 
         Terminal_history_row_cell cell;
-        cell.text = QString(QChar(static_cast<ushort>(printable_ascii)));
+        cell.text = printable_ascii_cell_text(QChar(static_cast<ushort>(printable_ascii)));
         cell.display_width = 1;
         cell.occupied = true;
         record.cells.push_back(std::move(cell));
@@ -2406,7 +2407,7 @@ Terminal_history_row_record_codec_status read_cell_stream(
                 return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
             }
 
-            cell.text = QString(QChar(static_cast<ushort>(opcode)));
+            cell.text = printable_ascii_cell_text(QChar(static_cast<ushort>(opcode)));
             cell.display_width = 1;
             cell.occupied = true;
         }

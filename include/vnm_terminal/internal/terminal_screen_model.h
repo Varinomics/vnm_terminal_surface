@@ -871,6 +871,7 @@ private:
                                                 owned_style_table;
         std::optional<std::map<Terminal_hyperlink_id, QByteArray>>
                                                 owned_hyperlink_identity_keys;
+        Terminal_retained_line_provenance        provenance;
         // Null when the row shows no image.
         std::shared_ptr<const Terminal_image_slice>
                                                 image_slice;
@@ -1739,10 +1740,6 @@ private:
         int                            logical_row) const;
 
     std::optional<Viewport_row_cells> viewport_row_cells(
-        const Terminal_viewport_state& viewport,
-        int                            viewport_row) const;
-
-    std::optional<Terminal_retained_line_provenance> viewport_row_provenance(
         const Terminal_viewport_state& viewport,
         int                            viewport_row) const;
 
