@@ -2527,6 +2527,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         posix_pty_backend/posix_pty_backend_tests.cpp
     )
 
+    add_executable(vnm_terminal_posix_executable_lookup
+        posix_pty_backend/executable_lookup_tests.cpp)
+    target_link_libraries(vnm_terminal_posix_executable_lookup PRIVATE
+        vnm_terminal_surface::vnm_terminal_surface)
+    set_target_properties(vnm_terminal_posix_executable_lookup PROPERTIES AUTOMOC OFF)
+    add_test(NAME vnm_terminal_posix_executable_lookup
+        COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_posix_executable_lookup>")
+    set_tests_properties(vnm_terminal_posix_executable_lookup PROPERTIES
+        LABELS "conformance;posix;pty" TIMEOUT 90)
+
     add_executable(vnm_terminal_posix_pty_exit_output
         posix_pty_backend/exit_output_tests.cpp)
     target_link_libraries(vnm_terminal_posix_pty_exit_output PRIVATE
@@ -2658,6 +2669,7 @@ endif()
 if(TARGET vnm_terminal_posix_pty_backend)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_posix_pty_backend
+        vnm_terminal_posix_executable_lookup
         vnm_terminal_posix_pty_exit_output
         vnm_terminal_posix_pty_foreground_interrupt
     )

@@ -3661,6 +3661,47 @@ bool test_scroll_up_down_sequences()
     return ok;
 }
 
+bool test_scroll_sequences_preserve_pending_wrap()
+{
+    bool ok = true;
+    // xterm-409 preserves delayed autowrap through SU and SD, including
+    // rectangular scrolling. A printable after the scroll consumes it.
+    for (const char operation : {'S', 'T'}) {
+        for (const bool rectangular : {false, true}) {
+            for (const int row : {1, 3}) {
+                auto model = make_model(4, 20);
+                const int left  = rectangular ? 2  : 0;
+                const int right = rectangular ? 14 : 19;
+                if (rectangular) {
+                    model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[3;15s"));
+                }
+                model.ingest(QByteArrayLiteral("\x1b[") + QByteArray::number(row + 1) +
+                    QByteArrayLiteral(";") + QByteArray::number(right + 1) +
+                    QByteArrayLiteral("HZ"));
+
+                const auto scrolled = model.ingest(QByteArrayLiteral("\x1b[") + operation);
+                ok &= check(diagnostic_count(scrolled) == 0 &&
+                        model.cursor_position().row    == row &&
+                        model.cursor_position().column == right,
+                    "SU and SD preserve the cursor at the pending-wrap margin");
+
+                model.ingest(QByteArrayLiteral("X"));
+                const int wrapped_row = std::min(row + 1, 3);
+                ok &= check(model.cursor_position().row    == wrapped_row &&
+                        model.cursor_position().column == left + 1,
+                    "printable after SU or SD consumes pending wrap at the left margin");
+                const auto snapshot = model.render_snapshot(153U);
+                const auto* cell = cell_at_or_null(snapshot, wrapped_row, left);
+                ok &= check(cell != nullptr && cell->text == QStringLiteral("X"),
+                    "printable after SU or SD appears on the wrapped row");
+                ok &= check(snapshot_valid(model, 154U),
+                    "pending-wrap scroll leaves a valid render snapshot");
+            }
+        }
+    }
+    return ok;
+}
+
 bool test_blank_fill_operations_use_current_style()
 {
     bool ok = true;
@@ -4027,6 +4068,86 @@ bool test_insert_delete_lines_cells_and_tabs()
         "TBC all makes HT use right edge");
     ok     &= check(snapshot_valid(model, 38U), "TBC snapshot validates");
 
+    return ok;
+}
+
+bool test_tab_stops_survive_resize()
+{
+    bool ok = true;
+    for (const bool alternate : {false, true}) {
+        term::Terminal_screen_model model({{4, 20}});
+        if (alternate) {
+            model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+        }
+        model.ingest(QByteArrayLiteral("\x1b[9G\x1b[g\r\t"));
+        ok &= check(model.cursor_position().column == 16,
+            "clearing column nine makes HT skip to column seventeen");
+        model.resize({5, 20});
+        model.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check(model.cursor_position().column == 16,
+            "height resize preserves a cleared tab stop");
+        model.resize({5, 28});
+        model.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check(model.cursor_position().column == 16,
+            "width growth preserves cleared and retained existing tab stops");
+        model.ingest(QByteArrayLiteral("\x1b[21G\t"));
+        ok &= check(model.cursor_position().column == 24,
+            "newly added columns receive the configured default tab spacing");
+        model.resize({5, 12});
+        model.ingest(QByteArrayLiteral("\r\t"));
+        ok &= check(model.cursor_position().column == 11,
+            "width shrink preserves a cleared surviving tab stop");
+
+        term::Terminal_screen_model cleared({{4, 20}});
+        if (alternate) {
+            cleared.ingest(QByteArrayLiteral("\x1b[?1049h"));
+        }
+        cleared.ingest(QByteArrayLiteral("\x1b[3g"));
+        cleared.resize({5, 20});
+        cleared.ingest(QByteArrayLiteral("\t"));
+        ok &= check(cleared.cursor_position().column == 19,
+            "height resize preserves TBC all so HT reaches the right edge");
+    }
+    return ok;
+}
+
+bool test_line_edits_home_cursor_within_margins()
+{
+    bool ok = true;
+    // xterm-409 InsertLine/DeleteLine home an effective edit to the active
+    // left margin. A cursor outside either margin makes the operation a no-op.
+    for (const char operation : {'L', 'M'}) {
+        for (const bool rectangular : {false, true}) {
+            auto model = make_model(4, 20);
+            if (rectangular) {
+                model.ingest(QByteArrayLiteral("\x1b[?69h\x1b[3;15s"));
+            }
+            const int left = rectangular ? 2 : 0;
+            model.ingest(QByteArrayLiteral("\x1b[2;5H"));
+            const auto edited = model.ingest(QByteArrayLiteral("\x1b[") + operation);
+            ok &= check(diagnostic_count(edited) == 0 &&
+                    model.cursor_position().row    == 1 &&
+                    model.cursor_position().column == left,
+                "IL and DL home the cursor to the active left margin");
+            ok &= dirty_rows_equal(edited, {1, 2, 3},
+                "line edit publishes the changed cursor and rows");
+            model.ingest(QByteArrayLiteral("X"));
+            ok &= check(model.row_text(1) == QString(left, QChar(u' ')) + QChar(u'X'),
+                "printable after IL or DL starts at the left margin");
+        }
+
+        auto outside = make_model(4, 20);
+        outside.ingest(QByteArrayLiteral("\x1b[2;3r\x1b[?69h\x1b[3;15s\x1b[1;5H"));
+        const auto above = outside.ingest(QByteArrayLiteral("\x1b[") + operation);
+        ok &= check(outside.cursor_position().row    == 0 &&
+                outside.cursor_position().column == 4 && above.dirty_rows.empty(),
+            "IL and DL leave a cursor above the scroll region unchanged");
+        outside.ingest(QByteArrayLiteral("\x1b[2;2H"));
+        const auto beside = outside.ingest(QByteArrayLiteral("\x1b[") + operation);
+        ok &= check(outside.cursor_position().row    == 1 &&
+                outside.cursor_position().column == 1 && beside.dirty_rows.empty(),
+            "IL and DL leave a cursor left of the scroll region unchanged");
+    }
     return ok;
 }
 
@@ -6478,8 +6599,11 @@ int main()
     ok &= test_scroll_region_history_insert_after_reverse_index();
     ok &= test_scroll_region_zero_bottom_defaults_to_screen_bottom();
     ok &= test_scroll_up_down_sequences();
+    ok &= test_scroll_sequences_preserve_pending_wrap();
     ok &= test_blank_fill_operations_use_current_style();
     ok &= test_insert_delete_lines_cells_and_tabs();
+    ok &= test_tab_stops_survive_resize();
+    ok &= test_line_edits_home_cursor_within_margins();
     ok &= test_retained_line_provenance_lifecycle();
     ok &= test_recovery_disabled_non_scroll_sources_do_not_grow_retained_history();
     ok &= test_recovery_disabled_chunk_split_invariance_for_non_scroll_sources();

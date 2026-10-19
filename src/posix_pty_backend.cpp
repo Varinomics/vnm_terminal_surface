@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -202,18 +203,35 @@ std::optional<QByteArray> resolved_executable(
     const QProcessEnvironment& environment,
     const QString&             working_directory)
 {
-    const auto usable_candidate = [&working_directory](QByteArray candidate)
-        -> std::optional<QByteArray> {
-        QString candidate_text = QFile::decodeName(candidate);
-        if (!QDir::isAbsolutePath(candidate_text)) {
-            candidate_text = QDir(working_directory).absoluteFilePath(candidate_text);
-        }
-        candidate = QFile::encodeName(QDir::cleanPath(candidate_text));
-        if (::access(candidate.constData(), X_OK) == 0) {
-            return candidate;
-        }
-        return std::nullopt;
-    };
+    const auto usable_candidate = [
+            &working_directory
+        ](
+            QByteArray candidate) -> std::optional<QByteArray>
+        {
+            // Preserve symlink/.. traversal while making the path independent
+            // of the custody owner's working directory.
+            if (!candidate.startsWith('/')) {
+                QByteArray directory = QFile::encodeName(working_directory);
+                if (!directory.startsWith('/')) {
+                    directory.prepend(QFile::encodeName(QDir::currentPath()) + '/');
+                }
+                if (!directory.endsWith('/')) {
+                    directory.append('/');
+                }
+                candidate.prepend(directory);
+            }
+
+            // X_OK also succeeds for searchable directories. They must not
+            // prevent lookup from reaching a later executable in PATH.
+            struct stat status{};
+            if (::stat(candidate.constData(), &status) == 0 &&
+                S_ISREG(status.st_mode) &&
+                ::access(candidate.constData(), X_OK) == 0)
+            {
+                return candidate;
+            }
+            return std::nullopt;
+        };
 
     if (executable.contains('/')) {
         return usable_candidate(executable);

@@ -1545,7 +1545,6 @@ void Terminal_screen_model::apply_control_sequence(
                             if (final_byte == 'P') { delete_cells(count); } else
                             if (final_byte == 'L') { insert_lines(count); } else
                             if (final_byte == 'S') {
-                                m_pending_wrap = false;
                                 break_soft_wrap_before(m_scroll_bottom + 1);
                                 scroll_up_region(
                                     m_scroll_top,
@@ -1556,7 +1555,6 @@ void Terminal_screen_model::apply_control_sequence(
                             }
                             else
                             if (final_byte == 'T') {
-                                m_pending_wrap = false;
                                 scroll_down_region(m_scroll_top, m_scroll_bottom, count);
                             }
                             else {
@@ -4910,7 +4908,11 @@ bool Terminal_screen_model::apply_grid_resize(
     m_config.grid_size = grid_size;
     resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
     resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size, false);
-    m_tab_stops = default_tab_stops(grid_size.columns);
+    // Resizing preserves the programmed tab stops in surviving columns.
+    m_tab_stops.resize(static_cast<std::size_t>(grid_size.columns), false);
+    for (int column = grid_size_before.columns; column < grid_size.columns; ++column) {
+        m_tab_stops[static_cast<std::size_t>(column)] = column % m_config.tab_width == 0;
+    }
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
     if (guard_primary_repaint_recovery) {
@@ -6473,6 +6475,7 @@ void Terminal_screen_model::insert_lines(int count)
         return;
     }
 
+    set_cursor_position(m_cursor.row, active_left_margin());
     break_soft_wrap_before(m_cursor.row);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, m_scroll_bottom - m_cursor.row + 1);
@@ -6491,7 +6494,6 @@ void Terminal_screen_model::insert_lines(int count)
                     : nullptr);
         }
         break_soft_wrap_before(m_scroll_bottom + 1);
-        m_pending_wrap = false;
         return;
     }
     std::move_backward(
@@ -6504,7 +6506,6 @@ void Terminal_screen_model::insert_lines(int count)
     }
 
     break_soft_wrap_before(m_scroll_bottom + 1);
-    m_pending_wrap = false;
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
@@ -6517,6 +6518,7 @@ void Terminal_screen_model::delete_lines(int count)
         return;
     }
 
+    set_cursor_position(m_cursor.row, active_left_margin());
     break_soft_wrap_before(m_cursor.row);
     mark_terminal_content_changed();
     count = std::clamp(count, 1, m_scroll_bottom - m_cursor.row + 1);
@@ -6535,7 +6537,6 @@ void Terminal_screen_model::delete_lines(int count)
                     ? &before_rows[static_cast<std::size_t>(source - m_cursor.row)]
                     : nullptr);
         }
-        m_pending_wrap = false;
         return;
     }
     std::move(
@@ -6547,7 +6548,6 @@ void Terminal_screen_model::delete_lines(int count)
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(row)]);
     }
 
-    m_pending_wrap = false;
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
