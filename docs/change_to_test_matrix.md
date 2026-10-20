@@ -27,18 +27,18 @@ against an app build that consumes this surface.
 
 | If you change | Run these targets | Repository |
 | --- | --- | --- |
-| Backend lifecycle and signals (start, write, resize, pause, interrupt, terminate, exit) | `vnm_terminal_backend_session`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_behavior_smoke` | surface |
-| Native backend shared I/O helpers or output delivery limit coupling | `vnm_terminal_backend_session`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend` | surface |
+| Backend lifecycle and signals (start, write, resize, pause, interrupt, terminate, exit) | `vnm_terminal_backend_session`, `vnm_terminal_backend_session_resize_frontier`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_behavior_smoke` | surface |
+| Native backend shared I/O helpers or output delivery limit coupling | `vnm_terminal_backend_session`, `vnm_terminal_backend_session_resize_frontier`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend` | surface |
 | Render snapshot and frame building | `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_qsg_atlas`, `vnm_terminal_render_cell_text` | surface |
-| Surface / host API (scroll, selection, paste, focus, clipboard) | `vnm_terminal_surface_host` | surface |
+| Surface / host API (scroll, selection, paste, focus, clipboard) | `vnm_terminal_surface_host`, `vnm_terminal_surface_host_resize_frontier`, `vnm_terminal_surface_host_async_resize_metadata` | surface |
 | Search, scrollback match identity, and search overlays | `vnm_terminal_search_index`, `vnm_terminal_backend_session`, `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, `vnm_terminal_custom_titlebar_integration` | surface + application |
 | Screen model, parser, and escape-sequence behavior | `vnm_terminal_screen_basic`, `vnm_terminal_screen_operations`, `vnm_terminal_screen_alternate`, `vnm_terminal_screen_sgr`, `vnm_terminal_terminal_modes`, `vnm_terminal_viewport`, `vnm_terminal_sequence_matrix`, `vnm_terminal_parser_ir`, `vnm_terminal_parser_randomized`, `vnm_terminal_sixel_decoder` | surface |
 | Horizontal scrolling margins, DEC column edits, partial-row images, and DA1 attribute 21 | `vnm_terminal_screen_operations`, `vnm_terminal_sixel_placement`, `vnm_terminal_sequence_matrix`, `vnm_terminal_backend_session` | surface |
-| XTWINOPS text-area resize arbitration | `vnm_terminal_backend_session`, `vnm_terminal_surface_host`, `vnm_terminal_screen_operations`, `vnm_terminal_sequence_matrix` | surface |
+| XTWINOPS text-area resize arbitration | `vnm_terminal_backend_session`, `vnm_terminal_backend_session_resize_frontier`, `vnm_terminal_surface_host`, `vnm_terminal_surface_host_resize_frontier`, `vnm_terminal_surface_host_async_resize_metadata`, `vnm_terminal_screen_operations`, `vnm_terminal_sequence_matrix` | surface |
 | Sixel image placement and image rows (slices, DECSDM, text under images, history image section, record-limit drops) | `vnm_terminal_sixel_placement`, `vnm_terminal_history_row_record_codec`, `vnm_terminal_sixel_decoder`, `vnm_terminal_screen_operations`, `vnm_terminal_sequence_matrix`, `vnm_terminal_windows_conpty_sixel_cursor_sync` | surface |
 | Row images in snapshots and frames (snapshot image field, image check, image quads, projection rows, canvas export and rendering) | `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_backend_session`, `vnm_terminal_canvas_export`, `vnm_terminal_canvas_contract`, `vnm_terminal_canvas_renderer`, `vnm_terminal_sixel_placement` | surface |
 | Image pass (image textures, texture cache, `atlas_image.frag`, image diagnostics) | `vnm_terminal_qsg_atlas`, `vnm_terminal_qsg_atlas_report_d3d11`, `vnm_terminal_qsg_atlas_host_state_d3d11`, `vnm_terminal_qsg_atlas_idle_recovery_threaded_d3d11`, `vnm_terminal_qsg_atlas_idle_recovery_basic_d3d11`, `vnm_terminal_diagnostics_schema_sync`, `vnm_terminal_diagnostics_text_layout` | surface |
-| Cell pixel size (CSI 14 t and CSI 16 t replies, POSIX winsize pixels, backend cell geometry) | `vnm_terminal_screen_operations`, `vnm_terminal_parser_ir`, `vnm_terminal_backend_session`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_qt_metrics`, `vnm_terminal_qt_metrics_scaled`, `vnm_terminal_sequence_matrix` | surface |
+| Cell pixel size (CSI 14 t and CSI 16 t replies, POSIX winsize pixels, backend cell geometry) | `vnm_terminal_screen_operations`, `vnm_terminal_parser_ir`, `vnm_terminal_backend_session`, `vnm_terminal_backend_session_resize_frontier`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_qt_metrics`, `vnm_terminal_qt_metrics_scaled`, `vnm_terminal_sequence_matrix` | surface |
 | Terminal capability replies (DA1 horizontal scrolling attribute 21, ANSI color attribute 22, rectangular editing attribute 28, stored-macro attribute 32, and conditional sixel attribute 4; XTSMGRAPHICS color registers and geometry) | `vnm_terminal_screen_operations`, `vnm_terminal_parser_ir`, `vnm_terminal_backend_session`, `vnm_terminal_sixel_placement`, `vnm_terminal_screen_sgr`, `vnm_terminal_sequence_matrix`, `vnm_terminal_windows_conpty_backend` | surface |
 | DEC rectangular cell editing, protection, visual attributes, image damage, and protected-cell retained history | `vnm_terminal_screen_operations`, `vnm_terminal_sixel_placement`, `vnm_terminal_history_row_record_codec`, `vnm_terminal_sequence_matrix` | surface |
 | DEC stored macros (DECDMAC, DECINVM, DSR macro space, replay ordering and resource bounds) | `vnm_terminal_screen_basic`, `vnm_terminal_parser_randomized`, `vnm_terminal_backend_session`, `vnm_terminal_sequence_matrix` | surface |
@@ -48,13 +48,21 @@ against an app build that consumes this surface.
 
 ## Notes On Specific Targets
 
+- The `vnm_terminal_backend_session` and `vnm_terminal_surface_host` CTest
+  entries run `--core-only`. Their resize-frontier cases run once in the
+  corresponding `_resize_frontier` entries. Surface async resize metadata runs
+  only in `_async_resize_metadata`; pending-mouse wheel trace runs only in
+  `_pending_mouse_wheel_trace` when transcript capture/replay is enabled.
+  Include these focused entries when validating callback ordering or resize
+  behavior. Running either executable without arguments retains its standalone
+  aggregate selection.
 - Image pass pixels are verified only by the D3D11 `vnm_terminal_qsg_atlas_*`
   tests; the GLSL and MSL variants of `atlas_image.frag` run in no gate.
 - The POSIX and Windows backend targets are platform-gated. The surface registers
   `vnm_terminal_posix_pty_backend` only on Linux and macOS and
   `vnm_terminal_windows_conpty_backend` only on Windows. Run the one that matches
-  your platform when you touch backend code; run `vnm_terminal_backend_session`
-  on every platform because it exercises the session ingress and the backend
+  your platform when you touch backend code; run `vnm_terminal_backend_session` and
+  `vnm_terminal_backend_session_resize_frontier` on every platform because it exercises the session ingress and the backend
   contract through a test backend.
 - `vnm_terminal_behavior_smoke` runs the native surface against the scripted
   `vnm_terminal_canvas_fixture` child process. It also registers the
@@ -70,7 +78,7 @@ against an app build that consumes this surface.
   model's cursor after an image matches the cursor OpenConsole computes for the
   same image behind the packaged ConPTY. `vnm_terminal_input_encoder`
   covers key, mouse, paste, and focus encoding and is the companion to
-  `vnm_terminal_surface_host` for input changes.
+  `vnm_terminal_surface_host` and its `_resize_frontier` entry for input changes.
 - `vnm_terminal_sequence_matrix` checks the supported/ignored/rejected sequence
   tables in `docs/terminal_sequence_matrix.md` and
   `docs/terminal_conformance_oracles.md`. Update those docs when you change
@@ -79,10 +87,8 @@ against an app build that consumes this surface.
   capture/replay (`-DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`). The
   application's transcript-facing CLI tests (capture, rejection when disabled)
   are likewise gated on that option.
-- The application `vnm_terminal_help_*` and `vnm_terminal_rejects_*` families are
-  groups of individually named tests (for example
-  `vnm_terminal_rejects_bad_window_size`,
-  `vnm_terminal_help_mentions_text_renderer`). Run the family with a `ctest -R`
+- The application `vnm_terminal_help_*` and `vnm_terminal_rejects_*` entries
+  cover help output and invalid arguments. Run either family with a
   prefix match, for example `ctest -R vnm_terminal_rejects`.
 
 ## Validation Reality

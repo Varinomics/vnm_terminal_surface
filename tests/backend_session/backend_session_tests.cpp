@@ -23557,19 +23557,22 @@ bool test_mapping_change_without_native_geometry_change_repaints()
 
 int main(int argc, char** argv)
 {
+    const bool core_only = argc == 2 && std::string_view(argv[1]) == "--core-only";
     bool ok = true;
-    ok &= test_presentation_bounds_at_session_entry_points();
-    ok &= test_mapping_change_without_native_geometry_change_repaints();
-    ok &= test_saved_primary_anchor_survives_constant_s_eviction();
-    ok &= test_detached_anchor_keeps_first_displayed_row();
-    ok &= test_frozen_frame_availability();
-    ok &= test_incompatible_held_growth_releases_early();
-    ok &= test_early_release_keeps_deferred_scroll_and_selection();
-    ok &= test_held_alternate_growth_keeps_its_hold();
-    ok &= test_parser_resize_inside_hold_reconciles_like_host_resize();
-    ok &= test_resize_after_output_ending_in_escape_prefix_is_applied();
-    ok &= test_key_after_output_ending_in_escape_prefix_is_written();
-    ok &= test_carried_callback_ending_in_two_byte_escape_claims_its_epoch();
+    if (!core_only) {
+        ok &= test_presentation_bounds_at_session_entry_points();
+        ok &= test_mapping_change_without_native_geometry_change_repaints();
+        ok &= test_saved_primary_anchor_survives_constant_s_eviction();
+        ok &= test_detached_anchor_keeps_first_displayed_row();
+        ok &= test_frozen_frame_availability();
+        ok &= test_incompatible_held_growth_releases_early();
+        ok &= test_early_release_keeps_deferred_scroll_and_selection();
+        ok &= test_held_alternate_growth_keeps_its_hold();
+        ok &= test_parser_resize_inside_hold_reconciles_like_host_resize();
+        ok &= test_resize_after_output_ending_in_escape_prefix_is_applied();
+        ok &= test_key_after_output_ending_in_escape_prefix_is_written();
+        ok &= test_carried_callback_ending_in_two_byte_escape_claims_its_epoch();
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--resize-frontier-only") {
         ok &= test_resize_controller_fast_path_applies_only_captured_callbacks();
         ok &= test_key_input_precedes_output_queued_after_frontier();
@@ -23712,10 +23715,12 @@ int main(int argc, char** argv)
     ok &= test_selection_only_synchronized_hold_keeps_held_output_unpublished();
     ok &= test_pre_input_queued_output_drains_during_input_without_echo();
     ok &= test_key_input_does_not_chase_output_replenished_on_resume();
-    ok &= test_resize_controller_fast_path_applies_only_captured_callbacks();
-    ok &= test_key_input_precedes_output_queued_after_frontier();
-    ok &= test_captured_callback_frontier_seals_coalesced_output();
-    ok &= test_synchronous_input_routes_do_not_chase_replenished_output();
+    if (!core_only) {
+        ok &= test_resize_controller_fast_path_applies_only_captured_callbacks();
+        ok &= test_key_input_precedes_output_queued_after_frontier();
+        ok &= test_captured_callback_frontier_seals_coalesced_output();
+        ok &= test_synchronous_input_routes_do_not_chase_replenished_output();
+    }
     ok &= test_viewport_scroll_public_session_path();
     ok &= test_resize_preserves_primary_scrollback();
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
@@ -23772,18 +23777,24 @@ int main(int argc, char** argv)
     ok &= test_settlement_results_do_not_depend_on_the_tail();
     ok &= test_withdrawal_reaches_an_open_operation();
     ok &= test_ingress_overflow_leaves_the_open_operation_to_finish();
-    ok &= test_reentrant_input_takes_the_unsettled_outcome();
-    ok &= test_final_settlement_step_keeps_its_ownership();
+    if (!core_only) {
+        ok &= test_reentrant_input_takes_the_unsettled_outcome();
+        ok &= test_final_settlement_step_keeps_its_ownership();
+    }
     ok &= test_reentrant_setters_leave_a_pending_placement_alone();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
     ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
     ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();
     ok &= test_output_callback_snapshot_inside_command_claims_processed_epoch();
-    ok &= test_incomplete_csi_output_callback_snapshot_keeps_previous_processed_epoch();
-    ok &= test_non_output_after_incomplete_csi_does_not_advance_processed_epoch();
+    if (!core_only) {
+        ok &= test_incomplete_csi_output_callback_snapshot_keeps_previous_processed_epoch();
+        ok &= test_non_output_after_incomplete_csi_does_not_advance_processed_epoch();
+    }
     ok &= test_rejected_output_callback_enqueue_advances_processed_epoch();
-    ok &= test_rejected_callback_epoch_waits_for_lower_sliced_output();
-    ok &= test_rejected_callback_epoch_waits_for_lower_non_output_callback();
+    if (!core_only) {
+        ok &= test_rejected_callback_epoch_waits_for_lower_sliced_output();
+        ok &= test_rejected_callback_epoch_waits_for_lower_non_output_callback();
+    }
     ok &= test_combined_synchronized_release_suffix_does_not_publish_epoch_early();
     ok &= test_budgeted_backend_callback_drain_coalesces_incomplete_content_snapshot();
     ok &= test_budgeted_backend_callback_drain_holds_output_command_backpressure();

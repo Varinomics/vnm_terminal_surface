@@ -1346,6 +1346,7 @@ add_test(
         ${vnm_terminal_qt_unscaled_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --core-only
 )
 
 set(vnm_terminal_surface_host_timeout 60)
@@ -2038,6 +2039,7 @@ add_test(
         "${CMAKE_COMMAND}" -E env
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_backend_session>"
+        --core-only
 )
 
 add_executable(vnm_terminal_backend_output_capture
