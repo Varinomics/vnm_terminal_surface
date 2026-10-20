@@ -3,6 +3,7 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
@@ -9861,10 +9862,14 @@ bool test_public_projection_release_reconciliation()
         "geometry best-effort reconciliation invalidates geometry while held");
     ok &= check(geometry_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
         "geometry best-effort reconciliation releases after resize");
+    // The growth leaves one vacant row, which the presented frame hides, so
+    // the restored row is read where the presented frame shows it.
     const std::optional<term::Terminal_render_snapshot> geometry_release =
         geometry_session->latest_render_snapshot();
-    ok &= check(geometry_release.has_value() &&
-        snapshot_row_text(*geometry_release, 0) == geometry_anchor_text &&
+    const auto geometry_release_display =
+        term::make_presented_snapshot(geometry_session->latest_render_snapshot_handle());
+    ok &= check(geometry_release.has_value() && geometry_release_display != nullptr &&
+        snapshot_row_text(*geometry_release_display, 0) == geometry_anchor_text &&
         geometry_release->public_scroll_diagnostics.diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::DETACHED_ANCHOR_GEOMETRY_CHANGED &&
         geometry_release->public_scroll_diagnostics.release_reconciliation_result ==
@@ -22884,11 +22889,283 @@ bool test_stop_failure_preserves_commitment_and_prior_geometry()
     return ok;
 }
 
+// Every live and held entry point bounds the presented offset by the policy
+// maximum (DESIGN 5.4 Bounds): ten output lines and a prompt at two rows leave
+// nine history rows; growth to six rows hides four vacant rows, so AUTOMATIC
+// allows five and COMPANION nine.
+bool test_presentation_bounds_at_session_entry_points()
+{
+    bool ok = true;
+    term::Terminal_session_config config;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {2, 20};
+    ok &= check(session->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "presentation bounds session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(10) + QByteArrayLiteral("$ ")),
+        "presentation bounds session writes history and a prompt");
+    session->resize(QSizeF(200.0, 120.0), {6, 20});
+    const term::Terminal_viewport_state grown = session->viewport_state();
+    ok &= check(grown.scrollback_rows == 9 &&
+            grown.presentation.policy == term::Terminal_presentation_policy::AUTOMATIC &&
+            grown.presentation.hidden_rows == 4 &&
+            term::presentation_max_offset_from_tail(grown) == 5,
+        "growth hides the vacated rows from the live scroll range");
+
+    const auto offset = [&] { return session->viewport_state().offset_from_tail; };
+    (void)session->scroll_viewport_lines(100);
+    ok &= check(offset() == 5, "line scrolling stops at the automatic maximum");
+    (void)session->scroll_published_viewport_to_offset_from_tail(50);
+    ok &= check(offset() == 5, "offset scrolling clamps to the automatic maximum");
+    (void)session->scroll_published_viewport_lines(-2);
+    ok &= check(offset() == 3, "published line scrolling moves inside the range");
+    (void)session->scroll_viewport_lines_from_published_state(100, session->viewport_state());
+    ok &= check(offset() == 5 && session->latest_render_snapshot_handle()->viewport.offset_from_tail == 5,
+        "scrolling from the published state publishes the bounded offset");
+
+    session->set_companion_presentation(true);
+    (void)session->scroll_viewport_lines(100);
+    ok &= check(offset() == 9, "the Companion range keeps the native scrollback");
+    session->set_companion_presentation(false);
+    ok &= check(offset() == 5 && term::presentation_max_offset_from_tail(session->viewport_state()) == 5,
+        "turning the toggle off keeps the view on the first history row at the automatic maximum");
+
+    (void)session->scroll_published_viewport_to_offset_from_tail(0);
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "presentation bounds session enters a held update");
+    (void)session->scroll_published_viewport_lines(100);
+    const auto held = session->latest_render_snapshot_handle();
+    ok &= check(held && held->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            held->viewport.offset_from_tail == 5 &&
+            term::presentation_max_offset_from_tail(held->viewport) == 5,
+        "the held public viewport clamps to the presentation maximum of its frame");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "presentation bounds session releases the held update");
+    return ok;
+}
+
+// The saved primary view keeps its first displayed row while the alternate
+// screen is active, even when a resize archives rows and history at its limit
+// evicts as many, leaving S unchanged (DESIGN 5.5, saved primary).
+bool test_saved_primary_anchor_survives_constant_s_eviction()
+{
+    bool ok = true;
+    const auto displayed = [](const std::unique_ptr<term::Terminal_session>& session, int row) {
+        const auto presented = term::make_presented_snapshot(session->latest_render_snapshot_handle());
+        return presented ? snapshot_row_text(*presented, row) : QStringLiteral("<unpresentable>");
+    };
+    for (const bool parser_resize : {false, true}) {
+        term::Terminal_session_config config;
+        config.scrollback_limit = 10;
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {6, 20};
+        ok &= check(session->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(numbered_scroll_lines(20) + QByteArrayLiteral("$ ")),
+            "the eviction session fills its ten-row history");
+        (void)session->scroll_viewport_lines(4);
+        ok &= check(session->viewport_state().scrollback_rows == 10 &&
+                displayed(session, 0) == QStringLiteral("scroll-line-011"),
+            "four rows up the view starts with scroll-line-011");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049h")),
+            "the eviction session enters the alternate screen");
+        if (parser_resize) {
+            ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;3;20t")) &&
+                    session->grid_size().rows == 3,
+                "a parser resize shrinks the grid while the alternate screen is active");
+        }
+        else {
+            ok &= check(session->resize(QSizeF(200.0, 60.0), {3, 20}).code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+                "a host resize shrinks the grid while the alternate screen is active");
+        }
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049l")) &&
+                session->viewport_state().scrollback_rows == 10 &&
+                displayed(session, 0) == QStringLiteral("scroll-line-011"),
+            parser_resize
+                ? "after a parser resize evicts at constant S the saved primary view returns to its row"
+                : "after a host resize evicts at constant S the saved primary view returns to its row");
+    }
+    return ok;
+}
+
+// A detached view keeps its first displayed row at the same display position
+// when the mapping or S changes (DESIGN 5.5): host and parser resizes, output
+// consuming vacancy, the saved primary view, and a Companion view whose first
+// rows are padding. A position the new mapping cannot show clamps.
+bool test_detached_anchor_keeps_first_displayed_row()
+{
+    bool ok = true;
+    const auto displayed = [](const std::unique_ptr<term::Terminal_session>& session, int row) {
+        const auto presented = term::make_presented_snapshot(session->latest_render_snapshot_handle());
+        return presented ? snapshot_row_text(*presented, row) : QStringLiteral("<unpresentable>");
+    };
+    const auto start = [&](std::unique_ptr<term::Terminal_session>& session, int rows) {
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {rows, 20};
+        ok &= check(session->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(numbered_scroll_lines(10) + QByteArrayLiteral("$ ")),
+            "anchor session writes ten history lines and a prompt");
+        return backend;
+    };
+
+    // Two rows leave nine history rows; six rows up shows scroll-line-003.
+    std::unique_ptr<term::Terminal_session> host;
+    Scripted_backend* host_backend = start(host, 2);
+    (void)host->scroll_viewport_lines(6);
+    ok &= check(displayed(host, 0) == QStringLiteral("scroll-line-003"),
+        "the detached view starts with scroll-line-003");
+    host->resize(QSizeF(200.0, 120.0), {6, 20});
+    ok &= check(host->viewport_state().offset_from_tail == 2 &&
+            displayed(host, 0) == QStringLiteral("scroll-line-003"),
+        "a host resize that hides four vacant rows keeps the first displayed row");
+    ok &= check(host_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
+            host->viewport_state().presentation.hidden_rows == 3 &&
+            host->viewport_state().offset_from_tail == 3 &&
+            displayed(host, 0) == QStringLiteral("scroll-line-003"),
+        "output consuming one vacant row keeps the first displayed row");
+    (void)host->scroll_viewport_lines(-2);
+    ok &= check(displayed(host, 0) == QStringLiteral("scroll-line-005"),
+        "the view moves to scroll-line-005 one row above the tail");
+    host->resize(QSizeF(200.0, 180.0), {9, 20});
+    ok &= check(host->viewport_state().offset_from_tail == 0 &&
+            displayed(host, 2) == QStringLiteral("scroll-line-005"),
+        "an anchor the grown mapping can only show below the tail clamps to the tail");
+
+    std::unique_ptr<term::Terminal_session> parser;
+    Scripted_backend* parser_backend = start(parser, 2);
+    (void)parser->scroll_viewport_lines(6);
+    ok &= check(parser_backend->emit_output(QByteArrayLiteral("\x1b[8;6;20t")) &&
+            parser->grid_size().rows == 6 &&
+            parser->viewport_state().offset_from_tail == 2 &&
+            displayed(parser, 0) == QStringLiteral("scroll-line-003"),
+        "a parser resize keeps the first displayed row");
+
+    std::unique_ptr<term::Terminal_session> saved;
+    Scripted_backend* saved_backend = start(saved, 2);
+    (void)saved->scroll_viewport_lines(6);
+    ok &= check(saved_backend->emit_output(QByteArrayLiteral("\x1b[?1049h")),
+        "the anchor session enters the alternate screen");
+    saved->resize(QSizeF(200.0, 120.0), {6, 20});
+    ok &= check(saved_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")) &&
+            saved->viewport_state().presentation.hidden_rows == 4 &&
+            saved->viewport_state().offset_from_tail == 2 &&
+            displayed(saved, 0) == QStringLiteral("scroll-line-003"),
+        "the saved primary view returns with its first displayed row");
+
+    // Shrinking four rows to two displaces two rows into history (K = 2) and
+    // regrowing leaves two vacant rows, so Companion inserts two padding rows
+    // before native row I = 7. Two rows up, the view starts with that padding.
+    std::unique_ptr<term::Terminal_session> companion;
+    Scripted_backend* companion_backend = start(companion, 4);
+    companion->set_companion_presentation(true);
+    companion->resize(QSizeF(200.0, 40.0), {2, 20});
+    companion->resize(QSizeF(200.0, 80.0), {4, 20});
+    (void)companion->scroll_viewport_lines(2);
+    ok &= check(companion->viewport_state().presentation.insertion_row == 7 &&
+            companion->viewport_state().presentation.hidden_rows == 2 &&
+            displayed(companion, 0).isEmpty() && displayed(companion, 1).isEmpty() &&
+            displayed(companion, 2) == QStringLiteral("scroll-line-007"),
+        "the Companion view starts with two padding rows above scroll-line-007");
+    ok &= check(companion_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
+            companion->viewport_state().presentation.hidden_rows == 1 &&
+            companion->viewport_state().offset_from_tail == 3 &&
+            displayed(companion, 2) == QStringLiteral("scroll-line-007"),
+        "the first row below the padding keeps its display position");
+    return ok;
+}
+
+bool full_repaint(const term::Terminal_render_snapshot& snapshot)
+{
+    return snapshot.dirty_row_ranges.size() == 1U &&
+        snapshot.dirty_row_ranges.front().first_row == 0 &&
+        snapshot.dirty_row_ranges.front().row_count == snapshot.grid_size.rows;
+}
+
+// A mapping change at an unchanged native grid and viewport is a different
+// display identity space, so the next frame repaints every row.
+bool test_mapping_change_without_native_geometry_change_repaints()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> automatic;
+    Scripted_backend* automatic_backend = make_session(automatic);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {2, 20};
+    ok &= check(automatic->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "vacancy-consumption session starts");
+    ok &= check(automatic_backend->emit_output(QByteArrayLiteral("a\r\n$ ")),
+        "vacancy-consumption session writes a prompt");
+    automatic->resize(QSizeF(200.0, 120.0), {6, 20});
+    const auto before = automatic->latest_render_snapshot_handle();
+    ok &= check(automatic_backend->emit_output(QByteArrayLiteral("x\r\n")),
+        "output moves the cursor into the vacancy");
+    const auto after = automatic->latest_render_snapshot_handle();
+    ok &= check(before && after &&
+            term::viewport_mappings_match(before->viewport, after->viewport) &&
+            before->viewport.presentation.hidden_rows == 4 &&
+            after->viewport.presentation.hidden_rows == 3 &&
+            !term::snapshots_share_row_identity_space(*before, *after) &&
+            full_repaint(*after),
+        "output consuming vacancy repaints every row at an unchanged native viewport");
+
+    std::unique_ptr<term::Terminal_session> companion;
+    Scripted_backend* companion_backend = make_session(companion);
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(companion->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "insertion-change session starts");
+    companion->set_companion_presentation(true);
+    ok &= check(companion_backend->emit_output(QByteArrayLiteral("l0\r\nl1\r\nl2\r\n$ ")),
+        "insertion-change session writes four rows");
+    companion->resize(QSizeF(200.0, 40.0), {2, 20});
+    companion->resize(QSizeF(200.0, 80.0), {4, 20});
+    const auto displaced = companion->latest_render_snapshot_handle();
+    ok &= check(companion_backend->emit_output(QByteArrayLiteral("\x1b[2J")),
+        "whole-screen erasure revokes the resize-displaced rows");
+    const auto cleared = companion->latest_render_snapshot_handle();
+    ok &= check(displaced && cleared &&
+            displaced->viewport.scrollback_rows == cleared->viewport.scrollback_rows &&
+            displaced->viewport.presentation.insertion_row == 0 &&
+            cleared->viewport.presentation.insertion_row == 2 &&
+            !term::snapshots_share_row_identity_space(*displaced, *cleared) &&
+            full_repaint(*cleared),
+        "a Companion insertion change at constant S repaints every row");
+
+    term::Terminal_session_config evicting_config;
+    evicting_config.scrollback_limit = 3;
+    std::unique_ptr<term::Terminal_session> evicting;
+    Scripted_backend* evicting_backend = make_session(evicting, evicting_config);
+    launch_config.initial_grid_size = {2, 20};
+    ok &= check(evicting->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "eviction session starts");
+    ok &= check(evicting_backend->emit_output(numbered_scroll_lines(6)),
+        "eviction session fills its history");
+    const auto full = evicting->latest_render_snapshot_handle();
+    ok &= check(evicting_backend->emit_output(QByteArrayLiteral("more\r\n")),
+        "eviction session evicts one row");
+    const auto evicted = evicting->latest_render_snapshot_handle();
+    ok &= check(full && evicted && full->viewport.scrollback_rows == 3 &&
+            evicted->viewport.scrollback_rows == 3 &&
+            !term::snapshots_share_row_identity_space(*full, *evicted) &&
+            full_repaint(*evicted),
+        "eviction at constant S repaints every row");
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
 {
     bool ok = true;
+    ok &= test_presentation_bounds_at_session_entry_points();
+    ok &= test_mapping_change_without_native_geometry_change_repaints();
+    ok &= test_saved_primary_anchor_survives_constant_s_eviction();
+    ok &= test_detached_anchor_keeps_first_displayed_row();
     ok &= test_resize_after_output_ending_in_escape_prefix_is_applied();
     ok &= test_key_after_output_ending_in_escape_prefix_is_written();
     ok &= test_carried_callback_ending_in_two_byte_escape_claims_its_epoch();

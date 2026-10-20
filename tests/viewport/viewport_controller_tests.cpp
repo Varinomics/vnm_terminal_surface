@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace term = vnm_terminal::internal;
@@ -237,6 +238,131 @@ bool test_model_continuity_fields_do_not_change_viewport_policy()
 
 }
 
+// Every clamp uses the presentation's maximum (DESIGN 5.4 Bounds): AUTOMATIC
+// excludes its hidden rows, and COMPANION and NATIVE keep the native S.
+bool test_presentation_bounds()
+{
+    bool ok = true;
+    const auto mapping = [](bool companion, int vacancy) {
+        return term::make_presentation_mapping(
+            term::Terminal_buffer_id::PRIMARY, companion, 6, 10, vacancy, 2, 0);
+    };
+
+    term::Terminal_viewport_controller viewport;
+    ok &= check(viewport.set_visible_rows(6).code == term::Terminal_viewport_result_code::ACCEPTED,
+        "the bounds fixture accepts six visible rows");
+    viewport.set_scrollback_rows(10);
+    viewport.set_presentation(mapping(false, 4));
+    ok &= check(viewport.max_offset_from_tail() == 6,
+        "the automatic maximum excludes the hidden vacancy");
+    const auto scrolled = viewport.scroll_lines(100);
+    ok &= check(scrolled.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+            scrolled.applied_line_delta == 6 && viewport.state().offset_from_tail == 6,
+        "scrolling stops at the automatic maximum");
+    ok &= check(viewport.scroll_pages(1).action == term::Terminal_viewport_scroll_action::AT_BOUNDARY,
+        "page scrolling reports the automatic boundary");
+
+    viewport.set_presentation(mapping(false, 2));
+    ok &= check(viewport.max_offset_from_tail() == 8,
+        "consumed vacancy widens the range");
+    viewport.set_presentation(mapping(false, 5));
+    ok &= check(viewport.max_offset_from_tail() == 5 && viewport.state().offset_from_tail <= 5,
+        "a larger vacancy narrows the range and the view stays inside it");
+
+    viewport.set_presentation(mapping(true, 5));
+    ok &= check(viewport.max_offset_from_tail() == 10,
+        "the Companion range keeps the native scrollback");
+
+    viewport.set_presentation(mapping(false, 4));
+    viewport.enter_alternate_screen();
+    ok &= check(viewport.max_offset_from_tail() == 0 &&
+            viewport.state().presentation.policy == term::Terminal_presentation_policy::NATIVE,
+        "the alternate screen is native and has no range");
+    viewport.set_presentation(mapping(false, 1));
+    viewport.leave_alternate_screen();
+    ok &= check(viewport.state().presentation.hidden_rows == 1 && viewport.max_offset_from_tail() == 9,
+        "the primary mapping set while the alternate screen was active returns with it");
+    return ok;
+}
+
+std::pair<int, int> first_displayed_row(const term::Terminal_viewport_state& state)
+{
+    const auto anchor = term::presentation_first_displayed_row(
+        state, 0, state.scrollback_rows + state.visible_rows);
+    return anchor ? std::pair<int, int>{anchor->logical_row, anchor->display_row} : std::pair<int, int>{-1, -1};
+}
+
+// A detached view keeps its first displayed row at the same display position
+// when the mapping changes (DESIGN 5.5). A view at the tail stays there, a
+// position the new mapping cannot show clamps, and the saved primary view
+// follows the same rule while the alternate screen is active.
+bool test_presentation_anchor()
+{
+    bool ok = true;
+    const auto automatic = [](int vacancy) {
+        return term::make_presentation_mapping(
+            term::Terminal_buffer_id::PRIMARY, false, 6, 10, vacancy, 6 - vacancy, 0);
+    };
+
+    term::Terminal_viewport_controller viewport;
+    ok &= check(viewport.set_visible_rows(6).code == term::Terminal_viewport_result_code::ACCEPTED,
+        "the anchor fixture accepts six visible rows");
+    viewport.set_scrollback_rows(10);
+    viewport.set_presentation(automatic(2));
+    viewport.set_presentation(automatic(4));
+    ok &= check(viewport.state().follow_tail && viewport.state().offset_from_tail == 0,
+        "a view at the tail stays at the tail");
+
+    viewport.set_presentation(automatic(2));
+    (void)viewport.scroll_lines(3);
+    ok &= check(first_displayed_row(viewport.state()) == std::pair<int, int>{5, 0},
+        "three rows up the view starts with native row 5");
+    viewport.set_presentation(automatic(4));
+    ok &= check(viewport.state().offset_from_tail == 1 &&
+            first_displayed_row(viewport.state()) == std::pair<int, int>{5, 0},
+        "more hidden rows keep the first displayed row");
+    viewport.set_presentation(automatic(1));
+    ok &= check(viewport.state().offset_from_tail == 4 &&
+            first_displayed_row(viewport.state()) == std::pair<int, int>{5, 0},
+        "fewer hidden rows keep the first displayed row");
+    (void)viewport.scroll_lines(-3);
+    viewport.set_presentation(automatic(5));
+    ok &= check(viewport.state().offset_from_tail == 0 && viewport.state().follow_tail,
+        "a row the new mapping can only show below the tail clamps the view to the tail");
+
+    term::Terminal_viewport_controller saved;
+    ok &= check(saved.set_visible_rows(6).code == term::Terminal_viewport_result_code::ACCEPTED,
+        "the saved-primary fixture accepts six visible rows");
+    saved.set_scrollback_rows(10);
+    saved.set_presentation(automatic(2));
+    (void)saved.scroll_lines(3);
+    saved.enter_alternate_screen();
+    saved.set_presentation(automatic(4));
+    saved.leave_alternate_screen();
+    ok &= check(saved.state().offset_from_tail == 1 &&
+            first_displayed_row(saved.state()) == std::pair<int, int>{5, 0},
+        "the saved primary view returns with its first displayed row");
+
+    // Companion with K = 3 of S = 3 inserts its three padding rows before
+    // native row 0, so the top of its range starts with padding; AUTOMATIC
+    // hides one row and cannot show native row 0 below row 0.
+    term::Terminal_viewport_controller companion;
+    ok &= check(companion.set_visible_rows(6).code == term::Terminal_viewport_result_code::ACCEPTED,
+        "the Companion fixture accepts six visible rows");
+    companion.set_scrollback_rows(3);
+    companion.set_presentation(term::make_presentation_mapping(
+        term::Terminal_buffer_id::PRIMARY, true, 6, 3, 1, 3, 3));
+    (void)companion.scroll_lines(3);
+    ok &= check(first_displayed_row(companion.state()) == std::pair<int, int>{0, 3},
+        "the Companion view's first native row follows three padding rows");
+    companion.set_presentation(term::make_presentation_mapping(
+        term::Terminal_buffer_id::PRIMARY, false, 6, 3, 1, 3, 3));
+    ok &= check(companion.state().offset_from_tail == 2 &&
+            first_displayed_row(companion.state()) == std::pair<int, int>{0, 0},
+        "a display position above the new maximum clamps to it");
+    return ok;
+}
+
 int main()
 {
     bool ok = true;
@@ -245,5 +371,7 @@ int main()
     ok &= test_alternate_screen_policy_and_restore();
     ok &= test_coordinate_mapping_and_selection_rows();
     ok &= test_model_continuity_fields_do_not_change_viewport_policy();
+    ok &= test_presentation_bounds();
+    ok &= test_presentation_anchor();
     return ok ? 0 : 1;
 }

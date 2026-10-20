@@ -1409,11 +1409,14 @@ set_tests_properties(vnm_terminal_surface_host_async_resize_metadata PROPERTIES
     TIMEOUT 30
 )
 
+# These read the frames the renderer committed, so on Windows they run where
+# windows draw. Offscreen windows draw nothing; there they read the frame the
+# surface hands its renderer.
 add_test(
     NAME vnm_terminal_surface_host_zoom_scroll_range
     COMMAND
         "${CMAKE_COMMAND}" -E env
-        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_readback_environment}
         ${vnm_terminal_qt_unscaled_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_surface_host>"
@@ -1421,8 +1424,41 @@ add_test(
 )
 set_tests_properties(vnm_terminal_surface_host_zoom_scroll_range PROPERTIES
     LABELS "conformance;surface;resize;wheel"
+    TIMEOUT 180
+)
+
+add_test(
+    NAME vnm_terminal_surface_host_resize_presentation
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_readback_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --resize-presentation-only
+)
+set_tests_properties(vnm_terminal_surface_host_resize_presentation PROPERTIES
+    LABELS "conformance;surface;resize;presentation"
     TIMEOUT 60
 )
+
+# Input leasing against the painted frame needs a platform that draws.
+if(WIN32)
+    add_test(
+        NAME vnm_terminal_surface_host_presentation_input_lease
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_readback_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --presentation-input-lease-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_presentation_input_lease PROPERTIES
+        LABELS "conformance;surface;input;presentation"
+        TIMEOUT 60
+    )
+endif()
 
 if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     add_test(

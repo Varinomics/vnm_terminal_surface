@@ -9,7 +9,7 @@ namespace {
 
 int state_max_offset_from_tail(const Terminal_viewport_state& state)
 {
-    return std::max(0, state.scrollback_rows);
+    return presentation_max_offset_from_tail(state);
 }
 
 void clamp_state_offset(Terminal_viewport_state& state)
@@ -58,6 +58,28 @@ void Terminal_viewport_controller::set_scrollback_rows(int rows)
     }
 
     apply_scrollback_rows(m_state, rows);
+}
+
+// A detached view keeps its first displayed row at the same display position
+// under the new mapping, clamped to the new bounds; a view at the tail stays
+// there. While the alternate screen is active this is the saved primary view.
+void Terminal_viewport_controller::set_presentation(Terminal_presentation_mapping presentation)
+{
+    Terminal_viewport_state& primary = m_state.active_buffer == Terminal_buffer_id::ALTERNATE
+        ? m_primary_state
+        : m_state;
+    const std::optional<Terminal_presentation_anchor> anchor = primary.follow_tail
+        ? std::nullopt
+        : presentation_first_displayed_row(
+            primary,
+            0,
+            primary.scrollback_rows + primary.visible_rows);
+    primary.presentation = presentation;
+    if (anchor.has_value()) {
+        primary.offset_from_tail =
+            presentation_offset_for_logical_row(primary, anchor->logical_row, anchor->display_row);
+    }
+    clamp_state_offset(primary);
 }
 
 Terminal_viewport_scroll_result Terminal_viewport_controller::scroll_lines(int line_delta)
@@ -123,6 +145,7 @@ void Terminal_viewport_controller::enter_alternate_screen()
     m_state.scrollback_rows  = 0;
     m_state.offset_from_tail = 0;
     m_state.follow_tail      = true;
+    m_state.presentation     = {};
 }
 
 void Terminal_viewport_controller::leave_alternate_screen()

@@ -686,6 +686,9 @@ public:
     // appended or rejoined that no application placement or cursor entry has
     // reached since. Presentation hides them; the native grid keeps them.
     int resize_vacancy_rows() const;
+    // The primary screen's mapping record inputs as a policy and its P and I;
+    // the alternate screen is always native.
+    Terminal_presentation_mapping presentation_mapping(bool companion_enabled) const;
 
     Terminal_selection_result selected_text(
         const Terminal_selection_range&                selection) const;
@@ -1141,6 +1144,7 @@ private:
     void replace_visible_retained_line_ids();
     void rebase_visible_retained_line_ids_preserving_content();
     void replace_row_with_erased_retained_line(Terminal_screen_row& row);
+    int primary_content_bottom_row_exclusive() const;
     void retire_resize_vacancy_through(int row);
     void retire_all_resize_vacancy();
     void normalize_resize_vacancy();

@@ -149,8 +149,7 @@ void Terminal_session::populate_touch_selection_projection(Terminal_render_snaps
 }
 
 Terminal_touch_selection_result Terminal_session::apply_touch_selection(
-    const Terminal_touch_selection_request& request,
-    bool content_tail_presentation)
+    const Terminal_touch_selection_request& request)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     Input_frontier_scope frontier(*this);
@@ -243,8 +242,11 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
     }
     int logical_row = -1;
     int visual_row = -1;
-    auto display_snapshot = content_tail_presentation
-        ? make_content_tail_display_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
+    // A request with its own presentation record composes the native frame
+    // itself; otherwise the request addresses the frame this session presents.
+    const bool presented_rows = !request.presentation;
+    auto display_snapshot = presented_rows
+        ? make_presented_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
     const Terminal_render_snapshot* snapshot = display_snapshot.get();
     if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
             (std::size_t)snapshot->grid_size.rows)
@@ -261,8 +263,8 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
         }
         const auto before = snapshot->viewport.offset_from_tail;
         (void)scroll_published_viewport_lines(request.scroll_lines);
-        display_snapshot = content_tail_presentation
-            ? make_content_tail_display_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
+        display_snapshot = presented_rows
+            ? make_presented_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
         snapshot = display_snapshot.get();
         if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
                 (std::size_t)snapshot->grid_size.rows)
@@ -285,7 +287,7 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
                 ? std::min(snapshot->grid_size.rows - 1,
                     leading_rows + request.presentation->visible_native_rows - 1)
                 : snapshot->grid_size.rows - 1;
-        if (content_tail_presentation) {
+        if (presented_rows) {
             const int direction = request.scroll_lines > 0 ? 1 : -1;
             while (visual_row >= 0 && visual_row < snapshot->grid_size.rows &&
                 snapshot->visible_line_provenance[static_cast<std::size_t>(visual_row)].retained_line_id == 0U)

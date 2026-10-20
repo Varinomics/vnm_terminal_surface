@@ -130,25 +130,18 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
     snapshot.purpose                   = request.purpose;
     snapshot.public_scroll_diagnostics = request.public_scroll_diagnostics;
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
-        int occupied_bottom = 0;
-        const auto& active_rows = primary_active_grid_rows();
-        std::vector<Cell> projected;
-        for (int row = m_config.grid_size.rows - 1; row >= 0; --row) {
-            const auto& active = active_rows[static_cast<std::size_t>(row)];
-            const auto& cells = row_cells_for_current_geometry(active.cells, projected);
-            if ((active.image_slice && active.image_slice->first_column < m_config.grid_size.columns) ||
-                std::any_of(cells.begin(), cells.end(), [](const Cell& cell) {
-                    return cell.occupied && !cell.wide_continuation;
-                }))
-            {
-                occupied_bottom = row + 1;
-                break;
-            }
-        }
-        snapshot.native_content_bottom_row_exclusive = terminal_canvas_content_bottom_row_exclusive(
-            m_config.grid_size.rows, occupied_bottom, m_modes.cursor_visible, m_cursor.row);
+        snapshot.native_content_bottom_row_exclusive = primary_content_bottom_row_exclusive();
         snapshot.resize_displaced_scrollback_rows = resize_displaced_scrollback_rows();
+        snapshot.resize_vacancy_rows = resize_vacancy_rows();
     }
+    snapshot.viewport.presentation = make_presentation_mapping(
+        viewport.active_buffer,
+        request.companion_presentation,
+        m_config.grid_size.rows,
+        viewport.scrollback_rows,
+        snapshot.resize_vacancy_rows,
+        snapshot.native_content_bottom_row_exclusive,
+        snapshot.resize_displaced_scrollback_rows);
     {
         VNM_TERMINAL_PROFILE_SCOPE(
             "Terminal_screen_model::render_snapshot::metadata");
@@ -395,13 +388,22 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         }
     }
 
-    if (request.include_resize_leading_rows && viewport.active_buffer == Terminal_buffer_id::PRIMARY) {
-        const int leading_rows = std::min(
-            std::max(0, resize_displaced_scrollback_rows() - viewport.offset_from_tail),
-            m_config.grid_size.rows - 1);
+    // Acquire the native rows the presentation requests above this frame's
+    // own rows, so the frame supplies every row its mapping presents. The
+    // phone still composes the rows a shrink displaced into history above its
+    // native frame, whatever the desktop presents, so they stay acquired too.
+    // Batch 3 composes the phone through the producer and deletes that term.
+    if (request.include_leading_rows) {
+        const int displaced_rows = viewport.active_buffer == Terminal_buffer_id::PRIMARY
+            ? std::min(
+                std::max(0, resize_displaced_scrollback_rows() - viewport.offset_from_tail),
+                m_config.grid_size.rows - 1)
+            : 0;
+        const int leading_rows =
+            std::max(presentation_leading_row_count(snapshot.viewport), displaced_rows);
         if (leading_rows > 0) {
             Terminal_render_snapshot_request leading_request = request;
-            leading_request.include_resize_leading_rows = false;
+            leading_request.include_leading_rows = false;
             leading_request.viewport = viewport;
             leading_request.viewport.offset_from_tail += leading_rows;
             leading_request.viewport_changed = true;
@@ -411,6 +413,42 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         }
     }
     return snapshot;
+}
+
+int Terminal_screen_model::primary_content_bottom_row_exclusive() const
+{
+    int occupied_bottom = 0;
+    const auto& active_rows = primary_active_grid_rows();
+    std::vector<Cell> projected;
+    for (int row = m_config.grid_size.rows - 1; row >= 0; --row) {
+        const auto& active = active_rows[static_cast<std::size_t>(row)];
+        const auto& cells = row_cells_for_current_geometry(active.cells, projected);
+        if ((active.image_slice && active.image_slice->first_column < m_config.grid_size.columns) ||
+            std::any_of(cells.begin(), cells.end(), [](const Cell& cell) {
+                return cell.occupied && !cell.wide_continuation;
+            }))
+        {
+            occupied_bottom = row + 1;
+            break;
+        }
+    }
+    return terminal_canvas_content_bottom_row_exclusive(
+        m_config.grid_size.rows, occupied_bottom, m_modes.cursor_visible, m_cursor.row);
+}
+
+Terminal_presentation_mapping Terminal_screen_model::presentation_mapping(bool companion_enabled) const
+{
+    if (m_active_buffer_id != Terminal_buffer_id::PRIMARY) {
+        return {};
+    }
+    return make_presentation_mapping(
+        m_active_buffer_id,
+        companion_enabled,
+        m_config.grid_size.rows,
+        scrollback_size(),
+        resize_vacancy_rows(),
+        primary_content_bottom_row_exclusive(),
+        resize_displaced_scrollback_rows());
 }
 
 Terminal_screen_model::snapshot_row_t

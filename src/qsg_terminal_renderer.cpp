@@ -462,8 +462,11 @@ Terminal_render_line_provenance line_provenance_for_viewport_row(
     bool                               use_visible_line_provenance)
 {
     if (!use_visible_line_provenance) {
+        // A presented frame names its rows through the producer's forward map.
         return {
-            logical_row_for_viewport_row(snapshot.viewport, row),
+            snapshot.display_source
+                ? snapshot.display_row_logical_rows[static_cast<std::size_t>(row)]
+                : logical_row_for_viewport_row(snapshot.viewport, row),
             0U,
             0U,
         };

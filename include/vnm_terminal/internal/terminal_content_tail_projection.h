@@ -6,11 +6,17 @@
 
 namespace vnm_terminal::internal {
 
-// Relocate the unwritten native suffix before the resize-displaced prefix.
-// The resulting stream retains its native length and viewport offsets.
-int content_tail_display_row_to_logical_row(const Terminal_render_snapshot& native_snapshot, int display_row);
-int content_tail_logical_row_to_display_row(const Terminal_render_snapshot& native_snapshot, int logical_row);
-std::shared_ptr<const Terminal_render_snapshot> make_content_tail_display_snapshot(
-    std::shared_ptr<const Terminal_render_snapshot> native_snapshot);
+// The producer: presents a native frame through its mapping record. The
+// requested positions come from the frame's viewport presentation (see
+// presentation_requested_logical_row); each requested native row resolves
+// against the same frame's coverage, its own rows and its leading rows.
+//
+// Returns the source itself when the presentation is the identity. Returns
+// null when a requested row is unavailable and cannot become an unused slot:
+// a live frame must supply every requested row, and a frozen frame only
+// tolerates missing rows above its coverage. A null result is never
+// published, and it never falls back to the native presentation.
+std::shared_ptr<const Terminal_render_snapshot> make_presented_snapshot(
+    std::shared_ptr<const Terminal_render_snapshot> source);
 
 }

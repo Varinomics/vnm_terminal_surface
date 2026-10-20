@@ -562,7 +562,10 @@ struct Terminal_render_snapshot_request
     bool                                  backend_geometry_in_sync = true;
     bool                                  visual_bell_active = false;
     bool                                  mouse_reporting_mode_changed = false;
-    bool                                  include_resize_leading_rows = true;
+    bool                                  include_leading_rows = true;
+    // The Companion toggle, which selects the COMPANION mapping on the
+    // primary screen.
+    bool                                  companion_presentation = false;
 };
 
 struct Terminal_render_snapshot;
@@ -593,13 +596,29 @@ struct Terminal_render_snapshot
     std::optional<Terminal_canvas_selection>            touch_selection;
     int                                                native_content_bottom_row_exclusive = 0;
     int                                                resize_displaced_scrollback_rows = 0;
+    // V: the trailing primary rows that are wholly resize vacancy. With the
+    // two fields above and viewport.presentation it completes the mapping
+    // record's inputs.
+    int                                                resize_vacancy_rows = 0;
+    // Coverage beyond the frame's own rows: leading_rows_snapshot supplies
+    // the leading_row_count native rows directly above them.
     int                                                leading_row_count = 0;
     std::shared_ptr<const Terminal_render_snapshot>     leading_rows_snapshot;
-    // Local desktop presentation only. The source remains authoritative;
-    // -1 identifies padding without a retained/native row.
+    // A presented frame: display_source is the native frame it presents and
+    // display_row_logical_rows its forward map, where -1 is an identity-free
+    // slot without a native row.
     std::shared_ptr<const Terminal_render_snapshot>     display_source;
     std::vector<int>                                   display_row_logical_rows;
 };
+
+// A frame whose rows were frozen, by synchronized-output geometry adaptation
+// or a public-projection scroll, rather than read from the live model.
+inline bool render_snapshot_has_frozen_basis(const Terminal_render_snapshot& snapshot)
+{
+    return
+        snapshot.basis   == Terminal_render_snapshot_basis::PUBLIC_PROJECTION ||
+        snapshot.purpose == Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
+}
 
 struct Terminal_render_snapshot_validation
 {
@@ -659,10 +678,11 @@ inline std::vector<Terminal_render_dirty_row_range> compact_dirty_row_ranges(
 
 // Two snapshots coalesce their dirty rows by physical row index only when they
 // describe the same physical row-identity space: same grid, same viewport
-// mapping, and the same row-origin generation. A scrollback-eviction row-origin
-// change shifts which logical line each physical index names, so coalescing
-// across it would carry a stale or missing row; the row-origin guard forces a
-// full repaint instead.
+// mapping, the same row-origin generation, and the same display mapping record
+// and coverage. A scrollback-eviction row-origin change shifts which logical
+// line each physical index names, and a mapping change shifts which native
+// row each display row presents, so coalescing across either would carry a
+// stale or missing row; the guard forces a full repaint instead.
 inline bool snapshots_share_row_identity_space(
     const Terminal_render_snapshot&    left,
     const Terminal_render_snapshot&    right)
@@ -670,7 +690,9 @@ inline bool snapshots_share_row_identity_space(
     return
         grid_sizes_match(left.grid_size, right.grid_size)                           &&
         left.metadata.row_origin_generation == right.metadata.row_origin_generation &&
-        viewport_mappings_match(left.viewport, right.viewport);
+        viewport_mappings_match(left.viewport, right.viewport)                      &&
+        left.viewport.presentation          == right.viewport.presentation          &&
+        left.leading_row_count              == right.leading_row_count;
 }
 
 inline void append_dirty_range_rows(
@@ -783,14 +805,9 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
     if (snapshot.display_source &&
         (snapshot.display_source->display_source ||
             !snapshots_share_row_identity_space(snapshot, *snapshot.display_source) ||
+            snapshot.viewport.presentation != snapshot.display_source->viewport.presentation ||
             snapshot.metadata.sequence != snapshot.display_source->metadata.sequence ||
-            snapshot.native_content_bottom_row_exclusive != snapshot.display_source->native_content_bottom_row_exclusive ||
-            snapshot.resize_displaced_scrollback_rows != snapshot.display_source->resize_displaced_scrollback_rows ||
             snapshot.viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
-            snapshot.native_content_bottom_row_exclusive < 1 ||
-            snapshot.native_content_bottom_row_exclusive > snapshot.grid_size.rows ||
-            snapshot.resize_displaced_scrollback_rows < 0 ||
-            snapshot.resize_displaced_scrollback_rows > snapshot.viewport.scrollback_rows ||
             snapshot.display_row_logical_rows.size() != static_cast<std::size_t>(snapshot.grid_size.rows) ||
             !render_snapshot_visible_line_provenance_is_valid(*snapshot.display_source)))
     {
@@ -803,21 +820,21 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
             ? snapshot.display_row_logical_rows[static_cast<std::size_t>(row)]
             : first_visible_logical_row + static_cast<std::int64_t>(row);
         if (snapshot.display_source) {
+            // The forward map is the producer's requested row, or a slot
+            // where a frozen basis lacks the row.
             const auto& source = *snapshot.display_source;
-            const int stream_row = static_cast<int>(first_visible_logical_row) + row;
-            const int insertion = source.viewport.scrollback_rows - source.resize_displaced_scrollback_rows;
-            const int padding = source.grid_size.rows - source.native_content_bottom_row_exclusive;
-            const int mapped = stream_row < insertion ? stream_row
-                : stream_row < insertion + padding ? -1 : stream_row - padding;
-            if (expected_logical_row != mapped) {
+            const int requested = presentation_requested_logical_row(source.viewport, row);
+            if (expected_logical_row != requested &&
+                !(expected_logical_row == -1 && render_snapshot_has_frozen_basis(source)))
+            {
                 return false;
             }
-            if (mapped >= 0) {
+            if (expected_logical_row >= 0) {
                 const auto* row_source = &source;
-                int source_row = mapped - render_snapshot_first_visible_logical_row(source);
+                int source_row = requested - render_snapshot_first_visible_logical_row(source);
                 if (source_row < 0 && source.leading_rows_snapshot) {
                     row_source = source.leading_rows_snapshot.get();
-                    source_row = mapped - render_snapshot_first_visible_logical_row(*row_source);
+                    source_row = requested - render_snapshot_first_visible_logical_row(*row_source);
                 }
                 if (source_row < 0 || source_row >= static_cast<int>(row_source->visible_line_provenance.size()) ||
                     provenance != row_source->visible_line_provenance[static_cast<std::size_t>(source_row)])

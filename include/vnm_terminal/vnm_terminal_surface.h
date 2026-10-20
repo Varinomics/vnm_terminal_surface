@@ -650,11 +650,14 @@ public:
     bool backend_geometry_in_sync() const;
     int rows() const;
     int columns() const;
+    // The presented scroll range: scrollback_rows() is the largest offset from
+    // the tail, which excludes trailing rows that resizing vacated.
     int scrollback_rows() const;
     int viewport_visible_rows() const;
     int viewport_offset_from_tail() const;
     bool viewport_at_tail() const;
-    // Presentation only: retain native terminal geometry and viewport offsets.
+    // The Companion toggle. Presentation only: native terminal geometry is
+    // unchanged, and the unwritten tail is relocated into history.
     bool content_tail_presentation_enabled() const;
     void set_content_tail_presentation_enabled(bool enabled);
     Selection_state selection_state() const;

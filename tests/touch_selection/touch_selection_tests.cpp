@@ -138,10 +138,13 @@ bool resize_leading_rows_selection_contract()
     scroll.request_id = 103U;
     scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
     scroll.scroll_lines = 1;
+    // The grow left four vacant rows, so the shared view's range is the
+    // AUTOMATIC one, max(0, S - P) = 0 rows here (DESIGN 5.4 Bounds); every
+    // history row is already among the acquired leading rows.
     ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
-            session.viewport_state().offset_from_tail == 1 &&
+            session.viewport_state().offset_from_tail == 0 &&
             session.selected_text().text == QStringLiteral("header"),
-        "older-history extension follows the displayed leading edge instead of native frame row zero");
+        "older-history extension follows the displayed leading edge within the presented range");
     snapshot = session.latest_render_snapshot_handle();
     scroll.request_id = 104U;
     scroll.expected_selection_generation = snapshot->touch_selection->selection_generation;
@@ -165,6 +168,44 @@ bool resize_leading_rows_selection_contract()
     return ok;
 }
 
+// The phone composes the rows a shrink displaced into history above its
+// native frame. With the Companion toggle off and no resize vacancy the
+// desktop presents natively, and the frame still carries those rows.
+bool shrink_only_phone_prefix_contract()
+{
+    auto backend = std::make_unique<Touch_backend>();
+    auto* output = backend.get();
+    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+    config.selection_viewport_projection_enabled = true;
+    term::Terminal_session session(std::move(backend), config);
+    term::Terminal_launch_config launch;
+    launch.argv = {QStringLiteral("shrink-only-phone-prefix-fixture")};
+    launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
+    bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+        "shrink-only phone prefix fixture starts");
+    output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
+    session.process_backend_callback_events();
+    session.resize(QSizeF(200.0, 60.0), {3, 20});
+    const auto snapshot = session.latest_render_snapshot_handle();
+    if (!check(snapshot &&
+            snapshot->viewport.presentation.policy == term::Terminal_presentation_policy::NATIVE &&
+            snapshot->leading_row_count == 2 && snapshot->leading_rows_snapshot &&
+            snapshot->leading_rows_snapshot->touch_selection &&
+            term::make_presented_snapshot(snapshot) == snapshot,
+            "a shrink-only native frame keeps the displaced rows for the phone and presents natively"))
+    {
+        return false;
+    }
+    auto word = request_at(*snapshot->leading_rows_snapshot,
+        touch::Terminal_touch_selection_action::SELECT_WORD, 0, 2, 111U);
+    word.presentation = touch::terminal_touch_selection_presentation_t{
+        touch::k_terminal_touch_selection_presentation_version, 2, 3};
+    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text == QStringLiteral("header"),
+        "the phone selects a displaced word while the desktop presents natively");
+    return ok;
+}
+
 bool desktop_content_tail_selection_contract()
 {
     auto backend = std::make_unique<Touch_backend>();
@@ -177,39 +218,99 @@ bool desktop_content_tail_selection_contract()
     launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
     bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
         "desktop content-tail selection fixture starts");
+    session.set_companion_presentation(true);
     output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
     session.process_backend_callback_events();
     session.resize(QSizeF(200.0, 40.0), {2, 20});
     session.resize(QSizeF(200.0, 120.0), {6, 20});
-    auto shown = term::make_content_tail_display_snapshot(session.latest_render_snapshot_handle());
+    auto shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
     if (!check(shown && shown->touch_selection && shown->display_row_logical_rows.front() == -1,
             "the desktop projection carries padding and retained touch rows"))
     {
         return false;
     }
     auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 1, 2, 201U);
-    ok &= check(session.apply_touch_selection(word, true).status == touch::Terminal_touch_selection_status::OK &&
+    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::OK &&
             session.selected_text().text == QStringLiteral("header") && !word.presentation,
         "desktop touch selects the displayed prefix without a phone presentation request");
-    shown = term::make_content_tail_display_snapshot(session.latest_render_snapshot_handle());
+    shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
     auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 1, 6, 202U);
     begin.handle = touch::Terminal_selection_handle::END;
-    ok &= check(session.apply_touch_selection(begin, true).status == touch::Terminal_touch_selection_status::OK,
+    ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
         "the desktop selection begins its end-handle gesture");
     auto scroll = begin;
     scroll.request_id = 203U;
     scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
     scroll.scroll_lines = 1;
-    ok &= check(session.apply_touch_selection(scroll, true).status == touch::Terminal_touch_selection_status::OK &&
+    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
             session.viewport_state().offset_from_tail == 1 && session.selected_text().text == QStringLiteral("header"),
         "desktop upward extension skips the relocated padding band");
     scroll.request_id = 204U;
     scroll.expected_selection_generation = session.latest_render_snapshot_handle()->touch_selection->selection_generation;
     scroll.scroll_lines = -1;
     scroll.target.column = 7;
-    ok &= check(session.apply_touch_selection(scroll, true).status == touch::Terminal_touch_selection_status::OK &&
+    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
             session.selected_text().text == QStringLiteral("header alpha\nsecond beta\nthird gamma\nfourth delta\nprompt>"),
         "desktop downward extension reaches the last written row without selecting the unwritten suffix");
+    return ok;
+}
+
+// Desktop touch on an AUTOMATIC presentation: the grow left four vacant rows
+// below the prompt, so the displayed rows are history and the written tail.
+// Selection addresses the displayed rows, and scroll-extension moves within
+// the presented range in both directions.
+bool desktop_automatic_selection_contract()
+{
+    auto backend = std::make_unique<Touch_backend>();
+    auto* output = backend.get();
+    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+    config.selection_viewport_projection_enabled = true;
+    term::Terminal_session session(std::move(backend), config);
+    term::Terminal_launch_config launch;
+    launch.argv = {QStringLiteral("desktop-automatic-selection")};
+    launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
+    bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+        "desktop automatic selection fixture starts");
+    QByteArray lines;
+    for (int line = 0; line < 10; ++line) {
+        lines += QStringLiteral("line-%1\r\n").arg(line).toUtf8();
+    }
+    output->output(lines + QByteArrayLiteral("prompt> "));
+    session.process_backend_callback_events();
+    session.resize(QSizeF(200.0, 40.0), {2, 20});
+    session.resize(QSizeF(200.0, 120.0), {6, 20});
+    auto shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
+    if (!check(shown && shown->touch_selection &&
+            shown->display_row_logical_rows == std::vector<int>({5, 6, 7, 8, 9, 10}) &&
+            term::presentation_max_offset_from_tail(session.viewport_state()) == 5,
+            "the desktop presents history above the prompt instead of the vacated rows"))
+    {
+        return false;
+    }
+    auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 2, 2, 301U);
+    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text == QStringLiteral("line"),
+        "desktop touch selects the displayed history word");
+    shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
+    auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 2, 6, 302U);
+    begin.handle = touch::Terminal_selection_handle::END;
+    ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
+        "the desktop selection begins its end-handle gesture");
+    auto scroll = begin;
+    scroll.request_id = 303U;
+    scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
+    scroll.scroll_lines = 1;
+    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
+            session.viewport_state().offset_from_tail == 1,
+        "upward extension scrolls the presented range by one row");
+    scroll.request_id = 304U;
+    scroll.expected_selection_generation = session.latest_render_snapshot_handle()->touch_selection->selection_generation;
+    scroll.scroll_lines = -1;
+    scroll.target.column = 7;
+    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
+            session.viewport_state().offset_from_tail == 0 &&
+            session.selected_text().text == QStringLiteral("line-7\nline-8\nline-9\nprompt>"),
+        "downward extension reaches the written tail without selecting the vacated rows");
     return ok;
 }
 
@@ -1301,7 +1402,9 @@ int main(int argc, char** argv)
     QGuiApplication app(argc, argv);
     bool ok = owner_selection_contract();
     ok &= resize_leading_rows_selection_contract();
+    ok &= shrink_only_phone_prefix_contract();
     ok &= desktop_content_tail_selection_contract();
+    ok &= desktop_automatic_selection_contract();
     ok &= touch_intent_contract();
     ok &= direct_word_hold_contract();
     ok &= cursor_hold_contract();

@@ -1085,6 +1085,7 @@ void sync_viewport_controller_to_snapshot(
 
     controller.leave_alternate_screen();
     controller.set_scrollback_rows(viewport.scrollback_rows);
+    controller.set_presentation(viewport.presentation);
     const int offset_delta =
         viewport.offset_from_tail - controller.state().offset_from_tail;
     if (offset_delta != 0) {
@@ -2757,7 +2758,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines_from_pub
         }
 
         const int bounded_public_max_offset =
-            std::max(0, published_viewport.scrollback_rows);
+            presentation_max_offset_from_tail(published_viewport);
         const long long requested_offset =
             static_cast<long long>(live_viewport.offset_from_tail) +
             static_cast<long long>(line_delta);
@@ -2912,7 +2913,7 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_o
 
     const Terminal_viewport_state viewport = m_viewport_controller.state();
     const int target_offset =
-        std::clamp(offset_from_tail, 0, std::max(0, viewport.scrollback_rows));
+        std::clamp(offset_from_tail, 0, presentation_max_offset_from_tail(viewport));
     const int line_delta = target_offset - viewport.offset_from_tail;
     if (line_delta == 0) {
         return {};
@@ -3079,6 +3080,33 @@ void Terminal_session::clear_selection()
     if (m_screen_model.has_value()) {
         m_selection_buffer_id = m_screen_model->active_buffer_id();
         publish_selection_snapshot(next_sequence(), QStringLiteral("selection cleared"));
+    }
+}
+
+void Terminal_session::set_companion_presentation(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_companion_presentation == enabled) {
+        return;
+    }
+
+    m_companion_presentation = enabled;
+    refresh_viewport_presentation();
+    (void)publish_viewport_snapshot_if_allowed(
+        next_sequence(),
+        QStringLiteral("presentation policy changed"));
+}
+
+// The controller bounds the presented offset by the primary screen's current
+// mapping. While the alternate screen is active the primary keeps its mapping
+// until it is active again.
+void Terminal_session::refresh_viewport_presentation()
+{
+    if (m_screen_model.has_value() &&
+        m_screen_model->active_buffer_id() == Terminal_buffer_id::PRIMARY)
+    {
+        m_viewport_controller.set_presentation(
+            m_screen_model->presentation_mapping(m_companion_presentation));
     }
 }
 
@@ -5424,9 +5452,10 @@ Terminal_session_result Terminal_session::process_resize_command(
 #endif
 
     Resize_transition_context resize_context;
-    resize_context.session     = this;
-    resize_context.host_resize = &resize;
-    resize_context.sequence    = command.sequence;
+    resize_context.session                  = this;
+    resize_context.host_resize              = &resize;
+    resize_context.detached_viewport_anchor = capture_live_primary_detached_viewport_anchor();
+    resize_context.sequence                 = command.sequence;
     const terminal_screen_model_resize_transition_sink_t resize_transition_sink{
         &resize_context,
         &Terminal_session::consume_screen_model_resize_transition_callback,
@@ -5488,7 +5517,7 @@ Terminal_session_result Terminal_session::process_resize_command(
         }
     }
 
-    sync_viewport_from_model_result(model_result, std::nullopt);
+    sync_viewport_from_model_result(model_result, resize_context.detached_viewport_anchor);
     m_render_snapshot_model_result = model_result;
     const bool render_snapshot_available =
         model_allows_render_snapshot(*m_screen_model);
@@ -8642,17 +8671,33 @@ void Terminal_session::sync_viewport_from_model_result(
         active_buffer_after_from_mode_transition_delta(result).value_or(
             m_screen_model->active_buffer_id());
     m_viewport_controller.set_scrollback_rows(result.scrollback_rows);
+    refresh_viewport_presentation();
     if (!m_selection.has_selection())                   { m_selection_buffer_id = active_buffer;          }
     if (active_buffer == Terminal_buffer_id::ALTERNATE) {
         if (detached_viewport_anchor.has_value()) {
             resolve_live_primary_detached_viewport_anchor(*detached_viewport_anchor);
         }
+        // The saved primary view keeps its first displayed row by identity
+        // while the alternate screen is active, since resizes can archive and
+        // evict primary rows at constant S.
+        if (m_viewport_controller.state().active_buffer == Terminal_buffer_id::PRIMARY) {
+            m_saved_primary_viewport_anchor = capture_live_primary_detached_viewport_anchor();
+        }
         m_viewport_controller.enter_alternate_screen();
     }
     else {
+        const bool leaving_alternate =
+            m_viewport_controller.state().active_buffer == Terminal_buffer_id::ALTERNATE;
         m_viewport_controller.leave_alternate_screen();
         if (detached_viewport_anchor.has_value()) {
             resolve_live_primary_detached_viewport_anchor(*detached_viewport_anchor);
+        }
+        else
+        if (leaving_alternate && m_saved_primary_viewport_anchor.has_value()) {
+            resolve_live_primary_detached_viewport_anchor(*m_saved_primary_viewport_anchor);
+        }
+        if (leaving_alternate) {
+            m_saved_primary_viewport_anchor.reset();
         }
     }
 }
@@ -8672,23 +8717,22 @@ Terminal_session::capture_live_primary_detached_viewport_anchor() const
         return std::nullopt;
     }
 
-    const int first_visible_logical_row =
-        viewport.scrollback_rows - viewport.offset_from_tail;
-    if (first_visible_logical_row < 0 ||
-        first_visible_logical_row >= viewport.scrollback_rows)
-    {
+    // The first displayed history row and its display position.
+    const std::optional<Terminal_presentation_anchor> anchor =
+        presentation_first_displayed_row(viewport, 0, viewport.scrollback_rows);
+    if (!anchor.has_value()) {
         return std::nullopt;
     }
 
     const std::optional<terminal_history_handle_t> history_handle =
         m_screen_model->retained_history_handle_at_logical_row(
             Terminal_buffer_id::PRIMARY,
-            first_visible_logical_row);
+            anchor->logical_row);
     if (!history_handle.has_value()) {
         return std::nullopt;
     }
 
-    return Live_primary_viewport_anchor{*history_handle, 0};
+    return Live_primary_viewport_anchor{*history_handle, anchor->display_row};
 }
 
 void Terminal_session::resolve_live_primary_detached_viewport_anchor(
@@ -8709,19 +8753,22 @@ void Terminal_session::resolve_live_primary_detached_viewport_anchor(
             Terminal_buffer_id::PRIMARY,
             detached_viewport_anchor.history_handle);
     }
+    // The row returns to its display position under the current mapping.
     if (lookup.exact_match) {
-        const int first_visible_logical_row =
-            lookup.exact_logical_row - detached_viewport_anchor.viewport_row;
         scroll_live_primary_viewport_to_offset_from_tail(
-            viewport.scrollback_rows - first_visible_logical_row);
+            presentation_offset_for_logical_row(
+                viewport,
+                lookup.exact_logical_row,
+                detached_viewport_anchor.viewport_row));
         return;
     }
 
     if (lookup.nearest_successor) {
-        const int first_visible_logical_row =
-            lookup.nearest_successor_logical_row - detached_viewport_anchor.viewport_row;
         scroll_live_primary_viewport_to_offset_from_tail(
-            viewport.scrollback_rows - first_visible_logical_row);
+            presentation_offset_for_logical_row(
+                viewport,
+                lookup.nearest_successor_logical_row,
+                detached_viewport_anchor.viewport_row));
         return;
     }
 
@@ -8737,7 +8784,7 @@ void Terminal_session::scroll_live_primary_viewport_to_offset_from_tail(
     }
 
     const int target_offset =
-        std::clamp(offset_from_tail, 0, std::max(0, viewport.scrollback_rows));
+        std::clamp(offset_from_tail, 0, presentation_max_offset_from_tail(viewport));
     const int line_delta = target_offset - viewport.offset_from_tail;
     if (line_delta != 0) {
         (void)m_viewport_controller.scroll_lines(line_delta);
@@ -9805,6 +9852,7 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
     request.backend_geometry_in_sync         = m_backend_geometry_in_sync;
     request.visual_bell_active               = m_visual_bell_active;
     request.ime_preedit                      = m_ime_preedit;
+    request.companion_presentation           = m_companion_presentation;
     if (m_render_snapshot_model_result.has_value()) {
         request.dirty_rows       = m_render_snapshot_model_result->dirty_rows;
         request.viewport_changed = m_render_snapshot_model_result->viewport_changed;
@@ -10287,20 +10335,17 @@ bool Terminal_session::reveal_current_search_match(QString message)
 
         const Terminal_viewport_state viewport_before =
             m_public_viewport_controller.viewport();
-        const int first_visible_row = first_public_row_for_viewport(viewport_before);
+        const int match_row = static_cast<int>(match->public_row);
+        const std::optional<int> display_row =
+            presentation_display_row_for_logical_row(viewport_before, match_row);
         int target_offset = viewport_before.offset_from_tail;
-        if (match->public_row < first_visible_row) {
-            target_offset = viewport_before.scrollback_rows -
-                static_cast<int>(match->public_row);
-        }
-        else
-        if (match->public_row >=
-            first_visible_row + viewport_before.visible_rows)
+        if (display_row.has_value() &&
+            (*display_row < 0 || *display_row >= viewport_before.visible_rows))
         {
-            const std::int64_t target_first_row =
-                match->public_row - viewport_before.visible_rows + 1;
-            target_offset = viewport_before.scrollback_rows -
-                static_cast<int>(target_first_row);
+            target_offset = presentation_offset_for_logical_row(
+                viewport_before,
+                match_row,
+                *display_row < 0 ? 0 : viewport_before.visible_rows - 1);
         }
 
         const Terminal_public_viewport_controller controller_before =
@@ -10335,26 +10380,18 @@ bool Terminal_session::reveal_current_search_match(QString message)
     Terminal_screen_model_result search_result;
     if (match->identity.buffer_id == Terminal_buffer_id::PRIMARY) {
         const Terminal_viewport_state viewport_before = m_viewport_controller.state();
-        const int first_visible_row = first_public_row_for_viewport(viewport_before);
-        int target_offset = viewport_before.offset_from_tail;
-        if (match->public_row < first_visible_row) {
-            target_offset = viewport_before.scrollback_rows -
-                static_cast<int>(match->public_row);
-        }
-        else
-        if (match->public_row >=
-            first_visible_row + viewport_before.visible_rows)
+        const int match_row = static_cast<int>(match->public_row);
+        const std::optional<int> display_row =
+            presentation_display_row_for_logical_row(viewport_before, match_row);
+        int bounded_target = viewport_before.offset_from_tail;
+        if (display_row.has_value() &&
+            (*display_row < 0 || *display_row >= viewport_before.visible_rows))
         {
-            const std::int64_t target_first_row =
-                match->public_row - viewport_before.visible_rows + 1;
-            target_offset = viewport_before.scrollback_rows -
-                static_cast<int>(target_first_row);
+            bounded_target = presentation_offset_for_logical_row(
+                viewport_before,
+                match_row,
+                *display_row < 0 ? 0 : viewport_before.visible_rows - 1);
         }
-
-        const int bounded_target = std::clamp(
-            target_offset,
-            0,
-            std::max(0, viewport_before.scrollback_rows));
         const int line_delta = bounded_target - viewport_before.offset_from_tail;
         if (line_delta != 0) {
             const Terminal_viewport_scroll_result scroll_result =
@@ -10683,7 +10720,7 @@ Terminal_session::reconcile_public_projection_release(
         }
 
         const int clamped_target =
-            std::clamp(target_offset, 0, std::max(0, viewport.scrollback_rows));
+            std::clamp(target_offset, 0, presentation_max_offset_from_tail(viewport));
         if (clamped_target != target_offset) {
             diagnostics.hidden_row_clamp_reason =
                 Terminal_hidden_row_clamp_reason::LIVE_VIEWPORT_BOUNDARY;
@@ -10694,14 +10731,17 @@ Terminal_session::reconcile_public_projection_release(
         }
         return clamped_target;
     };
+    // The live offset that shows the row at the anchor's display position,
+    // before set_target_offset clamps it and records the boundary.
     const auto offset_for_logical_row = [&](
         int logical_row,
         int anchor_viewport_row)
     {
-        const int target_first_visible_logical_row =
-            logical_row - anchor_viewport_row;
         return live_viewport_before_on_release.scrollback_rows -
-            target_first_visible_logical_row;
+            presentation_stream_row_for_logical_row(
+                live_viewport_before_on_release.presentation,
+                logical_row) +
+            anchor_viewport_row;
     };
     const auto record_incompatible_buffer = [&](
         Terminal_public_scroll_diagnostic_reason reason)
@@ -11137,6 +11177,13 @@ void Terminal_session::publish_render_snapshot(
             ++m_profile_stats.dirty_coalescing_applied;
         }
 #endif
+    }
+    // A mapping change that leaves the native viewport alone still changes
+    // what every display row presents, so the next drawn frame repaints in full.
+    if (m_latest_render_snapshot != nullptr &&
+        !snapshots_share_row_identity_space(*m_latest_render_snapshot, snapshot))
+    {
+        snapshot.dirty_row_ranges = compact_dirty_row_ranges({}, snapshot.grid_size.rows, true);
     }
     suppress_selection_spans_without_valid_line_provenance(snapshot);
     apply_search_matches_to_snapshot(snapshot, m_active_buffer_epoch);

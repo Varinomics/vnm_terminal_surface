@@ -4,69 +4,91 @@
 #include <map>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace vnm_terminal::internal {
 
 namespace {
 
-int padding_rows(const Terminal_render_snapshot& snapshot)
+bool presentation_is_identity(const Terminal_render_snapshot& source)
 {
-    return snapshot.viewport.active_buffer == Terminal_buffer_id::PRIMARY &&
-        snapshot.native_content_bottom_row_exclusive > 0
-        ? snapshot.grid_size.rows - snapshot.native_content_bottom_row_exclusive : 0;
-}
-
-}
-
-int content_tail_display_row_to_logical_row(const Terminal_render_snapshot& snapshot, int display_row)
-{
-    if (display_row < 0 || display_row >= snapshot.grid_size.rows) {
-        return -1;
+    const int first_native_row = render_snapshot_first_visible_logical_row(source);
+    for (int row = 0; row < source.grid_size.rows; ++row) {
+        if (presentation_requested_logical_row(source.viewport, row) != first_native_row + row) {
+            return false;
+        }
     }
-    const int first = render_snapshot_first_visible_logical_row(snapshot);
-    const int stream_row = first + display_row;
-    const int insertion = snapshot.viewport.scrollback_rows - snapshot.resize_displaced_scrollback_rows;
-    const int padding = padding_rows(snapshot);
-    if (padding == 0 || stream_row < insertion) {
-        return stream_row;
-    }
-    return stream_row < insertion + padding ? -1 : stream_row - padding;
+    return true;
 }
 
-int content_tail_logical_row_to_display_row(const Terminal_render_snapshot& snapshot, int logical_row)
+// Resolves every requested position against the frame's coverage: its own
+// rows from logical S - o on, and the leading rows directly above them. A
+// frozen frame's missing rows above that coverage become unused slots; any
+// other missing row leaves the frame unpresentable.
+std::optional<std::vector<int>> resolved_logical_rows(const Terminal_render_snapshot& source)
 {
-    const int insertion = snapshot.viewport.scrollback_rows - snapshot.resize_displaced_scrollback_rows;
-    return logical_row - render_snapshot_first_visible_logical_row(snapshot) +
-        (logical_row >= insertion ? padding_rows(snapshot) : 0);
+    const int rows             = source.grid_size.rows;
+    const int first_native_row = render_snapshot_first_visible_logical_row(source);
+    const int leading_rows     = source.leading_rows_snapshot ? source.leading_row_count : 0;
+    if (!presentation_window_resolvable(
+            source.viewport,
+            first_native_row - leading_rows,
+            leading_rows + rows,
+            render_snapshot_has_frozen_basis(source)))
+    {
+        return std::nullopt;
+    }
+
+    std::vector<int> logical_rows;
+    logical_rows.reserve(static_cast<std::size_t>(rows));
+    for (int row = 0; row < rows; ++row) {
+        const int requested = presentation_requested_logical_row(source.viewport, row);
+        logical_rows.push_back(requested < first_native_row - leading_rows ? -1 : requested);
+    }
+    return logical_rows;
 }
 
-std::shared_ptr<const Terminal_render_snapshot> make_content_tail_display_snapshot(
+}
+
+std::shared_ptr<const Terminal_render_snapshot> make_presented_snapshot(
     std::shared_ptr<const Terminal_render_snapshot> source)
 {
-    if (!source || source->display_source || padding_rows(*source) == 0 ||
-        !render_snapshot_visible_line_provenance_is_valid(*source) ||
-        (source->leading_rows_snapshot &&
-            !render_snapshot_visible_line_provenance_is_valid(*source->leading_rows_snapshot)))
-    {
+    if (!source || source->display_source || presentation_is_identity(*source)) {
         return source;
     }
+
+    const std::optional<std::vector<int>> logical_rows = resolved_logical_rows(*source);
+    if (!logical_rows.has_value()) {
+        return {};
+    }
+
+    const int rows = source->grid_size.rows;
+    const Terminal_render_snapshot* leading = source->leading_rows_snapshot.get();
+    // Frozen geometry-adapted frames render known cells without retained
+    // identities; the presented frame then carries none either.
+    const bool provenance_available =
+        render_snapshot_visible_line_provenance_is_valid(*source) &&
+        (!leading || render_snapshot_visible_line_provenance_is_valid(*leading));
+
     auto displayed = std::make_shared<Terminal_render_snapshot>(*source);
     displayed->display_source = source;
+    displayed->display_row_logical_rows = *logical_rows;
+    // The leading rows are composed into the presented rows; leading_row_count
+    // keeps describing the coverage, which is part of the frame's identity.
     displayed->leading_rows_snapshot.reset();
-    displayed->leading_row_count = 0;
     displayed->cells.clear();
     displayed->visible_line_provenance.clear();
-    displayed->visible_row_images.assign(static_cast<std::size_t>(source->grid_size.rows), {});
+    displayed->visible_row_images.clear();
     displayed->selection_spans.clear();
     displayed->search_match_spans.clear();
-    displayed->dirty_row_ranges = {{0, source->grid_size.rows}};
+    displayed->dirty_row_ranges = {{0, rows}};
     if (displayed->touch_selection) {
         displayed->touch_selection->visible_rows.clear();
         displayed->touch_selection->spans.clear();
         displayed->touch_selection->start.visible = false;
         displayed->touch_selection->end.visible = false;
     }
-    const Terminal_render_snapshot* leading = source->leading_rows_snapshot.get();
+
     const Terminal_render_snapshot_row_content_view native_rows(*source);
     std::optional<Terminal_render_snapshot_row_content_view> leading_rows;
     const auto leading_style_offset = static_cast<Terminal_style_id>(displayed->styles.size());
@@ -84,27 +106,25 @@ std::shared_ptr<const Terminal_render_snapshot> make_content_tail_display_snapsh
             displayed->hyperlinks.push_back(std::move(link));
         }
     }
-    for (int row = 0; row < source->grid_size.rows; ++row) {
-        const int logical_row = content_tail_display_row_to_logical_row(*source, row);
-        displayed->display_row_logical_rows.push_back(logical_row);
+
+    const int first_native_row = render_snapshot_first_visible_logical_row(*source);
+    for (int row = 0; row < rows; ++row) {
+        const int logical_row = (*logical_rows)[static_cast<std::size_t>(row)];
         if (logical_row < 0) {
-            Terminal_render_line_provenance padding;
-            padding.logical_row = -1;
-            displayed->visible_line_provenance.push_back(padding);
+            if (provenance_available) {
+                Terminal_render_line_provenance slot;
+                slot.logical_row = -1;
+                displayed->visible_line_provenance.push_back(slot);
+            }
             if (displayed->touch_selection) {
                 displayed->touch_selection->visible_rows.push_back({});
             }
             continue;
         }
-        int source_row = logical_row - render_snapshot_first_visible_logical_row(*source);
-        const bool from_leading = source_row < 0;
-        if (from_leading && !leading) {
-            return source;
-        }
-        const auto& row_source = from_leading ? *leading : *source;
-        if (from_leading) {
-            source_row = logical_row - render_snapshot_first_visible_logical_row(row_source);
-        }
+
+        const bool from_leading = logical_row < first_native_row;
+        const auto& row_source  = from_leading ? *leading : *source;
+        const int source_row    = logical_row - render_snapshot_first_visible_logical_row(row_source);
         const auto cells = (from_leading ? *leading_rows : native_rows).row_at(source_row);
         for (auto cell : cells) {
             cell.position.row = row;
@@ -116,11 +136,15 @@ std::shared_ptr<const Terminal_render_snapshot> make_content_tail_display_snapsh
             }
             displayed->cells.push_back(std::move(cell));
         }
-        displayed->visible_line_provenance.push_back(
-            row_source.visible_line_provenance[static_cast<std::size_t>(source_row)]);
+        if (provenance_available) {
+            displayed->visible_line_provenance.push_back(
+                row_source.visible_line_provenance[static_cast<std::size_t>(source_row)]);
+        }
         if (!row_source.visible_row_images.empty()) {
-            displayed->visible_row_images[static_cast<std::size_t>(row)] =
-                row_source.visible_row_images[static_cast<std::size_t>(source_row)];
+            set_render_snapshot_row_image(
+                *displayed,
+                row,
+                row_source.visible_row_images[static_cast<std::size_t>(source_row)]);
         }
         for (auto span : row_source.selection_spans) {
             if (span.row == source_row) {
@@ -152,10 +176,12 @@ std::shared_ptr<const Terminal_render_snapshot> make_content_tail_display_snapsh
             }
         }
     }
-    displayed->cursor.position.row = content_tail_logical_row_to_display_row(*source,
-        render_snapshot_first_visible_logical_row(*source) + source->cursor.position.row);
-    displayed->cursor.visible = source->cursor.visible && displayed->cursor.position.row >= 0 &&
-        displayed->cursor.position.row < source->grid_size.rows;
+
+    const std::optional<int> cursor_row = presentation_display_row_for_logical_row(
+        source->viewport, first_native_row + source->cursor.position.row);
+    displayed->cursor.position.row = cursor_row.value_or(-1);
+    displayed->cursor.visible = source->cursor.visible && cursor_row.has_value() &&
+        *cursor_row >= 0 && *cursor_row < rows;
     return displayed;
 }
 

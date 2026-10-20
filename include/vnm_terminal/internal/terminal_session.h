@@ -222,8 +222,10 @@ public:
 
     void clear_selection();
     Terminal_touch_selection_result apply_touch_selection(
-        const Terminal_touch_selection_request& request,
-        bool content_tail_presentation = false);
+        const Terminal_touch_selection_request& request);
+    // The Companion toggle: while enabled, the primary screen is presented
+    // through the COMPANION mapping instead of NATIVE or AUTOMATIC.
+    void set_companion_presentation(bool enabled);
     void set_scrollback_limit(int limit);
     void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
     void set_color_state(Terminal_color_state state);
@@ -853,6 +855,7 @@ private:
     void handle_bell_request(
         std::uint64_t              sequence);
 
+    void refresh_viewport_presentation();
     void sync_viewport_from_model_result(
         const Terminal_screen_model_result&    result,
         std::optional<Live_primary_viewport_anchor>
@@ -1258,6 +1261,10 @@ private:
         Terminal_buffer_id::PRIMARY;
     bool                                                   m_deferred_viewport_changed = false;
     bool                                                   m_visual_bell_active        = false;
+    bool                                                   m_companion_presentation    = false;
+    // The saved primary view's first displayed row while the alternate
+    // screen is active.
+    std::optional<Live_primary_viewport_anchor>            m_saved_primary_viewport_anchor;
 };
 
 }

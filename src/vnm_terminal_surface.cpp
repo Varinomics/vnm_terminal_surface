@@ -571,7 +571,7 @@ bool viewport_state_can_scroll_locally(
     }
 
     if (scroll_direction > 0) {
-        return viewport.offset_from_tail < viewport.scrollback_rows;
+        return viewport.offset_from_tail < term::presentation_max_offset_from_tail(viewport);
     }
 
     if (scroll_direction < 0) {
@@ -945,15 +945,17 @@ std::optional<term::terminal_grid_position_t> logical_grid_position_for_viewport
     };
 }
 
+// While input follows the committed frame, mouse reports address the native
+// screen row it shows: a displayed history row or slot receives none.
 std::optional<term::terminal_grid_position_t> native_mouse_position(
     const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
     term::terminal_grid_position_t position,
-    bool content_tail_presentation)
+    bool follows_committed_frame)
 {
     if (!snapshot) {
         return std::nullopt;
     }
-    if (!content_tail_presentation || snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE) {
+    if (!follows_committed_frame || snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE) {
         return position;
     }
     const auto logical = logical_grid_position_for_viewport_cell(snapshot, position);
@@ -2373,18 +2375,16 @@ struct VNM_TerminalSurface::Private
                     if (surface_ptr == nullptr) {
                         return;
                     }
-                    if (surface_private.content_tail_presentation_enabled ||
-                        surface_private.content_tail_presentation_retiring)
-                    {
+                    if (surface_private.input_follows_committed_frame() || surface_private.presentation_retiring) {
                         surface.updateInputMethod(Qt::ImCursorRectangle);
                         if (surface_ptr == nullptr) {
                             return;
                         }
                         const auto report = surface_private.qsg_atlas_recorder->snapshot();
-                        if (!surface_private.content_tail_presentation_enabled && report.rendered_snapshot &&
+                        if (!surface_private.input_follows_committed_frame() && report.rendered_snapshot &&
                             !report.rendered_snapshot->display_source)
                         {
-                            surface_private.content_tail_presentation_retiring = false;
+                            surface_private.presentation_retiring = false;
                         }
                     }
                 }
@@ -2500,12 +2500,12 @@ struct VNM_TerminalSurface::Private
 
     QRectF input_method_cursor_rectangle(const VNM_TerminalSurface& surface) const
     {
-        const auto report = (content_tail_presentation_enabled || content_tail_presentation_retiring) && qsg_atlas_recorder
+        const auto report = (input_follows_committed_frame() || presentation_retiring) && qsg_atlas_recorder
             ? qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
-        const bool projected = content_tail_presentation_enabled ||
-            (content_tail_presentation_retiring && report.rendered_snapshot && report.rendered_snapshot->display_source);
-        const auto snapshot = projected ? report.rendered_snapshot : render_snapshot;
-        const auto metrics = projected ? report.rendered_touch_cell_metrics : cell_metrics;
+        const bool projected = input_follows_committed_frame() ||
+            (presentation_retiring && report.rendered_snapshot && report.rendered_snapshot->display_source);
+        const auto snapshot = projected ? committed_input_frame(report) : render_snapshot;
+        const auto metrics = projected ? committed_input_metrics(report) : cell_metrics;
         const qreal cell_width = term::is_valid_cell_metrics(metrics)
             ? metrics.width
             : 1.0;
@@ -3065,8 +3065,40 @@ struct VNM_TerminalSurface::Private
                                                            term::k_vnm_terminal_default_logical_dpi;
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
     std::shared_ptr<const term::Terminal_render_snapshot>  display_snapshot;
+
+    // The display frame comes from the producer. A frame the producer cannot
+    // present is never shown; the previous display frame stays until a
+    // presentable one arrives. Input, IME and links follow the committed
+    // frame while it or the newest display frame is presented.
+    void present_render_snapshot()
+    {
+        const bool was_following = input_follows_committed_frame();
+        if (!render_snapshot) {
+            display_snapshot.reset();
+        }
+        else
+        if (auto presented = term::make_presented_snapshot(render_snapshot)) {
+            display_snapshot = std::move(presented);
+        }
+        presentation_retiring = presentation_retiring || (was_following && !input_follows_committed_frame());
+    }
+
+    bool presentation_active() const
+    {
+        return display_snapshot && display_snapshot->display_source;
+    }
+
+    // Input, IME and links follow the committed frame while the Companion
+    // toggle is on or the newest display frame is presented.
+    bool input_follows_committed_frame() const
+    {
+        return content_tail_presentation_enabled || presentation_active();
+    }
+
     bool                                                   content_tail_presentation_enabled = false;
-    bool                                                   content_tail_presentation_retiring = false;
+    // Set while a native display frame replaces a presented one, until a
+    // native frame is committed.
+    bool                                                   presentation_retiring = false;
     int                                                    display_input_depth = 0;
     bool                                                   display_input_projected = false;
     std::shared_ptr<const term::Terminal_render_snapshot>  display_input_snapshot;
@@ -3074,14 +3106,28 @@ struct VNM_TerminalSurface::Private
 
     void sample_display_input()
     {
-        if (!content_tail_presentation_enabled && !content_tail_presentation_retiring) {
+        if (!input_follows_committed_frame() && !presentation_retiring) {
             return;
         }
         const auto report = qsg_atlas_recorder ? qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
-        display_input_projected = content_tail_presentation_enabled ||
+        display_input_projected = input_follows_committed_frame() ||
             (report.rendered_snapshot && report.rendered_snapshot->display_source);
-        display_input_snapshot = report.rendered_snapshot;
-        display_input_metrics = report.rendered_touch_cell_metrics;
+        display_input_snapshot = committed_input_frame(report);
+        display_input_metrics = committed_input_metrics(report);
+    }
+
+    // Input addresses the frame the renderer committed. Until it has drawn
+    // one, the frame it was handed is what the user is about to see.
+    std::shared_ptr<const term::Terminal_render_snapshot> committed_input_frame(
+        const term::Qsg_atlas_frame_report& report) const
+    {
+        return report.rendered_snapshot ? report.rendered_snapshot : display_snapshot;
+    }
+
+    term::terminal_cell_metrics_t committed_input_metrics(
+        const term::Qsg_atlas_frame_report& report) const
+    {
+        return report.rendered_snapshot ? report.rendered_touch_cell_metrics : cell_metrics;
     }
 
     std::shared_ptr<const term::Terminal_render_snapshot> input_snapshot() const
@@ -3149,28 +3195,6 @@ struct VNM_TerminalSurface::Private
         return true;
     }
 
-    void reveal_current_search_in_display(VNM_TerminalSurface& surface)
-    {
-        if (!content_tail_presentation_enabled || !render_snapshot || !session) {
-            return;
-        }
-        for (const auto& span : render_snapshot->search_match_spans) {
-            if (!span.current) {
-                continue;
-            }
-            const int logical = term::render_snapshot_first_visible_logical_row(*render_snapshot) + span.row;
-            const int row = term::content_tail_logical_row_to_display_row(*render_snapshot, logical);
-            const int rows = render_snapshot->grid_size.rows;
-            if (row >= 0 && row < rows) {
-                return;
-            }
-            const int offset = render_snapshot->viewport.offset_from_tail -
-                (row < 0 ? row : row - rows + 1);
-            (void)session->scroll_published_viewport_to_offset_from_tail(offset);
-            surface.sync_from_session();
-            return;
-        }
-    }
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
     QTimer                                                 cursor_settle_timer;
@@ -3368,9 +3392,7 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
             },
             [this](const vnm_terminal::Terminal_touch_selection_request& request) {
                 Input_frontier_scope input_frontier(*this);
-                const auto result = m_private->session && m_private->content_tail_presentation_enabled
-                    ? m_private->session->apply_touch_selection(request, true)
-                    : apply_touch_selection(request);
+                const auto result = apply_touch_selection(request);
                 sync_from_session();
                 m_touch_controller->complete(result);
                 emit touch_selection_completed(result);
@@ -4766,9 +4788,12 @@ void VNM_TerminalSurface::set_content_tail_presentation_enabled(bool enabled)
     cancel_pointer_gesture();
     dismiss_row_timestamp_tooltip();
     m_private->content_tail_presentation_enabled = enabled;
-    m_private->content_tail_presentation_retiring = !enabled;
-    m_private->display_snapshot = enabled
-        ? term::make_content_tail_display_snapshot(m_private->render_snapshot) : m_private->render_snapshot;
+    m_private->presentation_retiring = m_private->presentation_retiring || !enabled;
+    if (m_private->session) {
+        m_private->session->set_companion_presentation(enabled);
+        sync_from_session();
+    }
+    m_private->present_render_snapshot();
     m_private->request_render_update(*this);
     updateInputMethod(Qt::ImCursorRectangle);
 }
@@ -4915,15 +4940,15 @@ void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
 QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const
 {
     Q_ASSERT(thread() == QThread::currentThread());
-    const auto report = (m_private->content_tail_presentation_enabled || m_private->content_tail_presentation_retiring) &&
+    const auto report = (m_private->input_follows_committed_frame() || m_private->presentation_retiring) &&
             m_private->qsg_atlas_recorder
         ? m_private->qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
-    const bool projected = m_private->content_tail_presentation_enabled ||
+    const bool projected = m_private->input_follows_committed_frame() ||
         (report.rendered_snapshot && report.rendered_snapshot->display_source);
     const std::optional<Surface_hyperlink_target> hyperlink =
         explicit_hyperlink_for_local_point(
-            projected ? report.rendered_snapshot : m_private->render_snapshot,
-            projected ? report.rendered_touch_cell_metrics : m_private->cell_metrics,
+            projected ? m_private->committed_input_frame(report) : m_private->render_snapshot,
+            projected ? m_private->committed_input_metrics(report) : m_private->cell_metrics,
             QPointF(x, y));
     return hyperlink.has_value() ? hyperlink->uri : QByteArray{};
 }
@@ -5223,7 +5248,6 @@ bool VNM_TerminalSurface::search_next()
 
     const bool selected = m_private->session->search_next();
     sync_from_session();
-    m_private->reveal_current_search_in_display(*this);
     return selected;
 }
 
@@ -5239,7 +5263,6 @@ bool VNM_TerminalSurface::search_previous()
 
     const bool selected = m_private->session->search_previous();
     sync_from_session();
-    m_private->reveal_current_search_in_display(*this);
     return selected;
 }
 
@@ -8088,7 +8111,9 @@ void VNM_TerminalSurface::set_grid_size(int rows, int columns)
 void VNM_TerminalSurface::set_viewport_state(
     const term::Terminal_viewport_state& state)
 {
-    const int scrollback_rows = std::max(0, state.scrollback_rows);
+    // The scroll range is the presentation's: the rows the producer can show
+    // above the tail, which excludes hidden resize vacancy.
+    const int scrollback_rows = term::presentation_max_offset_from_tail(state);
     const int visible_rows    = std::max(0, state.visible_rows);
     const int offset_from_tail =
         std::clamp(state.offset_from_tail, 0, scrollback_rows);
@@ -8438,6 +8463,7 @@ Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
     m_private->session_generation = started_session_generation;
     m_private->session->set_search_case_sensitive(m_search_case_sensitive);
+    m_private->session->set_companion_presentation(m_private->content_tail_presentation_enabled);
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     // Before the backend starts, so the child's first winsize has pixels.
@@ -8917,7 +8943,6 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
     };
 
     bool render_snapshot_installed = false;
-    bool search_selection_changed = false;
     std::shared_ptr<const term::Terminal_render_snapshot> installed_render_snapshot;
     const auto installed_render_snapshot_still_current = [&] {
         return m_private->render_snapshot == installed_render_snapshot;
@@ -8978,9 +9003,6 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         }
         const term::terminal_search_result_state_t search_state =
             session->search_result_state();
-        search_selection_changed = m_search_query != session->search_query() ||
-            m_search_result_state != surface_search_result_state(search_state.status) ||
-            m_current_search_match != search_state.current_match;
         set_search_state(
             session->search_query(),
             surface_search_result_state(search_state.status),
@@ -9128,9 +9150,6 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::recovery_timer");
 
         sync_synchronized_output_recovery_timer();
-    }
-    if (search_selection_changed && active_session_still_matches()) {
-        m_private->reveal_current_search_in_display(*this);
     }
 }
 
@@ -9593,8 +9612,7 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->observe_cursor_publication(surface, snapshot);
     surface.m_private->render_snapshot = std::move(snapshot);
-    surface.m_private->display_snapshot = surface.m_private->content_tail_presentation_enabled
-        ? make_content_tail_display_snapshot(surface.m_private->render_snapshot) : surface.m_private->render_snapshot;
+    surface.m_private->present_render_snapshot();
     surface.refresh_hyperlink_hover_feedback();
     surface.updateInputMethod(Qt::ImCursorRectangle);
     surface.m_private->request_render_update(surface);

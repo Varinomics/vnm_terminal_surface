@@ -717,7 +717,7 @@ void Terminal_public_viewport_controller::initialize_from_copied_rows(
     viewport.scrollback_rows =
         std::max(0, viewport.scrollback_rows);
     viewport.offset_from_tail =
-        std::clamp(viewport.offset_from_tail, 0, viewport.scrollback_rows);
+        std::clamp(viewport.offset_from_tail, 0, presentation_max_offset_from_tail(viewport));
     viewport.follow_tail = viewport.offset_from_tail == 0;
 
     m_release_intent.has_public_viewport            = true;
@@ -839,7 +839,7 @@ void Terminal_public_viewport_controller::record_selection_mutation_unsupported(
 int Terminal_public_viewport_controller::max_offset_from_tail() const
 {
     return m_release_intent.has_public_viewport
-        ? std::max(0, m_release_intent.public_viewport.scrollback_rows)
+        ? presentation_max_offset_from_tail(m_release_intent.public_viewport)
         : 0;
 }
 
@@ -890,10 +890,19 @@ void Terminal_public_viewport_controller::refresh_detached_anchor()
         return;
     }
 
-    const int first_public_row =
-        first_public_row_for_offset(m_release_intent.public_viewport.offset_from_tail);
+    // The first displayed copied row and its display position.
+    const std::optional<Terminal_presentation_anchor> displayed_row =
+        presentation_first_displayed_row(
+            m_release_intent.public_viewport,
+            m_first_copied_public_row,
+            static_cast<int>(m_copied_row_metadata.size()));
+    if (!displayed_row.has_value()) {
+        m_release_intent.detached_anchor.reset();
+        return;
+    }
+
     const std::size_t copied_index =
-        static_cast<std::size_t>(first_public_row - m_first_copied_public_row);
+        static_cast<std::size_t>(displayed_row->logical_row - m_first_copied_public_row);
     const Terminal_public_projection_row_metadata& metadata =
         m_copied_row_metadata[copied_index];
 
@@ -906,7 +915,7 @@ void Terminal_public_viewport_controller::refresh_detached_anchor()
     anchor.visual_fragment_index = metadata.visual_fragment_index;
     anchor.visual_fragment_index_is_exact =
         metadata.visual_fragment_index_is_exact;
-    anchor.viewport_row          = 0;
+    anchor.viewport_row          = displayed_row->display_row;
     anchor.sticky_tail           = m_release_intent.sticky_tail;
 
     m_release_intent.detached_anchor = anchor;
