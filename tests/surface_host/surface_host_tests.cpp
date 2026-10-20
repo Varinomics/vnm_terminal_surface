@@ -6,8 +6,10 @@
 #include "vnm_terminal/internal/wheel_gesture.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/internal/terminal_content_tail_projection.h"
+#include "vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "vnm_terminal/terminal_canvas_export.h"
+#include "vnm_terminal/vnm_terminal_canvas.h"
 #include "helpers/test_check.h"
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
@@ -46,6 +48,7 @@
 #include <QTemporaryDir>
 #include <QVariant>
 #include <QWheelEvent>
+#include <QtGui/private/qhighdpiscaling_p.h>
 #include <QtGui/private/qwindow_p.h>
 #include <algorithm>
 #include <atomic>
@@ -7601,6 +7604,459 @@ bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
         Qt::ShiftModifier, true, "the gesture finishes on the same displayed row");
     ok &= check(fixture.surface.selected_text() == QStringLiteral("older"),
         "selection copies the row the replacement frame displays");
+    return ok;
+}
+
+// The surface exports its publication in its current layout, and a receiver
+// composes the export like the desktop.
+bool export_matches_current_layout(
+    VNM_TerminalSurface& surface,
+    const char*          message)
+{
+    const auto latest   = term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+    const auto metrics  = current_cell_metrics(surface);
+    const auto exported = vnm_terminal::export_terminal_canvas_frame(surface);
+    bool ok = latest && exported.status == vnm_terminal::Terminal_canvas_export_status::OK &&
+        exported.frame                                      &&
+        exported.frame->rows == latest->grid_size.rows      &&
+        exported.frame->rows == surface.rows()              &&
+        exported.frame->columns == surface.columns()        &&
+        exported.frame->content_width == surface.width()    &&
+        exported.frame->content_height == surface.height()  &&
+        exported.frame->cell_width == metrics.width         &&
+        exported.frame->cell_height == metrics.height       &&
+        exported.frame->font_size == surface.font_size();
+    VNM_TerminalCanvas canvas;
+    const auto desktop = ok ? term::make_presented_snapshot(latest) : nullptr;
+    ok = ok && desktop && canvas.set_canvas_frame(exported.frame);
+    const auto received = ok ? term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas) : nullptr;
+    ok = ok && received && received->grid_size.rows == desktop->grid_size.rows;
+    for (int row = 0; ok && row < desktop->grid_size.rows; ++row) {
+        ok = snapshot_row_text(*received, row) == snapshot_row_text(*desktop, row);
+    }
+    if (!ok && exported.frame) {
+        std::cerr << message << ": exported rows=" << exported.frame->rows
+                  << " content=" << exported.frame->content_width << "x" << exported.frame->content_height
+                  << " cell=" << exported.frame->cell_width << "x" << exported.frame->cell_height
+                  << " font=" << exported.frame->font_size << "; surface rows=" << surface.rows()
+                  << " size=" << surface.width() << "x" << surface.height()
+                  << " cell=" << metrics.width << "x" << metrics.height
+                  << " font=" << surface.font_size() << "\n";
+    }
+    return check(ok, message);
+}
+
+// Where the platform draws, the renderer draws the publication with the
+// metrics and grid the export describes. The offscreen platform draws
+// nothing, so there is no rendering to compare.
+bool committed_frame_matches_export(
+    QGuiApplication&     app,
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface,
+    const char*          message)
+{
+    if (QGuiApplication::platformName() == QStringLiteral("offscreen")) {
+        return true;
+    }
+    const auto latest  = term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+    const auto metrics = current_cell_metrics(surface);
+    const auto drawn = [&] {
+        const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        return latest && report.drew && report.rendered_snapshot &&
+            report.rendered_snapshot->metadata.sequence == latest->metadata.sequence &&
+            report.rendered_touch_cell_metrics.width == metrics.width &&
+            report.rendered_touch_cell_metrics.height == metrics.height;
+    };
+    for (int attempt = 0; attempt < 30 && !drawn(); ++attempt) {
+        surface.update();
+        window.requestUpdate();
+        if (!pump_until(app, drawn, 5)) {
+            (void)window.grabWindow();
+        }
+    }
+    const auto report   = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const auto exported = vnm_terminal::export_terminal_canvas_frame(surface);
+    const bool ok = drawn() && exported.frame &&
+        report.rendered_touch_cell_metrics.width == exported.frame->cell_width &&
+        report.rendered_touch_cell_metrics.height == exported.frame->cell_height &&
+        report.rendered_snapshot->grid_size.rows == exported.frame->rows &&
+        report.rendered_snapshot->grid_size.columns == exported.frame->columns;
+    if (!ok) {
+        std::cerr << message << ": drawn=" << report.drew
+                  << " rendered_sequence="
+                  << (report.rendered_snapshot ? report.rendered_snapshot->metadata.sequence : 0U)
+                  << " latest_sequence=" << (latest ? latest->metadata.sequence : 0U)
+                  << " rendered_cell=" << report.rendered_touch_cell_metrics.width << "x"
+                  << report.rendered_touch_cell_metrics.height
+                  << " current_cell=" << metrics.width << "x" << metrics.height
+                  << " exported_cell="
+                  << (exported.frame ? exported.frame->cell_width : 0.0) << "x"
+                  << (exported.frame ? exported.frame->cell_height : 0.0) << "\n";
+    }
+    return check(ok, message);
+}
+
+// Starts a scripted session with S = 100 history rows and scrolls to the top.
+Scripted_backend* start_at_history_top(
+    QGuiApplication& app,
+    Surface_fixture& fixture)
+{
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(101) + QByteArrayLiteral("$ ")};
+    bool started = false;
+    auto* backend_ptr = start_surface_with_backend(
+        fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+    const bool ok =
+        check(started && pump_until(app, [&] { return fixture.surface.scrollback_rows() == 100; }),
+            "the held-layout fixture writes S = 100 history rows") &&
+        check(fixture.surface.scroll_to_offset_from_tail(100) &&
+                fixture.surface.viewport_offset_from_tail() == 100,
+            "the view is at the top of the history");
+    return ok ? backend_ptr : nullptr;
+}
+
+bool test_incompatible_held_growth_releases_early(QGuiApplication& app)
+{
+    // At the top of S = 100 history on two rows, a held growth to six rows
+    // needs history rows the hold did not capture. The two-row publication is
+    // not kept: the growth ends the hold early and publishes the live six-row
+    // frame, so bounds, presentation, rendering, export and a receiver all
+    // describe the current layout (DESIGN 5.7).
+    Surface_fixture fixture;
+    fixture.surface.set_cursor_blink_enabled(false);
+    pump_events(app);
+    const auto metrics = current_cell_metrics(fixture.surface);
+    const auto resize_rows = [&](int rows) {
+        fixture.surface.setSize(QSizeF(20.5 * metrics.width, (rows + 0.5) * metrics.height));
+        return pump_until(app, [&] { return fixture.surface.rows() == rows; });
+    };
+    bool ok = check(resize_rows(2), "the held-growth fixture starts at two rows");
+    auto* backend_ptr = start_at_history_top(app, fixture);
+    if (!ok || backend_ptr == nullptr) {
+        return false;
+    }
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(resize_rows(6), "the surface grows to six rows during the hold");
+    ok &= check(pump_until(app, [&] {
+            const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            return latest && latest->grid_size.rows == 6;
+        }),
+        "the growth publishes a six-row frame before the application's ESU");
+    const auto released = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    const auto released_display = term::make_presented_snapshot(released);
+    ok &= check(released && !released->frozen_basis && released_display &&
+            snapshot_row_text(*released_display, 0) == QStringLiteral("scroll-line-000"),
+        "the early release presents the live frame with the first history row on top");
+    ok &= check(fixture.surface.viewport_visible_rows() == 6 &&
+            fixture.surface.scrollback_rows() == 96 &&
+            fixture.surface.viewport_offset_from_tail() == 96,
+        "the surface's bounds are the live frame's");
+    ok &= export_matches_current_layout(fixture.surface,
+        "the export describes the live frame in the current layout and a receiver composes it");
+    ok &= committed_frame_matches_export(app, fixture.window, fixture.surface,
+        "the renderer draws the six-row frame as the export describes it");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface)->grid_size.rows == 6 &&
+            fixture.surface.viewport_offset_from_tail() == 96,
+        "the application's later ESU is harmless");
+    return ok;
+}
+
+// The cell metrics the surface computes for a font size and device pixel
+// ratio, without applying either.
+term::terminal_cell_metrics_t predicted_cell_metrics(
+    const VNM_TerminalSurface& surface,
+    const QQuickWindow&        window,
+    qreal                      font_size,
+    qreal                      device_pixel_ratio)
+{
+    const qreal logical_dpi = term::normalized_logical_dpi(
+        window.screen() != nullptr
+            ? window.screen()->logicalDotsPerInch()
+            : term::k_vnm_terminal_default_logical_dpi);
+    const vnm_terminal::Font_advance_policy policy = surface.font_advance_policy();
+    const term::Qt_grid_metrics_provider provider(
+        term::vnm_terminal_font(
+            surface.font_family(),
+            vnm_terminal::effective_font_size_for_font(
+                surface.font_family(), font_size, device_pixel_ratio, policy, logical_dpi),
+            logical_dpi),
+        device_pixel_ratio,
+        policy,
+        logical_dpi);
+    return provider.cell_metrics();
+}
+
+enum class Held_layout_change
+{
+    EXTENT,
+    FONT,
+    SCREEN,
+};
+
+// Two layouts that differ in one input and lay out the same 20x2 grid.
+struct Held_layout
+{
+    QSizeF size;
+    qreal  font_size          = 0.0;
+    qreal  device_pixel_ratio = 0.0;
+};
+
+std::optional<std::pair<Held_layout, Held_layout>> grid_preserving_layouts(
+    const VNM_TerminalSurface& surface,
+    const QQuickWindow&        window,
+    Held_layout_change         change)
+{
+    const qreal device_pixel_ratio = window.devicePixelRatio();
+    // The extent that gives both inputs 20 columns and 2 rows, if one does.
+    const auto shared_extent = [&](qreal font_a, qreal font_b, qreal ratio_a, qreal ratio_b)
+        -> std::optional<std::pair<Held_layout, Held_layout>>
+    {
+        const auto a = predicted_cell_metrics(surface, window, font_a, ratio_a);
+        const auto b = predicted_cell_metrics(surface, window, font_b, ratio_b);
+        const qreal width_low   = 20.0 * std::max(a.width, b.width);
+        const qreal width_high  = 21.0 * std::min(a.width, b.width);
+        const qreal height_low  = 2.0 * std::max(a.height, b.height);
+        const qreal height_high = 3.0 * std::min(a.height, b.height);
+        if (metrics_equal(a, b, 0.000001) || width_low >= width_high || height_low >= height_high) {
+            return std::nullopt;
+        }
+        const QSizeF size((width_low + width_high) / 2.0, (height_low + height_high) / 2.0);
+        return std::pair{Held_layout{size, font_a, ratio_a}, Held_layout{size, font_b, ratio_b}};
+    };
+    switch (change) {
+        case Held_layout_change::EXTENT: {
+            // 2.5 and 2.75 cell heights.
+            const auto metrics = predicted_cell_metrics(surface, window, 12.0, device_pixel_ratio);
+            return std::pair{
+                Held_layout{QSizeF(20.75 * metrics.width, 2.5 * metrics.height), 12.0, device_pixel_ratio},
+                Held_layout{QSizeF(20.75 * metrics.width, 2.75 * metrics.height), 12.0, device_pixel_ratio},
+            };
+        }
+        case Held_layout_change::FONT:
+            // Cell sizes move in device-pixel steps, so the relative step
+            // shrinks as the font grows.
+            for (const qreal base : {12.0, 16.0, 20.0, 24.0, 28.0, 32.0}) {
+                for (qreal step = 0.25; step <= 4.0; step += 0.25) {
+                    if (auto layouts = shared_extent(base, base + step, device_pixel_ratio, device_pixel_ratio)) {
+                        return layouts;
+                    }
+                }
+            }
+            return std::nullopt;
+        case Held_layout_change::SCREEN:
+            for (const qreal ratio : {1.5, 2.0, 1.75, 1.25, 1.1, 1.0}) {
+                if (ratio == device_pixel_ratio) {
+                    continue;
+                }
+                if (auto layouts = shared_extent(12.0, 12.0, device_pixel_ratio, ratio)) {
+                    return layouts;
+                }
+            }
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+bool test_held_layout_changes_use_the_current_layout(QGuiApplication& app)
+{
+    // Layout changes that keep the grid publish no new frame. Rendering and
+    // export both use the current extent, font and screen metrics: after the
+    // first publication, after a change outside a hold, after a change during
+    // a hold, and after an incompatible growth releases the hold early.
+    bool ok = true;
+    for (const Held_layout_change change :
+        {Held_layout_change::EXTENT, Held_layout_change::FONT, Held_layout_change::SCREEN})
+    {
+        const char* const name =
+            change == Held_layout_change::EXTENT ? "extent" :
+            change == Held_layout_change::FONT   ? "font"   : "screen";
+        Surface_fixture fixture;
+        fixture.surface.set_cursor_blink_enabled(false);
+        pump_events(app);
+        QScreen* const screen = fixture.window.screen();
+        const qreal screen_device_pixel_ratio = fixture.window.devicePixelRatio();
+        const auto layouts = grid_preserving_layouts(fixture.surface, fixture.window, change);
+        if (!layouts) {
+            std::cerr << "SKIP: no " << name << " change keeps a 20x2 grid with other metrics here\n";
+            continue;
+        }
+        // The screen's scale factor is process-wide; the variant's end
+        // restores it.
+        const qreal screen_factor = QHighDpiScaling::factor(screen);
+        struct Screen_factor_restore
+        {
+            QScreen* screen;
+            qreal    factor;
+            ~Screen_factor_restore()
+            {
+                if (screen != nullptr) {
+                    QHighDpiScaling::setScreenFactor(screen, factor);
+                }
+            }
+        } restore_screen_factor{change == Held_layout_change::SCREEN ? screen : nullptr, screen_factor};
+        const auto apply = [&](const Held_layout& layout) {
+            fixture.surface.setSize(layout.size);
+            fixture.surface.set_font_size(layout.font_size);
+            if (change == Held_layout_change::SCREEN) {
+                QHighDpiScaling::setScreenFactor(
+                    screen, screen_factor * layout.device_pixel_ratio / screen_device_pixel_ratio);
+            }
+            pump_events(app, 4);
+            const auto expected = predicted_cell_metrics(
+                fixture.surface, fixture.window, layout.font_size, layout.device_pixel_ratio);
+            const auto actual = current_cell_metrics(fixture.surface);
+            const bool applied = fixture.surface.rows() == 2 && fixture.surface.columns() == 20 &&
+                std::abs(fixture.window.devicePixelRatio() - layout.device_pixel_ratio) < 0.000001 &&
+                metrics_equal(actual, expected, 0.000001);
+            if (!applied) {
+                std::cerr << name << " layout: device_pixel_ratio=" << fixture.window.devicePixelRatio()
+                          << " wanted=" << layout.device_pixel_ratio
+                          << " grid=" << fixture.surface.rows() << "x" << fixture.surface.columns()
+                          << " cell=" << actual.width << "x" << actual.height
+                          << " expected=" << expected.width << "x" << expected.height << "\n";
+            }
+            return check(applied, "the layout applies its metrics and keeps the 20x2 grid");
+        };
+
+        std::cerr << "layout variant: " << name << "\n";
+        if (!apply(layouts->first)) {
+            return false;
+        }
+        auto* backend_ptr = start_at_history_top(app, fixture);
+        if (backend_ptr == nullptr) {
+            return false;
+        }
+        ok &= export_matches_current_layout(fixture.surface,
+            "the first publication exports in the current layout");
+        ok &= committed_frame_matches_export(app, fixture.window, fixture.surface,
+            "the renderer draws the first publication as the export describes it");
+
+        ok &= apply(layouts->second);
+        ok &= export_matches_current_layout(fixture.surface,
+            "after a layout change that publishes nothing the export uses the current layout");
+        ok &= committed_frame_matches_export(app, fixture.window, fixture.surface,
+            "after a layout change that publishes nothing the renderer draws as the export describes");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        ok &= apply(layouts->first);
+        const auto held = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const auto held_display = term::make_presented_snapshot(held);
+        ok &= check(held && held->grid_size.rows == 2 && held_display &&
+                snapshot_row_text(*held_display, 0) == QStringLiteral("scroll-line-000"),
+            "a compatible layout change keeps the held frame");
+        ok &= export_matches_current_layout(fixture.surface,
+            "after a held layout change the export uses the current layout");
+        ok &= committed_frame_matches_export(app, fixture.window, fixture.surface,
+            "after a held layout change the renderer draws as the export describes");
+
+        const auto metrics = current_cell_metrics(fixture.surface);
+        fixture.surface.setSize(QSizeF(fixture.surface.width(), 6.5 * metrics.height));
+        ok &= check(pump_until(app, [&] {
+                const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+                return fixture.surface.rows() == 6 && latest && latest->grid_size.rows == 6 &&
+                    !latest->frozen_basis;
+            }),
+            "an incompatible held growth releases the hold early");
+        ok &= export_matches_current_layout(fixture.surface,
+            "after the early release the export uses the current layout");
+        ok &= committed_frame_matches_export(app, fixture.window, fixture.surface,
+            "after the early release the renderer draws as the export describes");
+    }
+    return ok;
+}
+
+bool test_input_before_paint_addresses_the_committed_frame(QGuiApplication& app)
+{
+    // Before the first paint, input addresses the frame handed to the
+    // renderer, presented natively or through a mapping. After an early
+    // release and before its frame is painted, input addresses the painted
+    // frame or is refused; once the released frame is painted it addresses
+    // that.
+    bool ok = true;
+    // Whether the surface accepted the gesture's press.
+    const auto select_row = [](VNM_TerminalSurface& surface, int row, int last_column) {
+        const QPointF first = point_in_grid_cell(surface, row, 0);
+        QMouseEvent press(QEvent::MouseButtonPress, first, first, first,
+            Qt::LeftButton, Qt::LeftButton, Qt::ShiftModifier);
+        press.ignore();
+        QCoreApplication::sendEvent(&surface, &press);
+        if (press.isAccepted()) {
+            const QPointF last = point_in_grid_cell(surface, row, last_column);
+            QMouseEvent release(QEvent::MouseButtonRelease, last, last, last,
+                Qt::LeftButton, Qt::NoButton, Qt::ShiftModifier);
+            QCoreApplication::sendEvent(&surface, &release);
+        }
+        surface.cancel_pointer_gesture();
+        return press.isAccepted();
+    };
+    for (const bool projected : {false, true}) {
+        Surface_fixture fixture;
+        fixture.window.hide();
+        fixture.surface.set_cursor_blink_enabled(false);
+        pump_events(app);
+        const auto metrics = current_cell_metrics(fixture.surface);
+        const auto resize_rows = [&](int rows) {
+            fixture.surface.setSize(QSizeF(20.5 * metrics.width, (rows + 0.5) * metrics.height));
+            return pump_until(app, [&] { return fixture.surface.rows() == rows; });
+        };
+        ok &= check(resize_rows(projected ? 2 : 6), "the unpainted fixture sets its starting rows");
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("older\r\nnewer\r\n$ ")};
+        bool started = false;
+        (void)start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started && (!projected || resize_rows(6)), "the unpainted fixture starts");
+        ok &= check(!term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot,
+            "no frame has been painted");
+        ok &= check(select_row(fixture.surface, projected ? 3 : 0, 4),
+            projected
+                ? "before the first paint a gesture addresses the presented frame handed to the renderer"
+                : "before the first paint a gesture addresses the native frame handed to the renderer");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("older"),
+            "the gesture selects the row the handed frame shows");
+    }
+
+    Surface_fixture fixture;
+    fixture.surface.set_cursor_blink_enabled(false);
+    pump_events(app);
+    const auto metrics = current_cell_metrics(fixture.surface);
+    fixture.surface.setSize(QSizeF(20.5 * metrics.width, 2.5 * metrics.height));
+    ok &= check(pump_until(app, [&] { return fixture.surface.rows() == 2; }),
+        "the early-release input fixture starts at two rows");
+    auto* backend_ptr = start_at_history_top(app, fixture);
+    if (backend_ptr == nullptr) {
+        return false;
+    }
+    const auto painted = committed_display_frame(app, fixture.window, fixture.surface);
+    ok &= check(painted && painted->grid_size.rows == 2, "the two-row frame is painted");
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    fixture.surface.setSize(QSizeF(20.5 * metrics.width, 6.5 * metrics.height));
+    const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    if (report.rendered_snapshot && report.rendered_snapshot->grid_size.rows == 2) {
+        const QString painted_row = snapshot_row_text(*report.rendered_snapshot, 1);
+        const bool accepted = select_row(fixture.surface, 1, 14);
+        ok &= check(!accepted || fixture.surface.selected_text().isEmpty() ||
+                fixture.surface.selected_text() == painted_row,
+            "a gesture before the released frame is painted addresses the painted frame or nothing");
+        fixture.surface.clear_selection();
+    }
+    else {
+        std::cerr << "NOTE: the released frame was painted before input could be sent\n";
+    }
+    const auto released = committed_display_frame(app, fixture.window, fixture.surface);
+    ok &= check(released && released->grid_size.rows == 6 &&
+            snapshot_row_text(*released, 0) == QStringLiteral("scroll-line-000"),
+        "the released six-row frame is painted");
+    ok &= check(select_row(fixture.surface, 3, 14), "a gesture on the painted released frame is leased");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("scroll-line-003"),
+        "the gesture selects the row the released frame displays");
     return ok;
 }
 
@@ -21911,10 +22367,14 @@ int main(int argc, char** argv)
     if (app.arguments().contains(QStringLiteral("--resize-presentation-only"))) {
         bool ok = test_resize_keeps_presented_range_on_written_rows(app);
         ok &= test_resize_short_session_keeps_unused_space_above(app);
+        ok &= test_incompatible_held_growth_releases_early(app);
+        ok &= test_held_layout_changes_use_the_current_layout(app);
         return ok ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--presentation-input-lease-only"))) {
-        return test_input_before_mapping_change_is_painted(app) ? 0 : 1;
+        bool ok = test_input_before_mapping_change_is_painted(app);
+        ok &= test_input_before_paint_addresses_the_committed_frame(app);
+        return ok ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--async-resize-metadata-only"))) {
         return test_async_surface_resize_receipt_updates_geometry_snapshot(app) ? 0 : 1;

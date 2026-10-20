@@ -268,6 +268,31 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
     };
 }
 
+vnm_terminal::Terminal_canvas_presentation canvas_presentation(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   leading_rows)
+{
+    using namespace vnm_terminal;
+    Terminal_canvas_presentation presentation;
+    switch (snapshot.viewport.presentation.policy) {
+        case term::Terminal_presentation_policy::NATIVE:
+            presentation.policy = Terminal_canvas_presentation_policy::NATIVE;
+            break;
+        case term::Terminal_presentation_policy::AUTOMATIC:
+            presentation.policy = Terminal_canvas_presentation_policy::AUTOMATIC;
+            break;
+        case term::Terminal_presentation_policy::COMPANION:
+            presentation.policy = Terminal_canvas_presentation_policy::COMPANION;
+            break;
+    }
+    presentation.hidden_rows   = snapshot.viewport.presentation.hidden_rows;
+    presentation.insertion_row = snapshot.viewport.presentation.insertion_row;
+    presentation.covered_rows  = snapshot.grid_size.rows - snapshot.uncovered_trailing_rows;
+    presentation.leading_rows  = leading_rows;
+    presentation.frozen        = snapshot.frozen_basis;
+    return presentation;
+}
+
 } // namespace
 
 vnm_terminal::Terminal_canvas_export_result
@@ -289,42 +314,74 @@ vnm_terminal::export_terminal_canvas_frame(
         return {Terminal_canvas_export_status::NO_FRAME, {}};
     }
     auto result = export_snapshot_frame(surface, snapshot, allow_wide_styles, snapshot->grid_size.rows);
-    if (result.status != Terminal_canvas_export_status::OK || !snapshot->leading_rows_snapshot) {
+    if (result.status != Terminal_canvas_export_status::OK) {
         return result;
     }
-    Terminal_canvas_leading_rows leading;
-    const auto& leading_snapshot = *snapshot->leading_rows_snapshot;
-    const bool coherent_prefix = snapshot->leading_row_count > 0 &&
-        snapshot->leading_row_count < snapshot->grid_size.rows &&
-        term::grid_sizes_match(leading_snapshot.grid_size, snapshot->grid_size) &&
-        leading_snapshot.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
-        snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
-        leading_snapshot.viewport.scrollback_rows == snapshot->viewport.scrollback_rows &&
-        leading_snapshot.viewport.offset_from_tail ==
-            snapshot->viewport.offset_from_tail + snapshot->leading_row_count;
-    const auto prefix = coherent_prefix
-        ? export_snapshot_frame(surface, snapshot->leading_rows_snapshot, allow_wide_styles, snapshot->leading_row_count)
-        : Terminal_canvas_export_result{Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
-    if (prefix.status == Terminal_canvas_export_status::OK) {
-        leading.rows = snapshot->leading_row_count;
-        leading.styles = prefix.frame->styles;
-        leading.color_references = prefix.frame->color_references;
-        leading.cells = prefix.frame->cells;
-        leading.images = prefix.frame->images;
-        leading.selection = prefix.frame->selection;
-        leading.wide_styles = prefix.frame->wide_styles;
-        if (!terminal_canvas_leading_rows_are_valid(leading, result.frame->rows, result.frame->columns)) {
-            leading = {};
-            leading.status = Terminal_canvas_leading_rows_status::INVALID;
-        }
+    // The leading rows the frame's mapping presents must travel with it: a
+    // live frame supplies all it requests, and a frozen frame those its hold
+    // captured. Rows beyond them are a supplemental attachment for the phone,
+    // which composes them itself until batch 3.
+    const int required_leading_rows = term::presentation_leading_row_count(snapshot->viewport);
+    const int supplied_leading_rows =
+        snapshot->leading_rows_snapshot ? snapshot->leading_row_count : 0;
+    if (!snapshot->frozen_basis && supplied_leading_rows < required_leading_rows) {
+        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
     }
-    else {
-        leading.status = prefix.status == Terminal_canvas_export_status::INVALID_SOURCE_FRAME
-            ? Terminal_canvas_leading_rows_status::INVALID
-            : Terminal_canvas_leading_rows_status::OVER_LIMIT;
-    }
+    const int presented_leading_rows = std::min(supplied_leading_rows, required_leading_rows);
     auto frame = std::make_shared<Terminal_canvas_frame>(*result.frame);
-    frame->leading_rows = std::move(leading);
+    int exported_leading_rows = 0;
+    if (snapshot->leading_rows_snapshot) {
+        Terminal_canvas_leading_rows leading;
+        const auto& leading_snapshot = *snapshot->leading_rows_snapshot;
+        const bool coherent_prefix = snapshot->leading_row_count > 0 &&
+            snapshot->leading_row_count < snapshot->grid_size.rows &&
+            term::grid_sizes_match(leading_snapshot.grid_size, snapshot->grid_size) &&
+            leading_snapshot.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            leading_snapshot.viewport.scrollback_rows == snapshot->viewport.scrollback_rows &&
+            leading_snapshot.viewport.offset_from_tail ==
+                snapshot->viewport.offset_from_tail + snapshot->leading_row_count;
+        const auto prefix = coherent_prefix
+            ? export_snapshot_frame(
+                surface, snapshot->leading_rows_snapshot, allow_wide_styles, snapshot->leading_row_count)
+            : Terminal_canvas_export_result{Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
+        if (prefix.status == Terminal_canvas_export_status::OK) {
+            leading.rows = snapshot->leading_row_count;
+            leading.styles = prefix.frame->styles;
+            leading.color_references = prefix.frame->color_references;
+            leading.cells = prefix.frame->cells;
+            leading.images = prefix.frame->images;
+            leading.selection = prefix.frame->selection;
+            leading.wide_styles = prefix.frame->wide_styles;
+            if (!terminal_canvas_leading_rows_are_valid(leading, result.frame->rows, result.frame->columns)) {
+                leading = {};
+                leading.status = Terminal_canvas_leading_rows_status::INVALID;
+            }
+        }
+        else {
+            leading.status = prefix.status == Terminal_canvas_export_status::INVALID_SOURCE_FRAME
+                ? Terminal_canvas_leading_rows_status::INVALID
+                : Terminal_canvas_leading_rows_status::OVER_LIMIT;
+        }
+        // Rows the mapping presents are part of the frame: failing to send
+        // them fails the export instead of sending a frame that presents
+        // differently. A supplemental prefix only becomes unavailable.
+        if (leading.status != Terminal_canvas_leading_rows_status::AVAILABLE &&
+            presented_leading_rows > 0)
+        {
+            return {
+                coherent_prefix && prefix.status != Terminal_canvas_export_status::OK
+                    ? prefix.status
+                    : Terminal_canvas_export_status::INVALID_SOURCE_FRAME,
+                {},
+            };
+        }
+        exported_leading_rows = leading.status == Terminal_canvas_leading_rows_status::AVAILABLE
+            ? leading.rows
+            : 0;
+        frame->leading_rows = std::move(leading);
+    }
+    frame->presentation = canvas_presentation(*snapshot, exported_leading_rows);
     result.frame = std::move(frame);
     return result;
 }

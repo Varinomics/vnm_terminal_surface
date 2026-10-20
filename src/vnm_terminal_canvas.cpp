@@ -9,6 +9,7 @@
 #include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_canvas_content_extent.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
@@ -125,6 +126,61 @@ bool supported_content_extent_is_valid(
                 frame.cells.empty() ? 0 : frame.cells.back().row + 1,
                 frame.cursor.visible,
                 frame.cursor.row);
+}
+
+// A known presentation record of a frame whose content extent says where its
+// rows are.
+const vnm_terminal::Terminal_canvas_presentation* supported_presentation(
+    const vnm_terminal::Terminal_canvas_frame& frame)
+{
+    if (!frame.presentation ||
+        frame.presentation->record_version != vnm_terminal::k_terminal_canvas_presentation_version ||
+        supported_content_extent(&frame) == nullptr)
+    {
+        return nullptr;
+    }
+    return &*frame.presentation;
+}
+
+// The record's fields fit its frame, and the leading-rows record supplies
+// exactly the rows the record names.
+bool supported_presentation_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
+{
+    const vnm_terminal::Terminal_canvas_presentation* const presentation =
+        supported_presentation(frame);
+    if (presentation == nullptr) {
+        return true;
+    }
+    const vnm_terminal::terminal_canvas_content_extent_t& extent = *frame.content_extent;
+    if (!vnm_terminal::terminal_canvas_presentation_is_valid(
+            *presentation, frame.rows, extent.scrollback_rows, extent.offset_from_tail) ||
+        (extent.active_buffer == vnm_terminal::Terminal_canvas_buffer::ALTERNATE_BUFFER &&
+            presentation->policy != vnm_terminal::Terminal_canvas_presentation_policy::NATIVE))
+    {
+        return false;
+    }
+    if (presentation->leading_rows == 0) {
+        return true;
+    }
+    return frame.leading_rows &&
+        frame.leading_rows->record_version == vnm_terminal::k_terminal_canvas_leading_rows_version &&
+        frame.leading_rows->status == vnm_terminal::Terminal_canvas_leading_rows_status::AVAILABLE &&
+        frame.leading_rows->rows == presentation->leading_rows &&
+        vnm_terminal::terminal_canvas_leading_rows_are_valid(*frame.leading_rows, frame.rows, frame.columns);
+}
+
+term::Terminal_presentation_policy internal_presentation_policy(
+    vnm_terminal::Terminal_canvas_presentation_policy policy)
+{
+    switch (policy) {
+        case vnm_terminal::Terminal_canvas_presentation_policy::AUTOMATIC:
+            return term::Terminal_presentation_policy::AUTOMATIC;
+        case vnm_terminal::Terminal_canvas_presentation_policy::COMPANION:
+            return term::Terminal_presentation_policy::COMPANION;
+        case vnm_terminal::Terminal_canvas_presentation_policy::NATIVE:
+            break;
+    }
+    return term::Terminal_presentation_policy::NATIVE;
 }
 
 const vnm_terminal::Terminal_canvas_images* supported_images(
@@ -250,6 +306,33 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
             });
         }
     }
+
+    // The frame's mapping record and coverage; the leading rows become the
+    // rows directly above the frame's own, as the sender acquired them.
+    if (const auto* presentation = supported_presentation(frame)) {
+        snapshot->viewport.presentation = {
+            internal_presentation_policy(presentation->policy),
+            presentation->hidden_rows,
+            presentation->insertion_row,
+        };
+        snapshot->frozen_basis            = presentation->frozen;
+        snapshot->uncovered_trailing_rows = frame.rows - presentation->covered_rows;
+        if (presentation->leading_rows > 0) {
+            const vnm_terminal::Terminal_canvas_leading_rows& leading = *frame.leading_rows;
+            vnm_terminal::Terminal_canvas_frame leading_frame = frame;
+            leading_frame.styles           = leading.styles;
+            leading_frame.color_references = leading.color_references;
+            leading_frame.cells            = leading.cells;
+            leading_frame.images           = leading.images;
+            leading_frame.selection        = leading.selection;
+            leading_frame.wide_styles      = leading.wide_styles;
+            leading_frame.leading_rows.reset();
+            leading_frame.presentation.reset();
+            leading_frame.content_extent->offset_from_tail += presentation->leading_rows;
+            snapshot->leading_row_count     = presentation->leading_rows;
+            snapshot->leading_rows_snapshot = materialize_snapshot(leading_frame);
+        }
+    }
     return snapshot;
 }
 
@@ -365,7 +448,7 @@ bool canvas_frame_is_valid(const vnm_terminal::Terminal_canvas_frame& frame)
     {
         return false;
     }
-    return supported_content_extent_is_valid(frame);
+    return supported_content_extent_is_valid(frame) && supported_presentation_is_valid(frame);
 }
 
 term::Terminal_render_options render_options(
@@ -435,6 +518,14 @@ term::VNM_TerminalCanvas_render_bridge::qsg_atlas_recorder(
 {
     Q_ASSERT(canvas.thread() == QThread::currentThread());
     return canvas.m_private->recorder;
+}
+
+std::shared_ptr<const term::Terminal_render_snapshot>
+term::VNM_TerminalCanvas_render_bridge::render_snapshot(
+    const VNM_TerminalCanvas& canvas)
+{
+    Q_ASSERT(canvas.thread() == QThread::currentThread());
+    return canvas.m_private->snapshot;
 }
 
 void term::VNM_TerminalCanvas_render_bridge::set_render_profiler(
@@ -633,7 +724,13 @@ int VNM_TerminalCanvas::scrollback_rows() const
 {
     const vnm_terminal::terminal_canvas_content_extent_t* const extent =
         supported_content_extent(m_private->frame.get());
-    return extent != nullptr ? extent->scrollback_rows : 0;
+    if (extent == nullptr) {
+        return 0;
+    }
+    // The presented range: the producer's maximum under the frame's mapping.
+    return supported_presentation(*m_private->frame) != nullptr
+        ? term::presentation_max_offset_from_tail(m_private->snapshot->viewport)
+        : extent->scrollback_rows;
 }
 
 int VNM_TerminalCanvas::viewport_offset_from_tail() const
@@ -818,11 +915,18 @@ bool VNM_TerminalCanvas::set_canvas_frame(
         owned_frame->images->status = vnm_terminal::Terminal_canvas_images_status::INVALID;
         owned_frame->images->rows.clear();
     }
-    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+    const std::shared_ptr<const term::Terminal_render_snapshot> native_snapshot =
         materialize_snapshot(*owned_frame);
-    if (term::validate_render_snapshot(*snapshot).status !=
+    if (term::validate_render_snapshot(*native_snapshot).status !=
         term::Terminal_render_snapshot_status::OK)
     {
+        return false;
+    }
+    // The receiver presents the frame through the same producer as the
+    // sender; a live frame that lacks a requested row is invalid.
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::make_presented_snapshot(native_snapshot);
+    if (!snapshot) {
         return false;
     }
 

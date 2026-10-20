@@ -8,6 +8,7 @@ namespace vnm_terminal::internal {
 
 class Hierarchical_profiler;
 class Qsg_atlas_recorder;
+struct Terminal_render_snapshot;
 
 class VNM_TerminalCanvas_render_bridge
 {
@@ -16,6 +17,10 @@ public:
     // lifetime and a synchronized snapshot(), so render callbacks can observe
     // committed identities without reading the GUI's polled status fields.
     static std::shared_ptr<const Qsg_atlas_recorder> qsg_atlas_recorder(
+        const VNM_TerminalCanvas& canvas);
+
+    // Acquire on the canvas GUI thread: the frame the canvas presents.
+    static std::shared_ptr<const Terminal_render_snapshot> render_snapshot(
         const VNM_TerminalCanvas& canvas);
 
     // Set on the canvas GUI thread. Subsequent captures retain the optional

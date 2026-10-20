@@ -368,6 +368,73 @@ inline bool terminal_canvas_leading_rows_are_valid(
         (!leading.selection || terminal_canvas_selection_is_valid(*leading.selection, frame_rows, frame_columns));
 }
 
+inline constexpr std::uint16_t k_terminal_canvas_presentation_version = 1U;
+
+enum class Terminal_canvas_presentation_policy : std::uint8_t
+{
+    NATIVE,
+    AUTOMATIC,
+    COMPANION,
+};
+
+// The frame's presentation mapping record: which native row each display row
+// presents. Interpret it only when record_version is known and the content
+// extent is available; otherwise only this capability is unavailable and a
+// receiver shows the native frame. Incoherent fields in a known version
+// invalidate the complete enclosing frame.
+//
+// The frame's own rows are native logical rows from the content extent's
+// scrollback_rows - offset_from_tail on. Display row d shows stream row
+// scrollback_rows - offset_from_tail + d: NATIVE shows native rows as they
+// are, AUTOMATIC shifts them down by hidden_rows, and COMPANION inserts
+// hidden_rows padding rows before native row insertion_row. Coverage is the
+// first covered_rows of the frame's own rows and the leading_rows rows the
+// leading-rows record supplies directly above them. A frozen frame shows
+// requested rows above its coverage as unused slots; a frame that lacks any
+// other requested row is invalid.
+struct Terminal_canvas_presentation
+{
+    std::uint16_t                       record_version = k_terminal_canvas_presentation_version;
+    Terminal_canvas_presentation_policy policy         = Terminal_canvas_presentation_policy::NATIVE;
+    int                                 hidden_rows    = 0;
+    int                                 insertion_row  = 0;
+    int                                 covered_rows   = 0;
+    int                                 leading_rows   = 0;
+    bool                                frozen         = false;
+    bool operator==(const Terminal_canvas_presentation&) const = default;
+};
+
+// Field coherence of a known record against its frame; the receiver checks
+// that the coverage supplies every requested row.
+inline bool terminal_canvas_presentation_is_valid(
+    const Terminal_canvas_presentation& presentation,
+    int                                 frame_rows,
+    int                                 scrollback_rows,
+    int                                 offset_from_tail)
+{
+    if (presentation.record_version != k_terminal_canvas_presentation_version) {
+        return true;
+    }
+    switch (presentation.policy) {
+        case Terminal_canvas_presentation_policy::NATIVE:
+            if (presentation.hidden_rows != 0) {
+                return false;
+            }
+            break;
+        case Terminal_canvas_presentation_policy::AUTOMATIC:
+        case Terminal_canvas_presentation_policy::COMPANION:
+            break;
+        default:
+            return false;
+    }
+    return
+        presentation.hidden_rows   >= 0 && presentation.hidden_rows   <= frame_rows      &&
+        presentation.insertion_row >= 0 && presentation.insertion_row <= scrollback_rows &&
+        presentation.covered_rows  >= 0 && presentation.covered_rows  <= frame_rows      &&
+        presentation.leading_rows  >= 0 && presentation.leading_rows  <  frame_rows      &&
+        presentation.leading_rows  <= scrollback_rows - offset_from_tail;
+}
+
 struct Terminal_canvas_frame
 {
     std::uint32_t                    api_version = k_terminal_canvas_frame_api_version;
@@ -401,6 +468,7 @@ struct Terminal_canvas_frame
     Terminal_canvas_cursor             cursor;
     std::optional<Terminal_canvas_wide_styles> wide_styles;
     std::optional<Terminal_canvas_leading_rows> leading_rows;
+    std::optional<Terminal_canvas_presentation> presentation;
 };
 
 // Zero rejects an unsupported marker instead of interpreting it as the
