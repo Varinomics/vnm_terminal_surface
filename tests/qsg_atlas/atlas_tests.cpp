@@ -4535,7 +4535,8 @@ bool pump_pixel_atlas_surface(
     QGuiApplication&     app,
     QQuickWindow&        window,
     VNM_TerminalSurface& surface,
-    Pixel_render_result& out)
+    Pixel_render_result& out,
+    bool                wait_for_msdf = false)
 {
     for (int attempt = 0; attempt < 160; ++attempt) {
         surface.update();
@@ -4551,7 +4552,12 @@ bool pump_pixel_atlas_surface(
 
         out.atlas_report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-        if (out.atlas_report.render_count > 0U && out.atlas_report.drew) {
+        const bool msdf_ready =
+            out.atlas_report.render.msdf_text_resources_ready &&
+            out.atlas_report.render.msdf_text_draw_calls > 0;
+        if (out.atlas_report.render_count > 0U && out.atlas_report.drew &&
+            (!wait_for_msdf || msdf_ready))
+        {
             out.ready = true;
             return true;
         }
@@ -5692,7 +5698,8 @@ Pixel_render_result render_pixel_atlas_fixture(
     VNM_TerminalSurface::Text_renderer_mode text_renderer_mode =
         VNM_TerminalSurface::Text_renderer_mode::AUTO,
     VNM_TerminalSurface::Lcd_subpixel_order lcd_subpixel_order =
-        VNM_TerminalSurface::Lcd_subpixel_order::AUTO)
+        VNM_TerminalSurface::Lcd_subpixel_order::AUTO,
+    bool wait_for_msdf = false)
 {
     QQuickWindow window;
     window.setFlags(Qt::Window | Qt::FramelessWindowHint);
@@ -5748,7 +5755,7 @@ Pixel_render_result render_pixel_atlas_fixture(
         : QSGRendererInterface::Unknown;
     result.software_renderer    =
         result.graphics_api == QSGRendererInterface::Software;
-    pump_pixel_atlas_surface(app, window, surface, result);
+    pump_pixel_atlas_surface(app, window, surface, result, wait_for_msdf);
     result.device_pixel_ratio  = pixel_window_device_pixel_ratio(window);
     result.window_logical_size = window.size();
     result.graphics_api        = window.rendererInterface() != nullptr
@@ -6878,7 +6885,7 @@ int test_auto_text_renderer_routing(QGuiApplication& app, const char* backend)
     std::vector<Pixel_parity_fixture> layout =
         make_layout_parity_fixtures(device_pixel_ratio);
     const Pixel_parity_fixture& unsupported = layout.back();
-    const auto render_auto = [&](const Pixel_parity_fixture& fixture) {
+    const auto render_auto = [&](const Pixel_parity_fixture& fixture, bool wait_for_msdf) {
         return render_pixel_atlas_fixture(
             app,
             fixture,
@@ -6886,10 +6893,12 @@ int test_auto_text_renderer_routing(QGuiApplication& app, const char* backend)
             18.0,
             term::vnm_terminal_default_monospace_font_family(),
             VNM_TerminalSurface::Text_renderer_mode::AUTO,
-            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE,
+            wait_for_msdf);
     };
-    const Pixel_render_result supported_result = render_auto(supported);
-    const Pixel_render_result unsupported_result = render_auto(unsupported);
+    // AUTO may commit glyph fallback while its asynchronous MSDF atlas is pending.
+    const Pixel_render_result supported_result = render_auto(supported, true);
+    const Pixel_render_result unsupported_result = render_auto(unsupported, false);
     const int supported_status = verified_atlas_fixture_render_state_status(
         supported_result,
         "automatic text renderer routing",
