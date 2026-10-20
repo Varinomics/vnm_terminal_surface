@@ -4488,6 +4488,27 @@ void Terminal_screen_model::resize_buffer_state(
     state.origin_mode   = false;
 }
 
+// ConPTY resizes its inactive main buffer once, to the size then current, when
+// the buffer is used again: on return from the alternate buffer and before an
+// active alternate buffer is replaced (screenInfo.cpp _handleDeferredResize).
+// One resize to that size leaves the same rows as its two steps, width and
+// then height. A primary already at that size stays as it is, margins
+// included, as ConPTY's does.
+void Terminal_screen_model::resize_deferred_primary()
+{
+    screen_buffer_state_t& primary = m_primary_backing.active_grid_state();
+    const terminal_grid_size_t primary_size{
+        static_cast<int>(primary.rows.size()),
+        static_cast<int>(primary.rows.front().cells.size()),
+    };
+    if (grid_sizes_match(primary_size, m_config.grid_size)) {
+        return;
+    }
+
+    resize_buffer_state(primary, m_config.grid_size, true);
+    mark_grid_reflow_changed();
+}
+
 void Terminal_screen_model::resize_rows(
     std::vector<Terminal_screen_row>&    rows,
     terminal_grid_size_t               grid_size)
@@ -4945,8 +4966,14 @@ bool Terminal_screen_model::apply_grid_resize(
     save_active_buffer_state();
     // Reflowed prefix rows are sealed into history at their new source width.
     m_config.grid_size = grid_size;
-    resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
-    resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size, false);
+    // An inactive primary whose backend owns its screens waits for
+    // resize_deferred_primary.
+    if (!m_config.defer_inactive_primary_resize ||
+        m_active_buffer_id == Terminal_buffer_id::PRIMARY)
+    {
+        resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
+    }
+    resize_buffer_state(m_alternate_grid.active_grid_state(), grid_size, false);
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
     if (guard_primary_repaint_recovery) {
@@ -7053,6 +7080,7 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
     }
     else
     if (clear_alternate) {
+        resize_deferred_primary();
         m_alternate_grid.active_grid_state() = make_empty_buffer_state();
         mark_terminal_content_changed();
         restore_buffer_state(m_alternate_grid.active_grid_state());
@@ -7079,6 +7107,7 @@ bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
     if (clear_alternate) {
         m_alternate_grid.active_grid_state() = make_empty_buffer_state();
     }
+    resize_deferred_primary();
     const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
     m_active_buffer_id = Terminal_buffer_id::PRIMARY;
     record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -10257,9 +10286,16 @@ int Terminal_screen_model::active_grid_row_count() const
     return m_config.grid_size.rows;
 }
 
+// The primary's own height: while its resize is deferred, the inactive primary
+// keeps the height it had when the alternate screen became active.
+int Terminal_screen_model::primary_active_grid_row_count() const
+{
+    return static_cast<int>(primary_active_grid_rows().size());
+}
+
 int Terminal_screen_model::primary_backing_row_count() const
 {
-    return scrollback_size() + active_grid_row_count();
+    return scrollback_size() + primary_active_grid_row_count();
 }
 
 int Terminal_screen_model::primary_backing_active_grid_first_row() const
@@ -10314,7 +10350,7 @@ Terminal_screen_model::active_grid_row_from_primary_backing(primary_backing_row_
     active_grid_row_t converted{
         row.value - primary_backing_active_grid_first_row(),
     };
-    if (!active_grid_row_is_valid(converted)) {
+    if (converted.value < 0) {
         return std::nullopt;
     }
 

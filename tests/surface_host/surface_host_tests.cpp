@@ -22172,6 +22172,11 @@ public:
         return m_backend->set_cell_pixel_size(size);
     }
 
+    bool owns_screen_buffers() const override
+    {
+        return m_backend->owns_screen_buffers();
+    }
+
     bool type(const QByteArray& bytes)
     {
         return m_backend->write(bytes).code == term::Terminal_backend_result_code::ACCEPTED;

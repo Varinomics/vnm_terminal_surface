@@ -2544,6 +2544,13 @@ std::optional<terminal_cell_pixel_size_t> Windows_conpty_backend::fixed_cell_pix
     return k_openconsole_cell_pixel_size;
 }
 
+// OpenConsole keeps the main and alternate buffers the child writes to, and
+// addresses its output and cooked-read echo by their rows.
+bool Windows_conpty_backend::owns_screen_buffers() const
+{
+    return true;
+}
+
 Windows_conpty_backend_write_state_for_testing
 Windows_conpty_backend::write_state_for_testing()
 {

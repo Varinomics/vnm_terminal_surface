@@ -377,6 +377,117 @@ bool test_resize_while_alternate_active()
     return ok;
 }
 
+// A model for a backend that owns its screen buffers, as ConPTY does: while the
+// alternate screen is active, a resize leaves the primary at its size until
+// the primary is used again (screenInfo.cpp _handleDeferredResize).
+term::Terminal_screen_model make_backend_owned_model(int rows, int columns)
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size                     = {rows, columns};
+    config.scrollback_limit              = 8;
+    config.tab_width                     = 4;
+    config.defer_inactive_primary_resize = true;
+    return term::Terminal_screen_model(config);
+}
+
+const QByteArray k_backend_owned_primary = QByteArrayLiteral("aaaaaa\r\nbbbbbb\r\ncccccc\r\ndd");
+
+bool primary_screens_equal(
+    const term::Terminal_screen_model& actual,
+    const term::Terminal_screen_model& expected,
+    const std::string&                 label)
+{
+    bool equal =
+        actual.active_buffer_id()       == term::Terminal_buffer_id::PRIMARY    &&
+        actual.grid_size().rows         == expected.grid_size().rows            &&
+        actual.grid_size().columns      == expected.grid_size().columns         &&
+        actual.scrollback_size()        == expected.scrollback_size()           &&
+        actual.cursor_position().row    == expected.cursor_position().row       &&
+        actual.cursor_position().column == expected.cursor_position().column;
+    for (int row = 0; equal && row < expected.grid_size().rows; ++row) {
+        equal = actual.row_text(row) == expected.row_text(row);
+    }
+    return check(equal, label);
+}
+
+bool test_backend_owned_primary_keeps_its_size_across_an_alternate_round_trip()
+{
+    term::Terminal_screen_model model    = make_backend_owned_model(4, 6);
+    term::Terminal_screen_model expected = make_backend_owned_model(4, 6);
+    model.ingest(k_backend_owned_primary);
+    expected.ingest(k_backend_owned_primary);
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049hALT"));
+    model.resize({2, 6});
+    bool ok = check(model.scrollback_size() == 0,
+        "a shrink while the alternate screen is active leaves the primary's rows in place");
+    ok &= check(model.row_text(0) == QStringLiteral("ALT"),
+        "the alternate screen itself is resized");
+    model.resize({4, 6});
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= primary_screens_equal(model, expected,
+        "returning at the original size finds the primary as it was");
+    return ok;
+}
+
+bool test_backend_owned_primary_resizes_once_on_return()
+{
+    term::Terminal_screen_model model    = make_backend_owned_model(4, 6);
+    term::Terminal_screen_model expected = make_backend_owned_model(4, 6);
+    model.ingest(k_backend_owned_primary);
+    expected.ingest(k_backend_owned_primary);
+    expected.resize({3, 4});
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    model.resize({2, 6});
+    model.resize({3, 4});
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    return primary_screens_equal(model, expected,
+        "returning at a different size equals one resize of the primary to that size");
+}
+
+bool test_backend_owned_primary_resizes_before_the_alternate_screen_is_replaced()
+{
+    term::Terminal_screen_model model    = make_backend_owned_model(4, 6);
+    term::Terminal_screen_model expected = make_backend_owned_model(4, 6);
+    model.ingest(k_backend_owned_primary);
+    expected.ingest(k_backend_owned_primary);
+    expected.resize({2, 6});
+    const int replaced_scrollback = expected.scrollback_size();
+    expected.resize({4, 6});
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    model.resize({2, 6});
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    bool ok = check(model.scrollback_size() == replaced_scrollback,
+        "replacing the alternate screen first resizes the primary to the size then current");
+    model.resize({4, 6});
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= primary_screens_equal(model, expected,
+        "the return then applies only the resize after the replacement");
+    return ok;
+}
+
+bool test_backend_owned_primary_rows_end_at_its_own_height()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(2, 6);
+    model.ingest(QByteArrayLiteral("aa\r\nbb"));
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    model.resize({5, 6});
+
+    const int first_active_row = model.scrollback_size();
+    term::Terminal_search_row_text text;
+    bool ok = check(model.search_source_row_text(
+            term::Terminal_buffer_id::PRIMARY, first_active_row + 1, text),
+        "the inactive primary's last row resolves");
+    ok &= check(!model.search_source_row_text(
+            term::Terminal_buffer_id::PRIMARY, first_active_row + 2, text) &&
+            model.image_slice_for_testing(
+                term::Terminal_buffer_id::PRIMARY, first_active_row + 4) == nullptr,
+        "rows of the taller grid below the inactive primary do not resolve");
+    return ok;
+}
+
 bool test_resize_normalizes_saved_origin_mode_and_noop()
 {
     bool ok = true;
@@ -469,6 +580,10 @@ int main()
     ok &= test_1048_saved_cursor_is_per_buffer();
     ok &= test_decrqm_alternate_modes();
     ok &= test_resize_while_alternate_active();
+    ok &= test_backend_owned_primary_keeps_its_size_across_an_alternate_round_trip();
+    ok &= test_backend_owned_primary_resizes_once_on_return();
+    ok &= test_backend_owned_primary_resizes_before_the_alternate_screen_is_replaced();
+    ok &= test_backend_owned_primary_rows_end_at_its_own_height();
     ok &= test_resize_normalizes_saved_origin_mode_and_noop();
     ok &= test_resize_preserves_primary_wide_cells_crossing_right_edge();
     ok &= test_viewport_alternate_screen_policy_hooks();
