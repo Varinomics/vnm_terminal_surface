@@ -108,7 +108,11 @@ struct Terminal_screen_model_config
     //   it is active again or before the alternate screen is replaced;
     // - a resize never moves a saved cursor; restoring it clamps it to the grid;
     // - a cleared alternate screen being entered starts at the cursor of the
-    //   screen it is entered from.
+    //   screen it is entered from;
+    // - each screen keeps its saved cursor apart from its rows, and one never
+    //   saved restores to home with default attributes; every 1049 entry saves
+    //   the active screen's cursor and every 1049 return restores the
+    //   primary's.
     bool                   backend_owns_screen_buffers              = false;
 };
 
@@ -1132,7 +1136,9 @@ private:
     };
 
     screen_buffer_state_t make_empty_buffer_state();
-    screen_buffer_state_t make_entered_alternate_state(terminal_grid_position_t entry_cursor);
+    screen_buffer_state_t make_entered_alternate_state(
+        terminal_grid_position_t     entry_cursor,
+        const saved_cursor_state_t&  alternate_saved_cursor);
     void restore_buffer_state(const screen_buffer_state_t& state);
     void save_active_buffer_state();
     screen_buffer_state_t& active_buffer_state();

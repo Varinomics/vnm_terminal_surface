@@ -3522,13 +3522,18 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
 // A cleared alternate screen being entered. A backend that owns its screens
 // starts it at the cursor of the screen it is entered from, the primary's or
 // the replaced alternate screen's, as ConPTY creates its alternate buffer
-// (screenInfo.cpp _CreateAltBuffer).
+// (screenInfo.cpp _CreateAltBuffer), and keeps the alternate screen's saved
+// cursor, which ConPTY holds apart from the buffer (adaptDispatch.hpp
+// _savedCursorState).
 Terminal_screen_model::screen_buffer_state_t
-Terminal_screen_model::make_entered_alternate_state(terminal_grid_position_t entry_cursor)
+Terminal_screen_model::make_entered_alternate_state(
+    terminal_grid_position_t     entry_cursor,
+    const saved_cursor_state_t&  alternate_saved_cursor)
 {
     screen_buffer_state_t state = make_empty_buffer_state();
     if (m_config.backend_owns_screen_buffers) {
-        state.cursor = entry_cursor;
+        state.cursor       = entry_cursor;
+        state.saved_cursor = alternate_saved_cursor;
     }
     return state;
 }
@@ -7002,6 +7007,20 @@ void Terminal_screen_model::apply_dec_private_mode(
             }
             return;
         case 1049:
+            // A backend that owns its screens saves the active screen's cursor
+            // on every entry and restores the primary's on every return
+            // (adaptDispatch.cpp _SetAlternateScreenBufferMode).
+            if (m_config.backend_owns_screen_buffers) {
+                if (enabled) {
+                    save_cursor();
+                    enter_alternate_screen(true, mode);
+                }
+                else {
+                    (void)leave_alternate_screen(true);
+                    restore_cursor();
+                }
+                return;
+            }
             if (enabled) {
                 if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
                     save_cursor();
@@ -7099,7 +7118,9 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
         const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
         save_active_buffer_state();
         if (clear_alternate) {
-            m_alternate_grid.active_grid_state() = make_entered_alternate_state(entry_cursor);
+            m_alternate_grid.active_grid_state() = make_entered_alternate_state(
+                entry_cursor,
+                m_alternate_grid.active_grid_state().saved_cursor);
         }
         m_active_buffer_id = Terminal_buffer_id::ALTERNATE;
         record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -7109,7 +7130,8 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
     else
     if (clear_alternate) {
         resize_deferred_primary();
-        m_alternate_grid.active_grid_state() = make_entered_alternate_state(entry_cursor);
+        m_alternate_grid.active_grid_state() =
+            make_entered_alternate_state(entry_cursor, m_saved_cursor);
         mark_terminal_content_changed();
         restore_buffer_state(m_alternate_grid.active_grid_state());
     }
@@ -7133,7 +7155,14 @@ bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
 
     save_active_buffer_state();
     if (clear_alternate) {
+        const saved_cursor_state_t alternate_saved_cursor =
+            m_alternate_grid.active_grid_state().saved_cursor;
         m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+        // A backend that owns its screens keeps the alternate screen's saved
+        // cursor apart from its rows (adaptDispatch.hpp _savedCursorState).
+        if (m_config.backend_owns_screen_buffers) {
+            m_alternate_grid.active_grid_state().saved_cursor = alternate_saved_cursor;
+        }
     }
     resize_deferred_primary();
     const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
@@ -7161,7 +7190,9 @@ void Terminal_screen_model::save_cursor()
 
 void Terminal_screen_model::restore_cursor()
 {
-    if (!m_saved_cursor.valid) {
+    // A backend that owns its screens restores a cursor never saved as its
+    // default: home, with default attributes (adaptDispatch.hpp CursorState).
+    if (!m_saved_cursor.valid && !m_config.backend_owns_screen_buffers) {
         return;
     }
 
