@@ -85,18 +85,12 @@ std::optional<Terminal_selection_range> word_range(
 void Terminal_session::populate_touch_selection_projection(Terminal_render_snapshot& snapshot) const
 {
     if (snapshot.leading_rows_snapshot) {
-        const auto& leading = *snapshot.leading_rows_snapshot;
-        if (leading.grid_size.rows != snapshot.grid_size.rows ||
-            leading.grid_size.columns != snapshot.grid_size.columns ||
-            leading.viewport.active_buffer != snapshot.viewport.active_buffer ||
-            leading.viewport.scrollback_rows != snapshot.viewport.scrollback_rows ||
-            leading.viewport.offset_from_tail != snapshot.viewport.offset_from_tail + snapshot.leading_row_count)
-        {
+        if (!render_snapshot_leading_rows_are_coherent(snapshot)) {
             snapshot.leading_rows_snapshot.reset();
             snapshot.leading_row_count = 0;
         }
         else {
-            Terminal_render_snapshot updated = leading;
+            Terminal_render_snapshot updated = *snapshot.leading_rows_snapshot;
             updated.metadata = snapshot.metadata;
             if (!m_selection.has_selection() || !m_selection.visual_lease()) {
                 updated.selection_spans.clear();

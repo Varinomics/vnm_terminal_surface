@@ -332,15 +332,10 @@ vnm_terminal::export_terminal_canvas_frame(
     int exported_leading_rows = 0;
     if (snapshot->leading_rows_snapshot) {
         Terminal_canvas_leading_rows leading;
-        const auto& leading_snapshot = *snapshot->leading_rows_snapshot;
         const bool coherent_prefix = snapshot->leading_row_count > 0 &&
             snapshot->leading_row_count < snapshot->grid_size.rows &&
-            term::grid_sizes_match(leading_snapshot.grid_size, snapshot->grid_size) &&
-            leading_snapshot.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
             snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
-            leading_snapshot.viewport.scrollback_rows == snapshot->viewport.scrollback_rows &&
-            leading_snapshot.viewport.offset_from_tail ==
-                snapshot->viewport.offset_from_tail + snapshot->leading_row_count;
+            term::render_snapshot_leading_rows_are_coherent(*snapshot);
         const auto prefix = coherent_prefix
             ? export_snapshot_frame(
                 surface, snapshot->leading_rows_snapshot, allow_wide_styles, snapshot->leading_row_count)

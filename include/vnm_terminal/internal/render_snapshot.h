@@ -619,6 +619,23 @@ struct Terminal_render_snapshot
     std::vector<int>                                   display_row_logical_rows;
 };
 
+// The leading rows snapshot is the frame's own view moved leading_row_count
+// rows further from the tail, so its first rows are the native rows directly
+// above the frame's: the same grid, buffer and S.
+inline bool render_snapshot_leading_rows_are_coherent(const Terminal_render_snapshot& snapshot)
+{
+    if (!snapshot.leading_rows_snapshot) {
+        return false;
+    }
+    const Terminal_render_snapshot& leading = *snapshot.leading_rows_snapshot;
+    return
+        grid_sizes_match(leading.grid_size, snapshot.grid_size)                  &&
+        leading.viewport.active_buffer   == snapshot.viewport.active_buffer     &&
+        leading.viewport.scrollback_rows == snapshot.viewport.scrollback_rows   &&
+        leading.viewport.offset_from_tail ==
+            snapshot.viewport.offset_from_tail + snapshot.leading_row_count;
+}
+
 struct Terminal_render_snapshot_validation
 {
     Terminal_render_snapshot_status status = Terminal_render_snapshot_status::OK;

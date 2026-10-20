@@ -30,7 +30,8 @@ std::optional<std::vector<int>> resolved_logical_rows(const Terminal_render_snap
 {
     const int rows             = source.grid_size.rows;
     const int first_native_row = render_snapshot_first_visible_logical_row(source);
-    const int leading_rows     = source.leading_rows_snapshot ? source.leading_row_count : 0;
+    const int leading_rows     =
+        render_snapshot_leading_rows_are_coherent(source) ? source.leading_row_count : 0;
     if (!presentation_window_resolvable(
             source.viewport,
             first_native_row - leading_rows,
@@ -74,7 +75,9 @@ std::shared_ptr<const Terminal_render_snapshot> make_presented_snapshot(
     }
 
     const int rows = source->grid_size.rows;
-    const Terminal_render_snapshot* leading = source->leading_rows_snapshot.get();
+    const Terminal_render_snapshot* leading = render_snapshot_leading_rows_are_coherent(*source)
+        ? source->leading_rows_snapshot.get()
+        : nullptr;
     // Frozen geometry-adapted frames render known cells without retained
     // identities; the presented frame then carries none either.
     const bool provenance_available =
