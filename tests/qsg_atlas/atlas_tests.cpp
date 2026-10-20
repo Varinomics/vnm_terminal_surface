@@ -1747,19 +1747,6 @@ void append_exact_fill_class(
         1);
 }
 
-std::vector<QRectF> decoration_masks(
-    const term::Terminal_render_frame&      frame,
-    term::Terminal_render_decoration_kind   kind)
-{
-    std::vector<QRectF> masks;
-    for (const term::Terminal_render_decoration& decoration : frame.decorations) {
-        if (decoration.kind == kind) {
-            masks.push_back(decoration.rect);
-        }
-    }
-    return masks;
-}
-
 void append_decorative_primitives(
     Pixel_parity_fixture&                  fixture,
     std::string                             name,
@@ -1785,39 +1772,6 @@ void append_decorative_primitives(
             background,
         });
     }
-}
-
-std::vector<QRectF> rect_masks(
-    const std::vector<term::Terminal_render_rect>& rects)
-{
-    std::vector<QRectF> masks;
-    masks.reserve(rects.size());
-    for (const term::Terminal_render_rect& rect : rects) {
-        masks.push_back(rect.rect);
-    }
-    return masks;
-}
-
-std::vector<QRectF> inset_masks(
-    std::vector<QRectF> masks,
-    qreal               dx,
-    qreal               dy)
-{
-    for (QRectF& mask : masks) {
-        mask = inset_rect(mask, dx, dy);
-    }
-    return masks;
-}
-
-std::vector<QRectF> cursor_masks(
-    const std::vector<term::Terminal_render_cursor_primitive>& cursors)
-{
-    std::vector<QRectF> masks;
-    masks.reserve(cursors.size());
-    for (const term::Terminal_render_cursor_primitive& cursor : cursors) {
-        masks.push_back(cursor.rect);
-    }
-    return masks;
 }
 
 std::vector<QRectF> cursor_text_fill_masks(QRectF cursor_rect)

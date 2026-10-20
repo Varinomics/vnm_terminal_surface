@@ -277,6 +277,20 @@ function(vnm_terminal_configure_test_process target_name)
             target_link_options(${target_name} PRIVATE -fsanitize=address)
         endif()
     endif()
+    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+        vnm_process_custody_deploy_owner(${target_name})
+    endif()
+endfunction()
+
+function(vnm_terminal_add_test target_name)
+    add_executable(${target_name} ${ARGN})
+    target_link_libraries(${target_name} PRIVATE vnm_terminal_surface::vnm_terminal_surface)
+    set_target_properties(${target_name} PROPERTIES AUTOMOC OFF)
+    add_test(NAME ${target_name}
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:${target_name}>")
+    vnm_terminal_configure_test_process(${target_name})
 endfunction()
 
 function(vnm_terminal_add_external_conformance_command test_name labels command_value)
@@ -323,44 +337,12 @@ add_test(
 )
 
 
-add_executable(vnm_terminal_parser_ir
+vnm_terminal_add_test(vnm_terminal_parser_ir
     parser_ir/parser_ir_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_parser_ir PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_parser_ir PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_parser_ir
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_parser_ir>"
-)
-
-add_executable(vnm_terminal_sixel_decoder
+vnm_terminal_add_test(vnm_terminal_sixel_decoder
     sixel_decoder/sixel_decoder_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_sixel_decoder PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_sixel_decoder PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_sixel_decoder
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_sixel_decoder>"
 )
 # A suspension that retries a byte at no progress loops inside one parser
 # call, where no iteration limit reaches it.
@@ -370,14 +352,9 @@ add_executable(vnm_terminal_sixel_placement
     sixel_placement/sixel_placement_tests.cpp
 )
 
-add_executable(vnm_terminal_content_tail_projection
-    terminal_content_tail_projection/terminal_content_tail_projection_tests.cpp)
-target_link_libraries(vnm_terminal_content_tail_projection PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface)
-set_target_properties(vnm_terminal_content_tail_projection PROPERTIES AUTOMOC OFF)
-add_test(NAME vnm_terminal_content_tail_projection COMMAND
-    "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
-    "$<TARGET_FILE:vnm_terminal_content_tail_projection>")
+vnm_terminal_add_test(vnm_terminal_content_tail_projection
+    terminal_content_tail_projection/terminal_content_tail_projection_tests.cpp
+)
 
 target_link_libraries(vnm_terminal_sixel_placement PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
@@ -395,24 +372,8 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_sixel_placement>"
 )
 
-add_executable(vnm_terminal_unicode_width
+vnm_terminal_add_test(vnm_terminal_unicode_width
     unicode_width/unicode_width_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_unicode_width PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_unicode_width PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_unicode_width
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_unicode_width>"
 )
 
 add_test(
@@ -423,128 +384,32 @@ add_test(
         --self-test
 )
 
-add_executable(vnm_terminal_unicode_width_tables
+vnm_terminal_add_test(vnm_terminal_unicode_width_tables
     unicode_width_tables/unicode_width_tables_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_unicode_width_tables PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_unicode_width_tables PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_unicode_width_tables
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_unicode_width_tables>"
-)
-
-add_executable(vnm_terminal_history_ring
+vnm_terminal_add_test(vnm_terminal_history_ring
     history_ring/history_ring_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_history_ring PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_history_ring PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_history_ring
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_history_ring>"
-)
-
-add_executable(vnm_terminal_interaction_trace
+vnm_terminal_add_test(vnm_terminal_interaction_trace
     interaction_trace/interaction_trace_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_interaction_trace PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_interaction_trace PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_interaction_trace
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_interaction_trace>"
-)
-
-add_executable(vnm_terminal_history_row_record_codec
+vnm_terminal_add_test(vnm_terminal_history_row_record_codec
     history_row_record_codec/history_row_record_codec_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_history_row_record_codec PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_history_row_record_codec PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_history_row_record_codec
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_history_row_record_codec>"
-)
-
-add_executable(vnm_terminal_retained_history_benchmark
+vnm_terminal_add_test(vnm_terminal_retained_history_benchmark
     history_row_record_codec/retained_history_benchmark.cpp
-)
-
-target_link_libraries(vnm_terminal_retained_history_benchmark PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_retained_history_benchmark PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_retained_history_benchmark
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_retained_history_benchmark>"
 )
 
 set_tests_properties(vnm_terminal_retained_history_benchmark PROPERTIES
     LABELS "readiness;benchmark;structural"
 )
 
-add_executable(vnm_terminal_retained_history_capacity_stress
+vnm_terminal_add_test(vnm_terminal_retained_history_capacity_stress
     history_row_record_codec/retained_history_capacity_stress.cpp
-)
-
-target_link_libraries(vnm_terminal_retained_history_capacity_stress PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_retained_history_capacity_stress PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_retained_history_capacity_stress
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_retained_history_capacity_stress>"
 )
 
 set_tests_properties(vnm_terminal_retained_history_capacity_stress PROPERTIES
@@ -730,66 +595,18 @@ set_tests_properties(vnm_terminal_diagnostics_text_layout PROPERTIES
     TIMEOUT 30
 )
 
-add_executable(vnm_terminal_render_cell_text
+vnm_terminal_add_test(vnm_terminal_render_cell_text
     render_cell_text/render_cell_text_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_render_cell_text PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_render_cell_text PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_render_cell_text
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_render_cell_text>"
-)
-
-add_executable(vnm_terminal_render_snapshot
+vnm_terminal_add_test(vnm_terminal_render_snapshot
     render_snapshot/render_snapshot_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_render_snapshot PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_render_snapshot PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_render_snapshot
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_render_snapshot>"
-)
-
-add_executable(vnm_terminal_canvas_export
+vnm_terminal_add_test(vnm_terminal_canvas_export
     terminal_canvas_export/public_header_compile.cpp
     terminal_canvas_export/public_export_header_compile.cpp
     terminal_canvas_export/terminal_canvas_export_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_canvas_export PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_canvas_export PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_canvas_export
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_canvas_export>"
 )
 
 add_executable(vnm_terminal_canvas_contract
@@ -895,24 +712,8 @@ set_tests_properties(vnm_terminal_renderer_source_inventory PROPERTIES
     TIMEOUT 30
 )
 
-add_executable(vnm_terminal_render_frame
+vnm_terminal_add_test(vnm_terminal_render_frame
     render_frame/render_frame_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_render_frame PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_render_frame PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_render_frame
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_render_frame>"
 )
 
 add_executable(vnm_terminal_diagnostics_schema_sync
@@ -1497,24 +1298,8 @@ if(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT)
 
 endif()
 
-add_executable(vnm_terminal_shaping_contract
+vnm_terminal_add_test(vnm_terminal_shaping_contract
     shaping_contract/shaping_contract_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_shaping_contract PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_shaping_contract PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_shaping_contract
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_shaping_contract>"
 )
 
 add_executable(vnm_terminal_surface_host
@@ -1839,24 +1624,8 @@ set_tests_properties(vnm_terminal_parser_randomized PROPERTIES
     TIMEOUT 60
 )
 
-add_executable(vnm_terminal_resource_lifecycle
+vnm_terminal_add_test(vnm_terminal_resource_lifecycle
     resource_lifecycle/resource_lifecycle_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_resource_lifecycle PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_resource_lifecycle PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_resource_lifecycle
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_resource_lifecycle>"
 )
 
 set_tests_properties(vnm_terminal_resource_lifecycle PROPERTIES
@@ -2119,124 +1888,28 @@ add_test(
         "${CMAKE_BINARY_DIR}/qt_posture_cases"
 )
 
-add_executable(vnm_terminal_screen_basic
+vnm_terminal_add_test(vnm_terminal_screen_basic
     screen_basic/basic_model_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_screen_basic PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_screen_basic PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_screen_basic
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_screen_basic>"
-)
-
-add_executable(vnm_terminal_search_index
+vnm_terminal_add_test(vnm_terminal_search_index
     search_index/search_index_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_search_index PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_search_index PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_search_index
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_search_index>"
-)
-
-add_executable(vnm_terminal_screen_sgr
+vnm_terminal_add_test(vnm_terminal_screen_sgr
     screen_sgr/sgr_model_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_screen_sgr PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_screen_sgr PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_screen_sgr
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_screen_sgr>"
-)
-
-add_executable(vnm_terminal_screen_operations
+vnm_terminal_add_test(vnm_terminal_screen_operations
     screen_operations/model_ops_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_screen_operations PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_screen_operations PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_screen_operations
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_screen_operations>"
-)
-
-add_executable(vnm_terminal_screen_alternate
+vnm_terminal_add_test(vnm_terminal_screen_alternate
     screen_alternate/alternate_screen_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_screen_alternate PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_screen_alternate PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_screen_alternate
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_screen_alternate>"
-)
-
-add_executable(vnm_terminal_terminal_modes
+vnm_terminal_add_test(vnm_terminal_terminal_modes
     terminal_modes/private_modes_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_terminal_modes PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_terminal_modes PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_terminal_modes
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_terminal_modes>"
 )
 
 add_executable(vnm_terminal_wheel_gesture
@@ -2261,24 +1934,8 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_wheel_gesture>"
 )
 
-add_executable(vnm_terminal_viewport
+vnm_terminal_add_test(vnm_terminal_viewport
     viewport/viewport_controller_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_viewport PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_viewport PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_viewport
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_viewport>"
 )
 
 add_executable(vnm_terminal_touch_selection touch_selection/touch_selection_tests.cpp)
@@ -2653,16 +2310,7 @@ endif()
 set(vnm_terminal_test_process_targets
     vnm_terminal_canvas_fixture
     vnm_terminal_profiler
-    vnm_terminal_parser_ir
-    vnm_terminal_sixel_decoder
     vnm_terminal_sixel_placement
-    vnm_terminal_content_tail_projection
-    vnm_terminal_unicode_width
-    vnm_terminal_unicode_width_tables
-    vnm_terminal_history_ring
-    vnm_terminal_history_row_record_codec
-    vnm_terminal_retained_history_benchmark
-    vnm_terminal_retained_history_capacity_stress
     vnm_terminal_sequence_matrix
     vnm_terminal_canvas_fixture_contract
     vnm_terminal_qt_render_smoke
@@ -2670,29 +2318,16 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_profile_text
     vnm_terminal_diagnostics_text_layout
     vnm_terminal_diagnostics_schema_sync
-    vnm_terminal_render_cell_text
-    vnm_terminal_render_snapshot
-    vnm_terminal_canvas_export
     vnm_terminal_canvas_contract
     vnm_terminal_canvas_renderer
     vnm_terminal_renderer_surface_format
-    vnm_terminal_render_frame
     vnm_terminal_qsg_atlas
-    vnm_terminal_shaping_contract
     vnm_terminal_msdf_availability
     vnm_terminal_input_encoder
     vnm_terminal_surface_host
     vnm_terminal_behavior_smoke
     vnm_terminal_parser_randomized
-    vnm_terminal_resource_lifecycle
     vnm_terminal_qt_posture
-    vnm_terminal_screen_basic
-    vnm_terminal_search_index
-    vnm_terminal_screen_sgr
-    vnm_terminal_screen_operations
-    vnm_terminal_screen_alternate
-    vnm_terminal_terminal_modes
-    vnm_terminal_viewport
     vnm_terminal_wheel_gesture
     vnm_terminal_backend_session
     vnm_terminal_touch_selection
@@ -2922,7 +2557,4 @@ set_tests_properties(
 
 foreach(vnm_terminal_test_process_target IN LISTS vnm_terminal_test_process_targets)
     vnm_terminal_configure_test_process(${vnm_terminal_test_process_target})
-    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
-        vnm_process_custody_deploy_owner(${vnm_terminal_test_process_target})
-    endif()
 endforeach()
