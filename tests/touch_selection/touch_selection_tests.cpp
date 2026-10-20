@@ -96,7 +96,10 @@ bool consumer_capacity_selection_contract()
         return false;
     }
     auto coverage = *source->row_coverage_snapshot->touch_selection;
+    // Presentation and word-query capabilities travel independently of the
+    // base selection frame.
     coverage.presentation.reset();
+    coverage.word_query_version.reset();
     ok &= check(touch::touch_selection_codec::decode_frame(
             touch::touch_selection_codec::encode_frame(coverage)) == coverage,
         "arbitrary row coverage selection transports its source height separately from its row count");

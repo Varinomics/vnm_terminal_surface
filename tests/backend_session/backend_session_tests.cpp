@@ -4561,7 +4561,7 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     return ok;
 }
 
-bool test_hidden_safe_cursor_is_clamped_in_geometry_snapshot()
+bool test_hidden_cursor_endpoint_releases_incompatible_geometry()
 {
     bool ok = true;
 
@@ -4591,24 +4591,34 @@ bool test_hidden_safe_cursor_is_clamped_in_geometry_snapshot()
         "hidden-cursor geometry fixture mutates live content inside the hold");
     const term::Terminal_session_result resize_result =
         session->resize(QSizeF(50.0, 40.0), {2, 5});
-    const std::optional<term::Terminal_render_snapshot> derived_snapshot =
+    const std::optional<term::Terminal_render_snapshot> resized_snapshot =
         session->latest_render_snapshot();
     ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED &&
-            derived_snapshot.has_value() &&
-            derived_snapshot->basis ==
+            !session->synchronized_output_hold_active() &&
+            resized_snapshot.has_value() &&
+            !resized_snapshot->frozen_basis &&
+            resized_snapshot->basis ==
                 term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
-            derived_snapshot->purpose ==
-                term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
-            derived_snapshot->grid_size.rows == 2 &&
-            derived_snapshot->grid_size.columns == 5 &&
-            !derived_snapshot->cursor.visible &&
-            derived_snapshot->cursor.position.row == 1 &&
-            derived_snapshot->cursor.position.column == 4 &&
-            snapshot_contains_text(*derived_snapshot, QStringLiteral("SAFE")) &&
-            !snapshot_contains_text(*derived_snapshot, QStringLiteral("HIDDEN")),
-        "geometry derivation clamps hidden safe cursor without exposing held live state");
+            resized_snapshot->purpose ==
+                term::Terminal_render_snapshot_purpose::CONTENT &&
+            resized_snapshot->grid_size.rows == 2 &&
+            resized_snapshot->grid_size.columns == 5 &&
+            !resized_snapshot->cursor.visible &&
+            resized_snapshot->cursor.position.row == 1 &&
+            resized_snapshot->cursor.position.column == 1 &&
+            snapshot_row_text(*resized_snapshot, 0) == QStringLiteral("HIDDE") &&
+            snapshot_row_text(*resized_snapshot, 1) == QStringLiteral("N") &&
+            !snapshot_contains_text(*resized_snapshot, QStringLiteral("SAFE")),
+        "a hidden logical cursor endpoint that cannot fit releases the hold into coherent live geometry");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "hidden-cursor geometry fixture releases synchronized output");
+        "hidden-cursor geometry fixture accepts the later synchronized-output release");
+    const auto after_release = session->latest_render_snapshot();
+    ok &= check(after_release && !after_release->frozen_basis &&
+            !after_release->cursor.visible &&
+            snapshot_row_text(*after_release, 0) == QStringLiteral("HIDDE") &&
+            snapshot_row_text(*after_release, 1) == QStringLiteral("N") &&
+            !session->synchronized_output_hold_active(),
+        "the later release cannot restore the incompatible hidden-cursor frame");
     return ok;
 }
 
@@ -9397,26 +9407,26 @@ bool test_public_projection_resize_and_memory_invalidation()
         resize_session->capture_public_projection_for_testing();
     ok &= check(resize_projection.has_value(),
         "resize invalidation captures public projection");
-    const term::Terminal_viewport_state resize_frozen_viewport =
-        resize_projection.has_value()
-            ? resize_projection->viewport()
-            : term::Terminal_viewport_state{};
     ok &= check(resize_backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
         "resize invalidation enters synchronized-output hold");
     ok &= check(resize_session->resize(QSizeF(200.0, 80.0), {4, 18}).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "resize invalidation applies synchronized-output resize");
 
-    const std::optional<term::Terminal_public_release_intent> resize_intent =
-        resize_session->public_release_intent_for_testing();
-    ok &= check(resize_intent.has_value() &&
-        !resize_intent->public_projection_valid &&
-        viewport_states_equal(resize_intent->public_viewport, resize_frozen_viewport) &&
-        resize_intent->public_projection_disable_reason ==
+    const auto resized_snapshot = resize_session->latest_render_snapshot();
+    ok &= check(!resize_session->synchronized_output_hold_active() &&
+        !resize_session->public_release_intent_for_testing().has_value() &&
+        resized_snapshot && !resized_snapshot->frozen_basis &&
+        resized_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        resized_snapshot->grid_size.rows == 4 &&
+        snapshot_contains_text(*resized_snapshot, QStringLiteral("held")) &&
+        resized_snapshot->public_scroll_diagnostics.public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED &&
-        resize_intent->diagnostic_reason ==
-            term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_GEOMETRY_INVALIDATED,
-        "synchronized-output resize invalidates public projection geometry while freezing public viewport");
+        resized_snapshot->public_scroll_diagnostics.diagnostic_reason ==
+            term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_GEOMETRY_INVALIDATED &&
+        resized_snapshot->public_scroll_diagnostics.release_reconciliation_result ==
+            term::Terminal_release_reconciliation_result::STICKY_TAIL,
+        "growth beyond frozen coverage releases the public projection and reconciles its tail into live geometry");
     ok &= check(!resize_session->public_projection_for_testing().has_value(),
         "resize invalidation removes copied projection rows");
 
@@ -10229,7 +10239,7 @@ bool test_public_projection_release_reconciliation()
     return ok;
 }
 
-bool test_public_projection_geometry_invalidation_composes_with_prior_invalidation()
+bool test_public_projection_geometry_release_preserves_prior_invalidation()
 {
     bool ok = true;
 
@@ -10259,22 +10269,14 @@ bool test_public_projection_geometry_invalidation_composes_with_prior_invalidati
 
         session->invalidate_public_projection_for_testing(prior_reason);
         ok &= check(session->resize(QSizeF(200.0, 80.0), {4, 16}).code ==
-                term::Terminal_session_result_code::ACCEPTED &&
-                session->resize(QSizeF(200.0, 80.0), {3, 16}).code ==
-                    term::Terminal_session_result_code::ACCEPTED,
-            "composed geometry invalidation fixture resizes away and back");
-        const std::optional<term::Terminal_public_release_intent> held_intent =
-            session->public_release_intent_for_testing();
-        ok &= check(held_intent.has_value() &&
-                held_intent->public_projection_disable_reason == prior_reason &&
-                held_intent->geometry_invalidated,
-            "composed geometry invalidation retains the first reason and sticky geometry fact");
-
-        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-            "composed geometry invalidation fixture releases the hold");
+                term::Terminal_session_result_code::ACCEPTED,
+            "composed geometry invalidation fixture grows beyond its frozen coverage");
         const std::optional<term::Terminal_render_snapshot> release =
             session->latest_render_snapshot();
         ok &= check(release.has_value() &&
+                !release->frozen_basis &&
+                !session->synchronized_output_hold_active() &&
+                !session->public_release_intent_for_testing().has_value() &&
                 release->public_scroll_diagnostics.public_projection_disable_reason ==
                     prior_reason &&
                 release->public_scroll_diagnostics.diagnostic_reason ==
@@ -10282,7 +10284,18 @@ bool test_public_projection_geometry_invalidation_composes_with_prior_invalidati
                         DETACHED_ANCHOR_GEOMETRY_CHANGED &&
                 release->public_scroll_diagnostics.release_reconciliation_result ==
                     term::Terminal_release_reconciliation_result::RETAINED_ID_BEST_EFFORT,
-            "composed geometry invalidation cannot release an exact anchor after resize away and back");
+            "early geometry release retains the first invalidation reason and reconciles the detached row by identity");
+        ok &= check(session->resize(QSizeF(200.0, 80.0), {3, 16}).code ==
+                term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "composed geometry invalidation fixture returns to its original size and accepts the later release");
+        const auto returned = session->latest_render_snapshot();
+        ok &= check(returned && !returned->frozen_basis &&
+                returned->grid_size.rows == 3 &&
+                returned->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+                !session->synchronized_output_hold_active() &&
+                !session->public_release_intent_for_testing().has_value(),
+            "resizing back and the later release cannot restore the invalidated frozen projection");
     }
 
     return ok;
@@ -23552,6 +23565,66 @@ bool test_mapping_change_without_native_geometry_change_repaints()
 // offsets beyond raw history, and a large canvas can need rows after the native
 // source window. A held frame must not fill a newly requested interval with live
 // rows from a later state.
+bool test_search_highlights_row_coverage_with_native_source_geometry()
+{
+    bool ok = true;
+    for (const bool taller_consumer : {false, true}) {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch = valid_launch_config();
+        launch.initial_grid_size = {taller_consumer ? 2 : 6, 20};
+        ok &= check(session->start(launch).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(taller_consumer
+                    ? QByteArrayLiteral("header\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5\r\nrow6\r\nrow7\r\nrow8\r\nprompt>")
+                    : QByteArrayLiteral("header\r\nsecond\r\nmiddle\r\nprompt>")),
+            "coverage search fixture publishes a retained header");
+        const int display_rows = taller_consumer ? 12 : 6;
+        if (taller_consumer) {
+            session->set_canvas_presentation_rows(display_rows);
+        }
+        else {
+            ok &= check(session->resize(QSizeF(200.0, 40.0), {2, 20}).code ==
+                    term::Terminal_session_result_code::ACCEPTED &&
+                    session->resize(QSizeF(200.0, 120.0), {6, 20}).code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+                "coverage search fixture archives its header through shrink and growth");
+        }
+        const auto before_search = session->latest_render_snapshot_handle();
+        if (!check(before_search && term::render_snapshot_row_coverage_is_coherent(*before_search) &&
+                before_search->row_coverage_snapshot->grid_size.rows != before_search->grid_size.rows,
+                "search coverage has independent row capacity in the same native source publication"))
+        {
+            return false;
+        }
+        const auto header_identity = before_search->row_coverage_snapshot->visible_line_provenance.front();
+        session->set_search_query(QStringLiteral("header"));
+        ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)) &&
+                session->search_result_state().match_count == 1,
+            "coverage search finds the one retained header");
+        (void)session->scroll_published_viewport_to_offset_from_tail(0);
+        const auto source = session->latest_render_snapshot_handle();
+        const auto displayed = term::make_presented_snapshot(source, display_rows, 0);
+        const auto is_header_span = [](const auto& span, int row) {
+            return span.row == row && span.first_column == 0 && span.column_count == 6 && span.current;
+        };
+        ok &= check(source && term::render_snapshot_row_coverage_is_coherent(*source) &&
+                source->row_coverage_snapshot->visible_line_provenance.front().retained_line_id ==
+                    header_identity.retained_line_id &&
+                source->row_coverage_snapshot->visible_line_provenance.front().content_generation ==
+                    header_identity.content_generation &&
+                std::any_of(source->row_coverage_snapshot->search_match_spans.begin(),
+                    source->row_coverage_snapshot->search_match_spans.end(),
+                    [&](const auto& span) { return is_header_span(span, 0); }) &&
+                displayed && snapshot_row_text(*displayed, 2) == QStringLiteral("header") &&
+                std::any_of(displayed->search_match_spans.begin(), displayed->search_match_spans.end(),
+                    [&](const auto& span) { return is_header_span(span, 2); }),
+            taller_consumer
+                ? "coverage taller than the native grid paints its retained search match through the shared mapping"
+                : "coverage shorter than the native grid paints its retained search match through the shared mapping");
+    }
+    return ok;
+}
+
 bool test_canvas_capacity_uses_its_own_range_and_frozen_coverage()
 {
     bool ok = true;
@@ -23653,6 +23726,10 @@ int main(int argc, char** argv)
     ok &= test_held_alternate_growth_keeps_its_hold();
     ok &= test_parser_resize_inside_hold_reconciles_like_host_resize();
     ok &= test_canvas_capacity_uses_its_own_range_and_frozen_coverage();
+    ok &= test_search_highlights_row_coverage_with_native_source_geometry();
+    ok &= test_hidden_cursor_endpoint_releases_incompatible_geometry();
+    ok &= test_public_projection_resize_and_memory_invalidation();
+    ok &= test_public_projection_geometry_release_preserves_prior_invalidation();
     if (argc == 2 && std::string_view(argv[1]) == "--content-end-only") {
         return ok ? 0 : 1;
     }
@@ -23718,7 +23795,6 @@ int main(int argc, char** argv)
     ok &= test_selection_snapshot_and_visible_text();
     ok &= test_selection_snapshot_during_blocked_publication();
     ok &= test_blocked_detach_resize_snapshot_metadata_coherence();
-    ok &= test_hidden_safe_cursor_is_clamped_in_geometry_snapshot();
     ok &= test_selection_internal_state_and_lease();
     ok &= test_selection_replacement_empty_cancel_and_payload_detach();
     ok &= test_selection_model_semantic_flags();
@@ -23759,12 +23835,10 @@ int main(int argc, char** argv)
     ok &= test_public_projection_controller_diagnostic_precedence();
     ok &= test_public_projection_controller_mutates_copied_viewport_only();
     ok &= test_public_projection_session_invalidates_off_viewport_scroll();
-    ok &= test_public_projection_resize_and_memory_invalidation();
     ok &= test_public_projection_release_clears_hold_lifecycle();
     ok &= test_public_projection_selection_mutation_is_ignored_during_hold();
     ok &= test_public_projection_entry_and_release_boundaries();
     ok &= test_public_projection_release_reconciliation();
-    ok &= test_public_projection_geometry_invalidation_composes_with_prior_invalidation();
     ok &= test_public_projection_rebases_hidden_safe_cursor();
     ok &= test_public_projection_publishes_natural_full_row_scroll();
     ok &= test_public_projection_scroll_carries_row_images();

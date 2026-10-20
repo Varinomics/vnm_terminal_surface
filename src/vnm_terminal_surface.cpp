@@ -2383,7 +2383,7 @@ struct VNM_TerminalSurface::Private
                         }
                         const auto report = surface_private.qsg_atlas_recorder->snapshot();
                         if (!surface_private.input_follows_committed_frame() && report.rendered_snapshot &&
-                            !report.rendered_snapshot->display_source)
+                            !frame_uses_presentation(report.rendered_snapshot))
                         {
                             surface_private.presentation_retiring = false;
                         }
@@ -2504,7 +2504,7 @@ struct VNM_TerminalSurface::Private
         const auto report = (input_follows_committed_frame() || presentation_retiring) && qsg_atlas_recorder
             ? qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
         const bool projected = input_follows_committed_frame() ||
-            (presentation_retiring && report.rendered_snapshot && report.rendered_snapshot->display_source);
+            (presentation_retiring && frame_uses_presentation(report.rendered_snapshot));
         const auto snapshot = projected ? committed_input_frame(report) : render_snapshot;
         const auto metrics = projected ? committed_input_metrics(report) : cell_metrics;
         const qreal cell_width = term::is_valid_cell_metrics(metrics)
@@ -3084,16 +3084,18 @@ struct VNM_TerminalSurface::Private
         presentation_retiring = presentation_retiring || (was_following && !input_follows_committed_frame());
     }
 
-    bool presentation_active() const
+    static bool frame_uses_presentation(
+        const std::shared_ptr<const term::Terminal_render_snapshot>& frame)
     {
-        return display_snapshot && display_snapshot->display_source;
+        return frame && (frame->display_source ||
+            frame->viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL);
     }
 
-    // Input, IME and links follow the coordinates the renderer committed.
+    // Identity presentation has the same committed-frame ownership as a
+    // translated content tail, even when the producer reuses its native frame.
     bool input_follows_committed_frame() const
     {
-        return presentation_active() || (render_snapshot &&
-            render_snapshot->viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL);
+        return frame_uses_presentation(display_snapshot) || frame_uses_presentation(render_snapshot);
     }
 
     int                                                    canvas_presentation_rows = 0;
@@ -3107,12 +3109,12 @@ struct VNM_TerminalSurface::Private
 
     void sample_display_input()
     {
-        if (!input_follows_committed_frame() && !presentation_retiring) {
-            return;
-        }
+        // Retain a committed native frame too: draining this input frontier
+        // may switch from alternate-screen native layout to primary content
+        // presentation before the event is routed.
         const auto report = qsg_atlas_recorder ? qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
         display_input_projected = input_follows_committed_frame() ||
-            (report.rendered_snapshot && report.rendered_snapshot->display_source);
+            frame_uses_presentation(report.rendered_snapshot);
         display_input_snapshot = committed_input_frame(report);
         display_input_metrics = committed_input_metrics(report);
     }
@@ -3517,9 +3519,14 @@ VNM_TerminalSurface::Input_frontier_scope::Input_frontier_scope(
     bool                 fresh_ingress)
     : m_surface(surface)
 {
-    if (m_surface.m_private != nullptr && m_surface.m_private->display_input_depth++ == 0) {
+    const bool outer_frontier = m_surface.m_private != nullptr &&
+        m_surface.m_private->display_input_depth++ == 0;
+    if (outer_frontier) {
         m_surface.m_private->sample_display_input();
     }
+    const bool refresh_uncommitted_fallback = outer_frontier &&
+        (!m_surface.m_private->qsg_atlas_recorder ||
+            !m_surface.m_private->qsg_atlas_recorder->snapshot().rendered_snapshot);
     if (m_surface.m_private == nullptr || m_surface.m_private->session == nullptr) {
         return;
     }
@@ -3528,6 +3535,21 @@ VNM_TerminalSurface::Input_frontier_scope::Input_frontier_scope(
     m_session->begin_input_frontier(fresh_ingress);
     if (drain_before_route) {
         m_surface.drain_backend_callback_events_to_current_epoch();
+        // Before the renderer commits its first frame, the published display
+        // frame is the input fallback. Follow the callback frontier just
+        // drained in that case; an actually committed frame and its metrics
+        // remain the immutable input basis for the whole event.
+        if (refresh_uncommitted_fallback && m_surface.m_private != nullptr) {
+            m_surface.m_private->sample_display_input();
+        }
+        else
+        if (outer_frontier && m_surface.m_private != nullptr &&
+            m_surface.m_private->input_follows_committed_frame())
+        {
+            // A native alternate frame captured above still owns pointer
+            // coordinates if the drain has just entered primary presentation.
+            m_surface.m_private->display_input_projected = true;
+        }
     }
 }
 
@@ -4943,7 +4965,7 @@ QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const
             m_private->qsg_atlas_recorder
         ? m_private->qsg_atlas_recorder->snapshot() : term::Qsg_atlas_frame_report{};
     const bool projected = m_private->input_follows_committed_frame() ||
-        (report.rendered_snapshot && report.rendered_snapshot->display_source);
+        m_private->frame_uses_presentation(report.rendered_snapshot);
     const std::optional<Surface_hyperlink_target> hyperlink =
         explicit_hyperlink_for_local_point(
             projected ? m_private->committed_input_frame(report) : m_private->render_snapshot,

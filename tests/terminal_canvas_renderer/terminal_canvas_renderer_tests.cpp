@@ -282,8 +282,10 @@ bool rendered_presentation_handle_contract(
     selection.spans = {{2, 3, 7}};
     frame->cursor.row = 5;
     frame->cursor.visible = false;
+    // The legacy extent covers the occupied rows. The presentation endpoint
+    // below also includes the hidden logical cursor on the last native row.
     frame->content_extent = touch::terminal_canvas_content_extent_t{
-        touch::k_terminal_canvas_content_extent_version, 1, 0, 0,
+        touch::k_terminal_canvas_content_extent_version, 2, 0, 0,
         touch::Terminal_canvas_buffer::PRIMARY_BUFFER};
     frame->presentation.emplace();
     frame->presentation->policy = touch::Terminal_canvas_presentation_policy::CONTENT_TAIL;
@@ -314,7 +316,10 @@ bool rendered_presentation_handle_contract(
         renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
     });
     QImage rendered;
-    if (!check(canvas.set_canvas_frame(frame) && pump_until_rendered(application, window, canvas, rendered),
+    if (!check(canvas.set_canvas_frame(frame), "the initial presentation frame is valid")) {
+        return false;
+    }
+    if (!check(pump_until_rendered(application, window, canvas, rendered),
             "the initial presentation reaches a real committed canvas draw"))
     {
         return false;

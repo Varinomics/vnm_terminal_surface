@@ -1086,7 +1086,6 @@ bool expect_receiver_matches_desktop(
     }
     const auto received = term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas);
     bool same = received != nullptr &&
-        received->display_row_logical_rows == desktop->display_row_logical_rows &&
         received->cursor.visible == desktop->cursor.visible &&
         (!desktop->cursor.visible || received->cursor.position == desktop->cursor.position) &&
         received->visible_line_provenance.size() == desktop->visible_line_provenance.size() &&
@@ -1108,8 +1107,13 @@ bool expect_receiver_matches_desktop(
                     desktop_image->cell_pixel_size.width == received_image->cell_pixel_size.width &&
                     desktop_image->cell_pixel_size.height == received_image->cell_pixel_size.height));
         if (same && !desktop->visible_line_provenance.empty()) {
-            same = received->visible_line_provenance[static_cast<std::size_t>(row)].retained_line_id ==
-                desktop->visible_line_provenance[static_cast<std::size_t>(row)].retained_line_id;
+            const auto& received_row = received->visible_line_provenance[static_cast<std::size_t>(row)];
+            const auto& desktop_row = desktop->visible_line_provenance[static_cast<std::size_t>(row)];
+            // An identity projection may leave display_row_logical_rows
+            // implicit. Compare the effective row identity in either form.
+            same = received_row.logical_row == desktop_row.logical_row &&
+                received_row.retained_line_id == desktop_row.retained_line_id &&
+                received_row.content_generation == desktop_row.content_generation;
         }
     }
     for (std::size_t index = 0; same && index < desktop->selection_spans.size(); ++index) {

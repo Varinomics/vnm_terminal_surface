@@ -10541,7 +10541,9 @@ void Terminal_session::apply_search_matches_to_snapshot(
 {
     if (snapshot.row_coverage_snapshot) {
         auto coverage = std::make_shared<Terminal_render_snapshot>(*snapshot.row_coverage_snapshot);
-        apply_search_matches_to_snapshot(*coverage, active_buffer_epoch);
+        coverage->search_match_spans =
+            m_search.spans_for_row_coverage(snapshot, active_buffer_epoch);
+        suppress_search_match_spans_without_valid_line_provenance(*coverage);
         snapshot.row_coverage_snapshot = std::move(coverage);
     }
     snapshot.search_match_spans =
@@ -10894,6 +10896,7 @@ bool Terminal_session::publish_search_overlay_from_snapshot(
     }
     snapshot.metadata.sequence                = next_sequence();
     snapshot.metadata.publication_generation = m_render_snapshot_generation + 1U;
+    advance_row_coverage_metadata(snapshot);
     const std::uint64_t source_active_buffer_epoch = m_public_projection.has_value()
         ? m_public_projection->active_buffer_epoch()
         : m_queued_search_source_identity.has_value()

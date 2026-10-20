@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/sixel_decoder.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "helpers/test_check.h"
@@ -2214,10 +2215,30 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
     request.sequence = 3U;
     request.viewport.offset_from_tail = 1;
     const auto scrolled = model.render_snapshot(request);
-    ok &= check(scrolled.viewport.offset_from_tail == 0 && scrolled.row_coverage_snapshot &&
-            scrolled.row_coverage_snapshot->visible_line_provenance.front().retained_line_id ==
-                combined.visible_line_provenance.front().retained_line_id,
-        "a transcript shorter than the consumer has no scrollable tail beyond its content");
+    const auto presented = term::make_presented_snapshot(
+        std::make_shared<const term::Terminal_render_snapshot>(scrolled));
+    ok &= check(scrolled.viewport.offset_from_tail == 1 &&
+            term::presentation_max_offset_from_tail(scrolled.viewport) == 0 &&
+            presented && presented->viewport.offset_from_tail == 0 &&
+            presented->cursor.position.row == 28,
+        "the native source keeps its offset while the displayed short transcript clamps to its content end");
+    if (presented) {
+        const term::Terminal_render_snapshot_row_content_view rows(*presented);
+        ok &= check(rows.row_at(28).text(0, 51, true) ==
+                QStringLiteral("Type relay-production-input from Companion:"),
+            "the prompt remains on the final displayed row after native source scrolling");
+        for (int row = 0; row < 13; ++row) {
+            const int display_row = 16 + row;
+            ok &= check(presented->visible_line_provenance[(std::size_t)display_row].retained_line_id ==
+                    original.visible_line_provenance[(std::size_t)row].retained_line_id,
+                "the displayed transcript preserves every original row identity");
+            const auto before = term::render_snapshot_row_image(original, row);
+            const auto after = term::render_snapshot_row_image(*presented, display_row);
+            ok &= check((!before && !after) ||
+                    (before && after && before->pixels == after->pixels && before->revision == after->revision),
+                "the displayed transcript preserves every image slice and revision");
+        }
+    }
     model.ingest(QByteArrayLiteral("\x1b[8;45HX"));
     ok &= check(model.row_text(7).startsWith(QStringLiteral("Type relay-production-input from Companion: X")) &&
             model.cursor_position() == term::terminal_grid_position_t{7, 45},

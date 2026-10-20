@@ -3841,7 +3841,7 @@ bool test_full_projection_rows_carry_image_revisions()
     return ok;
 }
 
-bool test_geometry_derived_snapshots_keep_row_images()
+bool test_held_geometry_preserves_images_or_releases_for_live_tail()
 {
     bool ok = true;
 
@@ -3870,6 +3870,7 @@ bool test_geometry_derived_snapshots_keep_row_images()
     const std::shared_ptr<const term::Terminal_render_snapshot> taller =
         session->latest_render_snapshot_handle();
     ok &= check(taller != nullptr &&
+            session->synchronized_output_hold_active() && taller->frozen_basis &&
             taller->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
             taller->visible_row_images.size() == 4U &&
             term::render_snapshot_row_image(*taller, 1) == term::render_snapshot_row_image(*base, 1) &&
@@ -3882,12 +3883,20 @@ bool test_geometry_derived_snapshots_keep_row_images()
         "a shorter grid during synchronized output is accepted");
     const std::shared_ptr<const term::Terminal_render_snapshot> shorter =
         session->latest_render_snapshot_handle();
-    ok &= check(shorter != nullptr &&
+    // The captured endpoint includes the second image slice. Cropping that
+    // row out of a two-row frozen grid cannot present the captured tail, so
+    // resize releases the hold and publishes the live rows after native scroll.
+    ok &= check(shorter != nullptr && !session->synchronized_output_hold_active() &&
+            !shorter->frozen_basis && shorter->viewport.scrollback_rows == 1 &&
+            shorter->viewport.presentation.content_end_row_exclusive == 3 &&
             shorter->visible_row_images.size() == 2U &&
-            term::render_snapshot_row_image(*shorter, 1) == term::render_snapshot_row_image(*base, 1),
-        "a shorter geometry-derived snapshot keeps the images of the rows that remain");
-    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "the geometry image fixture releases synchronized output");
+            term::render_snapshot_row_image(*shorter, 0) == term::render_snapshot_row_image(*base, 1) &&
+            term::render_snapshot_row_image(*shorter, 1) == term::render_snapshot_row_image(*base, 2),
+        "a shrink that cannot present the held image tail releases and preserves both live image slices");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
+            !session->synchronized_output_hold_active() &&
+            session->latest_render_snapshot_handle() == shorter,
+        "the later synchronized-output end leaves the released image publication unchanged");
 
     return ok;
 }
@@ -4020,7 +4029,7 @@ int main()
     ok &= test_scrolled_back_snapshots_decode_history_row_images();
     ok &= test_an_image_only_change_dirties_only_its_row();
     ok &= test_full_projection_rows_carry_image_revisions();
-    ok &= test_geometry_derived_snapshots_keep_row_images();
+    ok &= test_held_geometry_preserves_images_or_releases_for_live_tail();
     ok &= test_row_image_check_leaves_snapshot_validation_alone();
     return ok ? 0 : 1;
 }
