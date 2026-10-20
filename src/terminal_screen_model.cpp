@@ -4125,6 +4125,9 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
         }
         std::vector<Cell> cells;
         std::vector<Terminal_retained_line_provenance> cell_origins;
+        // Resize vacancy of each logical slot. It follows the slot through
+        // flattening, joining and packing without changing either.
+        std::vector<char> cell_vacancy;
         std::optional<std::size_t> cursor_offset;
         std::optional<std::size_t> saved_offset;
         bool contains_latent_wide_cell = false;
@@ -4207,6 +4210,8 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 const std::size_t logical_start = cells.size();
                 const Terminal_retained_line_provenance origin =
                     origin_at_column(source_column);
+                // Synthesized continuations inherit their base cell's vacancy.
+                const char vacant = source_column >= source.resize_vacant_from_column;
                 record_source_position(source_column, logical_start);
 
                 Cell base_cell = source_cell;
@@ -4215,6 +4220,7 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 base_cell.wide_continuation = false;
                 cells.push_back(std::move(base_cell));
                 cell_origins.push_back(origin);
+                cell_vacancy.push_back(vacant);
 
                 for (int part = 1; part < natural_width; ++part) {
                     Cell continuation;
@@ -4238,6 +4244,7 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                     continuation.hyperlink_id = source_cell.hyperlink_id;
                     cells.push_back(std::move(continuation));
                     cell_origins.push_back(origin);
+                    cell_vacancy.push_back(vacant);
                 }
 
                 for (int part = 1; part < physical_width; ++part) {
@@ -4262,6 +4269,14 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             Terminal_screen_row row = std::move(state.rows[first]);
             row.cells.resize((std::size_t)columns);
             row.soft_wrap_columns = 0;
+            // The unused right margin inherits the last slot's vacancy; a row
+            // without slots keeps its empty-row origin.
+            const bool row_vacancy_kept = cell_vacancy.empty()
+                ? row.resize_vacant_from_column == 0
+                : cell_vacancy.back() != 0;
+            if (!row_vacancy_kept) {
+                row.resize_vacant_from_column = k_terminal_no_resize_vacancy_column;
+            }
             for (terminal_retained_line_content_origin_span_t& span :
                 row.content_origin_spans)
             {
@@ -4311,6 +4326,22 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             state.rows.begin() + static_cast<std::ptrdiff_t>(last) + 1,
             [](const Terminal_screen_row& source_row) { return source_row.image_slice != nullptr; }));
         row.image_slice = std::move(state.rows[first].image_slice);
+        // A destination row's vacancy is its trailing run of vacant slots: the
+        // unused right margin, a wide glyph's wrap margin included, inherits
+        // the last slot's vacancy, and a row without slots the empty-row origin.
+        const int empty_row_vacancy = state.rows[first].resize_vacant_from_column == 0
+            ? 0
+            : k_terminal_no_resize_vacancy_column;
+        int  vacant_run_start = -1;
+        bool row_has_slots    = false;
+        const auto finish_row_vacancy = [&](Terminal_screen_row& finished) {
+            finished.resize_vacant_from_column =
+                !row_has_slots         ? empty_row_vacancy :
+                vacant_run_start >= 0  ? vacant_run_start  :
+                                         k_terminal_no_resize_vacancy_column;
+            vacant_run_start = -1;
+            row_has_slots    = false;
+        };
         int column = 0;
         bool cursor_pending_end_mapped = false;
         bool saved_pending_end_mapped = false;
@@ -4334,6 +4365,7 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             if (column + width > columns) {
                 row.soft_wrap_columns = column;
                 finish_row_provenance(row);
+                finish_row_vacancy(row);
                 rows.push_back(std::move(row));
                 row = make_row(cell_origins[offset]);
                 column = 0;
@@ -4353,6 +4385,14 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                     row.cells[static_cast<std::size_t>(column + part)] =
                         std::move(output_cell);
                     append_origin(row, column + part, cell_origins[offset + part]);
+                    if (cell_vacancy[offset + part] == 0) {
+                        vacant_run_start = -1;
+                    }
+                    else
+                    if (vacant_run_start < 0) {
+                        vacant_run_start = column + part;
+                    }
+                    row_has_slots = true;
                 }
             }
             const std::size_t end_offset = offset + static_cast<std::size_t>(source_width);
@@ -4378,6 +4418,7 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
         }
         map_position(cells.size(), std::min(column, columns - 1), column == columns);
         finish_row_provenance(row);
+        finish_row_vacancy(row);
         rows.push_back(std::move(row));
         first = last + 1U;
     }
@@ -4415,7 +4456,17 @@ void Terminal_screen_model::resize_buffer_state(
         state.cursor.row -= prefix_rows;
         state.saved_cursor.position.row -= prefix_rows;
     }
+    const std::size_t kept_rows = state.rows.size();
     resize_rows(state.rows, grid_size);
+    if (primary) {
+        for (std::size_t row = kept_rows; row < state.rows.size(); ++row) {
+            state.rows[row].resize_vacant_from_column = 0;
+        }
+        m_primary_resize_vacancy = std::any_of(state.rows.begin(), state.rows.end(),
+            [](const Terminal_screen_row& candidate) {
+                return candidate.resize_vacant_from_column != k_terminal_no_resize_vacancy_column;
+            });
+    }
     state.cursor.row    = std::clamp(state.cursor.row,    0, grid_size.rows - 1);
     state.cursor.column = std::clamp(state.cursor.column, 0, grid_size.columns - 1);
     if (state.saved_cursor.valid) {
@@ -4531,7 +4582,70 @@ void Terminal_screen_model::replace_row_with_erased_retained_line(Terminal_scree
     fill_row_with_erased_cells(row.cells);
     row.soft_wrap_columns = 0;
     row.image_slice.reset();
+    row.resize_vacant_from_column = k_terminal_no_resize_vacancy_column;
     replace_retained_line_id(row);
+}
+
+int Terminal_screen_model::resize_vacancy_rows() const
+{
+    const std::vector<Terminal_screen_row>& rows = primary_active_grid_rows();
+    int vacant_rows = 0;
+    for (auto row = rows.rbegin();
+        row != rows.rend() && row->resize_vacant_from_column == 0;
+        ++row)
+    {
+        ++vacant_rows;
+    }
+    return vacant_rows;
+}
+
+// Application placement in a row, or the cursor entering it, makes that row
+// and every row above it application space, a mixed row's latent vacant
+// fragment included. The rule is an operation, not a cell comparison: a
+// placement that leaves the cells equal still retires.
+void Terminal_screen_model::retire_resize_vacancy_through(int row)
+{
+    if (!m_primary_resize_vacancy || m_active_buffer_id != Terminal_buffer_id::PRIMARY) {
+        return;
+    }
+
+    std::vector<Terminal_screen_row>& rows = active_grid_rows();
+    const int last_row = std::min(row, static_cast<int>(rows.size()) - 1);
+    for (int index = 0; index <= last_row; ++index) {
+        rows[static_cast<std::size_t>(index)].resize_vacant_from_column =
+            k_terminal_no_resize_vacancy_column;
+    }
+    if (last_row + 1 >= static_cast<int>(rows.size())) {
+        m_primary_resize_vacancy = false;
+    }
+}
+
+void Terminal_screen_model::retire_all_resize_vacancy()
+{
+    retire_resize_vacancy_through(m_config.grid_size.rows - 1);
+}
+
+// Rows carry their provenance when they move. A row that now lies above
+// application material, a moved application row or a replacement row the
+// application created, is retired, so vacancy remains a suffix.
+void Terminal_screen_model::normalize_resize_vacancy()
+{
+    if (!m_primary_resize_vacancy || m_active_buffer_id != Terminal_buffer_id::PRIMARY) {
+        return;
+    }
+
+    const std::vector<Terminal_screen_row>& rows = active_grid_rows();
+    int last_application_row = static_cast<int>(rows.size()) - 1;
+    while (last_application_row >= 0 &&
+        rows[static_cast<std::size_t>(last_application_row)].resize_vacant_from_column == 0)
+    {
+        --last_application_row;
+    }
+    retire_resize_vacancy_through(last_application_row - 1);
+    m_primary_resize_vacancy = std::any_of(rows.begin(), rows.end(),
+        [](const Terminal_screen_row& candidate) {
+            return candidate.resize_vacant_from_column != k_terminal_no_resize_vacancy_column;
+        });
 }
 
 bool Terminal_screen_model::cells_have_same_selection_content(
@@ -4798,6 +4912,7 @@ std::vector<bool> Terminal_screen_model::default_tab_stops(int column_count) con
 void Terminal_screen_model::reset_grid()
 {
     m_resize_displaced_scrollback_rows = 0;
+    m_primary_resize_vacancy = false;
     cancel_primary_repaint_recovery_candidate();
     cancel_primary_repaint_recovery_resize_guard();
     m_primary_backing.active_grid_state()     = make_empty_buffer_state();
@@ -5890,6 +6005,7 @@ void Terminal_screen_model::clear_screen_before_cursor()
         m_cursor.row == m_config.grid_size.rows - 1 && m_cursor.column == m_config.grid_size.columns - 1)
     {
         m_resize_displaced_scrollback_rows = 0;
+        retire_all_resize_vacancy();
     }
     for (int row = 0; row < m_cursor.row; ++row) {
         erase_row_range(row, 0, m_config.grid_size.columns - 1);
@@ -5901,6 +6017,7 @@ void Terminal_screen_model::clear_screen_after_cursor()
 {
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY && m_cursor.row == 0 && m_cursor.column == 0) {
         m_resize_displaced_scrollback_rows = 0;
+        retire_all_resize_vacancy();
     }
     erase_row_range(m_cursor.row, m_cursor.column, m_config.grid_size.columns - 1);
     for (int row = m_cursor.row + 1; row < m_config.grid_size.rows; ++row) {
@@ -5912,6 +6029,7 @@ void Terminal_screen_model::erase_visible_screen()
 {
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
         m_resize_displaced_scrollback_rows = 0;
+        retire_all_resize_vacancy();
     }
     mark_terminal_content_changed();
     const bool primary_repaint_rebuild =
@@ -6067,6 +6185,10 @@ void Terminal_screen_model::copy_rectangular_area(
         (margin_relative_columns ? m_scroll_right : m_config.grid_size.columns - 1) -
             target_left + 1);
 
+    if (copy_rows > 0) {
+        retire_resize_vacancy_through(target_top + copy_rows - 1);
+    }
+
     // Capture before writing so overlapping copies behave as a single move.
     std::vector<std::vector<Cell>> source_cells;
     source_cells.reserve(static_cast<std::size_t>(copy_rows));
@@ -6117,6 +6239,7 @@ void Terminal_screen_model::fill_rectangular_area(
     replacement.hyperlink_id  = m_current_hyperlink_id;
     replacement.protected_cell = m_character_protected;
 
+    retire_resize_vacancy_through(area.bottom);
     for (int row_number = area.top; row_number <= area.bottom; ++row_number) {
         Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
         const std::vector<Cell> before_cells = row.cells;
@@ -6425,6 +6548,7 @@ void Terminal_screen_model::insert_lines(int count)
     }
 
     break_soft_wrap_before(m_scroll_bottom + 1);
+    normalize_resize_vacancy();
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
@@ -6467,6 +6591,7 @@ void Terminal_screen_model::delete_lines(int count)
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(row)]);
     }
 
+    normalize_resize_vacancy();
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
@@ -7141,6 +7266,7 @@ void Terminal_screen_model::replace_row_segment(
 {
     const int left  = active_left_margin();
     const int right = active_right_margin() + 1;
+    retire_resize_vacancy_through(target_row);
     Terminal_screen_row& target = active_grid_rows()[static_cast<std::size_t>(target_row)];
     const std::vector<Cell> before_cells = target.cells;
 
@@ -7215,6 +7341,7 @@ void Terminal_screen_model::shift_columns(int first_column, int count, bool inse
     const int end_column = right + 1;
     mark_terminal_content_changed();
     m_pending_wrap = false;
+    retire_resize_vacancy_through(m_scroll_bottom);
     for (int row_index = m_scroll_top; row_index <= m_scroll_bottom; ++row_index) {
         Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row_index)];
         std::vector<Cell>& cells = screen_row.cells;
@@ -7341,6 +7468,7 @@ void Terminal_screen_model::scroll_up_region(
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(bottom)]);
     }
 
+    normalize_resize_vacancy();
     mark_dirty_rows(top, bottom);
 }
 
@@ -7377,6 +7505,7 @@ void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
     }
 
     break_soft_wrap_before(bottom + 1);
+    normalize_resize_vacancy();
     mark_dirty_rows(top, bottom);
 }
 
@@ -8348,6 +8477,8 @@ std::size_t Terminal_screen_model::place_image_band(
     int                        end_column,
     terminal_cell_pixel_size_t cell)
 {
+    retire_resize_vacancy_through(row);
+
     // Clip at the right margin, and copy the band out of the decoder's raster,
     // which may be a view keeping a larger capacity buffer alive.
     const int band_width = static_cast<int>(std::min<std::int64_t>(
@@ -8746,6 +8877,10 @@ void Terminal_screen_model::horizontal_tab()
 void Terminal_screen_model::mark_cursor_dirty()
 {
     mark_dirty(m_cursor.row);
+    // Every cursor movement marks the row it lands on here, so this is where
+    // the cursor enters a row: entry retires resize vacancy through that row,
+    // whether the cursor is visible or not.
+    retire_resize_vacancy_through(m_cursor.row);
 }
 
 void Terminal_screen_model::mark_dirty(int row)

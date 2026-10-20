@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -47,6 +48,7 @@ using terminal_hyperlink_identity_by_id_t = std::map<Terminal_hyperlink_id, QByt
 constexpr int         k_terminal_screen_model_max_rows    = 4096;
 constexpr int         k_terminal_screen_model_max_columns = 4096;
 constexpr std::size_t k_terminal_screen_model_max_cells   = 1024U * 1024U;
+constexpr int         k_terminal_no_resize_vacancy_column = std::numeric_limits<int>::max();
 
 inline bool is_terminal_screen_model_grid_size_supported(terminal_grid_size_t grid_size)
 {
@@ -680,6 +682,10 @@ public:
     {
         return std::min(m_resize_displaced_scrollback_rows, scrollback_size());
     }
+    // The trailing primary rows that are wholly resize vacancy: space a resize
+    // appended or rejoined that no application placement or cursor entry has
+    // reached since. Presentation hides them; the native grid keeps them.
+    int resize_vacancy_rows() const;
 
     Terminal_selection_result selected_text(
         const Terminal_selection_range&                selection) const;
@@ -816,6 +822,12 @@ private:
         // Zero is a hard boundary; otherwise this many cells continue into
         // the next row. A wide glyph can leave an unused cell at the margin.
         int                               soft_wrap_columns = 0;
+        // Primary presentation state only, never sealed into history: the
+        // cells from this column on originate from resize vacancy. Vacancy
+        // is a suffix of the screen in reading order, so a row holds at most
+        // one vacant column suffix; zero marks a wholly vacant row.
+        int                               resize_vacant_from_column =
+                                              k_terminal_no_resize_vacancy_column;
         // Null when the row shows no image, a moved-from row included. The
         // row owns its image; it moves and dies with the row.
         std::shared_ptr<const Terminal_image_slice>
@@ -1129,6 +1141,9 @@ private:
     void replace_visible_retained_line_ids();
     void rebase_visible_retained_line_ids_preserving_content();
     void replace_row_with_erased_retained_line(Terminal_screen_row& row);
+    void retire_resize_vacancy_through(int row);
+    void retire_all_resize_vacancy();
+    void normalize_resize_vacancy();
 
     bool cells_have_same_selection_content(
         const Cell&                    left,
@@ -1824,6 +1839,9 @@ private:
     std::uint64_t                   m_dropped_recovery_attempts = 0U;
     int                             m_last_dirty_row = -1;
     int                             m_resize_displaced_scrollback_rows = 0;
+    // Set when a resize leaves primary rows with resize vacancy; cleared once
+    // a pass finds none, so the cursor-entry hook costs nothing without it.
+    bool                            m_primary_resize_vacancy = false;
     std::vector<bool>               m_tab_stops;
     saved_cursor_state_t            m_saved_cursor;
     terminal_grid_position_t        m_cursor;
