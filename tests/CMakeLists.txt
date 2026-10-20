@@ -1447,6 +1447,21 @@ set_tests_properties(vnm_terminal_surface_host_resize_presentation PROPERTIES
     TIMEOUT 60
 )
 
+add_test(
+    NAME vnm_terminal_surface_host_clear_presentation
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_readback_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --clear-presentation-only
+)
+set_tests_properties(vnm_terminal_surface_host_clear_presentation PROPERTIES
+    LABELS "conformance;surface;presentation;wheel"
+    TIMEOUT 120
+)
+
 # A real POSIX pty whose shell redraws its prompt on SIGWINCH, as zsh does.
 if(NOT WIN32)
     add_test(
@@ -1460,6 +1475,20 @@ if(NOT WIN32)
             --shell-redraw-zoom-only
     )
     set_tests_properties(vnm_terminal_surface_host_shell_redraw_zoom PROPERTIES
+        LABELS "conformance;surface;resize;presentation;wheel"
+        TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_surface_host_shell_redraw_clear_zoom
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_readback_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --shell-redraw-clear-zoom-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_shell_redraw_clear_zoom PROPERTIES
         LABELS "conformance;surface;resize;presentation;wheel"
         TIMEOUT 180
     )

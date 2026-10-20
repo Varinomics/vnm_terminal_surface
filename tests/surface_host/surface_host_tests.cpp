@@ -7719,6 +7719,11 @@ bool test_resize_keeps_presented_range_on_written_rows(QGuiApplication& app)
 // because bash 3.2 (macOS /bin/sh) can run a trap inside a command
 // substitution and capture the nested redraw. A resize that arrives while it
 // is ignored is drawn at the next one-second wake.
+//
+// With the argument "clear" it clears the screen as zsh's Ctrl+L does,
+// ESC[H ESC[2J, between its output and its first prompt. Like zsh's, its
+// redraw after a reflow can leave rows of the previous prompt above the new
+// one, so the cleared page can grow beyond the prompt.
 constexpr const char* k_redrawing_shell_script = R"sh(
 prompt='redraw-check-0123456789-abcdefghijklmnopqrstuvwxyz-01234% '
 drawn_size=
@@ -7743,16 +7748,29 @@ draw_prompt() {
     trap : WINCH
 }
 seq 1 5000
+if [ "$1" = clear ]; then printf '\033[H\033[2J'; fi
 draw_prompt
 while :; do sleep 1 & wait $!; draw_prompt; done
 )sh";
 
-bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
+enum class Shell_redraw_start
 {
-    // The owner's requirement: after zooming in and out, nothing below the
-    // prompt can be seen or scrolled into. At the tail the prompt's cursor row
-    // is the bottom row, and the top bound shows the first written row.
+    AFTER_OUTPUT,
+    AFTER_CLEAR,
+};
+
+bool test_shell_redraw_zoom_keeps_prompt_in_place(
+    QGuiApplication&   app,
+    Shell_redraw_start redraw_start)
+{
+    // The owner's requirements: after zooming in and out, nothing below the
+    // prompt can be seen or scrolled into, and a cleared page that fits the
+    // view starts on its top row. At the tail the cursor is on the bottom row
+    // after the output or when the cleared page is longer than the view;
+    // otherwise the cleared page's first row is the top row. Either way the
+    // top bound shows the first written row.
     constexpr int k_prompt_length = 58;
+    const bool    cleared         = redraw_start == Shell_redraw_start::AFTER_CLEAR;
     const QString first_written_row = QStringLiteral("1");
 
 #if defined(__APPLE__)
@@ -7771,7 +7789,8 @@ bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
             backend_error = std::move(message);
         });
     vnm_terminal::Terminal_process_start_request request{
-        {QStringLiteral("/bin/sh"), QStringLiteral("-c"), QString::fromLatin1(k_redrawing_shell_script)},
+        {QStringLiteral("/bin/sh"), QStringLiteral("-c"), QString::fromLatin1(k_redrawing_shell_script),
+         QStringLiteral("redraw"), cleared ? QStringLiteral("clear") : QStringLiteral("output")},
         QStringLiteral("/"),
         {{QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin")}},
         std::nullopt,
@@ -7822,13 +7841,17 @@ bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
 
     bool ok           = true;
     int  failed_steps = 0;
-    const auto check_prompt_on_bottom_row = [&](const std::string& step) {
+    const auto check_prompt_in_place = [&](const std::string& step) {
         ok &= check(wait_for_redraw(), "the shell redraws its prompt for the current grid");
         fixture.surface.scroll_to_offset_from_tail(0);
         const int  rows       = fixture.surface.viewport_visible_rows();
         const auto presented  = committed_display_frame(app, fixture.window, fixture.surface);
         const auto native     = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
         const int  cursor_row = presented != nullptr ? presented->cursor.position.row : -1;
+        const QString first_row = presented != nullptr ? snapshot_row_text(*presented, 0) : QString();
+        const std::int64_t first_logical_row =
+            presented != nullptr && !presented->visible_line_provenance.empty()
+                ? presented->visible_line_provenance.front().logical_row : -1;
 
         const int top_bound = fixture.surface.scrollback_rows();
         fixture.surface.scroll_to_offset_from_tail(top_bound + 5);
@@ -7837,12 +7860,26 @@ bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
         const int     top_offset = fixture.surface.viewport_offset_from_tail();
         fixture.surface.scroll_to_offset_from_tail(0);
 
-        const bool bottom_ok = cursor_row == rows - 1;
-        const bool top_ok    = top_offset == top_bound && top_row == first_written_row;
-        if (!bottom_ok || !top_ok) {
+        // The cleared page runs from its boundary to the content end, which
+        // follows the cursor here. When it fits it starts on the top row, with
+        // the cursor on its own row of the page; otherwise, and after plain
+        // output, the cursor is on the bottom row.
+        const int page_start  = native != nullptr ? native->viewport.presentation.clear_page_start_row : -1;
+        const int page_end    = native != nullptr ? native->viewport.presentation.content_end_row_exclusive : -1;
+        const int cursor_line = native != nullptr
+            ? native->viewport.scrollback_rows + native->cursor.position.row : -1;
+        const bool page_fits  = cleared && page_end - page_start <= rows;
+        const bool tail_ok = page_fits
+            ? first_logical_row == page_start && !first_row.isEmpty() &&
+                cursor_row == cursor_line - page_start
+            : cursor_row == rows - 1;
+        const bool top_ok  = top_offset == top_bound && top_row == first_written_row;
+        if (!tail_ok || !top_ok) {
             ++failed_steps;
             std::cerr << step << ": grid=" << rows << 'x' << fixture.surface.columns()
                       << " presented_cursor_row=" << cursor_row
+                      << " presented_first_row=\"" << first_row.toStdString() << '"'
+                      << " presented_first_logical_row=" << first_logical_row
                       << " rows_below_prompt=" << (rows - 1 - cursor_row)
                       << " public_scrollback_rows=" << top_bound
                       << " native_scrollback_rows=" << (native ? native->viewport.scrollback_rows : -1)
@@ -7855,7 +7892,7 @@ bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
         }
     };
 
-    check_prompt_on_bottom_row("start");
+    check_prompt_in_place("start");
 
     // The owner's run: zoom in until the font stops growing, out until it
     // stops shrinking, and again. Each notch resizes the pty, and the shell
@@ -7873,7 +7910,7 @@ bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
             if (fixture.surface.font_size() == font_size_before) {
                 return;
             }
-            check_prompt_on_bottom_row(direction + " notch " + std::to_string(notch));
+            check_prompt_in_place(direction + " notch " + std::to_string(notch));
         }
     };
     for (int cycle = 1; cycle <= 3; ++cycle) {
@@ -7881,8 +7918,9 @@ bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
         zoom_until_clamped(-120, "cycle " + std::to_string(cycle) + " out");
     }
 
-    ok &= check(failed_steps == 0,
-        "after every zoom notch the prompt is on the bottom row and nothing below it can be seen or scrolled into");
+    ok &= check(failed_steps == 0, cleared
+        ? "after every zoom notch a cleared page that fits starts on the top row, and a longer one ends on the cursor"
+        : "after every zoom notch the prompt is on the bottom row and nothing below it can be seen or scrolled into");
     (void)fixture.surface.terminate_process();
     pump_events(app);
     return ok;
@@ -8394,10 +8432,12 @@ bool test_input_before_paint_addresses_the_committed_frame(QGuiApplication& app)
     return ok;
 }
 
-bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
+bool test_short_session_starts_on_the_top_row(QGuiApplication& app)
 {
-    // Two written rows and no history: growth leaves unused space above them,
-    // never below, and a partial shrink keeps them on the bottom rows.
+    // Two written rows and no clear: a fresh screen shows them from the top
+    // row with the rest blank below them, at every height they fit in. A
+    // height too small for them ends on the bottom row, and growing again
+    // brings the first row back from history to the top row.
     Surface_fixture fixture;
     fixture.surface.set_cursor_blink_enabled(false);
     pump_events(app);
@@ -8406,7 +8446,7 @@ bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
         fixture.surface.setSize(QSizeF(20.5 * metrics.width, (rows + 0.5) * metrics.height));
         return pump_until(app, [&] { return fixture.surface.rows() == rows; });
     };
-    bool ok = check(resize_rows(2), "the short-session fixture starts at two rows");
+    bool ok = check(resize_rows(6), "the short-session fixture starts at six rows");
     auto backend = std::make_unique<Scripted_backend>();
     backend->outputs_during_start = {QByteArrayLiteral("first\r\nprompt$ ")};
     bool started = false;
@@ -8419,12 +8459,16 @@ bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
     const auto check_rows = [&](int rows, const std::string& step) {
         bool step_ok = check(resize_rows(rows), "the surface reaches the requested height");
         const auto frame = committed_display_frame(app, fixture.window, fixture.surface);
-        bool rows_ok = frame != nullptr && fixture.surface.scrollback_rows() == 0;
+        const bool fits = rows >= 2;
+        bool rows_ok = frame != nullptr &&
+            fixture.surface.scrollback_rows() == (fits ? 0 : 1) &&
+            frame->cursor.position.row == (fits ? 1 : 0);
         for (int row = 0; frame && row < rows; ++row) {
             const QString expected =
-                row == rows - 2 ? QStringLiteral("first") :
-                row == rows - 1 ? QStringLiteral("prompt$") :
-                                  QString();
+                !fits     ? QStringLiteral("prompt$") :
+                row == 0  ? QStringLiteral("first")   :
+                row == 1  ? QStringLiteral("prompt$") :
+                            QString();
             const QString actual = snapshot_row_text(*frame, row);
             if (actual != expected) {
                 std::cerr << step << ": row " << row << " expected \"" << expected.toStdString()
@@ -8432,12 +8476,143 @@ bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
                 rows_ok = false;
             }
         }
-        step_ok &= check(rows_ok,
-            "the written rows end on the bottom row with unused space only above them");
+        if (frame && !rows_ok) {
+            std::cerr << step << ": scrollback_rows=" << fixture.surface.scrollback_rows()
+                      << " cursor_row=" << frame->cursor.position.row << '\n';
+        }
+        step_ok &= check(rows_ok, fits
+            ? "the written rows start on the top row with unused space only below them"
+            : "a height too small for the written rows ends on the prompt");
         return step_ok;
     };
-    ok &= check_rows(6, "growth 2 -> 6");
+    ok &= check_rows(6, "fresh at 6 rows");
     ok &= check_rows(3, "partial shrink 6 -> 3");
+    ok &= check_rows(1, "shrink 3 -> 1");
+    ok &= check_rows(6, "growth 1 -> 6");
+    return ok;
+}
+
+// A cleared screen looks as it always does: the prompt on the top row and the
+// rest of the screen blank below it until new output fills the view. Each
+// case writes what zsh -f sent in the owner's macOS transcript, with a short
+// prompt: Ctrl+L redraws the prompt after ESC[H ESC[2J; `clear` follows its
+// echoed command line, adds ESC[3J when the terminal description has E3, and
+// zsh marks a partial line (PROMPT_SP) before the prompt. History above the
+// cleared page stays reachable by scrolling up unless ESC[3J erased it, and
+// a zoom out and back in keeps all of this.
+bool test_cleared_screen_starts_on_the_top_row(QGuiApplication& app)
+{
+    const QString prompt     = QStringLiteral("prompt$");
+    const QString first_line = QStringLiteral("scroll-line-000");
+
+    struct Clear_case
+    {
+        std::string name;
+        bool        command_line   = false;
+        bool        erases_history = false;
+    };
+    const Clear_case cases[] = {
+        {"Ctrl+L",           false, false},
+        {"clear with E3",    true,  true},
+        {"clear without E3", true,  false},
+    };
+
+    bool ok = true;
+    for (const Clear_case& clear_case : cases) {
+        Surface_fixture fixture;
+        fixture.surface.set_cursor_blink_enabled(false);
+        // Zoom out and back in from a size clear of the zoom floor.
+        fixture.surface.set_font_size(24.0);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            numbered_scroll_lines(5000) + QByteArrayLiteral("prompt$ "),
+        };
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        if (!check(started && backend_ptr != nullptr, "the cleared-screen fixture starts its backend")) {
+            ok = false;
+            continue;
+        }
+        pump_events(app);
+
+        QByteArray bytes;
+        if (clear_case.command_line) {
+            bytes += QByteArrayLiteral("clear\x1b[?2004l\r\r\n");
+            if (clear_case.erases_history) {
+                bytes += QByteArrayLiteral("\x1b[3J");
+            }
+            bytes += QByteArrayLiteral("\x1b[H\x1b[2J\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m");
+            bytes += QByteArray(fixture.surface.columns() - 1, ' ');
+            bytes += QByteArrayLiteral("\r \r\r\x1b[0m\x1b[27m\x1b[24m\x1b[Jprompt$ \x1b[K\x1b[?2004h");
+        }
+        else {
+            bytes += QByteArrayLiteral("\x1b[H\x1b[2J\x1b[0m\x1b[27m\x1b[24m\x1b[Jprompt$ \x1b[K");
+        }
+        backend_ptr->emit_output(bytes);
+        pump_events(app);
+
+        const auto check_cleared = [&](const std::string& step) {
+            fixture.surface.scroll_to_offset_from_tail(0);
+            const int  rows  = fixture.surface.viewport_visible_rows();
+            const auto frame = committed_display_frame(app, fixture.window, fixture.surface);
+            bool tail_ok = frame != nullptr && frame->cursor.position.row == 0 &&
+                snapshot_row_text(*frame, 0) == prompt;
+            for (int row = 1; frame && row < rows; ++row) {
+                tail_ok = tail_ok && snapshot_row_text(*frame, row).isEmpty();
+            }
+
+            const int top_bound = fixture.surface.scrollback_rows();
+            fixture.surface.scroll_to_offset_from_tail(top_bound + 5);
+            const auto    top     = committed_display_frame(app, fixture.window, fixture.surface);
+            const QString top_row = top != nullptr ? snapshot_row_text(*top, 0) : QString();
+            fixture.surface.scroll_to_offset_from_tail(0);
+            const bool history_ok = clear_case.erases_history
+                ? top_bound == 0
+                : top_bound > 0 && top_row == first_line;
+
+            if (!tail_ok || !history_ok) {
+                const auto native = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+                std::cerr << clear_case.name << ", " << step << ": grid=" << rows << 'x'
+                          << fixture.surface.columns()
+                          << " presented_cursor_row=" << (frame ? frame->cursor.position.row : -1)
+                          << " top_bound=" << top_bound
+                          << " top_row=\"" << top_row.toStdString() << '"'
+                          << " native_scrollback_rows=" << (native ? native->viewport.scrollback_rows : -1)
+                          << " content_end_row=" << (native ? native->viewport.presentation.content_end_row_exclusive : -1)
+                          << " clear_page_start_row=" << (native ? native->viewport.presentation.clear_page_start_row : -1)
+                          << '\n';
+                for (int row = 0; frame && row < rows; ++row) {
+                    const QString text = snapshot_row_text(*frame, row);
+                    if (!text.isEmpty()) {
+                        std::cerr << "  presented row " << row << " \"" << text.toStdString() << "\"\n";
+                    }
+                }
+            }
+            bool step_ok = check(tail_ok,
+                "a cleared screen shows the prompt on the top row and blank rows below it");
+            step_ok &= check(history_ok, clear_case.erases_history
+                ? "ESC[3J leaves no history to scroll back to"
+                : "the history above the cleared page stays reachable by scrolling up");
+            return step_ok;
+        };
+
+        ok &= check_cleared("after the clear");
+        const int  rows_before = fixture.surface.rows();
+        bool       grid_changed = false;
+        for (const int delta : {-120, -120, -120, 120, 120, 120}) {
+            ok &= send_wheel_event(
+                fixture.surface, Qt::ControlModifier, delta, true, "Ctrl+wheel notch zooms the font");
+            pump_events(app, 2);
+            grid_changed = grid_changed || fixture.surface.rows() != rows_before;
+            ok &= check_cleared(delta < 0 ? "after a zoom-out notch" : "after a zoom-in notch");
+        }
+        ok &= check(grid_changed, "the zoom cycle changes the grid");
+        (void)fixture.surface.terminate_process();
+        pump_events(app);
+    }
     return ok;
 }
 
@@ -23025,13 +23200,19 @@ int main(int argc, char** argv)
     }
 #if !defined(Q_OS_WIN)
     if (app.arguments().contains(QStringLiteral("--shell-redraw-zoom-only"))) {
-        return test_shell_redraw_zoom_keeps_prompt_on_bottom_row(app) ? 0 : 1;
+        return test_shell_redraw_zoom_keeps_prompt_in_place(app, Shell_redraw_start::AFTER_OUTPUT) ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--shell-redraw-clear-zoom-only"))) {
+        return test_shell_redraw_zoom_keeps_prompt_in_place(app, Shell_redraw_start::AFTER_CLEAR) ? 0 : 1;
     }
 #endif
+    if (app.arguments().contains(QStringLiteral("--clear-presentation-only"))) {
+        return test_cleared_screen_starts_on_the_top_row(app) ? 0 : 1;
+    }
     if (app.arguments().contains(QStringLiteral("--resize-presentation-only"))) {
         bool ok = test_resize_keeps_presented_range_on_written_rows(app);
         ok &= test_redraw_shrinks_published_content_end(app);
-        ok &= test_resize_short_session_keeps_unused_space_above(app);
+        ok &= test_short_session_starts_on_the_top_row(app);
         ok &= test_incompatible_held_growth_releases_early(app);
         ok &= test_held_layout_changes_use_the_current_layout(app);
         return ok ? 0 : 1;
