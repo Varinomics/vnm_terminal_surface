@@ -245,8 +245,15 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
     int visual_row = -1;
     const int display_rows = request.presentation ? request.presentation->visible_rows : 0;
     const int display_offset = request.presentation ? request.presentation->offset_from_tail : -1;
-    auto display_snapshot = make_presented_snapshot(
-        m_latest_render_snapshot, display_rows, display_offset);
+    // A request names the presentation of the frame its gesture addressed.
+    // A receiver without a supported presentation record displays the native
+    // publication and names none; its rows are the native snapshot's.
+    const auto displayed_frame = [this, &request, display_rows](int offset) {
+        return request.presentation
+            ? make_presented_snapshot(m_latest_render_snapshot, display_rows, offset)
+            : m_latest_render_snapshot;
+    };
+    auto display_snapshot = displayed_frame(display_offset);
     const Terminal_render_snapshot* snapshot = display_snapshot.get();
     if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
             (std::size_t)snapshot->grid_size.rows)
@@ -269,8 +276,7 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
         else {
             (void)scroll_published_viewport_lines(request.scroll_lines);
         }
-        display_snapshot = make_presented_snapshot(m_latest_render_snapshot, display_rows,
-            request.presentation ? m_canvas_viewport_controller.state().offset_from_tail : -1);
+        display_snapshot = displayed_frame(m_canvas_viewport_controller.state().offset_from_tail);
         snapshot = display_snapshot.get();
         if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
                 (std::size_t)snapshot->grid_size.rows)

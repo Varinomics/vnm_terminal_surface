@@ -487,8 +487,12 @@ has its own version and does not change the canvas frame version.
 Selection requests for a content-tail presentation carry its rendered row
 capacity and offset in the independently versioned presentation record. Hosts
 must transport that record together with the source and row identities. Native
-frames without supported presentation metadata keep native selection requests;
-an actual projected request cannot be downgraded to native coordinates.
+frames without supported presentation metadata (absent, unknown, or `NATIVE`)
+keep native selection requests: a request without a presentation record
+addresses the native publication's rows, including after a handle scrolls the
+view. The desktop surface names its rendered presentation in every request that
+addresses rows; an actual projected request cannot be downgraded to native
+coordinates.
 
 ## Clipboard Policy
 
