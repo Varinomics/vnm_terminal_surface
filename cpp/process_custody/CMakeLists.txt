@@ -94,6 +94,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             set_tests_properties(vnm_process_custody_darwin_pty_tests PROPERTIES TIMEOUT 40)
         endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(vnm_process_custody_channel_resource_tests tests/channel_resource_tests.cpp)
+            target_link_libraries(vnm_process_custody_channel_resource_tests PRIVATE vnm_process_custody)
+            set_target_properties(vnm_process_custody_channel_resource_tests PROPERTIES
+                AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME vnm_process_custody_channel_resource_tests
+                COMMAND vnm_process_custody_channel_resource_tests)
+            set_tests_properties(vnm_process_custody_channel_resource_tests PROPERTIES TIMEOUT 10)
             add_test(NAME vnm_process_custody_started_descriptor_tests
                 COMMAND vnm_process_custody_tests --started-descriptor)
             set_tests_properties(vnm_process_custody_started_descriptor_tests PROPERTIES TIMEOUT 10)
