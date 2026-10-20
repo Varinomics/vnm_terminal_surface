@@ -866,6 +866,7 @@ private:
 
     void refresh_viewport_presentation();
     void sync_canvas_scroll_intent_from_native();
+    void reveal_search_match_in_canvas(int match_row);
     void sync_viewport_from_model_result(
         const Terminal_screen_model_result&    result,
         std::optional<Live_primary_viewport_anchor>

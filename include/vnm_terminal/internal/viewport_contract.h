@@ -213,6 +213,23 @@ inline int presentation_offset_for_logical_row(
         static_cast<long long>(presentation_max_offset_from_tail(viewport))));
 }
 
+// The presented offset at which this viewport's consumer shows logical_row,
+// moving no further than needed: the current offset when the row is already
+// displayed, otherwise the row lands on the nearer edge. Each consumer applies
+// it with its own capacity, so a smaller view reveals what a larger one shows.
+inline int presentation_reveal_offset(
+    const Terminal_viewport_state& viewport,
+    int                            logical_row)
+{
+    const std::optional<int> display_row =
+        presentation_display_row_for_logical_row(viewport, logical_row);
+    if (!display_row.has_value() || (*display_row >= 0 && *display_row < viewport.visible_rows)) {
+        return presentation_clamped_offset_from_tail(viewport);
+    }
+    return presentation_offset_for_logical_row(
+        viewport, logical_row, *display_row < 0 ? 0 : viewport.visible_rows - 1);
+}
+
 // The row a detached view keeps in place (DESIGN 5.5): the first display row
 // whose requested native row lies in the coverage, and its display position.
 struct Terminal_presentation_anchor
