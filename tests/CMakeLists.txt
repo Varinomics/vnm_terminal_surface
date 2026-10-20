@@ -1405,6 +1405,21 @@ set_tests_properties(vnm_terminal_surface_host_async_resize_metadata PROPERTIES
     TIMEOUT 30
 )
 
+add_test(
+    NAME vnm_terminal_surface_host_zoom_scroll_range
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --zoom-scroll-range-only
+)
+set_tests_properties(vnm_terminal_surface_host_zoom_scroll_range PROPERTIES
+    LABELS "conformance;surface;resize;wheel"
+    TIMEOUT 60
+)
+
 if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     add_test(
         NAME vnm_terminal_surface_host_pending_mouse_wheel_trace

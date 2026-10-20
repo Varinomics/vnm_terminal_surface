@@ -61,6 +61,7 @@
 #include <optional>
 #include <semaphore>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -7225,6 +7226,159 @@ bool test_plain_wheel_scrolls_primary_scrollback(QGuiApplication& app)
         "plain-wheel pixel fragments scroll after one cell-height step");
     ok &= check(backend_ptr->writes.size() == write_count,
         "plain-wheel pixel fragments do not write backend bytes");
+
+    return ok;
+}
+
+bool test_control_wheel_zoom_keeps_scroll_range_on_written_rows(QGuiApplication& app)
+{
+    // seq-style output followed by a prompt. Every produced line is one row of
+    // the scroll range, so at every font size the range holds exactly these
+    // rows and its bottom position ends at the prompt.
+    constexpr int k_output_lines = 5000;
+    constexpr int k_written_rows = k_output_lines + 1;
+    const QString last_output_line = QStringLiteral("scroll-line-4999");
+    const QString prompt           = QStringLiteral("prompt$");
+
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        numbered_scroll_lines(k_output_lines) + QByteArrayLiteral("prompt$ "),
+    };
+    bool started = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    if (!check(started, "zoom scroll-range surface starts")) {
+        return false;
+    }
+
+    const auto check_scroll_range = [&](const std::string& phase) {
+        const int visible_rows    = fixture.surface.viewport_visible_rows();
+        const int scrollback_rows = fixture.surface.scrollback_rows();
+        const int offset          = fixture.surface.viewport_offset_from_tail();
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        int     prompt_row = -1;
+        QString bottom_row;
+        QString above_bottom_row;
+        if (snapshot != nullptr) {
+            for (int row = 0; row < visible_rows; ++row) {
+                if (snapshot_row_text(*snapshot, row) == prompt) {
+                    prompt_row = row;
+                }
+            }
+            bottom_row       = snapshot_row_text(*snapshot, visible_rows - 1);
+            above_bottom_row = snapshot_row_text(*snapshot, visible_rows - 2);
+        }
+
+        const bool range_ok =
+            offset           == 0                &&
+            bottom_row       == prompt           &&
+            above_bottom_row == last_output_line &&
+            scrollback_rows + visible_rows == k_written_rows;
+        if (!range_ok) {
+            std::cerr << phase
+                      << ": font_size="        << fixture.surface.font_size()
+                      << " visible_rows="      << visible_rows
+                      << " scrollback_rows="   << scrollback_rows
+                      << " range_rows="        << scrollback_rows + visible_rows
+                      << " written_rows="      << k_written_rows
+                      << " offset_from_tail="  << offset
+                      << " prompt_row="        << prompt_row
+                      << " bottom_row=\""      << bottom_row.toStdString()
+                      << "\" above_bottom_row=\"" << above_bottom_row.toStdString()
+                      << "\"\n";
+        }
+        return check(range_ok,
+            "the bottom position ends at the prompt and the scroll range holds only written rows");
+    };
+
+    const auto displayed_row = [&](int row) {
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return snapshot != nullptr ? snapshot_row_text(*snapshot, row) : QString();
+    };
+
+    // Windows and X11 report a wheel notch as angle delta alone; macOS also
+    // attaches a pixel delta to an ordinary mouse notch. Two notches up and two
+    // back each move the offset and the displayed rows by three lines.
+    const auto check_lines_per_notch = [&](const std::string& phase) {
+        bool notch_ok = true;
+        for (const int pixel_delta : {0, 20}) {
+            for (const int direction : {1, 1, -1, -1}) {
+                const int     offset_before    = fixture.surface.viewport_offset_from_tail();
+                const QString first_row_before = displayed_row(0);
+                const QString row_3_before     = displayed_row(3);
+                notch_ok &= send_wheel_event(
+                    fixture.surface,
+                    Qt::NoModifier,
+                    direction * pixel_delta,
+                    direction * 120,
+                    true,
+                    "plain wheel notch after zoom scrolls the primary scrollback");
+                const int  moved_lines   =
+                    fixture.surface.viewport_offset_from_tail() - offset_before;
+                const bool content_moved = direction > 0
+                    ? displayed_row(3) == first_row_before
+                    : displayed_row(0) == row_3_before;
+                if (moved_lines != 3 * direction || !content_moved) {
+                    std::cerr << phase
+                              << ": font_size="     << fixture.surface.font_size()
+                              << " pixel_delta="    << pixel_delta
+                              << " direction="      << direction
+                              << " offset_before="  << offset_before
+                              << " moved_lines="    << moved_lines
+                              << " content_moved="  << content_moved
+                              << '\n';
+                }
+                notch_ok &= check(moved_lines == 3 * direction && content_moved,
+                    "one plain wheel notch scrolls three lines at every font size");
+            }
+        }
+        return notch_ok;
+    };
+
+    // A notch and its reverse return only to a settled size, the largest size
+    // that draws like its neighbours (b9f9e9b); the fixture's starting size
+    // need not be one, so one notch in and one out settle it first.
+    for (const int delta : {120, -120}) {
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::ControlModifier,
+            delta,
+            true,
+            "Ctrl+wheel notch settles the starting font size");
+        pump_events(app, 2);
+    }
+    const qreal initial_font_size = fixture.surface.font_size();
+    ok &= check_scroll_range("before zoom");
+    ok &= check_lines_per_notch("before zoom");
+
+    // In past the starting size, out past it, and back, one notch at a time.
+    std::vector<int> zoom_notches;
+    zoom_notches.insert(zoom_notches.end(),  6,  120);
+    zoom_notches.insert(zoom_notches.end(), 10, -120);
+    zoom_notches.insert(zoom_notches.end(),  4,  120);
+    for (std::size_t step = 0; step < zoom_notches.size(); ++step) {
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::ControlModifier,
+            zoom_notches[step],
+            true,
+            "Ctrl+wheel notch zooms the font");
+        pump_events(app, 2);
+        const std::string phase = "after zoom notch " + std::to_string(step + 1);
+        ok &= check_scroll_range(phase);
+        ok &= check_lines_per_notch(phase);
+    }
+    ok &= check(fixture.surface.font_size() == initial_font_size,
+        "the zoom sequence returns to the starting font size");
 
     return ok;
 }
@@ -21476,6 +21630,9 @@ int main(int argc, char** argv)
     if (app.arguments().contains(QStringLiteral("--selection-copy-intent-only"))) {
         return test_selection_copy_intent_after_output(app) ? 0 : 1;
     }
+    if (app.arguments().contains(QStringLiteral("--zoom-scroll-range-only"))) {
+        return test_control_wheel_zoom_keeps_scroll_range_on_written_rows(app) ? 0 : 1;
+    }
     if (app.arguments().contains(QStringLiteral("--async-resize-metadata-only"))) {
         return test_async_surface_resize_receipt_updates_geometry_snapshot(app) ? 0 : 1;
     }
@@ -21588,6 +21745,7 @@ int main(int argc, char** argv)
     ok &= test_control_wheel_font_zoom(app);
     ok &= test_control_wheel_zoom_changes_the_rendering_every_notch(app);
     ok &= test_plain_wheel_scrolls_primary_scrollback(app);
+    ok &= test_control_wheel_zoom_keeps_scroll_range_on_written_rows(app);
     ok &= test_public_viewport_scroll_api(app);
     ok &= test_immediate_public_projection_public_scroll_api(app);
     ok &= test_public_viewport_scroll_source_labels(app);
