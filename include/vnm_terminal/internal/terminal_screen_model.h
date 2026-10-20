@@ -106,7 +106,9 @@ struct Terminal_screen_model_config
     // - while the alternate screen is active, a resize leaves the primary at
     //   its size; the primary is resized once, to the size then current, when
     //   it is active again or before the alternate screen is replaced;
-    // - a resize never moves a saved cursor; restoring it clamps it to the grid.
+    // - a resize never moves a saved cursor; restoring it clamps it to the grid;
+    // - a cleared alternate screen being entered starts at the cursor of the
+    //   screen it is entered from.
     bool                   backend_owns_screen_buffers              = false;
 };
 
@@ -1130,6 +1132,7 @@ private:
     };
 
     screen_buffer_state_t make_empty_buffer_state();
+    screen_buffer_state_t make_entered_alternate_state(terminal_grid_position_t entry_cursor);
     void restore_buffer_state(const screen_buffer_state_t& state);
     void save_active_buffer_state();
     screen_buffer_state_t& active_buffer_state();

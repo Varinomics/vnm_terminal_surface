@@ -423,7 +423,7 @@ bool test_backend_owned_primary_keeps_its_size_across_an_alternate_round_trip()
     model.ingest(k_backend_owned_primary);
     expected.ingest(k_backend_owned_primary);
 
-    model.ingest(QByteArrayLiteral("\x1b[?1049hALT"));
+    model.ingest(QByteArrayLiteral("\x1b[?1049h\x1b[HALT"));
     model.resize({2, 6});
     bool ok = check(model.scrollback_size() == 0,
         "a shrink while the alternate screen is active leaves the primary's rows in place");
@@ -540,6 +540,21 @@ bool test_backend_owned_saved_cursor_is_not_shifted_by_a_shrink()
     return ok;
 }
 
+// ConPTY creates its alternate buffer with the cursor of the buffer it is
+// entered from (screenInfo.cpp _CreateAltBuffer).
+bool test_backend_owned_alternate_screen_starts_at_the_entry_cursor()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(4, 6);
+    model.ingest(QByteArrayLiteral("aa\r\nbb\x1b[?1049h"));
+    bool ok = check(model.cursor_position().row == 1 && model.cursor_position().column == 2,
+        "the alternate screen starts at the primary's cursor");
+    model.ingest(QByteArrayLiteral("x\x1b[1;5H\x1b[?1049h"));
+    ok &= check(model.row_text(1).isEmpty() &&
+            model.cursor_position().row == 0 && model.cursor_position().column == 4,
+        "a replacement clears the alternate screen and keeps its cursor");
+    return ok;
+}
+
 bool test_resize_normalizes_saved_origin_mode_and_noop()
 {
     bool ok = true;
@@ -638,6 +653,7 @@ int main()
     ok &= test_backend_owned_primary_rows_end_at_its_own_height();
     ok &= test_backend_owned_saved_cursor_keeps_its_coordinates_through_a_reflow();
     ok &= test_backend_owned_saved_cursor_is_not_shifted_by_a_shrink();
+    ok &= test_backend_owned_alternate_screen_starts_at_the_entry_cursor();
     ok &= test_resize_normalizes_saved_origin_mode_and_noop();
     ok &= test_resize_preserves_primary_wide_cells_crossing_right_edge();
     ok &= test_viewport_alternate_screen_policy_hooks();

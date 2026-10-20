@@ -3519,6 +3519,20 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
     return state;
 }
 
+// A cleared alternate screen being entered. A backend that owns its screens
+// starts it at the cursor of the screen it is entered from, the primary's or
+// the replaced alternate screen's, as ConPTY creates its alternate buffer
+// (screenInfo.cpp _CreateAltBuffer).
+Terminal_screen_model::screen_buffer_state_t
+Terminal_screen_model::make_entered_alternate_state(terminal_grid_position_t entry_cursor)
+{
+    screen_buffer_state_t state = make_empty_buffer_state();
+    if (m_config.backend_owns_screen_buffers) {
+        state.cursor = entry_cursor;
+    }
+    return state;
+}
+
 Terminal_screen_model::Retained_history_storage::Retained_history_storage() = default;
 
 Terminal_screen_model::Retained_history_storage::~Retained_history_storage() = default;
@@ -7080,11 +7094,12 @@ int Terminal_screen_model::dec_private_mode_status(int mode) const
 void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int active_mode)
 {
     cancel_primary_repaint_recovery_candidate();
+    const terminal_grid_position_t entry_cursor = m_cursor;
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
         const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
         save_active_buffer_state();
         if (clear_alternate) {
-            m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+            m_alternate_grid.active_grid_state() = make_entered_alternate_state(entry_cursor);
         }
         m_active_buffer_id = Terminal_buffer_id::ALTERNATE;
         record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -7094,7 +7109,7 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
     else
     if (clear_alternate) {
         resize_deferred_primary();
-        m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+        m_alternate_grid.active_grid_state() = make_entered_alternate_state(entry_cursor);
         mark_terminal_content_changed();
         restore_buffer_state(m_alternate_grid.active_grid_state());
     }

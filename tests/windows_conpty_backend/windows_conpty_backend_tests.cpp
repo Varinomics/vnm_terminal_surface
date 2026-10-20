@@ -6515,6 +6515,47 @@ bool test_native_cmd_alternate_resize()
     return ok;
 }
 
+// ConPTY creates an alternate buffer with the cursor of the buffer it is
+// entered from: the primary's, or the replaced alternate buffer's
+// (screenInfo.cpp _CreateAltBuffer). Output written before the application
+// positions the cursor, here cmd's prompt, has to land on ConPTY's rows.
+bool test_native_cmd_alternate_screen_entry()
+{
+    const std::string label = "native cmd alternate entry";
+    QTemporaryDir dir;
+    if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": files are written")) {
+        return false;
+    }
+
+    Native_cmd_screen screen;
+    if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+        screen.stop();
+        return false;
+    }
+
+    bool ok = check(screen.run(".\\lines"), label + ": cmd fills the primary screen");
+    ok &= check(screen.session().latest_render_snapshot()->cursor.position.row > 1,
+        label + ": the primary cursor is below the alternate screen's home row");
+    for (const char* step : {"entry", "replacement"}) {
+        const std::string step_label = label + ", " + step;
+        ok &= check(screen.run("type enter.txt") &&
+                screen.session().latest_render_snapshot()->viewport.active_buffer !=
+                    term::Terminal_buffer_id::PRIMARY,
+            step_label + ": the child is in the alternate screen");
+        const std::optional<Conpty_buffer_report> conpty = screen.probe();
+        ok &= check(conpty.has_value() && screen.probe_model().has_value(),
+            step_label + ": the probe reports ConPTY's alternate buffer");
+        if (conpty.has_value() && screen.probe_model().has_value()) {
+            ok &= screens_match(*screen.probe_model(), *conpty,
+                step_label + ": every row and the cursor equal ConPTY's");
+        }
+    }
+
+    ok &= check(screen.run("type leave.txt"), label + ": the child returns to the primary screen");
+    screen.stop();
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -6522,6 +6563,11 @@ int main(int argc, char** argv)
     if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-alternate-resize") {
         bool ok = test_native_cmd_alternate_resize();
         ok &= wait_for_console_host_children_to_exit("native cmd alternate resize");
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-alternate-entry") {
+        bool ok = test_native_cmd_alternate_screen_entry();
+        ok &= wait_for_console_host_children_to_exit("native cmd alternate entry");
         return ok ? 0 : 1;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-resize") {
