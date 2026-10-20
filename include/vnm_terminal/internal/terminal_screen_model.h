@@ -911,7 +911,6 @@ private:
         std::uint64_t             history_ordinal = 0U;
         int                       active_grid_row = 0;
         terminal_history_handle_t history_handle;
-        terminal_history_handle_t active_grid_handle;
         int                       history_match_count = 0;
         int                       active_grid_match_count = 0;
         int                       row_sequence_match_count = 0;
