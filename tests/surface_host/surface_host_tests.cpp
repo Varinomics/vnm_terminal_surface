@@ -22355,7 +22355,6 @@ int main(int argc, char** argv)
         ok &= test_geometry_change_resizes_session(app);
         ok &= test_control_wheel_resize_keeps_event_frontier(app);
         ok &= test_surface_key_routes_stop_at_callback_frontier(app);
-        ok &= test_async_surface_resize_receipt_updates_geometry_snapshot(app);
         return ok ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--selection-copy-intent-only"))) {
@@ -22421,6 +22420,7 @@ int main(int argc, char** argv)
     }
 #endif
 
+    const bool core_only = app.arguments().contains(QStringLiteral("--core-only"));
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_honored_text_area_resize_can_be_returned_to_item_geometry(app);
@@ -22509,11 +22509,15 @@ int main(int argc, char** argv)
     ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
     ok &= test_pending_mouse_report_preserves_following_key_input(app);
     ok &= test_single_pending_mouse_press_survives_frontier_backlog(app);
-    ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+    if (!core_only) {
+        ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+    }
     ok &= test_page_key_scrolls_before_post_frontier_alternate_screen(app);
     ok &= test_surface_text_input_routes_keep_one_frontier(app);
     ok &= test_mouse_input_stops_at_callback_frontier(app);
-    ok &= test_control_wheel_resize_keeps_event_frontier(app);
+    if (!core_only) {
+        ok &= test_control_wheel_resize_keeps_event_frontier(app);
+    }
     ok &= test_reentrant_paste_captures_new_public_frontier(app);
     ok &= test_resize_policy_setters_keep_callback_frontier(app);
     ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
@@ -22521,7 +22525,9 @@ int main(int argc, char** argv)
     ok &= test_drag_after_new_press_reports_repeated_cell(app);
     ok &= test_repeated_drag_after_local_scroll_returns_to_tail(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
-    ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
+    if (!core_only) {
+        ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
+    }
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
     ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
     ok &= test_transcript_timing_diagnostics_records_hot_paths();
@@ -22573,9 +22579,11 @@ int main(int argc, char** argv)
     ok &= test_heap_surface_destroy_closes_queued_worker_callback(app);
     ok &= test_after_frame_callback_update_latch_falls_back_on_window_destroy(app);
     ok &= test_window_destroy_keeps_surface_session_until_surface_destroy(app);
-    ok &= test_geometry_change_resizes_session(app);
-    ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
-    ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
+    if (!core_only) {
+        ok &= test_geometry_change_resizes_session(app);
+        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
+        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
+    }
     ok &= test_backend_exit_updates_surface(app);
     ok &= test_public_lifecycle_methods(app);
     ok &= test_terminal_icon_name_notifications(app);
