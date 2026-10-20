@@ -1944,7 +1944,8 @@ target_link_libraries(vnm_terminal_touch_selection PRIVATE
 set_target_properties(vnm_terminal_touch_selection PROPERTIES AUTOMOC OFF)
 add_test(NAME vnm_terminal_touch_selection
     COMMAND "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}" "QT_QPA_PLATFORM=offscreen"
+        ${vnm_terminal_qt_offscreen_environment}
+        "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_touch_selection>")
 
 add_executable(vnm_terminal_backend_session
