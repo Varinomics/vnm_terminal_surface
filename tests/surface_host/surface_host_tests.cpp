@@ -7323,6 +7323,10 @@ bool test_control_wheel_zoom_keeps_scroll_range_on_written_rows(QGuiApplication&
 
     bool ok = true;
     Surface_fixture fixture;
+    // The walk passes four distinct renderings below its starting size. Keep
+    // that size clear of the lower clamp, which can absorb a wheel notch when
+    // the platform gives neighbouring small sizes the same drawing.
+    fixture.surface.set_font_size(24.0);
     pump_events(app);
 
     auto backend = std::make_unique<Scripted_backend>();
