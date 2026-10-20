@@ -604,21 +604,20 @@ struct Terminal_render_snapshot
     // the leading_row_count native rows directly above them.
     int                                                leading_row_count = 0;
     std::shared_ptr<const Terminal_render_snapshot>     leading_rows_snapshot;
+    // Coverage within the frame's own rows: the trailing rows a
+    // geometry-adapted frame appended hold no native content.
+    int                                                uncovered_trailing_rows = 0;
+    // The frame's rows were frozen at a synchronized-output hold, by a
+    // public-projection scroll or geometry adaptation, rather than read from
+    // the live model. Requested rows above a frozen frame's coverage are
+    // shown as unused slots.
+    bool                                               frozen_basis = false;
     // A presented frame: display_source is the native frame it presents and
     // display_row_logical_rows its forward map, where -1 is an identity-free
     // slot without a native row.
     std::shared_ptr<const Terminal_render_snapshot>     display_source;
     std::vector<int>                                   display_row_logical_rows;
 };
-
-// A frame whose rows were frozen, by synchronized-output geometry adaptation
-// or a public-projection scroll, rather than read from the live model.
-inline bool render_snapshot_has_frozen_basis(const Terminal_render_snapshot& snapshot)
-{
-    return
-        snapshot.basis   == Terminal_render_snapshot_basis::PUBLIC_PROJECTION ||
-        snapshot.purpose == Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
-}
 
 struct Terminal_render_snapshot_validation
 {
@@ -692,7 +691,8 @@ inline bool snapshots_share_row_identity_space(
         left.metadata.row_origin_generation == right.metadata.row_origin_generation &&
         viewport_mappings_match(left.viewport, right.viewport)                      &&
         left.viewport.presentation          == right.viewport.presentation          &&
-        left.leading_row_count              == right.leading_row_count;
+        left.leading_row_count              == right.leading_row_count              &&
+        left.uncovered_trailing_rows        == right.uncovered_trailing_rows;
 }
 
 inline void append_dirty_range_rows(
@@ -825,7 +825,7 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
             const auto& source = *snapshot.display_source;
             const int requested = presentation_requested_logical_row(source.viewport, row);
             if (expected_logical_row != requested &&
-                !(expected_logical_row == -1 && render_snapshot_has_frozen_basis(source)))
+                !(expected_logical_row == -1 && source.frozen_basis))
             {
                 return false;
             }

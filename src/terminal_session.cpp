@@ -4,6 +4,7 @@
 #include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include <QKeyEvent>
@@ -449,6 +450,7 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
     Terminal_render_snapshot snapshot;
     snapshot.basis                     = Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
     snapshot.purpose                   = Terminal_render_snapshot_purpose::SCROLL;
+    snapshot.frozen_basis              = true;
     snapshot.public_scroll_diagnostics = diagnostics;
     snapshot.grid_size                 = grid_size;
     snapshot.viewport                  = viewport;
@@ -498,6 +500,38 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
     }
 
     return snapshot;
+}
+
+// The rows a public-projection frame's presentation requests above its
+// window come from the copied rows directly above it while they reach; the
+// producer shows the rest as unused slots.
+void add_public_projection_leading_rows(
+    Terminal_render_snapshot&            snapshot,
+    const Terminal_public_projection&    projection)
+{
+    const int first_copied_index =
+        first_public_row_for_viewport(snapshot.viewport) - projection.first_copied_public_row();
+    const int leading_rows =
+        std::min(presentation_leading_row_count(snapshot.viewport), first_copied_index);
+    if (leading_rows <= 0) {
+        return;
+    }
+
+    Terminal_viewport_state leading_viewport = snapshot.viewport;
+    leading_viewport.offset_from_tail += leading_rows;
+    std::optional<Terminal_render_snapshot> leading =
+        public_projection_scroll_snapshot_from_projection(
+            projection,
+            leading_viewport,
+            snapshot.metadata.sequence,
+            snapshot.public_scroll_diagnostics);
+    if (!leading.has_value()) {
+        return;
+    }
+
+    snapshot.leading_row_count     = leading_rows;
+    snapshot.leading_rows_snapshot =
+        std::make_shared<const Terminal_render_snapshot>(std::move(*leading));
 }
 
 bool viewport_states_match(
@@ -1214,6 +1248,32 @@ Terminal_viewport_state viewport_adapted_to_grid(
     return viewport;
 }
 
+// A geometry-adapted frame keeps its rows top-anchored: the rows appended at
+// the bottom are resize vacancy and clipping drops the trailing rows first
+// (DESIGN 5.7). Its mapping record follows from the frozen basis' record: P
+// moves by the row change under AUTOMATIC and COMPANION alike, and a NATIVE
+// frame that grows hides its appended rows.
+Terminal_presentation_mapping presentation_adapted_to_grid(
+    const Terminal_viewport_state& viewport,
+    int                            row_delta)
+{
+    if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
+        return {};
+    }
+
+    const Terminal_presentation_mapping& mapping = viewport.presentation;
+    const int hidden_rows = std::max(0, mapping.hidden_rows + row_delta);
+    if (mapping.policy == Terminal_presentation_policy::COMPANION) {
+        return {Terminal_presentation_policy::COMPANION, hidden_rows, mapping.insertion_row};
+    }
+
+    if (hidden_rows > 0) {
+        return {Terminal_presentation_policy::AUTOMATIC, hidden_rows, 0};
+    }
+
+    return {};
+}
+
 Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     const Terminal_render_snapshot&    public_snapshot,
     terminal_grid_size_t               grid_size,
@@ -1226,6 +1286,7 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     Terminal_render_snapshot snapshot;
     snapshot.basis                   = Terminal_render_snapshot_basis::LIVE_CONTENT;
     snapshot.purpose                 = Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
+    snapshot.frozen_basis            = true;
     snapshot.grid_size               = grid_size;
     snapshot.viewport                = viewport_adapted_to_grid(public_snapshot.viewport, grid_size);
     snapshot.color_state             = public_snapshot.color_state;
@@ -1263,6 +1324,35 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
         std::clamp(snapshot.cursor.position.row, 0, grid_size.rows - 1);
     snapshot.cursor.position.column =
         std::clamp(snapshot.cursor.position.column, 0, grid_size.columns - 1);
+
+    const int row_delta = grid_size.rows - public_snapshot.grid_size.rows;
+    snapshot.viewport.presentation = presentation_adapted_to_grid(public_snapshot.viewport, row_delta);
+    if (snapshot.viewport.active_buffer == Terminal_buffer_id::PRIMARY) {
+        snapshot.uncovered_trailing_rows =
+            std::clamp(public_snapshot.uncovered_trailing_rows + row_delta, 0, grid_size.rows);
+        snapshot.resize_vacancy_rows =
+            std::clamp(public_snapshot.resize_vacancy_rows + row_delta, 0, grid_size.rows);
+        snapshot.native_content_bottom_row_exclusive =
+            std::min(public_snapshot.native_content_bottom_row_exclusive, grid_size.rows);
+        snapshot.resize_displaced_scrollback_rows = public_snapshot.resize_displaced_scrollback_rows;
+    }
+    // The frozen basis' leading rows stay directly above the frame's own rows
+    // while they fit above its first row and their columns still match; they
+    // adapt like the frame's own rows.
+    if (public_snapshot.leading_rows_snapshot &&
+        public_snapshot.leading_row_count < grid_size.rows &&
+        public_snapshot.leading_rows_snapshot->grid_size.columns == grid_size.columns &&
+        snapshot.viewport.offset_from_tail == public_snapshot.viewport.offset_from_tail)
+    {
+        snapshot.leading_row_count     = public_snapshot.leading_row_count;
+        snapshot.leading_rows_snapshot = std::make_shared<const Terminal_render_snapshot>(
+            geometry_snapshot_from_public_snapshot(
+                *public_snapshot.leading_rows_snapshot,
+                grid_size,
+                sequence,
+                backend_geometry_in_sync,
+                profile_stats));
+    }
     return snapshot;
 }
 
@@ -4980,6 +5070,7 @@ void Terminal_session::run_operation_step(bool windowed)
         }
     }
 
+    const terminal_grid_size_t grid_size_before_step = m_grid_size;
     bool window_taken = false;
     while (operation.phase != Runner_operation_phase::RETIRED && !m_backend_output_stopped) {
         if (m_screen_model.has_value() &&
@@ -5020,6 +5111,22 @@ void Terminal_session::run_operation_step(bool windowed)
     }
     m_backend_output_stopped          = false;
     m_unconsumed_backend_output_bytes = 0;
+
+    // A text-area resize the step's output applied inside a hold reaches the
+    // published frame as a host resize does, once the step has settled: the
+    // frozen frame adapts to the new grid, or the hold ends when it cannot
+    // (DESIGN 5.7). A host resize has published already, and output that also
+    // released the hold published the live frame.
+    if (m_screen_model.has_value()                                &&
+        !model_allows_render_snapshot(*m_screen_model)            &&
+        !grid_sizes_match(grid_size_before_step, m_grid_size)     &&
+        (m_latest_render_snapshot == nullptr ||
+            !grid_sizes_match(m_latest_render_snapshot->grid_size, m_grid_size)))
+    {
+        publish_synchronized_resize_snapshot(
+            operation.command.sequence,
+            QStringLiteral("text-area resize geometry snapshot ready"));
+    }
 
     if (operation.category == Queue_category::OUTPUT) {
         set_output_backpressure_active(
@@ -8864,20 +8971,33 @@ void Terminal_session::publish_selection_snapshot(
         const bool latest_render_snapshot_is_current =
             m_latest_render_snapshot != nullptr &&
             grid_sizes_match(m_latest_render_snapshot->grid_size, m_grid_size);
-        Terminal_render_snapshot snapshot =
-            latest_render_snapshot_is_current
-                ? *m_latest_render_snapshot
-            : m_latest_content_render_snapshot != nullptr
-                ? geometry_snapshot_from_public_snapshot(
-                    *m_latest_content_render_snapshot,
-                    m_grid_size,
-                    sequence,
-                    m_backend_geometry_in_sync,
-                    &m_profile_stats)
-                : make_empty_render_snapshot(
-                    m_grid_size,
-                    viewport_adapted_to_grid(m_viewport_controller.state(), m_grid_size),
-                    sequence);
+        Terminal_render_snapshot snapshot;
+        if (latest_render_snapshot_is_current) {
+            snapshot = *m_latest_render_snapshot;
+        }
+        else
+        if (m_latest_content_render_snapshot != nullptr) {
+            snapshot = geometry_snapshot_from_public_snapshot(
+                *m_latest_content_render_snapshot,
+                m_grid_size,
+                sequence,
+                m_backend_geometry_in_sync,
+                &m_profile_stats);
+            // A frozen frame the producer cannot present at this grid is
+            // resolved by the release first, whose publication carries the
+            // detach. A sixel placement still in progress publishes it when
+            // it ends.
+            if (m_latest_render_snapshot != nullptr && !render_snapshot_presentable(snapshot)) {
+                release_hold_for_unpresentable_geometry(sequence);
+                return;
+            }
+        }
+        else {
+            snapshot = make_empty_render_snapshot(
+                m_grid_size,
+                viewport_adapted_to_grid(m_viewport_controller.state(), m_grid_size),
+                sequence);
+        }
         // Visual detaches during synchronized output must clear public spans
         // without basing the snapshot on unpublished held content.
         snapshot.basis                     = Terminal_render_snapshot_basis::LIVE_CONTENT;
@@ -11051,6 +11171,10 @@ bool Terminal_session::publish_public_projection_scroll_snapshot(
     if (!snapshot.has_value()) {
         return false;
     }
+    add_public_projection_leading_rows(*snapshot, *m_public_projection);
+    if (!render_snapshot_presentable(*snapshot)) {
+        return false;
+    }
     apply_search_matches_to_snapshot(
         *snapshot,
         m_public_projection->active_buffer_epoch());
@@ -11262,6 +11386,27 @@ void Terminal_session::publish_render_snapshot(
     });
 }
 
+// A frozen frame the producer cannot present at the current grid, a
+// detached view beyond the grown grid's maximum, is never published, and the
+// older-grid publication is not kept either: the application hold ends early
+// and the release publishes the live frame (DESIGN 5.7). A sixel placement in
+// progress keeps holding publication; its own end publishes the live frame.
+void Terminal_session::release_hold_for_unpresentable_geometry(std::uint64_t sequence)
+{
+    if (!model_allows_render_snapshot(*m_screen_model)) {
+        (void)force_release_synchronized_output_locked(sequence);
+    }
+    if (model_allows_render_snapshot(*m_screen_model) &&
+        (m_latest_render_snapshot == nullptr ||
+            !grid_sizes_match(m_latest_render_snapshot->grid_size, m_grid_size)))
+    {
+        Terminal_screen_model_result viewport_result;
+        viewport_result.viewport_changed = true;
+        m_render_snapshot_model_result = viewport_result;
+        publish_render_snapshot(sequence, QStringLiteral("geometry snapshot ready"));
+    }
+}
+
 void Terminal_session::publish_synchronized_resize_snapshot(
     std::uint64_t  sequence,
     QString        message)
@@ -11302,6 +11447,17 @@ void Terminal_session::publish_synchronized_resize_snapshot(
             m_backend_geometry_in_sync,
             &m_profile_stats);
         snapshot.metadata.row_origin_generation = m_row_origin_generation;
+        if (m_latest_render_snapshot != nullptr && !render_snapshot_presentable(snapshot)) {
+            if (selection_trace_requested(m_config.selection_trace_enabled)) {
+                write_selection_trace(m_config.selection_trace_enabled,
+                    QStringLiteral(
+                        "session publish-synchronized-resize-snapshot released hold "
+                        "reason=unpresentable-frozen-frame sequence=%1")
+                        .arg(static_cast<qulonglong>(sequence)));
+            }
+            release_hold_for_unpresentable_geometry(sequence);
+            return;
+        }
     }
     snapshot.metadata.publication_generation             = m_render_snapshot_generation + 1U;
 

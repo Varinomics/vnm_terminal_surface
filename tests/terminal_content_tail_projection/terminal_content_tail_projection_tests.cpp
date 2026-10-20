@@ -709,8 +709,10 @@ term::Terminal_render_snapshot frozen_frame(int scrollback_rows, int offset, int
     viewport.offset_from_tail = offset;
     viewport.follow_tail      = offset == 0;
     auto snapshot = term::make_empty_render_snapshot({6, 8}, viewport, 31U);
-    snapshot.purpose             = term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
-    snapshot.resize_vacancy_rows = vacancy;
+    snapshot.purpose                 = term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
+    snapshot.frozen_basis            = true;
+    snapshot.uncovered_trailing_rows = vacancy;
+    snapshot.resize_vacancy_rows     = vacancy;
     snapshot.viewport.presentation = term::make_presentation_mapping(
         term::Terminal_buffer_id::PRIMARY, false, 6, scrollback_rows, vacancy, 6 - vacancy, 0);
     const int first = scrollback_rows - offset;
@@ -746,7 +748,8 @@ bool test_availability()
         "frozen growth with a partial captured prefix");
 
     auto live = frozen_frame(100, 0, 4);
-    live.purpose = term::Terminal_render_snapshot_purpose::CONTENT;
+    live.purpose      = term::Terminal_render_snapshot_purpose::CONTENT;
+    live.frozen_basis = false;
     ok &= check(term::make_presented_snapshot(std::make_shared<const term::Terminal_render_snapshot>(live)) == nullptr,
         "a live frame missing requested rows is invalid and never falls back to native rows");
 
@@ -764,6 +767,36 @@ bool test_availability()
         "a frozen window missing rows below its coverage is refused");
     ok &= check(term::presentation_window_resolvable(held, 80, 20, false),
         "a window inside its coverage resolves");
+    return ok;
+}
+
+// Availability is resolved before a mapping that presents the native rows as
+// they are may hand back the native frame: a frame missing one of its own
+// rows is not presentable under NATIVE or an identity Companion mapping.
+bool test_identity_presentation_checks_coverage()
+{
+    bool ok = true;
+    auto native = frozen_frame(100, 0, 0);
+    ok &= check(native.viewport.presentation.policy == term::Terminal_presentation_policy::NATIVE &&
+            term::make_presented_snapshot(std::make_shared<const term::Terminal_render_snapshot>(native)) != nullptr,
+        "a complete native frame presents as it is");
+    native.uncovered_trailing_rows = 1;
+    ok &= check(term::make_presented_snapshot(std::make_shared<const term::Terminal_render_snapshot>(native)) == nullptr,
+        "a native frame missing its last row is not presentable");
+    native.frozen_basis = false;
+    ok &= check(term::make_presented_snapshot(std::make_shared<const term::Terminal_render_snapshot>(native)) == nullptr,
+        "a live native frame missing its last row is not presentable");
+
+    auto companion = frozen_frame(100, 3, 0);
+    companion.viewport.presentation = term::make_presentation_mapping(
+        term::Terminal_buffer_id::PRIMARY, true, 6, 100, 0, 6, 0);
+    ok &= check(companion.viewport.presentation.policy == term::Terminal_presentation_policy::COMPANION &&
+            companion.viewport.presentation.hidden_rows == 0 &&
+            term::make_presented_snapshot(std::make_shared<const term::Terminal_render_snapshot>(companion)) != nullptr,
+        "a complete identity Companion frame presents as it is");
+    companion.uncovered_trailing_rows = 1;
+    ok &= check(term::make_presented_snapshot(std::make_shared<const term::Terminal_render_snapshot>(companion)) == nullptr,
+        "an identity Companion frame missing its last row is not presentable");
     return ok;
 }
 
@@ -858,6 +891,7 @@ int main()
     ok &= test_short_or_missing_history();
     ok &= test_companion_padding_covers_vacancy();
     ok &= test_availability();
+    ok &= test_identity_presentation_checks_coverage();
     ok &= test_residual_absolute_rows_and_status_redraw();
     ok &= test_mapping_change_identity();
     return ok ? 0 : 1;

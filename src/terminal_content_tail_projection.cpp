@@ -22,9 +22,10 @@ bool presentation_is_identity(const Terminal_render_snapshot& source)
 }
 
 // Resolves every requested position against the frame's coverage: its own
-// rows from logical S - o on, and the leading rows directly above them. A
-// frozen frame's missing rows above that coverage become unused slots; any
-// other missing row leaves the frame unpresentable.
+// rows from logical S - o on, less any uncovered trailing rows, and the
+// leading rows directly above them. A frozen frame's missing rows above that
+// coverage become unused slots; any other missing row leaves the frame
+// unpresentable.
 std::optional<std::vector<int>> resolved_logical_rows(const Terminal_render_snapshot& source)
 {
     const int rows             = source.grid_size.rows;
@@ -33,8 +34,8 @@ std::optional<std::vector<int>> resolved_logical_rows(const Terminal_render_snap
     if (!presentation_window_resolvable(
             source.viewport,
             first_native_row - leading_rows,
-            leading_rows + rows,
-            render_snapshot_has_frozen_basis(source)))
+            leading_rows + rows - source.uncovered_trailing_rows,
+            source.frozen_basis))
     {
         return std::nullopt;
     }
@@ -50,16 +51,26 @@ std::optional<std::vector<int>> resolved_logical_rows(const Terminal_render_snap
 
 }
 
+bool render_snapshot_presentable(const Terminal_render_snapshot& source)
+{
+    return source.display_source || resolved_logical_rows(source).has_value();
+}
+
 std::shared_ptr<const Terminal_render_snapshot> make_presented_snapshot(
     std::shared_ptr<const Terminal_render_snapshot> source)
 {
-    if (!source || source->display_source || presentation_is_identity(*source)) {
+    if (!source || source->display_source) {
         return source;
     }
 
+    // Availability first: a mapping that shows the native rows as they are
+    // still needs every one of them.
     const std::optional<std::vector<int>> logical_rows = resolved_logical_rows(*source);
     if (!logical_rows.has_value()) {
         return {};
+    }
+    if (presentation_is_identity(*source)) {
+        return source;
     }
 
     const int rows = source->grid_size.rows;

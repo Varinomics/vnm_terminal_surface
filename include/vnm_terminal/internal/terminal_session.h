@@ -1004,6 +1004,7 @@ private:
     void publish_synchronized_resize_snapshot(
         std::uint64_t              sequence,
         QString                    message);
+    void release_hold_for_unpresentable_geometry(std::uint64_t sequence);
 
     bool selection_range_is_valid_for_active_model(
         const Terminal_selection_range&        range) const;
