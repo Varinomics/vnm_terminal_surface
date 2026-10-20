@@ -22537,7 +22537,7 @@ bool test_conpty_rows_reach_typing_and_mouse_reports(QGuiApplication& app)
 
             if (display_row >= 0 && conpty_row >= 0) {
                 const qsizetype written = conpty.writes().size();
-                const QPointF   point   = point_in_grid_cell(fixture.surface, display_row, 2);
+                const QPointF   point   = point_in_display_cell(fixture.surface, display_row, 2);
                 step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
                     Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
                     "the prompt click is accepted");
