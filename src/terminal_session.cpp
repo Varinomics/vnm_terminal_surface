@@ -8249,7 +8249,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
         m_config.recover_scrollback_from_primary_repaints;
     screen_config.text_area_resize_policy = m_config.text_area_resize_policy;
     screen_config.cell_pixel_size         = m_cell_pixel_size;
-    screen_config.defer_inactive_primary_resize = m_backend->owns_screen_buffers();
+    screen_config.backend_owns_screen_buffers = m_backend->owns_screen_buffers();
     m_screen_model.emplace(screen_config);
     if (m_color_state.has_value()) {
         m_screen_model->set_color_state(*m_color_state);

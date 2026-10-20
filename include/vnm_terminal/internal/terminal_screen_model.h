@@ -100,12 +100,14 @@ struct Terminal_screen_model_config
     // Must be positive when present. Without it no pixel geometry is known, so
     // the CSI 14 t and CSI 16 t pixel reports stay unsupported.
     std::optional<terminal_cell_pixel_size_t> cell_pixel_size;
-    // Set for a backend that owns its screen buffers (ConPTY). While the
-    // alternate screen is active such a backend leaves its primary at its
-    // size, and resizes it once, to the size then current, when the primary
-    // is active again or before the alternate screen is replaced. The model
-    // does the same, so it keeps addressing the backend's rows.
-    bool                   defer_inactive_primary_resize            = false;
+    // Set for a backend that owns its screen buffers (ConPTY). The model then
+    // changes its screens as that backend changes its own, so both keep
+    // addressing the same rows:
+    // - while the alternate screen is active, a resize leaves the primary at
+    //   its size; the primary is resized once, to the size then current, when
+    //   it is active again or before the alternate screen is replaced;
+    // - a resize never moves a saved cursor; restoring it clamps it to the grid.
+    bool                   backend_owns_screen_buffers              = false;
 };
 
 enum class Terminal_screen_model_config_status

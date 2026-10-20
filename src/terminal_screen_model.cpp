@@ -4430,6 +4430,16 @@ void Terminal_screen_model::resize_buffer_state(
     terminal_grid_size_t   grid_size,
     bool                   primary)
 {
+    // A backend that owns its screens never moves a saved cursor. ConPTY keeps
+    // DECSC and 1049 saves at the coordinates the application saved, and its
+    // restore clamps them to the grid (adaptDispatch.cpp CursorSaveState and
+    // CursorRestoreState), as restore_cursor does. Such a saved cursor takes no
+    // part in the resize, reflow included.
+    const saved_cursor_state_t kept_saved_cursor = state.saved_cursor;
+    if (m_config.backend_owns_screen_buffers) {
+        state.saved_cursor.valid = false;
+    }
+
     const bool width_changed = state.rows.front().cells.size() != (std::size_t)grid_size.columns;
     if (primary && width_changed) {
         reflow_primary_rows(state, grid_size.columns);
@@ -4480,6 +4490,9 @@ void Terminal_screen_model::resize_buffer_state(
             state.saved_cursor.pending_wrap = false;
         }
         state.saved_cursor.origin_mode = false;
+    }
+    if (m_config.backend_owns_screen_buffers) {
+        state.saved_cursor = kept_saved_cursor;
     }
     state.scroll_top    = 0;
     state.scroll_bottom = grid_size.rows - 1;
@@ -4968,7 +4981,7 @@ bool Terminal_screen_model::apply_grid_resize(
     m_config.grid_size = grid_size;
     // An inactive primary whose backend owns its screens waits for
     // resize_deferred_primary.
-    if (!m_config.defer_inactive_primary_resize ||
+    if (!m_config.backend_owns_screen_buffers ||
         m_active_buffer_id == Terminal_buffer_id::PRIMARY)
     {
         resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);

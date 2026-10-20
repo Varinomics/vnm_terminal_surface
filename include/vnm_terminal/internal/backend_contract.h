@@ -509,8 +509,8 @@ public:
 
     // A backend whose pseudoconsole keeps primary and alternate screen buffers
     // of its own, and positions the child's output by their rows, declares it
-    // here. The session's model then resizes its screens when that backend
-    // resizes its own, so both keep addressing the same rows.
+    // here. The session's model then changes its screens as that backend
+    // changes its own, so both keep addressing the same rows.
     virtual bool owns_screen_buffers() const
     {
         return false;

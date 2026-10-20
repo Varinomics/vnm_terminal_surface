@@ -6084,7 +6084,7 @@ bool test_native_cmd_resize()
 // row, and its cursor, and stays alive until the test has compared it. The
 // scripts are run by relative path: cmd does not search the current directory
 // when NoDefaultCurrentDirectoryInExePath is set.
-bool write_native_cmd_screen_files(const QTemporaryDir& dir, const QByteArray& leave_sequence)
+bool write_native_cmd_screen_files(const QTemporaryDir& dir)
 {
     const auto write_file = [&](const QString& name, const QByteArray& bytes) {
         QFile file(dir.filePath(name));
@@ -6095,8 +6095,11 @@ bool write_native_cmd_screen_files(const QTemporaryDir& dir, const QByteArray& l
     return
         write_file(QStringLiteral("lines.cmd"), QByteArrayLiteral(
             "@for /l %%i in (1,1,6) do @echo line%%i\r\n")) &&
+        write_file(QStringLiteral("wrapped.cmd"), QByteArrayLiteral(
+            "@cls\r\n"
+            "@echo 01234567890123456789012345678901234567890123456789\r\n")) &&
         write_file(QStringLiteral("enter.txt"), QByteArrayLiteral("\x1b[?1049h")) &&
-        write_file(QStringLiteral("leave.txt"), leave_sequence) &&
+        write_file(QStringLiteral("leave.txt"), QByteArrayLiteral("\x1b[?1049l")) &&
         write_file(QStringLiteral("probe.cmd"), QByteArrayLiteral(
             "@powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"%~dp0probe.ps1\"\r\n")) &&
         write_file(QStringLiteral("probe.ps1"), QByteArrayLiteral(
@@ -6371,23 +6374,27 @@ bool screens_match(
 struct Native_cmd_alternate_case
 {
     std::string                             name;
+    // The script that fills the primary screen before the child enters the
+    // alternate screen.
+    QByteArray                              setup;
     std::vector<term::terminal_grid_size_t> sizes_before_replacement;
     bool                                    replace_alternate = false;
     std::vector<term::terminal_grid_size_t> sizes_after_replacement;
-    QByteArray                              leave_sequence;
 };
 
 // ConPTY leaves its main buffer at its size while the alternate buffer is
 // active and resizes it once when it is used again: on return, and before an
 // active alternate buffer is replaced (screenInfo.cpp _handleDeferredResize).
-// After the child returns, the session's primary screen has to be ConPTY's:
+// No resize moves the cursor 1049 saved; the return restores it clamped
+// (adaptDispatch.cpp CursorRestoreState). After the child returns, the
+// session's primary screen has to be ConPTY's:
 // ConPTY places typed input with absolute cursor moves, so the echo lands
 // beside the prompt only then, and the probe compares every row.
 bool test_native_cmd_alternate_resize_case(const Native_cmd_alternate_case& test_case)
 {
     const std::string label = "native cmd alternate resize, " + test_case.name;
     QTemporaryDir dir;
-    if (!check(dir.isValid() && write_native_cmd_screen_files(dir, test_case.leave_sequence),
+    if (!check(dir.isValid() && write_native_cmd_screen_files(dir),
             label + ": files are written"))
     {
         return false;
@@ -6399,11 +6406,17 @@ bool test_native_cmd_alternate_resize_case(const Native_cmd_alternate_case& test
         return false;
     }
 
-    bool ok = check(screen.run(".\\lines") && screen.output().contains("line6"),
-        label + ": cmd writes six lines");
-    const int smallest_rows = 6;
-    ok &= check(screen.session().latest_render_snapshot()->cursor.position.row >= smallest_rows,
-        label + ": the prompt sits below the shrunk height, so shrinking moves rows");
+    bool ok = check(screen.run(test_case.setup), label + ": cmd fills the primary screen");
+    int smallest_rows = 12;
+    for (const auto* sizes : {&test_case.sizes_before_replacement, &test_case.sizes_after_replacement}) {
+        for (const term::terminal_grid_size_t grid_size : *sizes) {
+            smallest_rows = std::min(smallest_rows, grid_size.rows);
+        }
+    }
+    if (smallest_rows < 12) {
+        ok &= check(screen.session().latest_render_snapshot()->cursor.position.row >= smallest_rows,
+            label + ": the prompt sits below the shrunk height, so shrinking moves rows");
+    }
 
     // windows.h defines ALTERNATE, so the alternate buffer is named by exclusion.
     ok &= check(screen.run("type enter.txt") &&
@@ -6464,28 +6477,34 @@ bool test_native_cmd_alternate_resize()
     const std::vector<Native_cmd_alternate_case> cases{
         {
             "exit at the original size",
+            QByteArrayLiteral(".\\lines"),
             {{6, 40}, {12, 40}},
             false,
             {},
-            QByteArrayLiteral("\x1b[?1049l"),
         },
         {
             "exit at a different size",
+            QByteArrayLiteral(".\\lines"),
             {{6, 40}, {14, 30}},
             false,
             {},
-            QByteArrayLiteral("\x1b[?1049l"),
         },
-        // After return the child moves the cursor to the bottom row itself, so
-        // the case checks the rows ConPTY resized at the replacement apart from
-        // the cursor 1049 saved: ConPTY never moves a saved cursor on resize,
-        // while the session moves it with the rows.
         {
             "replacement",
+            QByteArrayLiteral(".\\lines"),
             {{6, 40}},
             true,
             {{12, 40}},
-            QByteArrayLiteral("\x1b[?1049l\x1b[12;1H"),
+        },
+        // Widening joins the wrapped line above the cursor 1049 saved. ConPTY
+        // restores the saved coordinates as they were, so the prompt follows
+        // them, not the rows.
+        {
+            "saved cursor through a joining reflow",
+            QByteArrayLiteral(".\\wrapped"),
+            {{12, 60}},
+            false,
+            {},
         },
     };
 
