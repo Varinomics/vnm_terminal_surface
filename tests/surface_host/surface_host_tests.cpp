@@ -1,6 +1,9 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
+#include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
+#include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
+#include "vnm_terminal/internal/wheel_gesture.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
@@ -15,8 +18,11 @@
 #include <QCursor>
 #include <QDateTime>
 #include <QEvent>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QFontDatabase>
+#include <QFontInfo>
 #include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QTimer>
@@ -33,6 +39,8 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QScreen>
+#include <QStandardPaths>
+#include <QStringList>
 #include <QThread>
 #include <QThreadPool>
 #include <QTemporaryDir>
@@ -52,6 +60,7 @@
 #include <memory>
 #include <optional>
 #include <semaphore>
+#include <sstream>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1307,6 +1316,46 @@ bool send_wheel_event(
         angle_delta_y,
         expected_accepted,
         message);
+}
+
+// The renderer's account of what `surface` draws the render font for
+// `effective_font_size` at, on each text path.
+term::qsg_atlas_text_draw_sizes_t surface_draw_sizes(
+    const VNM_TerminalSurface& surface,
+    qreal                      effective_font_size)
+{
+    const qreal logical_dpi = term::window_logical_dpi(surface.window());
+    return term::qsg_atlas_text_draw_sizes(
+        term::vnm_terminal_font(surface.font_family(), effective_font_size, logical_dpi),
+        term::window_device_pixel_ratio(surface.window()),
+        surface.font_advance_policy(),
+        logical_dpi);
+}
+
+term::qsg_atlas_text_draw_sizes_t surface_draw_sizes(const VNM_TerminalSurface& surface)
+{
+    return surface_draw_sizes(surface, surface.effective_font_size());
+}
+
+term::Terminal_text_renderer_policy surface_renderer_policy(const VNM_TerminalSurface& surface)
+{
+    switch (surface.text_renderer_mode()) {
+        case VNM_TerminalSurface::Text_renderer_mode::AUTO:
+            return term::Terminal_text_renderer_policy::AUTO;
+        case VNM_TerminalSurface::Text_renderer_mode::MSDF:
+            return term::Terminal_text_renderer_policy::MSDF;
+        case VNM_TerminalSurface::Text_renderer_mode::GLYPH:
+            return term::Terminal_text_renderer_policy::GLYPH;
+    }
+    return term::Terminal_text_renderer_policy::AUTO;
+}
+
+bool surface_draws_differently(
+    const VNM_TerminalSurface&               surface,
+    const term::qsg_atlas_text_draw_sizes_t& lhs,
+    const term::qsg_atlas_text_draw_sizes_t& rhs)
+{
+    return term::qsg_atlas_text_draws_differently(lhs, rhs, surface_renderer_policy(surface));
 }
 
 bool send_mouse_event(
@@ -6555,6 +6604,10 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         });
 
     const qreal initial_font_size = fixture.surface.font_size();
+    const term::qsg_atlas_text_draw_sizes_t initial_draw_sizes =
+        surface_draw_sizes(fixture.surface);
+    const qreal zoomed_in_font_size =
+        term::VNM_TerminalSurface_render_bridge::font_size_after_wheel_zoom(fixture.surface, 1);
     ok &= send_wheel_event(
         fixture.surface,
         Qt::NoModifier,
@@ -6586,8 +6639,8 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         40,
         true,
         "third high-resolution Ctrl+wheel fragment completes one zoom step");
-    ok &= check(fixture.surface.font_size() == initial_font_size + 1.0,
-        "three high-resolution Ctrl+wheel fragments zoom by one pixel");
+    ok &= check(fixture.surface.font_size() == zoomed_in_font_size,
+        "three high-resolution Ctrl+wheel fragments zoom by one notch");
 
     ok &= send_wheel_event(
         fixture.surface,
@@ -6595,8 +6648,10 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         -120,
         true,
         "Ctrl+wheel-down after high-resolution fragments is consumed");
-    ok &= check(fixture.surface.font_size() == initial_font_size,
-        "Ctrl+wheel-down after high-resolution fragments restores font size");
+    ok &= check(
+        !surface_draws_differently(
+            fixture.surface, initial_draw_sizes, surface_draw_sizes(fixture.surface)),
+        "Ctrl+wheel-down after high-resolution fragments restores the drawing");
 
     ok &= send_wheel_event(
         fixture.surface,
@@ -6604,8 +6659,8 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         120,
         true,
         "Ctrl+wheel-up is consumed by font zoom");
-    ok &= check(fixture.surface.font_size() == initial_font_size + 1.0,
-        "Ctrl+wheel-up increases font size by one pixel");
+    ok &= check(fixture.surface.font_size() == zoomed_in_font_size,
+        "Ctrl+wheel-up zooms in by one notch");
 
     ok &= send_wheel_event(
         fixture.surface,
@@ -6613,8 +6668,10 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         -120,
         true,
         "Ctrl+wheel-down is consumed by font zoom");
-    ok &= check(fixture.surface.font_size() == initial_font_size,
-        "Ctrl+wheel-down decreases font size by one pixel");
+    ok &= check(
+        !surface_draws_differently(
+            fixture.surface, initial_draw_sizes, surface_draw_sizes(fixture.surface)),
+        "Ctrl+wheel-down zooms out by one notch to the initial drawing");
 
     auto backend = std::make_unique<Scripted_backend>();
     bool started = false;
@@ -6708,6 +6765,326 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
             "Ctrl+wheel at the minimum font size leaves zoom clamped");
     }
 
+    return ok;
+}
+
+std::string describe_draw_sizes(const term::qsg_atlas_text_draw_sizes_t& sizes)
+{
+    std::ostringstream text;
+    text
+        << "raster " << sizes.raster_pixel_size << " px, MSDF " << sizes.msdf_draw_pixel_height
+        << " px, cell " << sizes.cell_metrics.width << 'x' << sizes.cell_metrics.height
+        << " ascent " << sizes.cell_metrics.ascent;
+    return text.str();
+}
+
+// A Ctrl+wheel notch exists to change what the terminal shows. Walk the zoom range in
+// both directions one notch at a time, with the shipped default face and this
+// platform's own metrics, under each text renderer, and require every notch to change
+// what that renderer's paths draw from. The renderer's account of the cell must be the
+// cell the surface lays out.
+bool test_control_wheel_zoom_changes_the_rendering_every_notch(QGuiApplication& app)
+{
+    bool ok = true;
+    for (const VNM_TerminalSurface::Text_renderer_mode mode : {
+             VNM_TerminalSurface::Text_renderer_mode::GLYPH,
+             VNM_TerminalSurface::Text_renderer_mode::MSDF,
+             VNM_TerminalSurface::Text_renderer_mode::AUTO})
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_text_renderer_mode(mode);
+        fixture.surface.set_font_family(vnm_terminal::default_monospace_font_family());
+        fixture.surface.set_font_size(term::k_font_zoom_min_pixel_size);
+        pump_events(app);
+
+        struct zoom_step_t
+        {
+            qreal                             font_size;
+            term::qsg_atlas_text_draw_sizes_t sizes;
+        };
+        const auto current_step = [&] {
+            const term::qsg_atlas_text_draw_sizes_t sizes = surface_draw_sizes(fixture.surface);
+            const term::terminal_cell_metrics_t     cell  = current_cell_metrics(fixture.surface);
+            ok &= check(
+                sizes.cell_metrics.width  == cell.width  &&
+                sizes.cell_metrics.height == cell.height &&
+                sizes.cell_metrics.ascent == cell.ascent,
+                "the renderer's account of the cell is the cell the surface lays out");
+            return zoom_step_t{fixture.surface.font_size(), sizes};
+        };
+
+        // One notch per whole size of the range is the longest walk that can still be
+        // converging.
+        const int notch_limit = static_cast<int>(
+            term::k_font_zoom_max_pixel_size - term::k_font_zoom_min_pixel_size) + 1;
+        const auto walk = [&](int angle_delta_y, const char* direction) {
+            std::vector<zoom_step_t> steps{current_step()};
+            for (int notch = 0; notch < notch_limit; ++notch) {
+                ok &= send_wheel_event(
+                    fixture.surface,
+                    Qt::ControlModifier,
+                    angle_delta_y,
+                    true,
+                    "Ctrl+wheel zoom walk notch is consumed");
+                if (fixture.surface.font_size() == steps.back().font_size) {
+                    break;
+                }
+
+                steps.push_back(current_step());
+                const zoom_step_t& before = steps[steps.size() - 2];
+                const zoom_step_t& after  = steps.back();
+                if (!surface_draws_differently(fixture.surface, before.sizes, after.sizes)) {
+                    std::cerr
+                        << "FAIL: Ctrl+wheel zoom " << direction << " under renderer mode "
+                        << static_cast<int>(mode) << ": the notch " << before.font_size
+                        << " -> " << after.font_size << " draws at "
+                        << describe_draw_sizes(before.sizes) << " -> "
+                        << describe_draw_sizes(after.sizes) << '\n';
+                    ok = false;
+                }
+            }
+            return steps;
+        };
+        const std::vector<zoom_step_t> zoom_in  = walk( 120, "in");
+        const std::vector<zoom_step_t> zoom_out = walk(-120, "out");
+
+        const auto draw_sizes_of = [&](qreal font_size) {
+            return surface_draw_sizes(
+                fixture.surface,
+                vnm_terminal::effective_font_size_for_font(
+                    fixture.surface.font_family(),
+                    font_size,
+                    term::window_device_pixel_ratio(&fixture.window),
+                    fixture.surface.font_advance_policy(),
+                    term::window_logical_dpi(&fixture.window)));
+        };
+        ok &= check(
+            !surface_draws_differently(
+                fixture.surface,
+                zoom_in.back().sizes,
+                draw_sizes_of(term::k_font_zoom_max_pixel_size)),
+            "Ctrl+wheel zooming in stops only where the maximum size draws");
+        ok &= check(
+            !surface_draws_differently(
+                fixture.surface,
+                zoom_out.back().sizes,
+                draw_sizes_of(term::k_font_zoom_min_pixel_size)),
+            "Ctrl+wheel zooming out stops only where the minimum size draws");
+
+        // Zooming in settles on the largest size of each drawing, so zooming out
+        // retraces those sizes exactly; only the size the walk started from need not
+        // be one of them.
+        const std::size_t count = zoom_in.size();
+        bool retraces_drawings = zoom_out.size() == count;
+        bool retraces_sizes    = retraces_drawings;
+        for (std::size_t i = 0; retraces_drawings && i < count; ++i) {
+            const std::size_t mirrored = count - 1 - i;
+            retraces_drawings = !surface_draws_differently(
+                fixture.surface, zoom_out[i].sizes, zoom_in[mirrored].sizes);
+            if (mirrored != 0) {
+                retraces_sizes = retraces_sizes &&
+                    zoom_out[i].font_size == zoom_in[mirrored].font_size;
+            }
+        }
+        ok &= check(retraces_drawings,
+            "Ctrl+wheel zooming out passes the drawings zooming in passed, in reverse");
+        ok &= check(retraces_drawings && retraces_sizes,
+            "Ctrl+wheel zooming out returns to the sizes zooming in settled on");
+    }
+    return ok;
+}
+
+// The MSDF path scales glyphs to the snapped cell ascent and lays them out in the cell,
+// not by the raster font. Where this display gives two neighbouring sizes the same MSDF
+// drawing while their raster fonts differ, a notch under the MSDF renderer must still
+// change what MSDF draws. The draw height the renderer reports for a frame must be the
+// one the zoom measures, which ties that measure to real MSDF drawing.
+//
+// MSDF draws only where the scene graph prepares RHI frames, which the offscreen
+// platform does not, so this runs on its own flag against a display: xcb on an X
+// server, where FreeType's rounded metrics give such pairs, or a real window on Windows.
+bool test_control_wheel_zoom_changes_the_msdf_drawing(QGuiApplication& app)
+{
+    struct Raster_only_pair
+    {
+        QString                           family;
+        vnm_terminal::Font_advance_policy advance_policy;
+        qreal                             font_size;
+    };
+
+    // The platform's own monospace face reaches such pairs more often than the shipped
+    // one; the offscreen font database on Windows has to be handed Consolas' file.
+    const QString consolas_file =
+        QStandardPaths::locate(QStandardPaths::FontsLocation, QStringLiteral("consola.ttf"));
+    if (!consolas_file.isEmpty()) {
+        QFontDatabase::addApplicationFont(consolas_file);
+    }
+    QStringList families{vnm_terminal::default_monospace_font_family()};
+    for (const QString& family : {
+             QStringLiteral("Consolas"),
+             QStringLiteral("Menlo"),
+             QStringLiteral("DejaVu Sans Mono")})
+    {
+        if (QFontInfo(QFont(family)).family() == family) {
+            families.push_back(family);
+        }
+    }
+
+    Surface_fixture fixture;
+    fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::MSDF);
+    pump_events(app);
+
+    std::optional<Raster_only_pair> pair;
+    for (const QString& family : families) {
+        fixture.surface.set_font_family(family);
+        for (const vnm_terminal::Font_advance_policy advance_policy : {
+                 vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+                 vnm_terminal::Font_advance_policy::SNAP_ADVANCE_UP,
+                 vnm_terminal::Font_advance_policy::SNAP_ADVANCE_NEAREST})
+        {
+            fixture.surface.set_font_advance_policy(advance_policy);
+            for (qreal font_size = term::k_font_zoom_min_pixel_size;
+                 !pair.has_value() && font_size < term::k_font_zoom_max_pixel_size;
+                 font_size += 1.0)
+            {
+                const auto draw_sizes_of = [&](qreal size) {
+                    return surface_draw_sizes(
+                        fixture.surface,
+                        vnm_terminal::effective_font_size_for_font(
+                            family,
+                            size,
+                            term::window_device_pixel_ratio(&fixture.window),
+                            advance_policy,
+                            term::window_logical_dpi(&fixture.window)));
+                };
+                const term::qsg_atlas_text_draw_sizes_t smaller = draw_sizes_of(font_size);
+                const term::qsg_atlas_text_draw_sizes_t larger  = draw_sizes_of(font_size + 1.0);
+                if (smaller.raster_pixel_size != larger.raster_pixel_size &&
+                    !term::qsg_atlas_text_draws_differently(
+                        smaller, larger, term::Terminal_text_renderer_policy::MSDF))
+                {
+                    pair = Raster_only_pair{family, advance_policy, font_size};
+                }
+            }
+        }
+    }
+
+    const Raster_only_pair start = pair.value_or(Raster_only_pair{
+        vnm_terminal::default_monospace_font_family(),
+        vnm_terminal::Font_advance_policy::ADJUST_FONT_SIZE,
+        static_cast<qreal>(term::k_vnm_terminal_default_font_pixel_size)});
+    fixture.surface.set_font_family(start.family);
+    fixture.surface.set_font_advance_policy(start.advance_policy);
+    fixture.surface.set_font_size(start.font_size);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("MSDF zoom 0123456789")};
+    bool started = false;
+    start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    bool ok = check(started, "MSDF zoom surface starts");
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+
+    // The MSDF atlas bakes off the render thread, which takes seconds in a debug build,
+    // so a frame that draws MSDF text can take a while to arrive. Only a build without
+    // MSDF, or a window whose scene graph never prepares an RHI frame, cannot draw one;
+    // an enabled MSDF renderer that draws nothing within the wait is a failure.
+    term::Qsg_atlas_frame_report last_report;
+    bool                         msdf_unsupported = false;
+    const auto capture_msdf_frame = [&](int draw_pixel_height_to_leave) {
+        std::optional<term::Qsg_atlas_frame_report> drawn;
+        QElapsedTimer waited;
+        waited.start();
+        for (int attempt = 0; waited.elapsed() < 60000 && !drawn.has_value(); ++attempt) {
+            fixture.surface.update();
+            fixture.window.requestUpdate();
+            pump_events(app, 1);
+            const QImage image = fixture.window.grabWindow();
+            const term::Qsg_atlas_frame_report report =
+                term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+            last_report = report;
+            const bool frames_prepared = report.prepare_count > 0U;
+            if ((frames_prepared && !report.render.msdf_text_renderer_enabled) ||
+                (!frames_prepared && attempt >= 50))
+            {
+                msdf_unsupported = true;
+                break;
+            }
+            if (!image.isNull()                              &&
+                report.render.msdf_text_renderer_active      &&
+                report.render.msdf_text_resources_ready      &&
+                report.render.msdf_text_runs > 0             &&
+                report.render.msdf_text_pixel_height != draw_pixel_height_to_leave)
+            {
+                drawn = report;
+            }
+        }
+        return drawn;
+    };
+    const auto describe_last_report = [&] {
+        std::ostringstream text;
+        text
+            << "prepared frames " << last_report.prepare_count << ", enabled "
+            << last_report.render.msdf_text_renderer_enabled << ", active "
+            << last_report.render.msdf_text_renderer_active << ", resources "
+            << last_report.render.msdf_text_resources_ready << ", runs "
+            << last_report.render.msdf_text_runs << ": "
+            << last_report.render.msdf_text_message.toStdString();
+        return text.str();
+    };
+
+    const std::optional<term::Qsg_atlas_frame_report> before = capture_msdf_frame(0);
+    if (!before.has_value()) {
+        if (msdf_unsupported) {
+            std::cerr
+                << "SKIP: this build or backend cannot draw MSDF text ("
+                << describe_last_report() << ")\n";
+            return ok;
+        }
+        std::cerr << "MSDF state: " << describe_last_report() << '\n';
+        return check(false, "an enabled MSDF renderer draws its first frame");
+    }
+
+    const term::qsg_atlas_text_draw_sizes_t sizes_before = surface_draw_sizes(fixture.surface);
+    ok &= check(before->render.msdf_text_pixel_height == sizes_before.msdf_draw_pixel_height,
+        "the MSDF draw height the renderer reports is the one the zoom measures");
+    if (!pair.has_value()) {
+        std::cout
+            << "no raster-only MSDF pair at device pixel ratio "
+            << term::window_device_pixel_ratio(&fixture.window) << " among "
+            << families.join(QStringLiteral(", ")).toStdString() << '\n';
+        return ok;
+    }
+
+    std::cout
+        << "raster-only MSDF pair: " << start.family.toStdString() << " "
+        << start.font_size << " and " << start.font_size + 1.0 << " at advance policy "
+        << static_cast<int>(start.advance_policy) << '\n';
+    const term::terminal_cell_metrics_t cell_before = current_cell_metrics(fixture.surface);
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::ControlModifier,
+        120,
+        true,
+        "Ctrl+wheel under the MSDF renderer is consumed");
+    const term::terminal_cell_metrics_t cell_after = current_cell_metrics(fixture.surface);
+    const bool cell_changed =
+        cell_after.width  != cell_before.width  ||
+        cell_after.height != cell_before.height ||
+        cell_after.ascent != cell_before.ascent;
+    const std::optional<term::Qsg_atlas_frame_report> after = capture_msdf_frame(
+        cell_changed ? 0 : before->render.msdf_text_pixel_height);
+    ok &= check(after.has_value(),
+        "a Ctrl+wheel notch under the MSDF renderer changes what MSDF draws");
+    if (after.has_value()) {
+        ok &= check(
+            after->render.msdf_text_pixel_height ==
+                surface_draw_sizes(fixture.surface).msdf_draw_pixel_height,
+            "the MSDF draw height after the notch is the one the zoom measured");
+    }
     return ok;
 }
 
@@ -9171,7 +9548,9 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             { sgr_mouse_report(64, report_row, report_column, 'M') },
             "ordinary output snapshot does not clear mouse wheel remainder");
 
-        const qreal       font_size_before_zoom  = fixture.surface.font_size();
+        const qreal zoomed_font_size =
+            term::VNM_TerminalSurface_render_bridge::font_size_after_wheel_zoom(
+                fixture.surface, 1);
         const std::size_t ctrl_wheel_write_count = backend_ptr->writes.size();
         ok &= send_wheel_event(
             fixture.surface,
@@ -9181,7 +9560,7 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             120,
             true,
             "Ctrl+wheel keeps zoom priority while mouse reporting is active");
-        ok &= check(fixture.surface.font_size() == font_size_before_zoom + 1.0,
+        ok &= check(fixture.surface.font_size() == zoomed_font_size,
             "Ctrl+wheel zoom still updates font size");
         ok &= check(backend_ptr->writes.size() == ctrl_wheel_write_count,
             "Ctrl+wheel zoom writes no mouse reporting bytes");
@@ -11027,7 +11406,6 @@ bool test_control_wheel_resize_keeps_event_frontier(QGuiApplication& app)
         return ok;
     }
 
-    const qreal font_size_before = fixture.surface.font_size();
     const std::size_t resize_count_before = backend_ptr->resize_requests.size();
     const std::uint64_t input_frontier_epoch = queue_surface_frontier_output(
         fixture.surface,
@@ -11037,6 +11415,8 @@ bool test_control_wheel_resize_keeps_event_frontier(QGuiApplication& app)
     ok &= check(backend_ptr->output_paused,
         "frontier Ctrl+wheel output starts behind backpressure");
 
+    const qreal zoomed_font_size =
+        term::VNM_TerminalSurface_render_bridge::font_size_after_wheel_zoom(fixture.surface, 10);
     ok &= send_wheel_event(
         fixture.surface,
         Qt::ControlModifier,
@@ -11045,7 +11425,8 @@ bool test_control_wheel_resize_keeps_event_frontier(QGuiApplication& app)
         "frontier Ctrl+wheel zoom is accepted");
     const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(fixture.surface.font_size() == font_size_before + 10.0 &&
+    ok &= check(
+        fixture.surface.font_size() == zoomed_font_size &&
         backend_ptr->resize_requests.size() > resize_count_before &&
         backend_ptr->writes.empty(),
         "frontier Ctrl+wheel changes font, resizes, and writes no terminal input");
@@ -21127,6 +21508,14 @@ int main(int argc, char** argv)
         ok &= test_search_completion_after_session_restart(app);
         return ok ? 0 : 1;
     }
+    if (app.arguments().contains(QStringLiteral("--control-wheel-zoom-only"))) {
+        bool ok = test_control_wheel_font_zoom(app);
+        ok &= test_control_wheel_zoom_changes_the_rendering_every_notch(app);
+        return ok ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--control-wheel-zoom-msdf"))) {
+        return test_control_wheel_zoom_changes_the_msdf_drawing(app) ? 0 : 1;
+    }
     if (app.arguments().contains(QStringLiteral("--cursor-settle-only"))) {
         bool ok = test_surface_cursor_settle_presentation(app);
         ok &= test_surface_cursor_settle_input_grace(app);
@@ -21203,6 +21592,7 @@ int main(int argc, char** argv)
     ok &= test_scroll_diagnostic_enum_name_table(app);
     ok &= test_no_payload_copy_fallback_states(app);
     ok &= test_control_wheel_font_zoom(app);
+    ok &= test_control_wheel_zoom_changes_the_rendering_every_notch(app);
     ok &= test_plain_wheel_scrolls_primary_scrollback(app);
     ok &= test_public_viewport_scroll_api(app);
     ok &= test_immediate_public_projection_public_scroll_api(app);

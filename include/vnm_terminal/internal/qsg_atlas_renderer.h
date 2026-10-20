@@ -4,6 +4,7 @@
 #define VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED 0
 #endif
 
+#include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 
 #include <QByteArray>
@@ -979,6 +980,37 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 bool qsg_atlas_msdf_text_available_for_font(const QFont& font);
 
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
+
+// The physical height the MSDF path scales its glyphs to for a frame with
+// `cell_metrics`: the cell ascent snapped to the device pixel grid.
+int qsg_atlas_msdf_draw_pixel_height(
+    const terminal_cell_metrics_t& cell_metrics,
+    qreal                          device_pixel_ratio);
+
+// The sizes the text paths draw one render font at: the physical pixel size the
+// shaped-glyph path rasterizes at, the physical height the MSDF path scales its
+// glyphs to, and the logical cell both paths lay text out in. A font's cell and MSDF
+// height follow from its raster font, so two fonts can differ in raster size alone.
+struct qsg_atlas_text_draw_sizes_t
+{
+    qreal                   raster_pixel_size      = 0.0;
+    int                     msdf_draw_pixel_height = 0;
+    terminal_cell_metrics_t cell_metrics;
+};
+
+qsg_atlas_text_draw_sizes_t qsg_atlas_text_draw_sizes(
+    const QFont&                      render_font,
+    qreal                             device_pixel_ratio,
+    vnm_terminal::Font_advance_policy advance_policy,
+    qreal                             logical_dpi);
+
+// Whether every text run drawn under `renderer_policy` looks different at `rhs`
+// than at `lhs`. GLYPH draws runs from the raster font and MSDF from the draw height,
+// each within the cell; AUTO can draw a run either way, so both must differ.
+bool qsg_atlas_text_draws_differently(
+    const qsg_atlas_text_draw_sizes_t& lhs,
+    const qsg_atlas_text_draw_sizes_t& rhs,
+    Terminal_text_renderer_policy      renderer_policy);
 
 qreal qsg_atlas_physical_pixel_size(
     const QFont& font,

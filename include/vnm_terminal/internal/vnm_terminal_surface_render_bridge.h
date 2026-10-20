@@ -225,6 +225,14 @@ public:
     static Ime_preedit_state ime_preedit_state(
         const VNM_TerminalSurface& surface);
 
+    // The font size a ctrl+wheel zoom of `steps` notches gives `surface`, measured with
+    // the font, metrics and text renderer the surface draws with. The surface's own
+    // wheel handling and the first-party scrollbar beside it both step through this, so
+    // the same gesture zooms identically over either.
+    static qreal font_size_after_wheel_zoom(
+        const VNM_TerminalSurface& surface,
+        int                        steps);
+
     static Terminal_surface_render_invalidation_stats_t invalidation_stats(
         const VNM_TerminalSurface& surface);
 

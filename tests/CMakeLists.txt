@@ -1571,6 +1571,23 @@ set_tests_properties(vnm_terminal_surface_host PROPERTIES
     TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
 
+# Fractional display scaling makes neighbouring font sizes round up to the same
+# device-pixel advance even where whole-pixel hinting keeps them apart at 100%.
+add_test(
+    NAME vnm_terminal_surface_host_control_wheel_zoom_scaled
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_scaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --control-wheel-zoom-only
+)
+set_tests_properties(vnm_terminal_surface_host_control_wheel_zoom_scaled PROPERTIES
+    LABELS "conformance;surface;input;wheel"
+    TIMEOUT 60
+)
+
 if(WIN32)
     add_test(
         NAME vnm_terminal_surface_content_tail_presentation
@@ -2238,6 +2255,8 @@ add_test(
     NAME vnm_terminal_wheel_gesture
     COMMAND
         "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_wheel_gesture>"
 )

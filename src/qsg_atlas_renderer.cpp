@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_atlas_font_bytes.h"
 #include "vnm_terminal/internal/qsg_atlas_warm_set.h"
+#include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
@@ -5701,11 +5702,9 @@ private:
     {
         const qreal normalized_device_pixel_ratio =
             atlas_normalized_device_pixel_ratio(m_frame.device_pixel_ratio);
-        const int draw_pixel_height = std::max(
-            1,
-            atlas_snapped_physical_int(
-                m_frame.cell_metrics.ascent,
-                normalized_device_pixel_ratio));
+        const int draw_pixel_height = qsg_atlas_msdf_draw_pixel_height(
+            m_frame.cell_metrics,
+            normalized_device_pixel_ratio);
         m_msdf_text_used_this_frame = true;
 
         const msdf_text::options_t options = atlas_msdf_text_options();
@@ -8872,6 +8871,55 @@ QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font)
         .arg(raw_font.familyName())
         .arg(raw_font.styleName())
         .arg(QString::number(qHash(name_table), 16));
+}
+
+int qsg_atlas_msdf_draw_pixel_height(
+    const terminal_cell_metrics_t& cell_metrics,
+    qreal                          device_pixel_ratio)
+{
+    return std::max(
+        1,
+        atlas_snapped_physical_int(cell_metrics.ascent, device_pixel_ratio));
+}
+
+qsg_atlas_text_draw_sizes_t qsg_atlas_text_draw_sizes(
+    const QFont&                      render_font,
+    qreal                             device_pixel_ratio,
+    vnm_terminal::Font_advance_policy advance_policy,
+    qreal                             logical_dpi)
+{
+    qsg_atlas_text_draw_sizes_t sizes;
+    sizes.raster_pixel_size = qsg_atlas_physical_pixel_size(
+        QRawFont::fromFont(render_font),
+        atlas_normalized_device_pixel_ratio(device_pixel_ratio));
+    sizes.cell_metrics      = Qt_grid_metrics_provider(
+        render_font,
+        device_pixel_ratio,
+        advance_policy,
+        logical_dpi).cell_metrics();
+    sizes.msdf_draw_pixel_height =
+        qsg_atlas_msdf_draw_pixel_height(sizes.cell_metrics, device_pixel_ratio);
+    return sizes;
+}
+
+bool qsg_atlas_text_draws_differently(
+    const qsg_atlas_text_draw_sizes_t& lhs,
+    const qsg_atlas_text_draw_sizes_t& rhs,
+    Terminal_text_renderer_policy      renderer_policy)
+{
+    const bool cell_differs =
+        !qsg_atlas_cell_metrics_equal(lhs.cell_metrics, rhs.cell_metrics);
+    const bool glyph_runs_differ =
+        cell_differs || lhs.raster_pixel_size != rhs.raster_pixel_size;
+    const bool msdf_runs_differ =
+        cell_differs || lhs.msdf_draw_pixel_height != rhs.msdf_draw_pixel_height;
+    switch (renderer_policy) {
+        case Terminal_text_renderer_policy::GLYPH: return glyph_runs_differ;
+        case Terminal_text_renderer_policy::MSDF:  return msdf_runs_differ;
+        case Terminal_text_renderer_policy::AUTO:  break;
+    }
+
+    return glyph_runs_differ && msdf_runs_differ;
 }
 
 qreal qsg_atlas_physical_pixel_size(
