@@ -740,9 +740,12 @@ content-extent record describes native text and visible cursor state. The
 independent presentation record supplies the primary screen's current content
 endpoint, including written spaces, styles, images, and the logical cursor
 even when cursor painting is disabled. It also carries the clear-page boundary,
-consumer viewport, native coverage, and frozen-publication status. Explicit
-clear starts a page; unused slots precede that page so its prompt remains at
-the display bottom. The alternate screen retains native geometry.
+consumer viewport, native coverage, and frozen-publication status. An explicit
+clear starts a page. The document runs from the later of the first retained
+row and that page to the content end: when it fits the consumer's rows it
+starts on the top row with unused slots after it, as a cleared or fresh screen
+does, and a longer document ends on the bottom row. History before the page
+stays in the scroll range. The alternate screen retains native geometry.
 
 `VNM_TerminalCanvas::presentationRows` selects a local row capacity for a
 supported content-tail frame; zero uses the native frame capacity. The optional
