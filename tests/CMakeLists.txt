@@ -1314,6 +1314,10 @@ target_link_libraries(vnm_terminal_surface_host PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
     Qt6::GuiPrivate
 )
+if(APPLE)
+    target_link_libraries(vnm_terminal_surface_host PRIVATE
+        vnm_process_custody::vnm_process_custody)
+endif()
 
 target_compile_definitions(vnm_terminal_surface_host PRIVATE
     VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
@@ -1442,6 +1446,24 @@ set_tests_properties(vnm_terminal_surface_host_resize_presentation PROPERTIES
     LABELS "conformance;surface;resize;presentation"
     TIMEOUT 60
 )
+
+# A real POSIX pty whose shell redraws its prompt on SIGWINCH, as zsh does.
+if(NOT WIN32)
+    add_test(
+        NAME vnm_terminal_surface_host_shell_redraw_zoom
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_readback_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --shell-redraw-zoom-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_shell_redraw_zoom PROPERTIES
+        LABELS "conformance;surface;resize;presentation;wheel"
+        TIMEOUT 180
+    )
+endif()
 
 # Input leasing against the painted frame needs a platform that draws.
 if(WIN32)

@@ -11,6 +11,7 @@
 #include "vnm_terminal/terminal_canvas_export.h"
 #include "vnm_terminal/vnm_terminal_canvas.h"
 #include "helpers/test_check.h"
+#include "posix_pty_backend/native_receipt_capture.h"
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 #endif
@@ -7706,6 +7707,187 @@ bool test_resize_keeps_presented_range_on_written_rows(QGuiApplication& app)
     ok &= check_range(7, "grow then partial shrink");
     return ok;
 }
+
+#if !defined(Q_OS_WIN)
+// A shell answers every resize by redrawing its prompt. This one does what
+// zsh -f did in the owner's macOS transcript: CR CR, one CUU for each row the
+// prompt took at the previous width, SGR resets, ED 0, the prompt, and CR LF
+// EL when the prompt ends at the right margin. It then names the grid it
+// redrew for in the title, so the test knows the redraw has been processed.
+//
+// SIGWINCH only interrupts the wait; the redraw runs with the signal ignored,
+// because bash 3.2 (macOS /bin/sh) can run a trap inside a command
+// substitution and capture the nested redraw. A resize that arrives while it
+// is ignored is drawn at the next one-second wake.
+constexpr const char* k_redrawing_shell_script = R"sh(
+prompt='redraw-check-0123456789-abcdefghijklmnopqrstuvwxyz-01234% '
+drawn_size=
+drawn_columns=
+draw_prompt() {
+    trap '' WINCH
+    size=$(stty size)
+    if [ "$size" != "$drawn_size" ]; then
+        columns=${size#* }
+        if [ -n "$drawn_columns" ]; then
+            up=$(( ${#prompt} / drawn_columns ))
+            printf '\r\r'
+            while [ "$up" -gt 0 ]; do printf '\033[A'; up=$((up - 1)); done
+            printf '\033[0m\033[27m\033[24m\033[J'
+        fi
+        printf '%s' "$prompt"
+        if [ $(( ${#prompt} % columns )) -eq 0 ]; then printf '\r\n\033[K'; fi
+        printf '\033]0;redrawn %s\007' "$size"
+        drawn_size=$size
+        drawn_columns=$columns
+    fi
+    trap : WINCH
+}
+seq 1 5000
+draw_prompt
+while :; do sleep 1 & wait $!; draw_prompt; done
+)sh";
+
+bool test_shell_redraw_zoom_keeps_prompt_on_bottom_row(QGuiApplication& app)
+{
+    // The owner's requirement: after zooming in and out, nothing below the
+    // prompt can be seen or scrolled into. At the tail the prompt's cursor row
+    // is the bottom row, and the top bound shows the first written row.
+    constexpr int k_prompt_length = 58;
+    const QString first_written_row = QStringLiteral("1");
+
+#if defined(__APPLE__)
+    // Native observations must outlive surface and backend teardown.
+    const auto native_receipts = std::make_shared<vnm_terminal::test_helpers::Native_receipt_capture>();
+#endif
+    Surface_fixture fixture;
+    fixture.window.resize(900, 760);
+    fixture.surface.setSize(QSizeF(878.0, 723.0));
+    fixture.surface.set_cursor_blink_enabled(false);
+    pump_events(app);
+
+    QString backend_error;
+    QObject::connect(&fixture.surface, &VNM_TerminalSurface::backend_error, &fixture.surface,
+        [&backend_error](VNM_TerminalSurface::Backend_error_code, QString message) {
+            backend_error = std::move(message);
+        });
+    vnm_terminal::Terminal_process_start_request request{
+        {QStringLiteral("/bin/sh"), QStringLiteral("-c"), QString::fromLatin1(k_redrawing_shell_script)},
+        QStringLiteral("/"),
+        {{QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin")}},
+        std::nullopt,
+    };
+#if defined(__APPLE__)
+    request.native_receipt_hook = [native_receipts](const auto& receipt) {
+        return native_receipts->retain(receipt);
+    };
+#endif
+    const vnm_terminal::Terminal_process_start_result start =
+        fixture.surface.start_terminal(std::move(request));
+    if (!start.accepted) {
+        std::cerr << "start failed: " << backend_error.toStdString() << '\n';
+    }
+    if (!check(start.accepted, "the redrawing shell starts on a POSIX pty")) {
+        return false;
+    }
+
+    // The redraw for the current grid is processed when the title names that
+    // grid and the published cursor follows the prompt.
+    const auto redraw_processed = [&] {
+        const int  rows    = fixture.surface.rows();
+        const int  columns = fixture.surface.columns();
+        const auto native  = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return
+            fixture.surface.terminal_title() == QStringLiteral("redrawn %1 %2").arg(rows).arg(columns) &&
+            native != nullptr                                                                          &&
+            native->grid_size.rows    == rows                                                          &&
+            native->grid_size.columns == columns                                                       &&
+            native->cursor.position.column == k_prompt_length % columns;
+    };
+    const auto wait_for_redraw = [&] {
+        if (pump_until(app, redraw_processed, 500)) {
+            return true;
+        }
+        const auto native = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        std::cerr << "no redraw for grid " << fixture.surface.rows() << 'x' << fixture.surface.columns()
+                  << ": title=\"" << fixture.surface.terminal_title().toStdString() << '"'
+                  << " published_grid=" << (native ? native->grid_size.rows : -1) << 'x'
+                  << (native ? native->grid_size.columns : -1)
+                  << " cursor=" << (native ? native->cursor.position.row : -1) << ','
+                  << (native ? native->cursor.position.column : -1) << '\n';
+        for (int row = 0; native != nullptr && row < native->grid_size.rows; ++row) {
+            std::cerr << "  row " << row << " \"" << snapshot_row_text(*native, row).toStdString() << "\"\n";
+        }
+        return false;
+    };
+
+    bool ok           = true;
+    int  failed_steps = 0;
+    const auto check_prompt_on_bottom_row = [&](const std::string& step) {
+        ok &= check(wait_for_redraw(), "the shell redraws its prompt for the current grid");
+        fixture.surface.scroll_to_offset_from_tail(0);
+        const int  rows       = fixture.surface.viewport_visible_rows();
+        const auto presented  = committed_display_frame(app, fixture.window, fixture.surface);
+        const auto native     = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const int  cursor_row = presented != nullptr ? presented->cursor.position.row : -1;
+
+        const int top_bound = fixture.surface.scrollback_rows();
+        fixture.surface.scroll_to_offset_from_tail(top_bound + 5);
+        const auto    top        = committed_display_frame(app, fixture.window, fixture.surface);
+        const QString top_row    = top != nullptr ? snapshot_row_text(*top, 0) : QString();
+        const int     top_offset = fixture.surface.viewport_offset_from_tail();
+        fixture.surface.scroll_to_offset_from_tail(0);
+
+        const bool bottom_ok = cursor_row == rows - 1;
+        const bool top_ok    = top_offset == top_bound && top_row == first_written_row;
+        if (!bottom_ok || !top_ok) {
+            ++failed_steps;
+            std::cerr << step << ": grid=" << rows << 'x' << fixture.surface.columns()
+                      << " presented_cursor_row=" << cursor_row
+                      << " rows_below_prompt=" << (rows - 1 - cursor_row)
+                      << " public_scrollback_rows=" << top_bound
+                      << " native_scrollback_rows=" << (native ? native->viewport.scrollback_rows : -1)
+                      << " native_cursor_row=" << (native ? native->cursor.position.row : -1)
+                      << " content_end_row=" << (native ? native->viewport.presentation.content_end_row_exclusive : -1)
+                      << " clear_page_start_row=" << (native ? native->viewport.presentation.clear_page_start_row : -1)
+                      << " policy=" << (native ? static_cast<int>(native->viewport.presentation.policy) : -1)
+                      << " top_offset=" << top_offset
+                      << " top_row=\"" << top_row.toStdString() << "\"\n";
+        }
+    };
+
+    check_prompt_on_bottom_row("start");
+
+    // The owner's run: zoom in until the font stops growing, out until it
+    // stops shrinking, and again. Each notch resizes the pty, and the shell
+    // redraws its prompt at the new width.
+    const auto zoom_until_clamped = [&](int angle_delta, const std::string& direction) {
+        for (int notch = 1; notch <= 40; ++notch) {
+            const qreal font_size_before = fixture.surface.font_size();
+            ok &= send_wheel_event(
+                fixture.surface,
+                Qt::ControlModifier,
+                angle_delta,
+                true,
+                "Ctrl+wheel notch zooms the font");
+            pump_events(app, 2);
+            if (fixture.surface.font_size() == font_size_before) {
+                return;
+            }
+            check_prompt_on_bottom_row(direction + " notch " + std::to_string(notch));
+        }
+    };
+    for (int cycle = 1; cycle <= 3; ++cycle) {
+        zoom_until_clamped( 120, "cycle " + std::to_string(cycle) + " in");
+        zoom_until_clamped(-120, "cycle " + std::to_string(cycle) + " out");
+    }
+
+    ok &= check(failed_steps == 0,
+        "after every zoom notch the prompt is on the bottom row and nothing below it can be seen or scrolled into");
+    (void)fixture.surface.terminate_process();
+    pump_events(app);
+    return ok;
+}
+#endif
 
 bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
 {
@@ -22841,6 +23023,11 @@ int main(int argc, char** argv)
     if (app.arguments().contains(QStringLiteral("--zoom-scroll-range-only"))) {
         return test_control_wheel_zoom_keeps_scroll_range_on_written_rows(app) ? 0 : 1;
     }
+#if !defined(Q_OS_WIN)
+    if (app.arguments().contains(QStringLiteral("--shell-redraw-zoom-only"))) {
+        return test_shell_redraw_zoom_keeps_prompt_on_bottom_row(app) ? 0 : 1;
+    }
+#endif
     if (app.arguments().contains(QStringLiteral("--resize-presentation-only"))) {
         bool ok = test_resize_keeps_presented_range_on_written_rows(app);
         ok &= test_redraw_shrinks_published_content_end(app);
