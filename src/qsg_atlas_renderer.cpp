@@ -1165,6 +1165,7 @@ msdf_text::options_t atlas_msdf_text_options()
 {
     msdf_text::options_t options;
     options.atlas_size           = k_atlas_msdf_text_texture_size;
+    options.auto_atlas_size      = true;
     options.min_atlas_font_size  = k_atlas_msdf_text_min_atlas_font_size;
     options.atlas_px_range       = k_atlas_msdf_text_atlas_px_range;
     options.sharpness_bias       = k_atlas_msdf_text_sharpness_bias;
