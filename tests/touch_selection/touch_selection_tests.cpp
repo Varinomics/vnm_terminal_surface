@@ -90,8 +90,8 @@ bool consumer_capacity_selection_contract()
     auto shown = term::make_presented_snapshot(source, 6, 0);
     if (!check(shown && shown->touch_selection && source->row_coverage_snapshot &&
             shown->touch_selection->source.rows == 3 && shown->touch_selection->visible_rows.size() == 6U &&
-            shown->display_row_logical_rows == std::vector<int>({-1, 0, 1, 2, 3, 4}),
-            "a taller consumer retains native source identity and displays one leading unused slot"))
+            shown->display_row_logical_rows == std::vector<int>({0, 1, 2, 3, 4, -1}),
+            "a taller consumer retains native source identity and displays one trailing unused slot"))
     {
         return false;
     }
@@ -103,7 +103,7 @@ bool consumer_capacity_selection_contract()
     ok &= check(touch::touch_selection_codec::decode_frame(
             touch::touch_selection_codec::encode_frame(coverage)) == coverage,
         "arbitrary row coverage selection transports its source height separately from its row count");
-    auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 1, 2, 101U);
+    auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 0, 2, 101U);
     word.presentation = shown->touch_selection->presentation;
     ok &= check(word.presentation && word.presentation->visible_rows == 6 &&
             word.presentation->offset_from_tail == 0 &&
@@ -121,10 +121,10 @@ bool consumer_capacity_selection_contract()
             session.selected_text().text == QStringLiteral("header") && session.viewport_state().offset_from_tail == 0,
         "the displayed acquired row selects without changing native geometry or offset");
     shown = term::make_presented_snapshot(session.latest_render_snapshot_handle(), 6, 0);
-    ok &= check(shown->touch_selection->start.row == 1 &&
-            shown->touch_selection->spans == std::vector<touch::terminal_canvas_selection_span_t>{{1, 0, 6}},
+    ok &= check(shown->touch_selection->start.row == 0 &&
+            shown->touch_selection->spans == std::vector<touch::terminal_canvas_selection_span_t>{{0, 0, 6}},
         "the retained word's highlight and handles share its displayed row");
-    auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 1, 6, 102U);
+    auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 0, 6, 102U);
     begin.presentation = word.presentation;
     begin.handle = touch::Terminal_selection_handle::END;
     ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,

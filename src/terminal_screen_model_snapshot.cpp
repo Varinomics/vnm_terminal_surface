@@ -396,8 +396,8 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot_with_row_count(
     }
 
     // Both consumer windows resolve against this same immutable model state.
-    // A clear-page padding interval can make the larger consumer need rows
-    // after the smaller window as well as rows before it.
+    // A short document's top-aligned window and independent consumer offsets
+    // can need rows after the native window as well as rows before it.
     if (request.include_row_coverage && viewport.active_buffer == Terminal_buffer_id::PRIMARY) {
         const auto native_range = presentation_requested_row_range(snapshot.viewport);
         Terminal_viewport_state consumer = snapshot.viewport;

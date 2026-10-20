@@ -390,10 +390,12 @@ enum class Terminal_canvas_presentation_policy : std::uint8_t
 // invalidate the complete enclosing frame.
 //
 // The frame's own rows are native logical rows from the content extent's
-// scrollback_rows - offset_from_tail on. CONTENT_TAIL ends at the current
-// semantic content end, including the logical cursor even when hidden. For
-// consumer capacity N it inserts max(0, N - (end - clear_page_start)) unused
-// slots before the clear page. The alternate screen retains NATIVE geometry.
+// scrollback_rows - offset_from_tail on. CONTENT_TAIL presents native rows
+// through the current semantic content end, including the logical cursor even
+// when hidden. For consumer capacity N it appends max(0, N - (end -
+// clear_page_start)) unused slots after the end, so a document from the clear
+// page that fits starts on the top row; the history before the clear page
+// stays in the scroll range. The alternate screen retains NATIVE geometry.
 // Coverage is the first covered_rows of the native frame plus its attached
 // native logical interval. Endpoint, clear page, coverage, and cells
 // belong to the same immutable publication, including while output is held.

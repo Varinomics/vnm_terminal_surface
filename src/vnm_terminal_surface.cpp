@@ -8161,7 +8161,8 @@ void VNM_TerminalSurface::set_viewport_state(
     const term::Terminal_viewport_state& state)
 {
     // The scroll range is the presentation's: the rows the producer can show
-    // above the current semantic endpoint and explicit page padding.
+    // above its tail window, which ends at the semantic endpoint or, for a
+    // document shorter than the view, at the unused slots after it.
     const int scrollback_rows = term::presentation_max_offset_from_tail(state);
     const int visible_rows    = std::max(0, state.visible_rows);
     const int offset_from_tail =

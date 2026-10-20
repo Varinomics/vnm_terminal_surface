@@ -29,8 +29,8 @@ bool presentation_is_identity(
 }
 
 // Native source and consumer windows have independent heights and offsets.
-// Resolve rows against actual immutable coverage, including rows after the
-// native window when a larger consumer crosses clear-page padding.
+// Resolve rows against actual immutable coverage, including rows before or
+// after the native window when the consumer's window differs from it.
 std::optional<std::vector<int>> resolved_logical_rows(
     const Terminal_render_snapshot& source,
     const Terminal_viewport_state& viewport)

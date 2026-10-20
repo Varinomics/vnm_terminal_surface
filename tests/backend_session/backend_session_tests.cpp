@@ -23083,8 +23083,8 @@ bool test_detached_anchor_keeps_first_displayed_row()
     ok &= check(cleared->viewport_state().presentation.clear_page_start_row == 7 &&
             displayed(cleared, 0) == QStringLiteral("scroll-line-005") &&
             displayed(cleared, 1) == QStringLiteral("scroll-line-006") &&
-            displayed(cleared, 2).isEmpty() && displayed(cleared, 3).isEmpty(),
-        "scrolling into a cleared page shows retained history followed by page padding");
+            displayed(cleared, 2) == QStringLiteral("$") && displayed(cleared, 3).isEmpty(),
+        "scrolling up from a cleared page shows the retained history directly above it");
     ok &= check(cleared_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
             cleared->viewport_state().presentation.clear_page_start_row == 7 &&
             cleared->viewport_state().offset_from_tail == 2 &&
@@ -23615,9 +23615,9 @@ bool test_search_highlights_row_coverage_with_native_source_geometry()
                 std::any_of(source->row_coverage_snapshot->search_match_spans.begin(),
                     source->row_coverage_snapshot->search_match_spans.end(),
                     [&](const auto& span) { return is_header_span(span, 0); }) &&
-                displayed && snapshot_row_text(*displayed, 2) == QStringLiteral("header") &&
+                displayed && snapshot_row_text(*displayed, 0) == QStringLiteral("header") &&
                 std::any_of(displayed->search_match_spans.begin(), displayed->search_match_spans.end(),
-                    [&](const auto& span) { return is_header_span(span, 2); }),
+                    [&](const auto& span) { return is_header_span(span, 0); }),
             taller_consumer
                 ? "coverage taller than the native grid paints its retained search match through the shared mapping"
                 : "coverage shorter than the native grid paints its retained search match through the shared mapping");

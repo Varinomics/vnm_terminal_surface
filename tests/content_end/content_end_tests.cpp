@@ -15,7 +15,8 @@ using vnm_terminal::test_helpers::check;
 
 // The oracle is the adopted transcript contract: current occupied content and
 // the logical cursor define the end; only explicit page clears establish a
-// clear boundary. A resize or a later erase cannot leave scrollable tail space.
+// clear boundary. A resize or a later erase cannot leave scrollable tail space,
+// and a cleared page that fits the view starts on the top row.
 term::Terminal_screen_model make_model(int rows, int columns, int history = 6000)
 {
     term::Terminal_screen_model_config config;
@@ -176,9 +177,10 @@ bool test_explicit_clear_boundary()
     const auto cleared = presented(model);
     bool ok = check(cleared && model.presentation_mapping().clear_page_start_row == history,
         "ED2 establishes the latest page boundary at the native live-screen start");
-    ok &= check(row_text(*cleared, 0).isEmpty() && row_text(*cleared, 2).isEmpty() &&
-            row_text(*cleared, 3) == QStringLiteral("prompt>"),
-        "a short cleared page has padding before the bottom-aligned prompt");
+    ok &= check(row_text(*cleared, 0) == QStringLiteral("prompt>") &&
+            row_text(*cleared, 1).isEmpty() && row_text(*cleared, 3).isEmpty() &&
+            cleared->cursor.position.row == 0,
+        "a short cleared page starts with the prompt on the top row and blank rows below");
     ok &= check(term::presentation_max_offset_from_tail(cleared->viewport) == history,
         "old history remains reachable before the cleared page");
 
@@ -187,8 +189,9 @@ bool test_explicit_clear_boundary()
     model.ingest(QByteArrayLiteral("\r\x1b[Jprompt> "));
     const auto grown = presented(model);
     ok &= check(model.presentation_mapping().clear_page_start_row == history &&
-            row_text(*grown, 6).isEmpty() && row_text(*grown, 7) == QStringLiteral("prompt>"),
-        "the explicit boundary survives a full page and later growth and ED0 redraw");
+            row_text(*grown, 0) == QStringLiteral("prompt>") && row_text(*grown, 1).isEmpty() &&
+            term::presentation_max_offset_from_tail(grown->viewport) == history,
+        "the explicit boundary survives a full page, later growth and an ED0 redraw on the top row");
 
     const auto before_eviction = model.presentation_mapping();
     model.set_scrollback_limit(3);

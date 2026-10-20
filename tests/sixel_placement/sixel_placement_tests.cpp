@@ -2220,15 +2220,16 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
     ok &= check(scrolled.viewport.offset_from_tail == 1 &&
             term::presentation_max_offset_from_tail(scrolled.viewport) == 0 &&
             presented && presented->viewport.offset_from_tail == 0 &&
-            presented->cursor.position.row == 28,
-        "the native source keeps its offset while the displayed short transcript clamps to its content end");
+            presented->cursor.position.row == 12,
+        "the native source keeps its offset while the displayed short transcript starts on the top row");
     if (presented) {
         const term::Terminal_render_snapshot_row_content_view rows(*presented);
-        ok &= check(rows.row_at(28).text(0, 51, true) ==
-                QStringLiteral("Type relay-production-input from Companion:"),
-            "the prompt remains on the final displayed row after native source scrolling");
+        ok &= check(rows.row_at(12).text(0, 51, true) ==
+                QStringLiteral("Type relay-production-input from Companion:") &&
+                rows.row_at(13).text(0, 51, true).isEmpty(),
+            "the prompt stays on the transcript's last row, with blank rows below, after native source scrolling");
         for (int row = 0; row < 13; ++row) {
-            const int display_row = 16 + row;
+            const int display_row = row;
             ok &= check(presented->visible_line_provenance[(std::size_t)display_row].retained_line_id ==
                     original.visible_line_provenance[(std::size_t)row].retained_line_id,
                 "the displayed transcript preserves every original row identity");

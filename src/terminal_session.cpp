@@ -11033,9 +11033,7 @@ Terminal_session::reconcile_public_projection_release(
     {
         return presentation_stream_end_row_exclusive(live_viewport_before_on_release) -
             live_viewport_before_on_release.visible_rows -
-            presentation_stream_row_for_logical_row(
-                live_viewport_before_on_release,
-                logical_row) +
+            logical_row +
             anchor_viewport_row;
     };
     const auto record_incompatible_buffer = [&](

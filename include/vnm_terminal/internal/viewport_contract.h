@@ -11,8 +11,9 @@ enum class Terminal_buffer_id
     ALTERNATE,
 };
 
-// The alternate screen keeps its native layout. A primary transcript ends at
-// its current semantic content and places its latest cleared page at the tail.
+// The alternate screen keeps its native layout. A primary transcript is its
+// native rows through the current semantic content end; a document that fits
+// the view starts on the top row, and a longer one ends on the bottom row.
 enum class Terminal_presentation_policy
 {
     NATIVE,
@@ -21,8 +22,9 @@ enum class Terminal_presentation_policy
 
 // Immutable native logical boundaries, acquired with the frame's rows. The
 // end includes occupied cells/images and the logical cursor even when hidden.
-// The latest explicit page clear establishes the boundary before that page;
-// consumer capacity determines how much identity-free padding precedes it.
+// The latest explicit page clear (ED 2 or a host clear) establishes the
+// boundary before that page; the history above it stays in the scroll range.
+// Consumer capacity determines how many identity-free slots follow the end.
 struct Terminal_presentation_mapping
 {
     Terminal_presentation_policy policy = Terminal_presentation_policy::NATIVE;
@@ -105,6 +107,11 @@ inline Terminal_presentation_mapping make_presentation_mapping(
     };
 }
 
+// The document runs from D, the later of the first retained row and the
+// clear page boundary, to the content end E. Retained rows start at logical
+// row 0 and the boundary is rebased with them, so D is the boundary. A
+// document shorter than the view is followed by this many unused slots: the
+// blank rest of a cleared or fresh screen.
 inline int presentation_padding_rows(const Terminal_viewport_state& viewport)
 {
     if (viewport.presentation.policy != Terminal_presentation_policy::CONTENT_TAIL) {
@@ -125,8 +132,9 @@ inline long long presentation_stream_end_row_exclusive(const Terminal_viewport_s
     return static_cast<long long>(viewport.scrollback_rows) + viewport.visible_rows;
 }
 
-// Every allowed window ends at or before the same semantic end. The padding
-// before a short cleared page retains access to older history when scrolling.
+// Every allowed window ends at or before the same semantic end plus its
+// slots. The tail window of a short document starts at D; the history above
+// D stays reachable by scrolling up.
 inline int presentation_max_offset_from_tail(const Terminal_viewport_state& viewport)
 {
     return static_cast<int>(std::max(
@@ -138,21 +146,10 @@ inline int presentation_clamped_offset_from_tail(const Terminal_viewport_state& 
     return std::clamp(viewport.offset_from_tail, 0, presentation_max_offset_from_tail(viewport));
 }
 
-// Native [0,Q), padding of P slots, then native [Q,E). P is derived for this
-// consumer, so a phone and desktop can share E/Q without sharing their height.
-inline long long presentation_stream_row_for_logical_row(
-    const Terminal_viewport_state& viewport,
-    int                            logical_row)
-{
-    if (viewport.presentation.policy == Terminal_presentation_policy::CONTENT_TAIL &&
-        logical_row >= viewport.presentation.clear_page_start_row)
-    {
-        return static_cast<long long>(logical_row) + presentation_padding_rows(viewport);
-    }
-    return logical_row;
-}
-
-// A native logical row, or -1 for identity-free padding before the page.
+// The presented stream is native [0,E), then P unused slots, so a native
+// row's stream position is its logical row. P is derived for this consumer,
+// so a phone and desktop can share E/Q without sharing their height. Returns
+// the native logical row a display row presents, or -1 for a slot.
 inline int presentation_requested_logical_row(
     const Terminal_viewport_state& viewport,
     int                            display_row)
@@ -171,16 +168,12 @@ inline int presentation_requested_logical_row(
     if (stream_row < 0) {
         return -1;
     }
-    if (mapping.policy != Terminal_presentation_policy::CONTENT_TAIL ||
-        stream_row < mapping.clear_page_start_row)
+    if (mapping.policy == Terminal_presentation_policy::CONTENT_TAIL &&
+        stream_row >= mapping.content_end_row_exclusive)
     {
-        return static_cast<int>(stream_row);
+        return -1;
     }
-
-    const int padding_rows = presentation_padding_rows(viewport);
-    return stream_row < static_cast<long long>(mapping.clear_page_start_row) + padding_rows
-        ? -1
-        : static_cast<int>(stream_row - padding_rows);
+    return static_cast<int>(stream_row);
 }
 
 // The display row presenting native logical_row, outside [0, H) when the
@@ -204,8 +197,7 @@ inline std::optional<int> presentation_display_row_for_logical_row(
 
     const long long first_stream_row = presentation_stream_end_row_exclusive(viewport) -
         viewport.visible_rows - presentation_clamped_offset_from_tail(viewport);
-    return static_cast<int>(
-        presentation_stream_row_for_logical_row(viewport, logical_row) - first_stream_row);
+    return static_cast<int>(logical_row - first_stream_row);
 }
 
 // The presented offset that shows native logical_row at display_row, clamped
@@ -215,9 +207,8 @@ inline int presentation_offset_for_logical_row(
     int                            logical_row,
     int                            display_row)
 {
-    const long long stream_row = presentation_stream_row_for_logical_row(viewport, logical_row);
     return static_cast<int>(std::clamp(
-        presentation_stream_end_row_exclusive(viewport) - viewport.visible_rows - stream_row + display_row,
+        presentation_stream_end_row_exclusive(viewport) - viewport.visible_rows - logical_row + display_row,
         0LL,
         static_cast<long long>(presentation_max_offset_from_tail(viewport))));
 }

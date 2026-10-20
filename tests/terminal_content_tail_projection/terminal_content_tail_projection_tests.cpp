@@ -56,18 +56,16 @@ QString row_text(const term::Terminal_render_snapshot& snapshot, int row)
     return text.trimmed();
 }
 
-// Construct the adopted stream independently: history before the explicit
-// clear, padding before a short page, then native content through E-1.
+// Construct the agreed stream independently: every native row through E-1,
+// the history before an explicit clear included, then the unused slots that
+// fill the rest of the view below a page shorter than it.
 std::vector<int> expected_stream(int capacity, int end, int page)
 {
     std::vector<int> stream;
-    for (int row = 0; row < page; ++row) {
+    for (int row = 0; row < end; ++row) {
         stream.push_back(row);
     }
     stream.insert(stream.end(), static_cast<std::size_t>(std::max(0, capacity - (end - page))), -1);
-    for (int row = page; row < end; ++row) {
-        stream.push_back(row);
-    }
     return stream;
 }
 
@@ -108,8 +106,13 @@ bool test_stream_mapping_and_inverse()
                 "a native row after the semantic end is never presented");
         }
         viewport.offset_from_tail = 0;
-        ok &= check(term::presentation_requested_logical_row(viewport, sample.capacity - 1) == end - 1,
-            "at tail the final semantic row occupies the final consumer row");
+        const int page_rows = end - sample.page;
+        ok &= check(page_rows >= sample.capacity
+                ? term::presentation_requested_logical_row(viewport, sample.capacity - 1) == end - 1
+                : term::presentation_requested_logical_row(viewport, 0) == sample.page &&
+                    term::presentation_requested_logical_row(viewport, page_rows - 1) == end - 1 &&
+                    term::presentation_requested_logical_row(viewport, page_rows) == -1,
+            "at tail a page that fits starts on the top row and a longer one ends on the final row");
     }
     return ok;
 }
@@ -234,17 +237,17 @@ bool test_shared_cells_images_selection_and_search()
     if (!check(display != nullptr, "all row-derived content resolves through the common mapping")) {
         return false;
     }
-    bool ok = check(display->display_row_logical_rows == std::vector<int>{-1, -1, -1, 0, 1, 2},
-        "short content uses identity-free leading padding");
-    ok &= check(row_text(*display, 3) == QStringLiteral("old") &&
-            row_text(*display, 4) == QStringLiteral("mid") && row_text(*display, 5) == QStringLiteral("prompt>"),
+    bool ok = check(display->display_row_logical_rows == std::vector<int>{0, 1, 2, -1, -1, -1},
+        "short content starts on the top row and identity-free slots follow it");
+    ok &= check(row_text(*display, 0) == QStringLiteral("old") &&
+            row_text(*display, 1) == QStringLiteral("mid") && row_text(*display, 2) == QStringLiteral("prompt>"),
         "history and live text follow the same mapping");
-    ok &= check(term::render_snapshot_row_image(*display, 3) != nullptr &&
-            display->search_match_spans.size() == 1U && display->search_match_spans.front().row == 3 &&
-            display->selection_spans.size() == 3U && display->selection_spans.front().row == 3,
+    ok &= check(term::render_snapshot_row_image(*display, 0) != nullptr &&
+            display->search_match_spans.size() == 1U && display->search_match_spans.front().row == 0 &&
+            display->selection_spans.size() == 3U && display->selection_spans.front().row == 0,
         "images, search and selection share the displayed row coordinates");
     const auto found = std::find_if(display->cells.begin(), display->cells.end(), [](const auto& cell) {
-        return cell.position.row == 3 && cell.position.column == 0;
+        return cell.position.row == 0 && cell.position.column == 0;
     });
     ok &= check(found != display->cells.end() && found->hyperlink_id != term::k_no_terminal_hyperlink_id &&
             display->styles[found->style_id] != term::make_default_terminal_text_style(),
@@ -266,12 +269,12 @@ bool test_frozen_coverage_and_alternate_screen()
     model.ingest(QByteArrayLiteral("\x1b[H\x1b[2Jdifferent"));
     const auto second = term::make_presented_snapshot(held);
     bool ok = check(first && second && second->viewport.presentation == held_end &&
-            row_text(*second, 5) == QStringLiteral("prompt>"),
+            row_text(*second, 2) == QStringLiteral("prompt>"),
         "a held frame retains its own end, boundary and rows after live output changes");
     held->row_coverage_snapshot.reset();
     const auto without_prefix = term::make_presented_snapshot(held);
     ok &= check(!without_prefix && !term::render_snapshot_presentable(*held),
-        "missing frozen history is unavailable; only the page map may create leading slots");
+        "missing frozen history is unavailable; only the page map may create unused slots");
 
     model.ingest(QByteArrayLiteral("\x1b[?1049h\x1b[6;1Hstatus"));
     const auto alternate = std::make_shared<const term::Terminal_render_snapshot>(model.render_snapshot(request_for()));
