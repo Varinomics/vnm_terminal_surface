@@ -3040,8 +3040,7 @@ void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
                 break;
             }
             retained_lookup_index_entry_t& entry = found->second;
-            entry.history_handle     = handle;
-            entry.active_grid_handle = handle;
+            entry.history_handle = handle;
         }
         if (m_selection_reconciliation_counters.enabled) {
             m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited += visited;
@@ -3075,7 +3074,6 @@ void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
                 0U,
                 active_row,
                 handle,
-                handle,
                 0,
                 1,
                 1,
@@ -3105,7 +3103,6 @@ void Terminal_screen_model::insert_primary_history_retained_lookup(
             history_ordinal,
             0,
             handle,
-            {},
             1,
             0,
             1,

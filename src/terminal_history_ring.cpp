@@ -514,13 +514,7 @@ terminal_history_ring_resize_result_t Terminal_history_ring::resize_capacity(
         return result;
     }
 
-    struct Record_bytes
-    {
-        terminal_history_ring_record_descriptor_t descriptor;
-        std::vector<std::byte>                   bytes;
-    };
-
-    std::vector<Record_bytes> retained_records;
+    std::size_t retained_count = 0U;
     std::size_t retained_bytes = 0U;
     const std::size_t new_max_record_bytes = new_capacity / 8U;
     for (auto it = m_records.rbegin(); it != m_records.rend(); ++it) {
@@ -530,40 +524,37 @@ terminal_history_ring_resize_result_t Terminal_history_ring::resize_capacity(
             break;
         }
 
-        retained_records.push_back({
-            *it,
-            copy_record_bytes(it->byte_sequence, it->record_bytes),
-        });
+        ++retained_count;
         retained_bytes += it->record_bytes;
     }
-    std::reverse(retained_records.begin(), retained_records.end());
 
+    // Copy directly between storage blocks while keeping the old ring intact
+    // until all allocations and copies have succeeded.
     auto new_storage = std::make_unique_for_overwrite<std::byte[]>(new_capacity);
     std::deque<terminal_history_ring_record_descriptor_t> new_records;
-    const auto write_new_record = [
-        &new_storage,
-        new_capacity
-    ](
-        std::uint64_t              byte_sequence,
-        std::span<const std::byte> bytes)
-    {
-        const std::size_t offset = static_cast<std::size_t>(
-            byte_sequence % new_capacity);
-        const std::size_t first_count = std::min(
-            bytes.size(),
-            new_capacity - offset);
-        std::copy_n(bytes.begin(), first_count, new_storage.get() + offset);
-        if (first_count < bytes.size()) {
-            std::copy(
-                bytes.begin() + static_cast<std::ptrdiff_t>(first_count),
-                bytes.end(),
-                new_storage.get());
+    const auto first_retained = m_records.end() -
+        static_cast<std::ptrdiff_t>(retained_count);
+    for (auto it = first_retained; it != m_records.end(); ++it) {
+        new_records.push_back(*it);
+        std::size_t   remaining = it->record_bytes;
+        std::uint64_t sequence  = it->byte_sequence;
+        while (remaining != 0U) {
+            const std::size_t old_offset = static_cast<std::size_t>(
+                sequence % m_capacity_bytes);
+            const std::size_t new_offset = static_cast<std::size_t>(
+                sequence % new_capacity);
+            const std::size_t count = std::min({
+                remaining,
+                m_capacity_bytes - old_offset,
+                new_capacity - new_offset,
+            });
+            std::copy_n(
+                m_storage.get() + old_offset,
+                count,
+                new_storage.get() + new_offset);
+            sequence += count;
+            remaining -= count;
         }
-    };
-
-    for (const Record_bytes& record : retained_records) {
-        write_new_record(record.descriptor.byte_sequence, record.bytes);
-        new_records.push_back(record.descriptor);
     }
 
     result.discarded_records = m_records.size() - new_records.size();

@@ -7,6 +7,7 @@
 #include <iterator>
 #include <new>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -262,6 +263,50 @@ bool test_capacity_resize_preserves_wrapped_records()
     return ok;
 }
 
+bool test_capacity_shrink_discards_oldest_and_preserves_different_wrap_boundaries()
+{
+    bool ok = true;
+
+    constexpr std::size_t record_bytes = 120U;
+    constexpr std::size_t payload_bytes =
+        record_bytes - term::terminal_history_ring_record_overhead_bytes();
+    term::Terminal_history_ring ring({1536U, 256U});
+    std::vector<term::terminal_history_ring_commit_result_t> commits;
+    for (std::size_t index = 0U; index < 18U; ++index) {
+        const std::string payload(payload_bytes, static_cast<char>('a' + index));
+        commits.push_back(append_record(ring, payload));
+        ok &= check(commits.back().status == term::Terminal_history_ring_status::OK &&
+                commits.back().record_bytes == record_bytes,
+            "shrink fixture commits equal-sized records");
+    }
+
+    const std::uint64_t head = ring.head_byte_sequence();
+    ok &= check(commits[12U].byte_sequence % 1536U + record_bytes > 1536U &&
+            commits[17U].byte_sequence % 1024U + record_bytes > 1024U,
+        "shrink fixture wraps different records in the old and new storage");
+    const auto resized = ring.resize_capacity(1024U, 256U);
+    ok &= check(resized.status == term::Terminal_history_ring_status::OK &&
+            resized.discarded_records == 4U && ring.capacity_bytes() == 1024U,
+        "shrink discards only the oldest live records that no longer fit");
+    ok &= check(ring.oldest_live_byte_sequence() == commits[10U].byte_sequence &&
+            ring.head_byte_sequence() == head,
+        "shrink retains the newest eight records at their original byte sequences");
+    for (std::size_t index = 0U; index < commits.size(); ++index) {
+        const auto read = ring.read_record(commits[index].byte_sequence);
+        if (index < 10U) {
+            ok &= check(read.status() == term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+                "shrink leaves all evicted records outside the live range");
+        }
+        else {
+            const std::string payload(payload_bytes, static_cast<char>('a' + index));
+            ok &= check(read.ok() && payload_equal(read, payload),
+                "shrink preserves every byte across both storage wrap boundaries");
+        }
+    }
+
+    return ok;
+}
+
 bool test_explicit_discard_advances_live_bounds()
 {
     bool ok = true;
@@ -434,6 +479,7 @@ int main()
     ok &= test_wrap_traversal_tail_boundaries();
     ok &= test_read_scope_boundaries();
     ok &= test_capacity_resize_preserves_wrapped_records();
+    ok &= test_capacity_shrink_discards_oldest_and_preserves_different_wrap_boundaries();
     ok &= test_explicit_discard_advances_live_bounds();
     ok &= test_live_index_read_validates_lockstep_identity();
     ok &= test_clear_preserves_capacity_and_sequence();
