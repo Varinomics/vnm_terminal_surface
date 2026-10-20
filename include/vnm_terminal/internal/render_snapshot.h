@@ -1341,37 +1341,6 @@ inline Terminal_selection_result selected_text_from_render_snapshot(
     return {Terminal_selection_result_code::OK, text};
 }
 
-inline Terminal_render_cell_text_category render_cell_text_category_for_validation(
-    const QString& text)
-{
-    if (text.isEmpty()) {
-        return Terminal_render_cell_text_category::EMPTY;
-    }
-
-    constexpr unsigned int printable_ascii_first = 0x20U;
-    constexpr unsigned int printable_ascii_last  = 0x7eU;
-
-    unsigned int outside_printable_ascii = 0U;
-    unsigned int non_ascii               = 0U;
-    const qsizetype text_size            = text.size();
-    const QChar* characters              = text.data();
-    for (qsizetype index = 0; index < text_size; ++index) {
-        const unsigned int code_unit = characters[index].unicode();
-        outside_printable_ascii |= static_cast<unsigned int>(
-            code_unit - printable_ascii_first >
-                printable_ascii_last - printable_ascii_first);
-        non_ascii |= code_unit;
-    }
-
-    if (outside_printable_ascii == 0U) {
-        return Terminal_render_cell_text_category::PRINTABLE_ASCII;
-    }
-
-    return (non_ascii & ~0x7fU) != 0U
-        ? Terminal_render_cell_text_category::NON_ASCII
-        : Terminal_render_cell_text_category::OTHER_ASCII;
-}
-
 inline bool render_cell_text_category_is_valid(const Terminal_render_cell& cell)
 {
     return
