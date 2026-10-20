@@ -531,12 +531,6 @@ std::uint64_t live_root_node_count(
     return stats.render_root_nodes_created - stats.render_root_nodes_destroyed;
 }
 
-std::uint64_t live_text_resource_count(
-    const term::terminal_renderer_lifecycle_stats_t& stats)
-{
-    return stats.render_text_resources_created - stats.render_text_resources_destroyed;
-}
-
 bool has_valid_lifecycle_resource_counts(
     const term::terminal_renderer_lifecycle_stats_t& stats)
 {
