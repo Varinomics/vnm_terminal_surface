@@ -2245,6 +2245,18 @@ if(WIN32)
         LABELS "conformance;windows;conpty"
         TIMEOUT 120
     )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_resize_text_below
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-resize-text-below
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_resize_text_below PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 120
+    )
 
     set_tests_properties(vnm_terminal_windows_native_cmd PROPERTIES
         LABELS "conformance;windows;conpty"

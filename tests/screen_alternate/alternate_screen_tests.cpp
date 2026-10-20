@@ -555,6 +555,77 @@ bool test_backend_owned_alternate_screen_starts_at_the_entry_cursor()
     return ok;
 }
 
+// ConPTY keeps one saved cursor per buffer apart from the buffers' rows, and
+// one never saved restores to home (adaptDispatch.hpp _savedCursorState).
+// Every 1049h saves the active buffer's cursor and every 1049l restores the
+// main buffer's (adaptDispatch.cpp _SetAlternateScreenBufferMode).
+bool test_backend_owned_saved_cursors_live_apart_from_the_screens()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(4, 6);
+    model.ingest(QByteArrayLiteral("aa\r\nbb\x1b[?1049h\x1b" "8X"));
+    bool ok = check(model.row_text(0) == QStringLiteral("X") &&
+            model.cursor_position().row == 0 && model.cursor_position().column == 1,
+        "restoring right after entry goes home");
+    model.ingest(QByteArrayLiteral("\x1b[2;4H\x1b[?1049h\x1b[4;1H\x1b" "8Y"));
+    ok &= check(model.row_text(1) == QStringLiteral("   Y") &&
+            model.cursor_position().row == 1 && model.cursor_position().column == 4,
+        "a replacement saves the alternate screen's cursor first");
+    model.ingest(QByteArrayLiteral("\x1b[?1049l\x1b[?1049h\x1b" "8"));
+    ok &= check(model.cursor_position().row == 1 && model.cursor_position().column == 3,
+        "the alternate screen's save outlives leaving it");
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(model.cursor_position().row == 1 && model.cursor_position().column == 2,
+        "returning restores the primary's save");
+
+    term::Terminal_screen_model unsaved = make_backend_owned_model(4, 6);
+    unsaved.ingest(QByteArrayLiteral("abc\x1b[?1049l"));
+    ok &= check(unsaved.cursor_position().row == 0 && unsaved.cursor_position().column == 0,
+        "a return without an entry restores the primary's unused save, home");
+    return ok;
+}
+
+// ConPTY's reflow keeps the last rows that hold text or the cursor, up to a
+// screen from the cursor down (textBuffer.cpp TextBuffer::Reflow): with text
+// below the cursor, a shrink drops rows from the top.
+bool test_backend_owned_primary_resize_keeps_text_below_the_cursor()
+{
+    const QByteArray rows = QByteArrayLiteral("a\r\nb\r\nc\r\nd\x1b[2;1H");
+    const auto rows_are = [](
+            const term::Terminal_screen_model& model,
+            std::initializer_list<const char*> expected)
+        {
+            int row = 0;
+            for (const char* text : expected) {
+                if (model.row_text(row++) != QString::fromLatin1(text)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+    term::Terminal_screen_model primary = make_backend_owned_model(4, 6);
+    primary.ingest(rows);
+    primary.resize({3, 6});
+    bool ok = check(rows_are(primary, {"b", "c", "d"}) && primary.scrollback_size() == 1 &&
+            primary.cursor_position().row == 0,
+        "a shrink of the active primary keeps the rows below the cursor");
+
+    term::Terminal_screen_model deferred = make_backend_owned_model(4, 6);
+    deferred.ingest(rows + QByteArrayLiteral("\x1b[?1049h"));
+    deferred.resize({3, 6});
+    deferred.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(rows_are(deferred, {"b", "c", "d"}) && deferred.scrollback_size() == 1 &&
+            deferred.cursor_position().row == 1,
+        "the deferred shrink keeps them too, and the return restores the saved row");
+
+    term::Terminal_screen_model far = make_backend_owned_model(4, 6);
+    far.ingest(QByteArrayLiteral("a\r\nb\r\nc\r\nd\x1b[1;1H"));
+    far.resize({2, 6});
+    ok &= check(rows_are(far, {"a", "b"}) && far.scrollback_size() == 0,
+        "rows more than a screen below the cursor are cut");
+    return ok;
+}
+
 bool test_resize_normalizes_saved_origin_mode_and_noop()
 {
     bool ok = true;
@@ -654,6 +725,8 @@ int main()
     ok &= test_backend_owned_saved_cursor_keeps_its_coordinates_through_a_reflow();
     ok &= test_backend_owned_saved_cursor_is_not_shifted_by_a_shrink();
     ok &= test_backend_owned_alternate_screen_starts_at_the_entry_cursor();
+    ok &= test_backend_owned_saved_cursors_live_apart_from_the_screens();
+    ok &= test_backend_owned_primary_resize_keeps_text_below_the_cursor();
     ok &= test_resize_normalizes_saved_origin_mode_and_noop();
     ok &= test_resize_preserves_primary_wide_cells_crossing_right_edge();
     ok &= test_viewport_alternate_screen_policy_hooks();

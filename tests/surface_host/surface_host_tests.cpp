@@ -22123,8 +22123,12 @@ public:
         const term::Terminal_launch_config& config,
         term::Terminal_backend_callbacks    callbacks) override
     {
-        callbacks.output_received =
-            [this, forward = std::move(callbacks.output_received)](QByteArray bytes) {
+        callbacks.output_received = [
+                this,
+                forward = std::move(callbacks.output_received)
+            ](
+                QByteArray bytes)
+            {
                 {
                     std::lock_guard lock(m_mutex);
                     m_output += bytes;
@@ -22208,12 +22212,15 @@ private:
 bool test_conpty_rows_reach_typing_and_mouse_reports(QGuiApplication& app)
 {
     QTemporaryDir dir;
-    const auto write_file = [&](const QString& name, const QByteArray& bytes) {
-        QFile file(dir.filePath(name));
-        return
-            file.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
-            file.write(bytes) == bytes.size();
-    };
+    const auto write_file = [&](
+            const QString&    name,
+            const QByteArray& bytes)
+        {
+            QFile file(dir.filePath(name));
+            return
+                file.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
+                file.write(bytes) == bytes.size();
+        };
     // cmd does not search the current directory for the scripts when
     // NoDefaultCurrentDirectoryInExePath is set, so they run as .\name.
     bool ok = check(dir.isValid() &&
@@ -22234,18 +22241,21 @@ bool test_conpty_rows_reach_typing_and_mouse_reports(QGuiApplication& app)
     fixture.surface.set_cursor_blink_enabled(false);
     pump_events(app);
     const auto metrics = current_cell_metrics(fixture.surface);
-    const auto set_grid = [&](int rows, int columns) {
-        // Stay inside each floor-based cell bin when DPI makes metrics fractional.
-        fixture.surface.setSize(
-            QSizeF((columns + 0.5) * metrics.width, (rows + 0.5) * metrics.height));
-        return pump_until(app, [&] {
-            return
-                fixture.surface.rows()    == rows    &&
-                fixture.surface.columns() == columns &&
-                (fixture.surface.process_state() != VNM_TerminalSurface::Process_state::RUNNING ||
-                 fixture.surface.backend_geometry_in_sync());
-        }, 500);
-    };
+    const auto set_grid = [&](
+            int rows,
+            int columns)
+        {
+            // Stay inside each floor-based cell bin when DPI makes metrics fractional.
+            fixture.surface.setSize(
+                QSizeF((columns + 0.5) * metrics.width, (rows + 0.5) * metrics.height));
+            return pump_until(app, [&] {
+                return
+                    fixture.surface.rows()    == rows    &&
+                    fixture.surface.columns() == columns &&
+                    (fixture.surface.process_state() != VNM_TerminalSurface::Process_state::RUNNING ||
+                     fixture.surface.backend_geometry_in_sync());
+            }, 500);
+        };
     ok &= check(set_grid(12, 40), "the ConPTY row fixture starts at 12x40");
 
     auto backend = std::make_unique<Recording_conpty_backend>();
@@ -22289,87 +22299,93 @@ bool test_conpty_rows_reach_typing_and_mouse_reports(QGuiApplication& app)
     };
     // ConPTY applies a resize on its own thread, apart from input, so typing
     // waits until cmd reads the new size from ConPTY's active buffer.
-    const auto resize = [&](int rows, int columns) {
-        if (!set_grid(rows, columns)) {
-            return false;
-        }
-        const QString size_path = dir.filePath(QStringLiteral("size.txt"));
-        const QString expected  = QStringLiteral("%1 %2").arg(rows).arg(columns);
-        for (int attempt = 0; attempt < 20; ++attempt) {
-            QFile::remove(size_path);
-            if (!run(".\\size")) {
+    const auto resize = [&](
+            int rows,
+            int columns)
+        {
+            if (!set_grid(rows, columns)) {
                 return false;
             }
-            QFile file(size_path);
-            if (file.open(QIODevice::ReadOnly) && QString::fromUtf8(file.readAll()) == expected) {
-                return true;
+            const QString size_path = dir.filePath(QStringLiteral("size.txt"));
+            const QString expected  = QStringLiteral("%1 %2").arg(rows).arg(columns);
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                QFile::remove(size_path);
+                if (!run(".\\size")) {
+                    return false;
+                }
+                QFile file(size_path);
+                if (file.open(QIODevice::ReadOnly) && QString::fromUtf8(file.readAll()) == expected) {
+                    return true;
+                }
             }
-        }
-        return false;
-    };
-    const auto check_prompt = [&](const std::string& step, bool hides_vacancy = false) {
-        const qsizetype typed_at = conpty.output().size();
-        bool step_ok = check(conpty.type("x") &&
-                pump_until(app, [&] {
-                    return
-                        conpty.output().indexOf('x', typed_at) >= 0 &&
-                        cursor_row_text().endsWith(QChar(u'x'));
-                }, 1000),
-            step + ": cmd echoes typed input");
+            return false;
+        };
+    const auto check_prompt = [&](
+            const std::string& step,
+            bool               hides_vacancy = false)
+        {
+            const qsizetype typed_at = conpty.output().size();
+            bool step_ok = check(conpty.type("x") &&
+                    pump_until(app, [&] {
+                        return
+                            conpty.output().indexOf('x', typed_at) >= 0 &&
+                            cursor_row_text().endsWith(QChar(u'x'));
+                    }, 1000),
+                step + ": cmd echoes typed input");
 
-        // ConPTY places the echo with an absolute cursor move: ESC [ row ; column H x.
-        const QByteArray echo   = conpty.output().mid(typed_at);
-        const qsizetype  x_at   = echo.indexOf("Hx");
-        const qsizetype  csi_at = x_at >= 0 ? echo.lastIndexOf("\x1b[", x_at) : -1;
-        const QList<QByteArray> position = csi_at >= 0
-            ? echo.mid(csi_at + 2, x_at - csi_at - 2).split(';')
-            : QList<QByteArray>{};
-        const int conpty_row = position.size() == 2 ? position[0].toInt() - 1 : -1;
-        step_ok &= check(conpty_row >= 0, step + ": ConPTY places the echo with a cursor move");
+            // ConPTY places the echo with an absolute cursor move: ESC [ row ; column H x.
+            const QByteArray echo   = conpty.output().mid(typed_at);
+            const qsizetype  x_at   = echo.indexOf("Hx");
+            const qsizetype  csi_at = x_at >= 0 ? echo.lastIndexOf("\x1b[", x_at) : -1;
+            const QList<QByteArray> position = csi_at >= 0
+                ? echo.mid(csi_at + 2, x_at - csi_at - 2).split(';')
+                : QList<QByteArray>{};
+            const int conpty_row = position.size() == 2 ? position[0].toInt() - 1 : -1;
+            step_ok &= check(conpty_row >= 0, step + ": ConPTY places the echo with a cursor move");
 
-        const auto frame = committed_display_frame(app, fixture.window, fixture.surface);
-        int display_row = -1;
-        for (int row = 0; frame && row < frame->grid_size.rows; ++row) {
-            if (snapshot_row_text(*frame, row) == QStringLiteral("PROMPT>x")) {
-                display_row = row;
+            const auto frame = committed_display_frame(app, fixture.window, fixture.surface);
+            int display_row = -1;
+            for (int row = 0; frame && row < frame->grid_size.rows; ++row) {
+                if (snapshot_row_text(*frame, row) == QStringLiteral("PROMPT>x")) {
+                    display_row = row;
+                }
             }
-        }
-        if (display_row < 0) {
-            std::cerr << step << ": cursor row \"" << cursor_row_text().toStdString()
-                << "\", ConPTY echo row " << conpty_row << '\n';
-        }
-        step_ok &= check(display_row >= 0, step + ": the echo is beside the displayed prompt");
-        if (hides_vacancy) {
-            step_ok &= check(display_row > conpty_row,
-                step + ": rows the growth vacated are hidden, so the prompt is displayed lower");
-        }
-
-        if (display_row >= 0 && conpty_row >= 0) {
-            const qsizetype written = conpty.writes().size();
-            const QPointF   point   = point_in_grid_cell(fixture.surface, display_row, 2);
-            step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
-                Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
-                "the prompt click is accepted");
-            step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, point,
-                Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
-                "the prompt click release is accepted");
-            const QByteArray report   = conpty.writes().mid(written);
-            const QByteArray expected = sgr_mouse_report(0, conpty_row, 2, 'M');
-            if (!report.startsWith(expected)) {
-                std::cerr << step << ": report " << report.toHex(' ').constData()
-                    << ", expected " << expected.toHex(' ').constData() << '\n';
+            if (display_row < 0) {
+                std::cerr << step << ": cursor row \"" << cursor_row_text().toStdString()
+                    << "\", ConPTY echo row " << conpty_row << '\n';
             }
-            step_ok &= check(report.startsWith(expected),
-                step + ": a click on the displayed prompt reports ConPTY's row");
-        }
+            step_ok &= check(display_row >= 0, step + ": the echo is beside the displayed prompt");
+            if (hides_vacancy) {
+                step_ok &= check(display_row > conpty_row,
+                    step + ": rows the growth vacated are hidden, so the prompt is displayed lower");
+            }
 
-        const qsizetype cleared_at = conpty.output().size();
-        step_ok &= check(conpty.type("\x1b") &&
-                pump_until(app, [&] { return conpty.output().size() > cleared_at; }, 1000),
-            step + ": cmd clears the typed input");
-        pump_events(app);
-        return step_ok;
-    };
+            if (display_row >= 0 && conpty_row >= 0) {
+                const qsizetype written = conpty.writes().size();
+                const QPointF   point   = point_in_grid_cell(fixture.surface, display_row, 2);
+                step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
+                    Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+                    "the prompt click is accepted");
+                step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, point,
+                    Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+                    "the prompt click release is accepted");
+                const QByteArray report   = conpty.writes().mid(written);
+                const QByteArray expected = sgr_mouse_report(0, conpty_row, 2, 'M');
+                if (!report.startsWith(expected)) {
+                    std::cerr << step << ": report " << report.toHex(' ').constData()
+                        << ", expected " << expected.toHex(' ').constData() << '\n';
+                }
+                step_ok &= check(report.startsWith(expected),
+                    step + ": a click on the displayed prompt reports ConPTY's row");
+            }
+
+            const qsizetype cleared_at = conpty.output().size();
+            step_ok &= check(conpty.type("\x1b") &&
+                    pump_until(app, [&] { return conpty.output().size() > cleared_at; }, 1000),
+                step + ": cmd clears the typed input");
+            pump_events(app);
+            return step_ok;
+        };
 
     ok &= check(pump_until(app, [&] { return cursor_row_text() == QStringLiteral("PROMPT>"); }, 1000),
         "cmd shows its prompt");
