@@ -4471,7 +4471,26 @@ void Terminal_screen_model::resize_buffer_state(
 
     // Retained history is archival. Resize only the live screen and keep its
     // cursor visible; growing the screen does not pull archived rows back in.
-    const int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    if (primary && m_config.backend_owns_screen_buffers) {
+        // ConPTY's reflow keeps the last rows that hold text or the cursor, up
+        // to a screen from the cursor down (textBuffer.cpp TextBuffer::Reflow).
+        // A row holds text when it has a character other than a space or
+        // continues into the next row (Row.cpp ROW::MeasureRight).
+        int content_rows = state.cursor.row + 1;
+        for (int row = static_cast<int>(state.rows.size()) - 1; row >= content_rows; --row) {
+            const Terminal_screen_row& candidate = state.rows[static_cast<std::size_t>(row)];
+            const bool holds_text = candidate.soft_wrap_columns > 0 ||
+                std::any_of(candidate.cells.begin(), candidate.cells.end(), [](const Cell& cell) {
+                    return cell.occupied && !cell.wide_continuation && cell.text != QStringLiteral(" ");
+                });
+            if (holds_text) {
+                content_rows = row + 1;
+            }
+        }
+        prefix_rows = std::max(0,
+            std::min(content_rows, state.cursor.row + grid_size.rows) - grid_size.rows);
+    }
     for (int row = 0; row < prefix_rows; ++row) {
         if (primary) {
             append_scrollback_row(
@@ -4528,17 +4547,38 @@ void Terminal_screen_model::resize_buffer_state(
 // included, as ConPTY's does.
 void Terminal_screen_model::resize_deferred_primary()
 {
-    screen_buffer_state_t& primary = m_primary_backing.active_grid_state();
-    const terminal_grid_size_t primary_size{
-        static_cast<int>(primary.rows.size()),
-        static_cast<int>(primary.rows.front().cells.size()),
-    };
-    if (grid_sizes_match(primary_size, m_config.grid_size)) {
+    if (grid_sizes_match(primary_grid_size(), m_config.grid_size)) {
         return;
     }
 
-    resize_buffer_state(primary, m_config.grid_size, true);
+    resize_primary_state(m_config.grid_size);
     mark_grid_reflow_changed();
+}
+
+// A backend that owns its screens resizes the primary as ConPTY resizes its
+// main buffer: a narrowing or widening that also shrinks reflows the width at
+// the old height first, then the height (outputStream.cpp
+// ConhostInternalGetSet::ResizeWindow, screenInfo.cpp _handleDeferredResize).
+void Terminal_screen_model::resize_primary_state(terminal_grid_size_t grid_size)
+{
+    screen_buffer_state_t&     primary      = m_primary_backing.active_grid_state();
+    const terminal_grid_size_t primary_size = primary_grid_size();
+    if (m_config.backend_owns_screen_buffers   &&
+        grid_size.rows    <  primary_size.rows &&
+        grid_size.columns != primary_size.columns)
+    {
+        resize_buffer_state(primary, {primary_size.rows, grid_size.columns}, true);
+    }
+    resize_buffer_state(primary, grid_size, true);
+}
+
+terminal_grid_size_t Terminal_screen_model::primary_grid_size() const
+{
+    const screen_buffer_state_t& primary = m_primary_backing.active_grid_state();
+    return {
+        static_cast<int>(primary.rows.size()),
+        static_cast<int>(primary.rows.front().cells.size()),
+    };
 }
 
 void Terminal_screen_model::resize_rows(
@@ -5003,7 +5043,7 @@ bool Terminal_screen_model::apply_grid_resize(
     if (!m_config.backend_owns_screen_buffers ||
         m_active_buffer_id == Terminal_buffer_id::PRIMARY)
     {
-        resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
+        resize_primary_state(grid_size);
     }
     resize_buffer_state(m_alternate_grid.active_grid_state(), grid_size, false);
     restore_buffer_state(active_buffer_state());

@@ -106,6 +106,9 @@ struct Terminal_screen_model_config
     // - while the alternate screen is active, a resize leaves the primary at
     //   its size; the primary is resized once, to the size then current, when
     //   it is active again or before the alternate screen is replaced;
+    // - a primary resize keeps the last rows that hold text or the cursor, up
+    //   to a screen from the cursor down, and a resize that changes the width
+    //   and shrinks reflows the width first;
     // - a resize never moves a saved cursor; restoring it clamps it to the grid;
     // - a cleared alternate screen being entered starts at the cursor of the
     //   screen it is entered from;
@@ -1149,6 +1152,8 @@ private:
     void resize_buffer_state(
         screen_buffer_state_t& state, terminal_grid_size_t grid_size, bool primary);
     void resize_deferred_primary();
+    void resize_primary_state(terminal_grid_size_t grid_size);
+    terminal_grid_size_t primary_grid_size() const;
     void resize_rows(std::vector<Terminal_screen_row>& rows, terminal_grid_size_t grid_size);
     std::uint64_t next_retained_line_id();
     void replace_retained_line_id(
