@@ -856,6 +856,10 @@ private:
         std::uint64_t              sequence);
 
     void refresh_viewport_presentation();
+    void finish_model_setting_change(
+        const Terminal_screen_model_result& model_result,
+        const std::optional<Live_primary_viewport_anchor>& detached_viewport_anchor,
+        QString message);
     void sync_viewport_from_model_result(
         const Terminal_screen_model_result&    result,
         std::optional<Live_primary_viewport_anchor>
