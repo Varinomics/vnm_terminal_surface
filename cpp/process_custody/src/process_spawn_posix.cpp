@@ -1,4 +1,5 @@
 #include <vnm_process_custody/process_spawn.h>
+#include "process_spawn_common_posix.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -8,10 +9,8 @@
 #include <linux/sched.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <limits>
 
 namespace vnm::process_custody {
 
@@ -172,66 +171,9 @@ Spawn_result spawn(const Spawn_request& in_request)
 {
     Spawn_result result;
 
-    if (in_request.inherited.size() > 64) {
-        result.error = "spawn: more than 64 inherited descriptors";
+    detail::Prepared_spawn prepared;
+    if (!detail::prepare_spawn(in_request, prepared, result.error)) {
         return result;
-    }
-
-    // Everything the child needs is materialized here, before fork. Typed
-    // inherited arguments resolve from the same descriptor table that dup2
-    // applies, so argv cannot name the parent's descriptor by accident.
-    std::vector<std::string> resolved_arguments;
-    resolved_arguments.reserve(in_request.argv.size());
-    for (const Spawn_argument& argument : in_request.argv) {
-        if (const auto* text = std::get_if<std::string>(&argument.value)) {
-            resolved_arguments.push_back(*text);
-            continue;
-        }
-        const std::size_t index = std::get<Inherited_reference>(argument.value).inherited_index;
-        if (index >= in_request.inherited.size()) {
-            result.error = "spawn: inherited argv reference is out of range";
-            return result;
-        }
-        resolved_arguments.push_back(std::to_string(in_request.inherited[index].child_number));
-    }
-
-    std::vector<char*> argv;
-    argv.reserve(resolved_arguments.size() + 1);
-    for (const std::string& argument : resolved_arguments) {
-        argv.push_back(const_cast<char*>(argument.c_str()));
-    }
-    argv.push_back(nullptr);
-
-    std::vector<char*> envp;
-    envp.reserve(in_request.environment.size() + 1);
-    for (const std::string& entry : in_request.environment) {
-        envp.push_back(const_cast<char*>(entry.c_str()));
-    }
-    envp.push_back(nullptr);
-
-    int sources[64];
-    int targets[64];
-    std::vector<Native_handle> child_handles;
-    child_handles.reserve(in_request.inherited.size());
-    int highest_target = 2;   // stdio positions are always part of the range that gets tidied
-    for (std::size_t i = 0; i < in_request.inherited.size(); ++i) {
-        const Inherited_descriptor& descriptor = in_request.inherited[i];
-        if (descriptor.parent_handle < 0 || descriptor.child_number < 0 ||
-            descriptor.child_number > std::numeric_limits<int>::max() - 65) {
-            result.error = "spawn: inherited descriptor entry is not a valid descriptor/number pair";
-            return result;
-        }
-        for (std::size_t j = 0; j < i; ++j) {
-            if (targets[j] == descriptor.child_number) {
-                result.error = "spawn: two inherited descriptors share child number " +
-                    std::to_string(descriptor.child_number);
-                return result;
-            }
-        }
-        sources[i]     = descriptor.parent_handle;
-        targets[i]     = descriptor.child_number;
-        child_handles.push_back(descriptor.child_number);
-        highest_target = std::max(highest_target, descriptor.child_number);
     }
 
     int error_pipe[2] = {-1, -1};
@@ -283,12 +225,12 @@ Spawn_result spawn(const Spawn_request& in_request)
         if (received != 1 || admission != 'A') _exit(127);
         run_child(
             in_request,
-            argv.data(),
-            envp.data(),
-            sources,
-            targets,
+            prepared.argv.data(),
+            prepared.envp.data(),
+            prepared.sources,
+            prepared.targets,
             in_request.inherited.size(),
-            highest_target,
+            prepared.highest_target,
             error_pipe[1]);
     }
 
@@ -368,36 +310,8 @@ Spawn_result spawn(const Spawn_request& in_request)
     result.ok             = true;
     result.process_id     = pid;
     result.process_handle = pidfd;
-    result.inherited_handles = std::move(child_handles);
+    result.inherited_handles = std::move(prepared.child_handles);
     return result;
-}
-
-Inherited_reference inherited_argument(std::size_t in_inherited_index)
-{
-    return Inherited_reference{in_inherited_index};
-}
-
-std::vector<Inherited_descriptor> inherit_standard_streams()
-{
-    std::vector<Inherited_descriptor> streams;
-    for (int fd = 0; fd <= 2; ++fd) {
-        if (fcntl(fd, F_GETFD) != -1) {
-            streams.push_back(Inherited_descriptor{fd, fd});
-        }
-    }
-    return streams;
-}
-
-bool prepare_parent_process(std::string* out_error)
-{
-    struct sigaction action{};
-    action.sa_handler = SIG_IGN;
-    sigemptyset(&action.sa_mask);
-    if (sigaction(SIGPIPE, &action, nullptr) != 0) {
-        *out_error = std::string("sigaction(SIGPIPE): ") + std::strerror(errno);
-        return false;
-    }
-    return true;
 }
 
 } // namespace vnm::process_custody
