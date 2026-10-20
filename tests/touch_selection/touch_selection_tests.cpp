@@ -8,6 +8,7 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
@@ -67,6 +68,9 @@ touch::Terminal_touch_selection_request request_at(
     request.source     = snapshot.touch_selection->source;
     request.target     = {snapshot.touch_selection->visible_rows[(std::size_t)row], column};
     request.expected_selection_generation = snapshot.touch_selection->selection_generation;
+    // As the touch controller does: the request names the presentation of the
+    // frame it addressed, or none when that frame displays native rows.
+    request.presentation = snapshot.touch_selection->presentation;
     return request;
 }
 
@@ -194,13 +198,121 @@ bool desktop_content_end_selection_contract()
             session.viewport_state().offset_from_tail == 1,
         "upward extension scrolls the presented range by one row");
     scroll.request_id = 304U;
-    scroll.expected_selection_generation = session.latest_render_snapshot_handle()->touch_selection->selection_generation;
+    // The next request names the frame the scroll produced, as the touch
+    // controller does with each rendered frame.
+    shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
+    scroll.expected_selection_generation = shown->touch_selection->selection_generation;
+    scroll.presentation = shown->touch_selection->presentation;
     scroll.scroll_lines = -1;
     scroll.target.column = 7;
     ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
             session.viewport_state().offset_from_tail == 0 &&
             session.selected_text().text == QStringLiteral("line-7\nline-8\nline-9\nprompt>"),
         "downward extension reaches the written tail without selecting the vacated rows");
+    return ok;
+}
+
+// A canvas whose frame carries no supported presentation record (absent, an
+// unknown version, or NATIVE) displays the native publication, and its touch
+// requests carry no presentation. The session addresses those requests to the
+// native rows the canvas showed, also after a handle scrolls the view.
+bool native_canvas_selection_contract()
+{
+    bool ok = true;
+    for (int variant = 0; variant < 3; ++variant) {
+        const std::string name = variant == 0 ? "absent" : variant == 1 ? "unknown" : "native";
+        auto backend = std::make_unique<Touch_backend>();
+        auto* output = backend.get();
+        auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+        config.selection_viewport_projection_enabled = true;
+        term::Terminal_session session(std::move(backend), config);
+        term::Terminal_launch_config launch;
+        launch.argv = {QStringLiteral("native-canvas-selection")};
+        launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
+        ok &= check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+            "native canvas selection fixture starts");
+        QByteArray lines;
+        for (int line = 0; line < 13; ++line) {
+            lines += QStringLiteral("w%1\r\n").arg(line, 2, 10, QLatin1Char('0')).toUtf8();
+        }
+        output->output(lines + QByteArrayLiteral("prompt>"));
+        session.process_backend_callback_events();
+        // History 12 and content end 14 in six native rows; the native view at
+        // offset 3 shows rows 9..14, the content-tail view rows 5..10.
+        session.resize(QSizeF(200.0, 40.0), {2, 20});
+        session.resize(QSizeF(200.0, 120.0), {6, 20});
+        (void)session.scroll_published_viewport_to_offset_from_tail(3);
+        const auto native = session.latest_render_snapshot_handle();
+        if (!check(native && native->viewport.scrollback_rows == 12 &&
+                native->viewport.presentation.content_end_row_exclusive == 14 &&
+                native->viewport.offset_from_tail == 3,
+                "the native view shows rows 9..14 of a content end of 14"))
+        {
+            return false;
+        }
+
+        VNM_TerminalSurface exporter;
+        const auto exporter_metrics = term::VNM_TerminalSurface_render_bridge::cell_metrics(exporter);
+        exporter.setWidth(20 * exporter_metrics.width);
+        exporter.setHeight(6 * exporter_metrics.height);
+        VNM_TerminalCanvas canvas;
+        // The canvas receives the session's publication with its presentation
+        // record withheld, unknown, or explicitly native.
+        const auto show_natively = [&]() -> std::shared_ptr<const term::Terminal_render_snapshot> {
+            term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                exporter, session.latest_render_snapshot_handle());
+            const auto exported = touch::export_terminal_canvas_frame(exporter);
+            if (!exported.frame || !exported.frame->presentation) {
+                return nullptr;
+            }
+            auto frame = std::make_shared<touch::Terminal_canvas_frame>(*exported.frame);
+            if (variant == 0) {
+                frame->presentation.reset();
+            }
+            else if (variant == 1) {
+                frame->presentation->record_version = 99U;
+            }
+            else {
+                frame->presentation->policy = touch::Terminal_canvas_presentation_policy::NATIVE;
+                frame->presentation->content_end_row_exclusive = 0;
+                frame->presentation->clear_page_start_row = 0;
+            }
+            return canvas.set_canvas_frame(frame)
+                ? term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas) : nullptr;
+        };
+        auto shown = show_natively();
+        if (!check(shown && shown->touch_selection && !shown->touch_selection->presentation &&
+                shown->visible_line_provenance.size() == 6U &&
+                shown->visible_line_provenance[2].logical_row == 11,
+                name + ": the canvas displays native rows 9..14 and its touch frame names no presentation"))
+        {
+            return false;
+        }
+        auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 2, 1, 401U);
+        const auto selected = session.apply_touch_selection(word);
+        ok &= check(selected.status == touch::Terminal_touch_selection_status::OK &&
+                session.selected_text().text == QStringLiteral("w11"),
+            name + ": a word the native canvas displays is selected");
+
+        shown = show_natively();
+        if (!check(shown && shown->touch_selection, name + ": the canvas shows the new selection")) {
+            return false;
+        }
+        auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 2, 0, 402U);
+        begin.handle = touch::Terminal_selection_handle::START;
+        ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
+            name + ": the native canvas begins a start-handle gesture");
+        auto scroll = begin;
+        scroll.request_id = 403U;
+        scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
+        scroll.scroll_lines = 1;
+        scroll.target.column = 0;
+        const auto scrolled = session.apply_touch_selection(scroll);
+        ok &= check(scrolled.status == touch::Terminal_touch_selection_status::OK &&
+                session.latest_render_snapshot_handle()->viewport.offset_from_tail == 4 &&
+                session.selected_text().text == QStringLiteral("w08\nw09\nw10\nw11"),
+            name + ": an upward handle scroll extends to the top native row the canvas then shows");
+    }
     return ok;
 }
 
@@ -1285,6 +1397,7 @@ int main(int argc, char** argv)
     bool ok = owner_selection_contract();
     ok &= consumer_capacity_selection_contract();
     ok &= desktop_content_end_selection_contract();
+    ok &= native_canvas_selection_contract();
     ok &= touch_intent_contract();
     ok &= direct_word_hold_contract();
     ok &= cursor_hold_contract();

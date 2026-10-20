@@ -23561,6 +23561,56 @@ bool test_mapping_change_without_native_geometry_change_repaints()
     return ok;
 }
 
+// Search reveal moves each consumer only as far as its own capacity needs. A
+// match the six-row native view already shows lies outside a two-row canvas at
+// the tail, so the canvas alone moves to it, live and inside a synchronized
+// hold.
+bool test_search_reveal_moves_a_smaller_canvas_to_the_match()
+{
+    bool ok = true;
+    for (const bool held : {false, true}) {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch = valid_launch_config();
+        launch.initial_grid_size = {6, 20};
+        ok &= check(session->start(launch).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(QByteArrayLiteral(
+                    "needle\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nprompt>")),
+            "the reveal fixture fills its six native rows");
+        session->set_canvas_presentation_rows(2);
+        if (held) {
+            ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+                "the reveal fixture enters a synchronized hold");
+        }
+        session->set_search_query(QStringLiteral("needle"));
+        ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)) &&
+                session->search_result_state().match_count == 1,
+            "the reveal fixture finds its one match");
+        const auto source = session->latest_render_snapshot_handle();
+        const auto native = source ? term::make_presented_snapshot(source) : nullptr;
+        const auto canvas = source
+            ? term::make_presented_snapshot(source, 2, source->presentation_offset_from_tail) : nullptr;
+        const auto shows_current_match = [](const term::Terminal_render_snapshot& frame) {
+            return snapshot_row_text(frame, 0) == QStringLiteral("needle") &&
+                std::any_of(frame.search_match_spans.begin(), frame.search_match_spans.end(),
+                    [](const auto& span) { return span.row == 0 && span.current; });
+        };
+        if (canvas && !shows_current_match(*canvas)) {
+            std::cerr << (held ? "held" : "live") << " canvas offset="
+                      << source->presentation_offset_from_tail << " rows: \""
+                      << snapshot_row_text(*canvas, 0).toStdString() << "\", \""
+                      << snapshot_row_text(*canvas, 1).toStdString() << "\"\n";
+        }
+        ok &= check(native && native->viewport.offset_from_tail == 0 && shows_current_match(*native),
+            "the native view already shows the match and stays at the tail");
+        ok &= check(canvas && source->presentation_offset_from_tail == 4 && shows_current_match(*canvas),
+            held
+                ? "a held reveal moves the smaller canvas to the match the native view shows"
+                : "a live reveal moves the smaller canvas to the match the native view shows");
+    }
+    return ok;
+}
+
 // Consumer capacity is independent of the native grid: a small canvas needs
 // offsets beyond raw history, and a large canvas can need rows after the native
 // source window. A held frame must not fill a newly requested interval with live
@@ -23729,6 +23779,7 @@ int main(int argc, char** argv)
         ok &= test_parser_resize_inside_hold_reconciles_like_host_resize();
         ok &= test_canvas_capacity_uses_its_own_range_and_frozen_coverage();
         ok &= test_search_highlights_row_coverage_with_native_source_geometry();
+        ok &= test_search_reveal_moves_a_smaller_canvas_to_the_match();
         ok &= test_hidden_cursor_endpoint_releases_incompatible_geometry();
         ok &= test_public_projection_resize_and_memory_invalidation();
         ok &= test_public_projection_geometry_release_preserves_prior_invalidation();
