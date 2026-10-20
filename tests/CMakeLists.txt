@@ -1493,6 +1493,21 @@ if(WIN32)
         LABELS "conformance;windows;conpty;surface;resize"
         TIMEOUT 60
     )
+
+    add_test(
+        NAME vnm_terminal_surface_host_conpty_rows
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --conpty-rows-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_conpty_rows PROPERTIES
+        LABELS "conformance;windows;conpty;surface;resize;mouse"
+        TIMEOUT 180
+    )
 endif()
 
 add_executable(vnm_terminal_msdf_availability
@@ -2204,6 +2219,18 @@ if(WIN32)
     )
     set_tests_properties(vnm_terminal_windows_native_cmd_resize PROPERTIES
         LABELS "conformance;windows;conpty"
+        TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_alternate_resize
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-alternate-resize
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_alternate_resize PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
         TIMEOUT 180
     )
 
