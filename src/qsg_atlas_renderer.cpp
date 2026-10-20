@@ -7949,8 +7949,10 @@ Qsg_atlas_buffer_upload_planner::plan(
         return plan;
     }
 
-    commit.bytes =
-        byte_count > 0 ? QByteArray(input.bytes, byte_count) : QByteArray();
+    if (!plan.ranges.empty() || previous_byte_count != byte_count) {
+        commit.bytes =
+            byte_count > 0 ? QByteArray(input.bytes, byte_count) : QByteArray();
+    }
     finalize_partial_upload();
     return plan;
 }

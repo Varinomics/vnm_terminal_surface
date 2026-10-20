@@ -9414,6 +9414,8 @@ bool test_atlas_logical_buffer_planner()
             !seed_slot_1.summary.rotating_slot_seed_upload &&
             seed_slot_1.summary.seeded_slots == 2,
         "frame slot rotation does not repeat a submitted logical update");
+    ok &= check(seed_slot_1.commit.bytes.constData() == seed_slot_0.commit.bytes.constData(),
+        "unchanged packed instances reuse the initialized CPU buffer history");
     ok &= check(partial_slot_0.summary.partial_upload &&
             !partial_slot_0.summary.full_upload &&
             partial_slot_0.ranges.size() == 1U &&
@@ -9429,6 +9431,9 @@ bool test_atlas_logical_buffer_planner()
     ok &= check(clean_slot_0.summary.skipped_upload &&
             clean_slot_0.summary.uploaded_bytes == 0,
         "atlas upload planner skips uploads when submitted logical bytes match");
+    ok &= check(partial_slot_1.commit.bytes.constData() == partial_slot_0.commit.bytes.constData() &&
+            clean_slot_0.commit.bytes.constData() == partial_slot_0.commit.bytes.constData(),
+        "unchanged packed instances reuse CPU history after a partial update");
     ok &= check(shifted_rows_slot_0.summary.partial_upload &&
             !shifted_rows_slot_0.summary.full_upload &&
             !shifted_rows_slot_0.summary.instance_layout_changed_upload &&
