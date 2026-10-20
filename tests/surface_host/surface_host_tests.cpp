@@ -61,6 +61,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <semaphore>
 #include <sstream>
@@ -7464,6 +7465,10 @@ bool test_control_wheel_zoom_keeps_scroll_range_on_written_rows(QGuiApplication&
 
     bool ok = true;
     Surface_fixture fixture;
+    // The walk passes four distinct renderings below its starting size. Keep
+    // that size clear of the lower clamp, which can absorb a wheel notch when
+    // the platform gives neighbouring small sizes the same drawing.
+    fixture.surface.set_font_size(24.0);
     pump_events(app);
 
     auto backend = std::make_unique<Scripted_backend>();
@@ -22282,6 +22287,306 @@ bool test_held_conpty_resize_keeps_surface_event_loop_responsive(QGuiApplication
         "held-resize Surface fixture exits after termination");
     return ok;
 }
+
+// The real ConPTY backend, keeping what the surface writes to it and what it
+// sends. Commands are typed straight into ConPTY: the test reads where ConPTY
+// and the surface put rows, not how the surface encodes keys.
+class Recording_conpty_backend final : public term::Terminal_backend
+{
+public:
+    term::Terminal_backend_result start(
+        const term::Terminal_launch_config& config,
+        term::Terminal_backend_callbacks    callbacks) override
+    {
+        callbacks.output_received = [
+                this,
+                forward = std::move(callbacks.output_received)
+            ](
+                QByteArray bytes)
+            {
+                {
+                    std::lock_guard lock(m_mutex);
+                    m_output += bytes;
+                }
+                forward(std::move(bytes));
+            };
+        return m_backend->start(config, std::move(callbacks));
+    }
+
+    term::Terminal_backend_result write(QByteArray bytes) override
+    {
+        {
+            std::lock_guard lock(m_mutex);
+            m_writes += bytes;
+        }
+        return m_backend->write(std::move(bytes));
+    }
+
+    term::Terminal_backend_result resize(term::Terminal_backend_resize_request request) override
+    {
+        return m_backend->resize(request);
+    }
+
+    term::Terminal_backend_resize_dispatch dispatch_resize(
+        term::Terminal_backend_resize_request request) override
+    {
+        return m_backend->dispatch_resize(request);
+    }
+
+    term::Terminal_backend_result set_output_paused(bool paused) override
+    {
+        return m_backend->set_output_paused(paused);
+    }
+
+    term::Terminal_backend_result interrupt() override { return m_backend->interrupt(); }
+    term::Terminal_backend_result terminate() override { return m_backend->terminate(); }
+
+    std::optional<term::terminal_cell_pixel_size_t> fixed_cell_pixel_size() const override
+    {
+        return m_backend->fixed_cell_pixel_size();
+    }
+
+    term::Terminal_backend_result set_cell_pixel_size(term::terminal_cell_pixel_size_t size) override
+    {
+        return m_backend->set_cell_pixel_size(size);
+    }
+
+    bool owns_screen_buffers() const override
+    {
+        return m_backend->owns_screen_buffers();
+    }
+
+    bool type(const QByteArray& bytes)
+    {
+        return m_backend->write(bytes).code == term::Terminal_backend_result_code::ACCEPTED;
+    }
+
+    QByteArray output() const
+    {
+        std::lock_guard lock(m_mutex);
+        return m_output;
+    }
+
+    QByteArray writes() const
+    {
+        std::lock_guard lock(m_mutex);
+        return m_writes;
+    }
+
+private:
+    std::unique_ptr<term::Terminal_backend> m_backend = term::make_windows_conpty_backend();
+    mutable std::mutex                      m_mutex;
+    QByteArray                              m_output;
+    QByteArray                              m_writes;
+};
+
+// A real cmd under ConPTY in a surface. After every primary-screen resize, and
+// after an alternate-screen excursion with resizes, cmd's typed input has to
+// echo beside the prompt the user sees, and a click on that prompt has to
+// report the row ConPTY itself placed the echo on.
+bool test_conpty_rows_reach_typing_and_mouse_reports(QGuiApplication& app)
+{
+    QTemporaryDir dir;
+    const auto write_file = [&](
+            const QString&    name,
+            const QByteArray& bytes)
+        {
+            QFile file(dir.filePath(name));
+            return
+                file.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
+                file.write(bytes) == bytes.size();
+        };
+    // cmd does not search the current directory for the scripts when
+    // NoDefaultCurrentDirectoryInExePath is set, so they run as .\name.
+    bool ok = check(dir.isValid() &&
+            write_file(QStringLiteral("lines.cmd"), QByteArrayLiteral(
+                "@for /l %%i in (1,1,6) do @echo line%%i\r\n")) &&
+            write_file(QStringLiteral("mouse.txt"), QByteArrayLiteral("\x1b[?1000h\x1b[?1006h")) &&
+            write_file(QStringLiteral("enter.txt"), QByteArrayLiteral("\x1b[?1049h")) &&
+            write_file(QStringLiteral("leave.txt"), QByteArrayLiteral("\x1b[?1049l")) &&
+            write_file(QStringLiteral("size.cmd"), QByteArrayLiteral(
+                "@powershell -NoLogo -NoProfile -Command \"$s = $Host.UI.RawUI.BufferSize; "
+                "[IO.File]::WriteAllText('%~dp0size.txt', '' + $s.Height + ' ' + $s.Width)\"\r\n")),
+        "the ConPTY row fixture writes its scripts");
+    if (!ok) {
+        return false;
+    }
+
+    Surface_fixture fixture;
+    fixture.surface.set_cursor_blink_enabled(false);
+    pump_events(app);
+    const auto metrics = current_cell_metrics(fixture.surface);
+    const auto set_grid = [&](
+            int rows,
+            int columns)
+        {
+            // Stay inside each floor-based cell bin when DPI makes metrics fractional.
+            fixture.surface.setSize(
+                QSizeF((columns + 0.5) * metrics.width, (rows + 0.5) * metrics.height));
+            return pump_until(app, [&] {
+                return
+                    fixture.surface.rows()    == rows    &&
+                    fixture.surface.columns() == columns &&
+                    (fixture.surface.process_state() != VNM_TerminalSurface::Process_state::RUNNING ||
+                     fixture.surface.backend_geometry_in_sync());
+            }, 500);
+        };
+    ok &= check(set_grid(12, 40), "the ConPTY row fixture starts at 12x40");
+
+    auto backend = std::make_unique<Recording_conpty_backend>();
+    Recording_conpty_backend& conpty = *backend;
+    const auto start_result = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+        fixture.surface,
+        std::move(backend),
+        {
+            qEnvironmentVariable("ComSpec"),
+            QStringLiteral("/d"),
+            QStringLiteral("/q"),
+            QStringLiteral("/k"),
+            QStringLiteral("prompt PROMPT$G"),
+        },
+        dir.path());
+    if (!check(start_result.accepted, "the surface starts cmd under ConPTY")) {
+        return false;
+    }
+
+    const auto prompt_count = [&] {
+        const QByteArray output = conpty.output();
+        int count = 0;
+        for (qsizetype at = output.indexOf("PROMPT>"); at >= 0; at = output.indexOf("PROMPT>", at + 1)) {
+            ++count;
+        }
+        return count;
+    };
+    const auto cursor_row_text = [&] {
+        const auto snapshot = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return snapshot ? snapshot_row_text(*snapshot, snapshot->cursor.position.row) : QString();
+    };
+    // Waits for the prompt after the command, in ConPTY's output and in the
+    // surface's published screen.
+    const auto run = [&](const QByteArray& command) {
+        const int prompts = prompt_count();
+        return
+            conpty.type(command + "\r") &&
+            pump_until(app, [&] {
+                return prompt_count() > prompts && cursor_row_text() == QStringLiteral("PROMPT>");
+            }, 1000);
+    };
+    // ConPTY applies a resize on its own thread, apart from input, so typing
+    // waits until cmd reads the new size from ConPTY's active buffer.
+    const auto resize = [&](
+            int rows,
+            int columns)
+        {
+            if (!set_grid(rows, columns)) {
+                return false;
+            }
+            const QString size_path = dir.filePath(QStringLiteral("size.txt"));
+            const QString expected  = QStringLiteral("%1 %2").arg(rows).arg(columns);
+            for (int attempt = 0; attempt < 20; ++attempt) {
+                QFile::remove(size_path);
+                if (!run(".\\size")) {
+                    return false;
+                }
+                QFile file(size_path);
+                if (file.open(QIODevice::ReadOnly) && QString::fromUtf8(file.readAll()) == expected) {
+                    return true;
+                }
+            }
+            return false;
+        };
+    const auto check_prompt = [&](
+            const std::string& step,
+            bool               hides_vacancy = false)
+        {
+            const qsizetype typed_at = conpty.output().size();
+            bool step_ok = check(conpty.type("x") &&
+                    pump_until(app, [&] {
+                        return
+                            conpty.output().indexOf('x', typed_at) >= 0 &&
+                            cursor_row_text().endsWith(QChar(u'x'));
+                    }, 1000),
+                step + ": cmd echoes typed input");
+
+            // ConPTY places the echo with an absolute cursor move: ESC [ row ; column H x.
+            const QByteArray echo   = conpty.output().mid(typed_at);
+            const qsizetype  x_at   = echo.indexOf("Hx");
+            const qsizetype  csi_at = x_at >= 0 ? echo.lastIndexOf("\x1b[", x_at) : -1;
+            const QList<QByteArray> position = csi_at >= 0
+                ? echo.mid(csi_at + 2, x_at - csi_at - 2).split(';')
+                : QList<QByteArray>{};
+            const int conpty_row = position.size() == 2 ? position[0].toInt() - 1 : -1;
+            step_ok &= check(conpty_row >= 0, step + ": ConPTY places the echo with a cursor move");
+
+            const auto frame = committed_display_frame(app, fixture.window, fixture.surface);
+            int display_row = -1;
+            for (int row = 0; frame && row < frame->grid_size.rows; ++row) {
+                if (snapshot_row_text(*frame, row) == QStringLiteral("PROMPT>x")) {
+                    display_row = row;
+                }
+            }
+            if (display_row < 0) {
+                std::cerr << step << ": cursor row \"" << cursor_row_text().toStdString()
+                    << "\", ConPTY echo row " << conpty_row << '\n';
+            }
+            step_ok &= check(display_row >= 0, step + ": the echo is beside the displayed prompt");
+            if (hides_vacancy) {
+                step_ok &= check(display_row > conpty_row,
+                    step + ": rows the growth vacated are hidden, so the prompt is displayed lower");
+            }
+
+            if (display_row >= 0 && conpty_row >= 0) {
+                const qsizetype written = conpty.writes().size();
+                const QPointF   point   = point_in_grid_cell(fixture.surface, display_row, 2);
+                step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, point,
+                    Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+                    "the prompt click is accepted");
+                step_ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, point,
+                    Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+                    "the prompt click release is accepted");
+                const QByteArray report   = conpty.writes().mid(written);
+                const QByteArray expected = sgr_mouse_report(0, conpty_row, 2, 'M');
+                if (!report.startsWith(expected)) {
+                    std::cerr << step << ": report " << report.toHex(' ').constData()
+                        << ", expected " << expected.toHex(' ').constData() << '\n';
+                }
+                step_ok &= check(report.startsWith(expected),
+                    step + ": a click on the displayed prompt reports ConPTY's row");
+            }
+
+            const qsizetype cleared_at = conpty.output().size();
+            step_ok &= check(conpty.type("\x1b") &&
+                    pump_until(app, [&] { return conpty.output().size() > cleared_at; }, 1000),
+                step + ": cmd clears the typed input");
+            pump_events(app);
+            return step_ok;
+        };
+
+    ok &= check(pump_until(app, [&] { return cursor_row_text() == QStringLiteral("PROMPT>"); }, 1000),
+        "cmd shows its prompt");
+    ok &= check(run(".\\lines") && run("type mouse.txt"),
+        "cmd writes lines and enables SGR mouse reports");
+    ok &= check_prompt("start");
+    ok &= check(resize(6, 40), "ConPTY shrinks to 6x40");
+    ok &= check_prompt("shrink");
+    ok &= check(resize(14, 40), "ConPTY grows to 14x40");
+    ok &= check_prompt("grow", true);
+    ok &= check(resize(14, 50), "ConPTY widens to 14x50");
+    ok &= check_prompt("widen");
+
+    ok &= check(run("type enter.txt"), "the child enters the alternate screen");
+    ok &= check(resize(6, 50) && resize(16, 50),
+        "ConPTY resizes its alternate buffer twice");
+    ok &= check(run("type leave.txt"), "the child returns to the primary screen");
+    ok &= check_prompt("return from the alternate screen");
+
+    ok &= check(fixture.surface.terminate_process(), "the ConPTY row fixture terminates cmd");
+    ok &= check(pump_until(app, [&] {
+            return fixture.surface.process_state() == VNM_TerminalSurface::Process_state::EXITED;
+        }, 1000),
+        "cmd exits");
+    return ok;
+}
 #endif
 
 bool test_async_surface_resize_receipt_updates_geometry_snapshot(QGuiApplication& app)
@@ -22528,7 +22833,6 @@ int main(int argc, char** argv)
         ok &= test_geometry_change_resizes_session(app);
         ok &= test_control_wheel_resize_keeps_event_frontier(app);
         ok &= test_surface_key_routes_stop_at_callback_frontier(app);
-        ok &= test_async_surface_resize_receipt_updates_geometry_snapshot(app);
         return ok ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--selection-copy-intent-only"))) {
@@ -22593,8 +22897,12 @@ int main(int argc, char** argv)
     if (app.arguments().contains(QStringLiteral("--held-resize-gui"))) {
         return test_held_conpty_resize_keeps_surface_event_loop_responsive(app) ? 0 : 1;
     }
+    if (app.arguments().contains(QStringLiteral("--conpty-rows-only"))) {
+        return test_conpty_rows_reach_typing_and_mouse_reports(app) ? 0 : 1;
+    }
 #endif
 
+    const bool core_only = app.arguments().contains(QStringLiteral("--core-only"));
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_honored_text_area_resize_can_be_returned_to_item_geometry(app);
@@ -22683,11 +22991,15 @@ int main(int argc, char** argv)
     ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
     ok &= test_pending_mouse_report_preserves_following_key_input(app);
     ok &= test_single_pending_mouse_press_survives_frontier_backlog(app);
-    ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+    if (!core_only) {
+        ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+    }
     ok &= test_page_key_scrolls_before_post_frontier_alternate_screen(app);
     ok &= test_surface_text_input_routes_keep_one_frontier(app);
     ok &= test_mouse_input_stops_at_callback_frontier(app);
-    ok &= test_control_wheel_resize_keeps_event_frontier(app);
+    if (!core_only) {
+        ok &= test_control_wheel_resize_keeps_event_frontier(app);
+    }
     ok &= test_reentrant_paste_captures_new_public_frontier(app);
     ok &= test_resize_policy_setters_keep_callback_frontier(app);
     ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
@@ -22695,7 +23007,9 @@ int main(int argc, char** argv)
     ok &= test_drag_after_new_press_reports_repeated_cell(app);
     ok &= test_repeated_drag_after_local_scroll_returns_to_tail(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
-    ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
+    if (!core_only) {
+        ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
+    }
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
     ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
     ok &= test_transcript_timing_diagnostics_records_hot_paths();
@@ -22747,9 +23061,11 @@ int main(int argc, char** argv)
     ok &= test_heap_surface_destroy_closes_queued_worker_callback(app);
     ok &= test_after_frame_callback_update_latch_falls_back_on_window_destroy(app);
     ok &= test_window_destroy_keeps_surface_session_until_surface_destroy(app);
-    ok &= test_geometry_change_resizes_session(app);
-    ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
-    ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
+    if (!core_only) {
+        ok &= test_geometry_change_resizes_session(app);
+        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
+        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
+    }
     ok &= test_backend_exit_updates_surface(app);
     ok &= test_public_lifecycle_methods(app);
     ok &= test_terminal_icon_name_notifications(app);

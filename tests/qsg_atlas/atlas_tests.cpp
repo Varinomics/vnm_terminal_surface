@@ -1858,7 +1858,7 @@ term::Terminal_render_cell make_pixel_cell(
         display_width,
         false,
         style_id,
-        term::render_cell_text_category_for_validation(text),
+        term::Terminal_render_cell_text::category_for_text(text),
     };
 }
 

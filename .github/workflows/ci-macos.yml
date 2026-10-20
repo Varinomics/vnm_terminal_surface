@@ -140,7 +140,7 @@ jobs:
               'custody-rights': ['-R', '^vnm_process_custody_truncated_rights_tests$'],
               'native': ['-R', native, '-E', custody],
               'remaining': ['-E', native],
-              'focused': ['-R', '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session|surface_host)$'],
+              'focused': ['-R', '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session(_resize_frontier)?|surface_host(_resize_frontier|_async_resize_metadata|_pending_mouse_wheel_trace)?)$'],
           }
           evidence = Path(os.environ['RUNNER_TEMP'])
 

@@ -1346,6 +1346,7 @@ add_test(
         ${vnm_terminal_qt_unscaled_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --core-only
 )
 
 set(vnm_terminal_surface_host_timeout 60)
@@ -1491,6 +1492,21 @@ if(WIN32)
     set_tests_properties(vnm_terminal_surface_host_held_resize_gui PROPERTIES
         LABELS "conformance;windows;conpty;surface;resize"
         TIMEOUT 60
+    )
+
+    add_test(
+        NAME vnm_terminal_surface_host_conpty_rows
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --conpty-rows-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_conpty_rows PROPERTIES
+        LABELS "conformance;windows;conpty;surface;resize;mouse"
+        TIMEOUT 180
     )
 endif()
 
@@ -2038,6 +2054,7 @@ add_test(
         "${CMAKE_COMMAND}" -E env
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_backend_session>"
+        --core-only
 )
 
 add_executable(vnm_terminal_backend_output_capture
@@ -2203,6 +2220,42 @@ if(WIN32)
     set_tests_properties(vnm_terminal_windows_native_cmd_resize PROPERTIES
         LABELS "conformance;windows;conpty"
         TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_alternate_resize
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-alternate-resize
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_alternate_resize PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_alternate_entry
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-alternate-entry
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_alternate_entry PROPERTIES
+        LABELS "conformance;windows;conpty"
+        TIMEOUT 120
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_resize_text_below
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-resize-text-below
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_resize_text_below PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 120
     )
 
     set_tests_properties(vnm_terminal_windows_native_cmd PROPERTIES

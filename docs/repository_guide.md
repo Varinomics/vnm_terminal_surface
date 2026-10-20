@@ -187,7 +187,8 @@ CTest names are the stable way to find a test. The main families are:
 - `vnm_terminal_screen_*`, `vnm_terminal_terminal_modes`, and
   `vnm_terminal_viewport`: screen model behavior, SGR, model operations,
   alternate screen, private modes, and viewport control.
-- `vnm_terminal_backend_session`, `vnm_terminal_windows_conpty_backend`, and
+- `vnm_terminal_backend_session` and its `_resize_frontier` entry,
+  `vnm_terminal_windows_conpty_backend`, and
   `vnm_terminal_posix_pty_backend`: session and platform backend behavior.
 - `vnm_terminal_sixel_decoder`, `vnm_terminal_sixel_placement`, and the
   Windows-only `vnm_terminal_windows_conpty_sixel_cursor_sync`: sixel
@@ -197,7 +198,9 @@ CTest names are the stable way to find a test. The main families are:
 - `vnm_terminal_qt_*`, `vnm_terminal_render_*`,
   `vnm_terminal_qsg_*`, and `vnm_terminal_shaping_contract`: metrics, render
   snapshots, render frames, atlas QSG rendering, and shaping checks.
-- `vnm_terminal_surface_host`, `vnm_terminal_input_encoder`, and
+- `vnm_terminal_surface_host` and its `_resize_frontier`,
+  `_async_resize_metadata`, and optional `_pending_mouse_wheel_trace` entries,
+  `vnm_terminal_input_encoder`, and
   `vnm_terminal_behavior_smoke`: public surface host behavior, input encoding,
   and behavior-smoke launches through the canvas fixture.
 - `vnm_terminal_compat_smoke`: compatibility smoke behavior when the target
@@ -227,9 +230,9 @@ Focused examples:
 ```powershell
 ctest --test-dir build -C Release -R "^vnm_terminal_(parser|sequence_matrix|unicode)" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(screen|terminal_modes|viewport)" --output-on-failure
-ctest --test-dir build -C Release -R "^vnm_terminal_(backend_session|windows_conpty_backend|posix_pty_backend)$" --output-on-failure
+ctest --test-dir build -C Release -R "^vnm_terminal_(backend_session($|_)|windows_conpty_backend$|posix_pty_backend$)" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(qt|render|qsg|shaping)" --output-on-failure
-ctest --test-dir build -C Release -R "^vnm_terminal_(surface_host|input_encoder|behavior_smoke)$" --output-on-failure
+ctest --test-dir build -C Release -R "^vnm_terminal_(surface_host($|_)|input_encoder$|behavior_smoke$)" --output-on-failure
 ```
 
 For AddressSanitizer checks on Windows, use a separate build directory and an

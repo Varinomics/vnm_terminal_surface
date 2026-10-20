@@ -99,6 +99,25 @@ struct Terminal_screen_model_config
     // Must be positive when present. Without it no pixel geometry is known, so
     // the CSI 14 t and CSI 16 t pixel reports stay unsupported.
     std::optional<terminal_cell_pixel_size_t> cell_pixel_size;
+    // Set for a backend that owns its screen buffers (ConPTY). The model then
+    // changes its screens as that backend changes its own, so both keep
+    // addressing the same rows:
+    // - while the alternate screen is active, a resize leaves the primary at
+    //   its size; the primary is resized once, to the size then current, when
+    //   it is active again or before the alternate screen is replaced;
+    // - a primary resize reflows a line's text without its trailing spaces,
+    //   written or not, and keeps the attributes past the text in the row the
+    //   text ends on; it keeps the last rows that hold text or the cursor, up
+    //   to a screen from the cursor down, and a resize that changes the width
+    //   and shrinks reflows the width first;
+    // - a resize never moves a saved cursor; restoring it clamps it to the grid;
+    // - a cleared alternate screen being entered starts at the cursor of the
+    //   screen it is entered from;
+    // - each screen keeps its saved cursor apart from its rows, and one never
+    //   saved restores to home with default attributes; every 1049 entry saves
+    //   the active screen's cursor and every 1049 return restores the
+    //   primary's.
+    bool                   backend_owns_screen_buffers              = false;
 };
 
 enum class Terminal_screen_model_config_status
@@ -1107,6 +1126,9 @@ private:
     };
 
     screen_buffer_state_t make_empty_buffer_state();
+    screen_buffer_state_t make_entered_alternate_state(
+        terminal_grid_position_t     entry_cursor,
+        const saved_cursor_state_t&  alternate_saved_cursor);
     void restore_buffer_state(const screen_buffer_state_t& state);
     void save_active_buffer_state();
     screen_buffer_state_t& active_buffer_state();
@@ -1116,6 +1138,10 @@ private:
     void reflow_primary_rows(screen_buffer_state_t& state, int columns);
     void resize_buffer_state(
         screen_buffer_state_t& state, terminal_grid_size_t grid_size, bool primary);
+    void resize_deferred_primary();
+    void resize_primary_state(terminal_grid_size_t grid_size);
+    terminal_grid_size_t primary_grid_size() const;
+    static bool is_space_cell(const Cell& cell);
     void resize_rows(std::vector<Terminal_screen_row>& rows, terminal_grid_size_t grid_size);
     std::uint64_t next_retained_line_id();
     void replace_retained_line_id(
@@ -1662,6 +1688,7 @@ private:
         retained_row_record_t&         row) const;
 
     int active_grid_row_count() const;
+    int primary_active_grid_row_count() const;
     int primary_backing_row_count() const;
     int primary_backing_active_grid_first_row() const;
     bool active_grid_row_is_valid(active_grid_row_t row) const;

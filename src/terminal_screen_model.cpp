@@ -3519,6 +3519,25 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
     return state;
 }
 
+// A cleared alternate screen being entered. A backend that owns its screens
+// starts it at the cursor of the screen it is entered from, the primary's or
+// the replaced alternate screen's, as ConPTY creates its alternate buffer
+// (screenInfo.cpp _CreateAltBuffer), and keeps the alternate screen's saved
+// cursor, which ConPTY holds apart from the buffer (adaptDispatch.hpp
+// _savedCursorState).
+Terminal_screen_model::screen_buffer_state_t
+Terminal_screen_model::make_entered_alternate_state(
+    terminal_grid_position_t     entry_cursor,
+    const saved_cursor_state_t&  alternate_saved_cursor)
+{
+    screen_buffer_state_t state = make_empty_buffer_state();
+    if (m_config.backend_owns_screen_buffers) {
+        state.cursor       = entry_cursor;
+        state.saved_cursor = alternate_saved_cursor;
+    }
+    return state;
+}
+
 Terminal_screen_model::Retained_history_storage::Retained_history_storage() = default;
 
 Terminal_screen_model::Retained_history_storage::~Retained_history_storage() = default;
@@ -4128,14 +4147,25 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
         std::optional<std::size_t> cursor_offset;
         std::optional<std::size_t> saved_offset;
         bool contains_latent_wide_cell = false;
+        int  last_source_text_columns  = 0;
         for (std::size_t index = first; index <= last; ++index) {
             const Terminal_screen_row& source = state.rows[index];
             int count = (int)source.cells.size();
-            while (count > 0 &&
-                !source.cells[(std::size_t)count - 1U].occupied &&
-                !source.cells[(std::size_t)count - 1U].protected_cell)
-            {
-                --count;
+            if (m_config.backend_owns_screen_buffers) {
+                // ConPTY's reflow packs a line's text without its trailing
+                // spaces, written or not, and copies the attributes past the
+                // text apart from it (textBuffer.cpp TextBuffer::Reflow).
+                while (count > 0 && is_space_cell(source.cells[(std::size_t)count - 1U])) {
+                    --count;
+                }
+            }
+            else {
+                while (count > 0 &&
+                    !source.cells[(std::size_t)count - 1U].occupied &&
+                    !source.cells[(std::size_t)count - 1U].protected_cell)
+                {
+                    --count;
+                }
             }
             // Preserve written cells beyond an earlier wide-glyph wrap gap.
             count = std::max(count, source.soft_wrap_columns);
@@ -4151,6 +4181,9 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 (int)index == old_saved.position.row)
             {
                 count = std::max(count, old_saved.position.column + 1);
+            }
+            if (index == last) {
+                last_source_text_columns = count;
             }
 
             std::size_t origin_span_index = 0U;
@@ -4377,6 +4410,18 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             offset = end_offset;
         }
         map_position(cells.size(), std::min(column, columns - 1), column == columns);
+        if (m_config.backend_owns_screen_buffers) {
+            // Past the text, the line's last source row keeps its attributes in
+            // the row the text ends on, as ConPTY's reflow copies them.
+            const std::vector<Cell>& tail = state.rows[last].cells;
+            for (int source_column = last_source_text_columns, target_column = column;
+                 source_column < static_cast<int>(tail.size()) && target_column < columns;
+                 ++source_column, ++target_column)
+            {
+                row.cells[static_cast<std::size_t>(target_column)] =
+                    tail[static_cast<std::size_t>(source_column)];
+            }
+        }
         finish_row_provenance(row);
         rows.push_back(std::move(row));
         first = last + 1U;
@@ -4389,6 +4434,16 @@ void Terminal_screen_model::resize_buffer_state(
     terminal_grid_size_t   grid_size,
     bool                   primary)
 {
+    // A backend that owns its screens never moves a saved cursor. ConPTY keeps
+    // DECSC and 1049 saves at the coordinates the application saved, and its
+    // restore clamps them to the grid (adaptDispatch.cpp CursorSaveState and
+    // CursorRestoreState), as restore_cursor does. Such a saved cursor takes no
+    // part in the resize, reflow included.
+    const saved_cursor_state_t kept_saved_cursor = state.saved_cursor;
+    if (m_config.backend_owns_screen_buffers) {
+        state.saved_cursor.valid = false;
+    }
+
     const bool width_changed = state.rows.front().cells.size() != (std::size_t)grid_size.columns;
     if (primary && width_changed) {
         reflow_primary_rows(state, grid_size.columns);
@@ -4401,7 +4456,24 @@ void Terminal_screen_model::resize_buffer_state(
 
     // Retained history is archival. Resize only the live screen and keep its
     // cursor visible; growing the screen does not pull archived rows back in.
-    const int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    if (primary && m_config.backend_owns_screen_buffers) {
+        // ConPTY's reflow keeps the last rows that hold text or the cursor, up
+        // to a screen from the cursor down (textBuffer.cpp TextBuffer::Reflow).
+        // A row holds text when it has a character other than a space or
+        // continues into the next row (Row.cpp ROW::MeasureRight).
+        int content_rows = state.cursor.row + 1;
+        for (int row = static_cast<int>(state.rows.size()) - 1; row >= content_rows; --row) {
+            const Terminal_screen_row& candidate = state.rows[static_cast<std::size_t>(row)];
+            const bool holds_text = candidate.soft_wrap_columns > 0 ||
+                !std::all_of(candidate.cells.begin(), candidate.cells.end(), is_space_cell);
+            if (holds_text) {
+                content_rows = row + 1;
+            }
+        }
+        prefix_rows = std::max(0,
+            std::min(content_rows, state.cursor.row + grid_size.rows) - grid_size.rows);
+    }
     for (int row = 0; row < prefix_rows; ++row) {
         if (primary) {
             append_scrollback_row(
@@ -4429,11 +4501,62 @@ void Terminal_screen_model::resize_buffer_state(
         }
         state.saved_cursor.origin_mode = false;
     }
+    if (m_config.backend_owns_screen_buffers) {
+        state.saved_cursor = kept_saved_cursor;
+    }
     state.scroll_top    = 0;
     state.scroll_bottom = grid_size.rows - 1;
     state.scroll_left   = 0;
     state.scroll_right  = grid_size.columns - 1;
     state.origin_mode   = false;
+}
+
+// ConPTY resizes its inactive main buffer once, to the size then current, when
+// the buffer is used again: on return from the alternate buffer and before an
+// active alternate buffer is replaced (screenInfo.cpp _handleDeferredResize).
+// A primary already at that size stays as it is, margins included, as
+// ConPTY's does.
+void Terminal_screen_model::resize_deferred_primary()
+{
+    if (grid_sizes_match(primary_grid_size(), m_config.grid_size)) {
+        return;
+    }
+
+    resize_primary_state(m_config.grid_size);
+    mark_grid_reflow_changed();
+}
+
+// A backend that owns its screens resizes the primary as ConPTY resizes its
+// main buffer: a narrowing or widening that also shrinks reflows the width at
+// the old height first, then the height (outputStream.cpp
+// ConhostInternalGetSet::ResizeWindow, screenInfo.cpp _handleDeferredResize).
+void Terminal_screen_model::resize_primary_state(terminal_grid_size_t grid_size)
+{
+    screen_buffer_state_t&     primary      = m_primary_backing.active_grid_state();
+    const terminal_grid_size_t primary_size = primary_grid_size();
+    if (m_config.backend_owns_screen_buffers   &&
+        grid_size.rows    <  primary_size.rows &&
+        grid_size.columns != primary_size.columns)
+    {
+        resize_buffer_state(primary, {primary_size.rows, grid_size.columns}, true);
+    }
+    resize_buffer_state(primary, grid_size, true);
+}
+
+// A space, written or not, whatever its attributes: ConPTY's reflow measures a
+// line's text up to its last other character (Row.cpp ROW::MeasureRight).
+bool Terminal_screen_model::is_space_cell(const Cell& cell)
+{
+    return cell.text == QStringLiteral(" ");
+}
+
+terminal_grid_size_t Terminal_screen_model::primary_grid_size() const
+{
+    const screen_buffer_state_t& primary = m_primary_backing.active_grid_state();
+    return {
+        static_cast<int>(primary.rows.size()),
+        static_cast<int>(primary.rows.front().cells.size()),
+    };
 }
 
 void Terminal_screen_model::resize_rows(
@@ -4829,8 +4952,14 @@ bool Terminal_screen_model::apply_grid_resize(
     save_active_buffer_state();
     // Reflowed prefix rows are sealed into history at their new source width.
     m_config.grid_size = grid_size;
-    resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
-    resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size, false);
+    // An inactive primary whose backend owns its screens waits for
+    // resize_deferred_primary.
+    if (!m_config.backend_owns_screen_buffers ||
+        m_active_buffer_id == Terminal_buffer_id::PRIMARY)
+    {
+        resize_primary_state(grid_size);
+    }
+    resize_buffer_state(m_alternate_grid.active_grid_state(), grid_size, false);
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
     if (guard_primary_repaint_recovery) {
@@ -6813,6 +6942,20 @@ void Terminal_screen_model::apply_dec_private_mode(
             }
             return;
         case 1049:
+            // A backend that owns its screens saves the active screen's cursor
+            // on every entry and restores the primary's on every return
+            // (adaptDispatch.cpp _SetAlternateScreenBufferMode).
+            if (m_config.backend_owns_screen_buffers) {
+                if (enabled) {
+                    save_cursor();
+                    enter_alternate_screen(true, mode);
+                }
+                else {
+                    (void)leave_alternate_screen(true);
+                    restore_cursor();
+                }
+                return;
+            }
             if (enabled) {
                 if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
                     save_cursor();
@@ -6905,11 +7048,14 @@ int Terminal_screen_model::dec_private_mode_status(int mode) const
 void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int active_mode)
 {
     cancel_primary_repaint_recovery_candidate();
+    const terminal_grid_position_t entry_cursor = m_cursor;
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
         const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
         save_active_buffer_state();
         if (clear_alternate) {
-            m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+            m_alternate_grid.active_grid_state() = make_entered_alternate_state(
+                entry_cursor,
+                m_alternate_grid.active_grid_state().saved_cursor);
         }
         m_active_buffer_id = Terminal_buffer_id::ALTERNATE;
         record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -6918,7 +7064,9 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
     }
     else
     if (clear_alternate) {
-        m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+        resize_deferred_primary();
+        m_alternate_grid.active_grid_state() =
+            make_entered_alternate_state(entry_cursor, m_saved_cursor);
         mark_terminal_content_changed();
         restore_buffer_state(m_alternate_grid.active_grid_state());
     }
@@ -6942,8 +7090,16 @@ bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
 
     save_active_buffer_state();
     if (clear_alternate) {
+        const saved_cursor_state_t alternate_saved_cursor =
+            m_alternate_grid.active_grid_state().saved_cursor;
         m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+        // A backend that owns its screens keeps the alternate screen's saved
+        // cursor apart from its rows (adaptDispatch.hpp _savedCursorState).
+        if (m_config.backend_owns_screen_buffers) {
+            m_alternate_grid.active_grid_state().saved_cursor = alternate_saved_cursor;
+        }
     }
+    resize_deferred_primary();
     const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
     m_active_buffer_id = Terminal_buffer_id::PRIMARY;
     record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -6969,7 +7125,9 @@ void Terminal_screen_model::save_cursor()
 
 void Terminal_screen_model::restore_cursor()
 {
-    if (!m_saved_cursor.valid) {
+    // A backend that owns its screens restores a cursor never saved as its
+    // default: home, with default attributes (adaptDispatch.hpp CursorState).
+    if (!m_saved_cursor.valid && !m_config.backend_owns_screen_buffers) {
         return;
     }
 
@@ -10102,9 +10260,16 @@ int Terminal_screen_model::active_grid_row_count() const
     return m_config.grid_size.rows;
 }
 
+// The primary's own height: while its resize is deferred, the inactive primary
+// keeps the height it had when the alternate screen became active.
+int Terminal_screen_model::primary_active_grid_row_count() const
+{
+    return static_cast<int>(primary_active_grid_rows().size());
+}
+
 int Terminal_screen_model::primary_backing_row_count() const
 {
-    return scrollback_size() + active_grid_row_count();
+    return scrollback_size() + primary_active_grid_row_count();
 }
 
 int Terminal_screen_model::primary_backing_active_grid_first_row() const
@@ -10159,7 +10324,7 @@ Terminal_screen_model::active_grid_row_from_primary_backing(primary_backing_row_
     active_grid_row_t converted{
         row.value - primary_backing_active_grid_first_row(),
     };
-    if (!active_grid_row_is_valid(converted)) {
+    if (converted.value < 0) {
         return std::nullopt;
     }
 

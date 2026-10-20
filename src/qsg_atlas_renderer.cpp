@@ -261,16 +261,16 @@ struct Atlas_prepare_commit
     bool                   render_cursor_rect_state_invalidation = false;
 };
 
-struct Atlas_prepare_layout_state
+struct Atlas_row_capacities
 {
-    std::vector<int> render_rect_background_row_capacities;
-    std::vector<int> render_rect_selection_row_capacities;
-    std::vector<int> render_rect_graphic_row_capacities;
-    std::vector<int> render_rect_decoration_row_capacities;
-    std::vector<int> render_rect_cursor_row_capacities;
-    std::vector<int> render_rect_overlay_row_capacities;
-    std::vector<int> render_glyph_text_row_capacities;
-    std::vector<int> render_glyph_cursor_text_row_capacities;
+    std::vector<int> rect_background;
+    std::vector<int> rect_selection;
+    std::vector<int> rect_graphic;
+    std::vector<int> rect_decoration;
+    std::vector<int> rect_cursor;
+    std::vector<int> rect_overlay;
+    std::vector<int> glyph_text;
+    std::vector<int> glyph_cursor_text;
 };
 
 struct Atlas_draw_pass_state
@@ -2312,8 +2312,7 @@ public:
             rect_ready = ensure_rect_resources(rhi, target);
         }
 
-        const Atlas_prepare_layout_state prepare_layout_state =
-            capture_prepare_layout_state();
+        const Atlas_row_capacities prepare_row_capacities = m_row_capacities;
         const Atlas_draw_pass_state committed_draw_pass_state =
             capture_draw_pass_state();
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -2404,7 +2403,7 @@ public:
                 m_msdf_text_resource_failure_disabled = true;
                 retried_msdf_text_fallback = true;
                 discard_pending_glyph_resources();
-                restore_prepare_layout_state(prepare_layout_state);
+                m_row_capacities = prepare_row_capacities;
                 discard_prepared_glyph_resolutions();
                 prepare_result = prepare_atlas_instances(rhi);
                 prepared_generation_complete =
@@ -2498,7 +2497,7 @@ public:
         }
         else {
             restore_draw_pass_state(committed_draw_pass_state);
-            restore_prepare_layout_state(prepare_layout_state);
+            m_row_capacities = prepare_row_capacities;
             discard_prepared_glyph_resolutions();
             m_cache.reset();
             m_force_next_render_full_upload = true;
@@ -2713,15 +2712,15 @@ private:
         m_msdf_text_upload_planner.reset();
         m_glyph_sampler_mode     = Qsg_atlas_sampler_mode::UNKNOWN;
         m_msdf_text_sampler_mode = Qsg_atlas_sampler_mode::UNKNOWN;
-        m_render_glyph_text_row_capacities.clear();
-        m_render_glyph_cursor_text_row_capacities.clear();
+        m_row_capacities.glyph_text.clear();
+        m_row_capacities.glyph_cursor_text.clear();
         m_glyph_buffer_row_stable_ranges.clear();
-        m_render_rect_background_row_capacities.clear();
-        m_render_rect_selection_row_capacities.clear();
-        m_render_rect_graphic_row_capacities.clear();
-        m_render_rect_decoration_row_capacities.clear();
-        m_render_rect_cursor_row_capacities.clear();
-        m_render_rect_overlay_row_capacities.clear();
+        m_row_capacities.rect_background.clear();
+        m_row_capacities.rect_selection.clear();
+        m_row_capacities.rect_graphic.clear();
+        m_row_capacities.rect_decoration.clear();
+        m_row_capacities.rect_cursor.clear();
+        m_row_capacities.rect_overlay.clear();
         m_rect_buffer_row_stable_ranges.clear();
         m_msdf_text_resources_ready            = false;
         m_msdf_text_resource_failure_disabled = false;
@@ -3620,8 +3619,9 @@ private:
         return ranges;
     }
 
-    std::vector<int> glyph_required_row_capacities(
-        const atlas_pass_range_t& pass) const
+    std::vector<int> required_row_capacities(
+        const atlas_pass_range_t&     pass,
+        const std::vector<int>&       logical_rows) const
     {
         std::vector<int> row_capacities;
         if (!pass.has_instances() || m_render_row_count <= 0) {
@@ -3634,23 +3634,22 @@ private:
         for (quint32 offset = 0U; offset < pass.count; ++offset) {
             const std::size_t instance =
                 static_cast<std::size_t>(pass.first + offset);
-            if (instance >= m_glyph_instance_rows.size()) {
+            if (instance >= logical_rows.size()) {
                 continue;
             }
 
-            const int row = m_glyph_instance_rows[instance];
+            const int row = logical_rows[instance];
             if (row < 0 || row >= m_render_row_count) {
                 continue;
             }
 
-            int& row_count = row_capacities[static_cast<std::size_t>(row)];
-            ++row_count;
+            ++row_capacities[static_cast<std::size_t>(row)];
         }
 
         return row_capacities;
     }
 
-    void update_render_glyph_row_capacities(
+    void update_render_row_capacities(
         std::vector<int>&        capacities,
         const std::vector<int>&  required_capacities)
     {
@@ -3773,88 +3772,32 @@ private:
         m_glyph_buffer_row_stable_ranges.clear();
 
         const std::vector<int> text_required_capacities =
-            glyph_required_row_capacities(logical_text_pass);
+            required_row_capacities(logical_text_pass, m_glyph_instance_rows);
         const std::vector<int> cursor_required_capacities =
-            glyph_required_row_capacities(logical_cursor_text_pass);
-        update_render_glyph_row_capacities(
-            m_render_glyph_text_row_capacities,
+            required_row_capacities(logical_cursor_text_pass, m_glyph_instance_rows);
+        update_render_row_capacities(
+            m_row_capacities.glyph_text,
             text_required_capacities);
-        update_render_glyph_row_capacities(
-            m_render_glyph_cursor_text_row_capacities,
+        update_render_row_capacities(
+            m_row_capacities.glyph_cursor_text,
             cursor_required_capacities);
 
         m_text_pass = append_row_stable_glyph_pass(
             logical_text_pass,
-            m_render_glyph_text_row_capacities,
+            m_row_capacities.glyph_text,
             m_glyph_buffer_row_stable_ranges);
         m_cursor_text_pass = append_row_stable_glyph_pass(
             logical_cursor_text_pass,
-            m_render_glyph_cursor_text_row_capacities,
+            m_row_capacities.glyph_cursor_text,
             m_glyph_buffer_row_stable_ranges);
 
         result.render.glyph_buffer_instances =
             static_cast<int>(m_glyph_buffer_instances.size());
         result.render.glyph_text_row_capacity =
-            render_glyph_row_capacity_max(m_render_glyph_text_row_capacities);
+            render_glyph_row_capacity_max(m_row_capacities.glyph_text);
         result.render.glyph_cursor_text_row_capacity =
             render_glyph_row_capacity_max(
-                m_render_glyph_cursor_text_row_capacities);
-    }
-
-    std::vector<int> rect_required_row_capacities(
-        const atlas_pass_range_t&     pass,
-        const std::vector<int>&       logical_rows) const
-    {
-        std::vector<int> row_capacities;
-        if (!pass.has_instances() || m_render_row_count <= 0) {
-            return row_capacities;
-        }
-
-        row_capacities.assign(
-            static_cast<std::size_t>(m_render_row_count),
-            0);
-        for (quint32 offset = 0U; offset < pass.count; ++offset) {
-            const std::size_t instance =
-                static_cast<std::size_t>(pass.first + offset);
-            if (instance >= logical_rows.size()) {
-                continue;
-            }
-
-            const int row = logical_rows[instance];
-            if (row < 0 || row >= m_render_row_count) {
-                continue;
-            }
-
-            ++row_capacities[static_cast<std::size_t>(row)];
-        }
-
-        return row_capacities;
-    }
-
-    void update_render_rect_row_capacities(
-        std::vector<int>&        capacities,
-        const std::vector<int>&  required_capacities)
-    {
-        if (m_render_row_count <= 0) {
-            capacities.clear();
-            return;
-        }
-
-        if (capacities.size() != static_cast<std::size_t>(m_render_row_count)) {
-            capacities.assign(static_cast<std::size_t>(m_render_row_count), 0);
-        }
-
-        const std::size_t row_count = std::min(
-            capacities.size(),
-            required_capacities.size());
-        for (std::size_t row = 0; row < row_count; ++row) {
-            const int required = required_capacities[row];
-            if (required > 0) {
-                capacities[row] = std::max(
-                    capacities[row],
-                    render_glyph_row_capacity_bucket(required));
-            }
-        }
+                m_row_capacities.glyph_cursor_text);
     }
 
     atlas_pass_range_t append_row_stable_rect_pass(
@@ -3976,12 +3919,19 @@ private:
 
     void build_render_rect_buffer_layout(Atlas_prepare_result& result)
     {
-        const atlas_pass_range_t logical_background_pass = m_background_pass;
-        const atlas_pass_range_t logical_selection_pass  = m_selection_pass;
-        const atlas_pass_range_t logical_graphic_pass    = m_graphic_pass;
-        const atlas_pass_range_t logical_decoration_pass = m_decoration_pass;
-        const atlas_pass_range_t logical_cursor_pass     = m_cursor_pass;
-        const atlas_pass_range_t logical_overlay_pass    = m_overlay_pass;
+        struct rect_pass_layout_t
+        {
+            atlas_pass_range_t& range;
+            std::vector<int>&   row_capacities;
+        };
+        const rect_pass_layout_t passes[] = {
+            {m_background_pass, m_row_capacities.rect_background},
+            {m_selection_pass,  m_row_capacities.rect_selection},
+            {m_graphic_pass,    m_row_capacities.rect_graphic},
+            {m_decoration_pass, m_row_capacities.rect_decoration},
+            {m_cursor_pass,     m_row_capacities.rect_cursor},
+            {m_overlay_pass,    m_row_capacities.rect_overlay},
+        };
         const std::vector<atlas_instance_t> logical_instances =
             std::move(m_rect_instances);
         const std::vector<int> logical_rows = std::move(m_rect_instance_rows);
@@ -3990,89 +3940,24 @@ private:
         m_rect_instance_rows.clear();
         m_rect_buffer_row_stable_ranges.clear();
 
-        const std::vector<int> background_required =
-            rect_required_row_capacities(logical_background_pass, logical_rows);
-        const std::vector<int> selection_required =
-            rect_required_row_capacities(logical_selection_pass, logical_rows);
-        const std::vector<int> graphic_required =
-            rect_required_row_capacities(logical_graphic_pass, logical_rows);
-        const std::vector<int> decoration_required =
-            rect_required_row_capacities(logical_decoration_pass, logical_rows);
-        const std::vector<int> cursor_required =
-            rect_required_row_capacities(logical_cursor_pass, logical_rows);
-        const std::vector<int> overlay_required =
-            rect_required_row_capacities(logical_overlay_pass, logical_rows);
-        update_render_rect_row_capacities(
-            m_render_rect_background_row_capacities,
-            background_required);
-        update_render_rect_row_capacities(
-            m_render_rect_selection_row_capacities,
-            selection_required);
-        update_render_rect_row_capacities(
-            m_render_rect_graphic_row_capacities,
-            graphic_required);
-        update_render_rect_row_capacities(
-            m_render_rect_decoration_row_capacities,
-            decoration_required);
-        update_render_rect_row_capacities(
-            m_render_rect_cursor_row_capacities,
-            cursor_required);
-        update_render_rect_row_capacities(
-            m_render_rect_overlay_row_capacities,
-            overlay_required);
+        for (const auto& pass : passes) {
+            update_render_row_capacities(
+                pass.row_capacities,
+                required_row_capacities(pass.range, logical_rows));
+        }
 
-        m_background_pass = append_row_stable_rect_pass(
-            logical_background_pass,
-            logical_instances,
-            logical_rows,
-            m_render_rect_background_row_capacities,
-            m_rect_buffer_row_stable_ranges);
-        m_selection_pass = append_row_stable_rect_pass(
-            logical_selection_pass,
-            logical_instances,
-            logical_rows,
-            m_render_rect_selection_row_capacities,
-            m_rect_buffer_row_stable_ranges);
-        m_graphic_pass = append_row_stable_rect_pass(
-            logical_graphic_pass,
-            logical_instances,
-            logical_rows,
-            m_render_rect_graphic_row_capacities,
-            m_rect_buffer_row_stable_ranges);
-        m_decoration_pass = append_row_stable_rect_pass(
-            logical_decoration_pass,
-            logical_instances,
-            logical_rows,
-            m_render_rect_decoration_row_capacities,
-            m_rect_buffer_row_stable_ranges);
-        m_cursor_pass = append_row_stable_rect_pass(
-            logical_cursor_pass,
-            logical_instances,
-            logical_rows,
-            m_render_rect_cursor_row_capacities,
-            m_rect_buffer_row_stable_ranges);
-        m_overlay_pass = append_row_stable_rect_pass(
-            logical_overlay_pass,
-            logical_instances,
-            logical_rows,
-            m_render_rect_overlay_row_capacities,
-            m_rect_buffer_row_stable_ranges);
-
-        result.render.rect_row_capacity =
-            std::max({
-                render_glyph_row_capacity_max(
-                    m_render_rect_background_row_capacities),
-                render_glyph_row_capacity_max(
-                    m_render_rect_selection_row_capacities),
-                render_glyph_row_capacity_max(
-                    m_render_rect_graphic_row_capacities),
-                render_glyph_row_capacity_max(
-                    m_render_rect_decoration_row_capacities),
-                render_glyph_row_capacity_max(
-                    m_render_rect_cursor_row_capacities),
-                render_glyph_row_capacity_max(
-                    m_render_rect_overlay_row_capacities),
-            });
+        result.render.rect_row_capacity = 0;
+        for (const auto& pass : passes) {
+            pass.range = append_row_stable_rect_pass(
+                pass.range,
+                logical_instances,
+                logical_rows,
+                pass.row_capacities,
+                m_rect_buffer_row_stable_ranges);
+            result.render.rect_row_capacity = std::max(
+                result.render.rect_row_capacity,
+                render_glyph_row_capacity_max(pass.row_capacities));
+        }
     }
 
     void append_rect_instance(
@@ -4234,14 +4119,14 @@ private:
             m_have_previous_render_font_epoch &&
             m_previous_render_font_epoch != m_frame.font_epoch;
         if (font_epoch_changed) {
-            m_render_glyph_text_row_capacities.clear();
-            m_render_glyph_cursor_text_row_capacities.clear();
-            m_render_rect_background_row_capacities.clear();
-            m_render_rect_selection_row_capacities.clear();
-            m_render_rect_graphic_row_capacities.clear();
-            m_render_rect_decoration_row_capacities.clear();
-            m_render_rect_cursor_row_capacities.clear();
-            m_render_rect_overlay_row_capacities.clear();
+            m_row_capacities.glyph_text.clear();
+            m_row_capacities.glyph_cursor_text.clear();
+            m_row_capacities.rect_background.clear();
+            m_row_capacities.rect_selection.clear();
+            m_row_capacities.rect_graphic.clear();
+            m_row_capacities.rect_decoration.clear();
+            m_row_capacities.rect_cursor.clear();
+            m_row_capacities.rect_overlay.clear();
             m_failed_visible_lazy_glyph_raster_keys.clear();
         }
         begin_prepared_text_cache_frame(font_epoch_changed);
@@ -4598,28 +4483,6 @@ private:
         return keys;
     }
 
-    Atlas_prepare_layout_state capture_prepare_layout_state() const
-    {
-        Atlas_prepare_layout_state state;
-        state.render_rect_background_row_capacities =
-            m_render_rect_background_row_capacities;
-        state.render_rect_selection_row_capacities =
-            m_render_rect_selection_row_capacities;
-        state.render_rect_graphic_row_capacities =
-            m_render_rect_graphic_row_capacities;
-        state.render_rect_decoration_row_capacities =
-            m_render_rect_decoration_row_capacities;
-        state.render_rect_cursor_row_capacities =
-            m_render_rect_cursor_row_capacities;
-        state.render_rect_overlay_row_capacities =
-            m_render_rect_overlay_row_capacities;
-        state.render_glyph_text_row_capacities =
-            m_render_glyph_text_row_capacities;
-        state.render_glyph_cursor_text_row_capacities =
-            m_render_glyph_cursor_text_row_capacities;
-        return state;
-    }
-
     Atlas_draw_pass_state capture_draw_pass_state() const
     {
         return {
@@ -4659,26 +4522,6 @@ private:
         m_msdf_text_resources_ready =
             state.msdf_text_resources_ready &&
             state.msdf_text_uploaded_generation == msdf_text_uploaded_generation();
-    }
-
-    void restore_prepare_layout_state(const Atlas_prepare_layout_state& state)
-    {
-        m_render_rect_background_row_capacities =
-            state.render_rect_background_row_capacities;
-        m_render_rect_selection_row_capacities =
-            state.render_rect_selection_row_capacities;
-        m_render_rect_graphic_row_capacities =
-            state.render_rect_graphic_row_capacities;
-        m_render_rect_decoration_row_capacities =
-            state.render_rect_decoration_row_capacities;
-        m_render_rect_cursor_row_capacities =
-            state.render_rect_cursor_row_capacities;
-        m_render_rect_overlay_row_capacities =
-            state.render_rect_overlay_row_capacities;
-        m_render_glyph_text_row_capacities =
-            state.render_glyph_text_row_capacities;
-        m_render_glyph_cursor_text_row_capacities =
-            state.render_glyph_cursor_text_row_capacities;
     }
 
     void publish_prepare_upload_directives(
@@ -5741,8 +5584,8 @@ private:
                 // committed, but atlas adoption changes the text draw owner.
                 m_force_next_render_full_upload = true;
                 if (m_msdf_text_cache.ready) {
-                    m_render_glyph_text_row_capacities.clear();
-                    m_render_glyph_cursor_text_row_capacities.clear();
+                    m_row_capacities.glyph_text.clear();
+                    m_row_capacities.glyph_cursor_text.clear();
                 }
             }
             else {
@@ -6565,17 +6408,17 @@ private:
     {
         QByteArray key;
         append_pass_key(key, m_background_pass);
-        append_key_int_vector(key, m_render_rect_background_row_capacities);
+        append_key_int_vector(key, m_row_capacities.rect_background);
         append_pass_key(key, m_selection_pass);
-        append_key_int_vector(key, m_render_rect_selection_row_capacities);
+        append_key_int_vector(key, m_row_capacities.rect_selection);
         append_pass_key(key, m_graphic_pass);
-        append_key_int_vector(key, m_render_rect_graphic_row_capacities);
+        append_key_int_vector(key, m_row_capacities.rect_graphic);
         append_pass_key(key, m_decoration_pass);
-        append_key_int_vector(key, m_render_rect_decoration_row_capacities);
+        append_key_int_vector(key, m_row_capacities.rect_decoration);
         append_pass_key(key, m_cursor_pass);
-        append_key_int_vector(key, m_render_rect_cursor_row_capacities);
+        append_key_int_vector(key, m_row_capacities.rect_cursor);
         append_pass_key(key, m_overlay_pass);
-        append_key_int_vector(key, m_render_rect_overlay_row_capacities);
+        append_key_int_vector(key, m_row_capacities.rect_overlay);
         append_key_row_stable_ranges(key, m_rect_buffer_row_stable_ranges);
         return key;
     }
@@ -6584,9 +6427,9 @@ private:
     {
         QByteArray key;
         append_pass_key(key, m_text_pass);
-        append_key_int_vector(key, m_render_glyph_text_row_capacities);
+        append_key_int_vector(key, m_row_capacities.glyph_text);
         append_pass_key(key, m_cursor_text_pass);
-        append_key_int_vector(key, m_render_glyph_cursor_text_row_capacities);
+        append_key_int_vector(key, m_row_capacities.glyph_cursor_text);
         return key;
     }
 
@@ -7428,14 +7271,7 @@ private:
     Qsg_atlas_buffer_upload_planner   m_msdf_text_upload_planner;
     int                                      m_render_row_count = 0;
     int                                      m_rect_active_instance_count = 0;
-    std::vector<int>                         m_render_rect_background_row_capacities;
-    std::vector<int>                         m_render_rect_selection_row_capacities;
-    std::vector<int>                         m_render_rect_graphic_row_capacities;
-    std::vector<int>                         m_render_rect_decoration_row_capacities;
-    std::vector<int>                         m_render_rect_cursor_row_capacities;
-    std::vector<int>                         m_render_rect_overlay_row_capacities;
-    std::vector<int>                         m_render_glyph_text_row_capacities;
-    std::vector<int>                         m_render_glyph_cursor_text_row_capacities;
+    Atlas_row_capacities                    m_row_capacities;
     std::vector<Terminal_render_dirty_row_range>
                                              m_render_dirty_row_ranges;
     bool                                     m_render_force_full_reupload = false;
