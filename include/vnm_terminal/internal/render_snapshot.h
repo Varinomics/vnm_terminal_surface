@@ -562,10 +562,11 @@ struct Terminal_render_snapshot_request
     bool                                  backend_geometry_in_sync = true;
     bool                                  visual_bell_active = false;
     bool                                  mouse_reporting_mode_changed = false;
-    bool                                  include_leading_rows = true;
-    // The Companion toggle, which selects the COMPANION mapping on the
-    // primary screen.
-    bool                                  companion_presentation = false;
+    bool                                  include_row_coverage = true;
+    // Acquire the rows required by this consumer window in addition to the
+    // native window. Zero rows / negative offset use the native viewport.
+    int                                   presentation_rows = 0;
+    int                                   presentation_offset_from_tail = -1;
 };
 
 struct Terminal_render_snapshot;
@@ -595,22 +596,21 @@ struct Terminal_render_snapshot
     Terminal_mode_state                                modes;
     std::optional<Terminal_canvas_selection>            touch_selection;
     int                                                native_content_bottom_row_exclusive = 0;
-    int                                                resize_displaced_scrollback_rows = 0;
-    // V: the trailing primary rows that are wholly resize vacancy. With the
-    // two fields above and viewport.presentation it completes the mapping
-    // record's inputs.
-    int                                                resize_vacancy_rows = 0;
-    // Coverage beyond the frame's own rows: leading_rows_snapshot supplies
-    // the leading_row_count native rows directly above them.
-    int                                                leading_row_count = 0;
-    std::shared_ptr<const Terminal_render_snapshot>     leading_rows_snapshot;
+    int                                                clear_page_start_row = 0;
+    // The independently sized consumer window acquired with this frame.
+    // Native viewport/grid coordinates remain unchanged.
+    int                                                presentation_rows = 0;
+    int                                                presentation_offset_from_tail = -1;
+    // Additional immutable native row coverage. Its viewport gives its
+    // first logical row; it can precede, overlap or follow the native window.
+    std::shared_ptr<const Terminal_render_snapshot>     row_coverage_snapshot;
     // Coverage within the frame's own rows: the trailing rows a
     // geometry-adapted frame appended hold no native content.
     int                                                uncovered_trailing_rows = 0;
     // The frame's rows were frozen at a synchronized-output hold, by a
     // public-projection scroll or geometry adaptation, rather than read from
-    // the live model. Requested rows above a frozen frame's coverage are
-    // shown as unused slots.
+    // the live model. Presentation still requires actual coverage for every
+    // requested native row; only the page mapping creates unused slots.
     bool                                               frozen_basis = false;
     // A presented frame: display_source is the native frame it presents and
     // display_row_logical_rows its forward map, where -1 is an identity-free
@@ -619,21 +619,27 @@ struct Terminal_render_snapshot
     std::vector<int>                                   display_row_logical_rows;
 };
 
-// The leading rows snapshot is the frame's own view moved leading_row_count
-// rows further from the tail, so its first rows are the native rows directly
-// above the frame's: the same grid, buffer and S.
-inline bool render_snapshot_leading_rows_are_coherent(const Terminal_render_snapshot& snapshot)
+// Additional rows belong to the same publication and native backing basis.
+inline bool render_snapshot_row_coverage_is_coherent(const Terminal_render_snapshot& snapshot)
 {
-    if (!snapshot.leading_rows_snapshot) {
+    if (!snapshot.row_coverage_snapshot) {
         return false;
     }
-    const Terminal_render_snapshot& leading = *snapshot.leading_rows_snapshot;
+    const Terminal_render_snapshot& coverage = *snapshot.row_coverage_snapshot;
+    const int first_row = coverage.viewport.scrollback_rows - coverage.viewport.offset_from_tail;
     return
-        grid_sizes_match(leading.grid_size, snapshot.grid_size)                  &&
-        leading.viewport.active_buffer   == snapshot.viewport.active_buffer     &&
-        leading.viewport.scrollback_rows == snapshot.viewport.scrollback_rows   &&
-        leading.viewport.offset_from_tail ==
-            snapshot.viewport.offset_from_tail + snapshot.leading_row_count;
+        coverage.grid_size.rows > 0                                               &&
+        coverage.grid_size.columns == snapshot.grid_size.columns                   &&
+        coverage.viewport.active_buffer == Terminal_buffer_id::PRIMARY              &&
+        snapshot.viewport.active_buffer == Terminal_buffer_id::PRIMARY              &&
+        coverage.viewport.scrollback_rows == snapshot.viewport.scrollback_rows      &&
+        coverage.metadata.sequence == snapshot.metadata.sequence                    &&
+        coverage.metadata.publication_generation == snapshot.metadata.publication_generation &&
+        coverage.metadata.row_origin_generation == snapshot.metadata.row_origin_generation   &&
+        first_row >= 0 && first_row <= snapshot.viewport.scrollback_rows             &&
+        static_cast<long long>(coverage.grid_size.rows) <=
+            static_cast<long long>(snapshot.viewport.scrollback_rows) + snapshot.grid_size.rows - first_row &&
+        coverage.uncovered_trailing_rows == 0 && !coverage.display_source;
 }
 
 struct Terminal_render_snapshot_validation
@@ -708,7 +714,12 @@ inline bool snapshots_share_row_identity_space(
         left.metadata.row_origin_generation == right.metadata.row_origin_generation &&
         viewport_mappings_match(left.viewport, right.viewport)                      &&
         left.viewport.presentation          == right.viewport.presentation          &&
-        left.leading_row_count              == right.leading_row_count              &&
+        ((!left.row_coverage_snapshot && !right.row_coverage_snapshot) ||
+            (left.row_coverage_snapshot && right.row_coverage_snapshot &&
+                left.row_coverage_snapshot->grid_size.rows ==
+                    right.row_coverage_snapshot->grid_size.rows &&
+                left.row_coverage_snapshot->viewport.offset_from_tail ==
+                    right.row_coverage_snapshot->viewport.offset_from_tail)) &&
         left.uncovered_trailing_rows        == right.uncovered_trailing_rows;
 }
 
@@ -821,10 +832,13 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
     }
     if (snapshot.display_source &&
         (snapshot.display_source->display_source ||
-            !snapshots_share_row_identity_space(snapshot, *snapshot.display_source) ||
+            snapshot.grid_size.columns != snapshot.display_source->grid_size.columns ||
+            snapshot.metadata.row_origin_generation !=
+                snapshot.display_source->metadata.row_origin_generation ||
+            snapshot.viewport.active_buffer != snapshot.display_source->viewport.active_buffer ||
+            snapshot.viewport.scrollback_rows != snapshot.display_source->viewport.scrollback_rows ||
             snapshot.viewport.presentation != snapshot.display_source->viewport.presentation ||
             snapshot.metadata.sequence != snapshot.display_source->metadata.sequence ||
-            snapshot.viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
             snapshot.display_row_logical_rows.size() != static_cast<std::size_t>(snapshot.grid_size.rows) ||
             !render_snapshot_visible_line_provenance_is_valid(*snapshot.display_source)))
     {
@@ -840,17 +854,22 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
             // The forward map is the producer's requested row, or a slot
             // where a frozen basis lacks the row.
             const auto& source = *snapshot.display_source;
-            const int requested = presentation_requested_logical_row(source.viewport, row);
+            const int requested = presentation_requested_logical_row(snapshot.viewport, row);
             if (expected_logical_row != requested &&
-                !(expected_logical_row == -1 && source.frozen_basis))
+                !(expected_logical_row == -1 &&
+                    (source.frozen_basis ||
+                        (source.viewport.active_buffer == Terminal_buffer_id::ALTERNATE &&
+                         requested >= source.grid_size.rows))))
             {
                 return false;
             }
             if (expected_logical_row >= 0) {
                 const auto* row_source = &source;
                 int source_row = requested - render_snapshot_first_visible_logical_row(source);
-                if (source_row < 0 && source.leading_rows_snapshot) {
-                    row_source = source.leading_rows_snapshot.get();
+                if ((source_row < 0 || source_row >= source.grid_size.rows - source.uncovered_trailing_rows) &&
+                    render_snapshot_row_coverage_is_coherent(source))
+                {
+                    row_source = source.row_coverage_snapshot.get();
                     source_row = requested - render_snapshot_first_visible_logical_row(*row_source);
                 }
                 if (source_row < 0 || source_row >= static_cast<int>(row_source->visible_line_provenance.size()) ||
@@ -1443,7 +1462,9 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_metadata(
         snapshot.viewport.visible_rows             != snapshot.grid_size.rows           ||
         snapshot.viewport.scrollback_rows          <  0                                 ||
         snapshot.viewport.offset_from_tail         <  0                                 ||
-        snapshot.viewport.offset_from_tail         >  snapshot.viewport.scrollback_rows ||
+        snapshot.viewport.offset_from_tail         >
+            (snapshot.display_source ? presentation_max_offset_from_tail(snapshot.viewport)
+                                     : snapshot.viewport.scrollback_rows) ||
         (snapshot.viewport.active_buffer == Terminal_buffer_id::ALTERNATE &&
             (snapshot.viewport.scrollback_rows != 0 ||
                 snapshot.viewport.offset_from_tail != 0)))

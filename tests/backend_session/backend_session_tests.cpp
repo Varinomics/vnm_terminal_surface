@@ -22889,10 +22889,9 @@ bool test_stop_failure_preserves_commitment_and_prior_geometry()
     return ok;
 }
 
-// Every live and held entry point bounds the presented offset by the policy
-// maximum (DESIGN 5.4 Bounds): ten output lines and a prompt at two rows leave
-// nine history rows; growth to six rows hides four vacant rows, so AUTOMATIC
-// allows five and COMPANION nine.
+// Every live and held entry point uses the current content end. Ten output
+// lines and a prompt end at logical row 11, so a six-row consumer can scroll
+// five rows from the tail, while a two-row consumer can scroll nine.
 bool test_presentation_bounds_at_session_entry_points()
 {
     bool ok = true;
@@ -22910,28 +22909,33 @@ bool test_presentation_bounds_at_session_entry_points()
     session->resize(QSizeF(200.0, 120.0), {6, 20});
     const term::Terminal_viewport_state grown = session->viewport_state();
     ok &= check(grown.scrollback_rows == 9 &&
-            grown.presentation.policy == term::Terminal_presentation_policy::AUTOMATIC &&
-            grown.presentation.hidden_rows == 4 &&
+            grown.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
+            grown.presentation.content_end_row_exclusive == 11 &&
             term::presentation_max_offset_from_tail(grown) == 5,
-        "growth hides the vacated rows from the live scroll range");
+        "growth does not extend the semantic end or the live scroll range");
 
     const auto offset = [&] { return session->viewport_state().offset_from_tail; };
     (void)session->scroll_viewport_lines(100);
-    ok &= check(offset() == 5, "line scrolling stops at the automatic maximum");
+    ok &= check(offset() == 5, "line scrolling stops at the content-end maximum");
     (void)session->scroll_published_viewport_to_offset_from_tail(50);
-    ok &= check(offset() == 5, "offset scrolling clamps to the automatic maximum");
+    ok &= check(offset() == 5, "offset scrolling clamps to the content-end maximum");
     (void)session->scroll_published_viewport_lines(-2);
     ok &= check(offset() == 3, "published line scrolling moves inside the range");
     (void)session->scroll_viewport_lines_from_published_state(100, session->viewport_state());
     ok &= check(offset() == 5 && session->latest_render_snapshot_handle()->viewport.offset_from_tail == 5,
         "scrolling from the published state publishes the bounded offset");
 
-    session->set_companion_presentation(true);
-    (void)session->scroll_viewport_lines(100);
-    ok &= check(offset() == 9, "the Companion range keeps the native scrollback");
-    session->set_companion_presentation(false);
-    ok &= check(offset() == 5 && term::presentation_max_offset_from_tail(session->viewport_state()) == 5,
-        "turning the toggle off keeps the view on the first history row at the automatic maximum");
+    session->set_canvas_presentation_rows(2);
+    (void)session->scroll_canvas_presentation_lines(100, 2);
+    const auto canvas_source = session->latest_render_snapshot_handle();
+    const auto canvas = term::make_presented_snapshot(canvas_source, 2, 9);
+    ok &= check(offset() == 5 && canvas_source && canvas_source->grid_size.rows == 6 &&
+            canvas_source->presentation_rows == 2 && canvas_source->presentation_offset_from_tail == 9 &&
+            canvas && snapshot_row_text(*canvas, 0) == QStringLiteral("scroll-line-000") &&
+            snapshot_row_text(*canvas, 1) == QStringLiteral("scroll-line-001"),
+        "a smaller consumer reaches the same first history row with its own offset and native source geometry");
+    (void)session->scroll_canvas_presentation_lines(-100, 2);
+    session->set_canvas_presentation_rows(0);
 
     (void)session->scroll_published_viewport_to_offset_from_tail(0);
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
@@ -22949,7 +22953,7 @@ bool test_presentation_bounds_at_session_entry_points()
 
 // The saved primary view keeps its first displayed row while the alternate
 // screen is active, even when a resize archives rows and history at its limit
-// evicts as many, leaving S unchanged (DESIGN 5.5, saved primary).
+// evicts as many, leaving the history count unchanged.
 bool test_saved_primary_anchor_survives_constant_s_eviction()
 {
     bool ok = true;
@@ -22994,9 +22998,9 @@ bool test_saved_primary_anchor_survives_constant_s_eviction()
 }
 
 // A detached view keeps its first displayed row at the same display position
-// when the mapping or S changes (DESIGN 5.5): host and parser resizes, output
-// consuming vacancy, the saved primary view, and a Companion view whose first
-// rows are padding. A position the new mapping cannot show clamps.
+// when the content end or history changes: host and parser resizes, output,
+// the saved primary view, and an explicitly cleared page. A position the new
+// mapping cannot show clamps.
 bool test_detached_anchor_keeps_first_displayed_row()
 {
     bool ok = true;
@@ -23023,12 +23027,12 @@ bool test_detached_anchor_keeps_first_displayed_row()
     host->resize(QSizeF(200.0, 120.0), {6, 20});
     ok &= check(host->viewport_state().offset_from_tail == 2 &&
             displayed(host, 0) == QStringLiteral("scroll-line-003"),
-        "a host resize that hides four vacant rows keeps the first displayed row");
+        "a host resize keeps the first displayed row");
     ok &= check(host_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
-            host->viewport_state().presentation.hidden_rows == 3 &&
+            host->viewport_state().presentation.content_end_row_exclusive == 12 &&
             host->viewport_state().offset_from_tail == 3 &&
             displayed(host, 0) == QStringLiteral("scroll-line-003"),
-        "output consuming one vacant row keeps the first displayed row");
+        "output extending the content end keeps the first displayed row");
     (void)host->scroll_viewport_lines(-2);
     ok &= check(displayed(host, 0) == QStringLiteral("scroll-line-005"),
         "the view moves to scroll-line-005 one row above the tail");
@@ -23053,39 +23057,32 @@ bool test_detached_anchor_keeps_first_displayed_row()
         "the anchor session enters the alternate screen");
     saved->resize(QSizeF(200.0, 120.0), {6, 20});
     ok &= check(saved_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")) &&
-            saved->viewport_state().presentation.hidden_rows == 4 &&
+            saved->viewport_state().presentation.content_end_row_exclusive == 11 &&
             saved->viewport_state().offset_from_tail == 2 &&
             displayed(saved, 0) == QStringLiteral("scroll-line-003"),
         "the saved primary view returns with its first displayed row");
 
-    // Shrinking four rows to two displaces two rows into history (K = 2) and
-    // regrowing leaves two vacant rows, so Companion inserts two padding rows
-    // before native row I = 7. Two rows up, the view starts with that padding.
-    std::unique_ptr<term::Terminal_session> companion;
-    Scripted_backend* companion_backend = start(companion, 4);
-    companion->set_companion_presentation(true);
-    companion->resize(QSizeF(200.0, 40.0), {2, 20});
-    companion->resize(QSizeF(200.0, 80.0), {4, 20});
-    (void)companion->scroll_viewport_lines(2);
-    ok &= check(companion->viewport_state().presentation.insertion_row == 7 &&
-            companion->viewport_state().presentation.hidden_rows == 2 &&
-            displayed(companion, 0).isEmpty() && displayed(companion, 1).isEmpty() &&
-            displayed(companion, 2) == QStringLiteral("scroll-line-007"),
-        "the Companion view starts with two padding rows above scroll-line-007");
-    ok &= check(companion_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
-            companion->viewport_state().presentation.hidden_rows == 1 &&
-            companion->viewport_state().offset_from_tail == 3 &&
-            displayed(companion, 2) == QStringLiteral("scroll-line-007"),
-        "the first row below the padding keeps its display position");
+    std::unique_ptr<term::Terminal_session> cleared;
+    Scripted_backend* cleared_backend = start(cleared, 4);
+    ok &= check(cleared_backend->emit_output(QByteArrayLiteral("\x1b[H\x1b[2J$ ")),
+        "the shell explicitly clears the current page");
+    (void)cleared->scroll_viewport_lines(2);
+    ok &= check(cleared->viewport_state().presentation.clear_page_start_row == 7 &&
+            displayed(cleared, 0) == QStringLiteral("scroll-line-005") &&
+            displayed(cleared, 1) == QStringLiteral("scroll-line-006") &&
+            displayed(cleared, 2).isEmpty() && displayed(cleared, 3).isEmpty(),
+        "scrolling into a cleared page shows retained history followed by page padding");
+    ok &= check(cleared_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
+            cleared->viewport_state().presentation.clear_page_start_row == 7 &&
+            cleared->viewport_state().offset_from_tail == 2 &&
+            displayed(cleared, 0) == QStringLiteral("scroll-line-005"),
+        "output within the clear page preserves the first history row and the page boundary");
     return ok;
 }
 
-// Held frames take their mapping record and coverage from their frozen basis
-// (DESIGN 5.7), independently of retained-row provenance. The worked example:
-// S = 100, the frame's own rows 100 and 101 at two rows, and held growth to
-// six rows under the default deferred policy with no captured prefix present
-// four unused slots and then rows 100 and 101, with the AUTOMATIC maximum 96
-// and native S 100.
+// Held frames take their content end, clear page and coverage from one frozen
+// basis. Growth requiring uncaptured real history releases the hold; page
+// padding is created only by E/Q/N, never by absence of captured rows.
 bool test_frozen_frame_availability()
 {
     bool ok = true;
@@ -23124,44 +23121,47 @@ bool test_frozen_frame_availability()
         "the default-policy session holds an update and grows from two to six rows");
     const auto adapted = deferred->latest_render_snapshot_handle();
     const auto adapted_display = presented(deferred);
-    ok &= check(adapted && adapted->frozen_basis && adapted_display &&
-            adapted_display->display_row_logical_rows == rows_t({-1, -1, -1, -1, 100, 101}) &&
+    ok &= check(adapted && !adapted->frozen_basis && !deferred->synchronized_output_hold_active() && adapted_display &&
+            adapted_display->display_row_logical_rows == rows_t({96, 97, 98, 99, 100, 101}) &&
             snapshot_row_text(*adapted_display, 4) == QStringLiteral("scroll-line-100") &&
             snapshot_row_text(*adapted_display, 5) == QStringLiteral("$") &&
             adapted->viewport.scrollback_rows == 100 &&
             term::presentation_max_offset_from_tail(adapted->viewport) == 96,
-        "held growth without a captured prefix shows unused slots above the frame's rows");
+        "held growth acquires missing real history only after releasing the frozen basis");
 
     ok &= check(resize_rows(deferred, 3) &&
-            presented_rows(deferred) == rows_t({-1, 100, 101}),
-        "a held shrink adapts the frozen frame to one unused slot");
+            presented_rows(deferred) == rows_t({99, 100, 101}),
+        "a subsequent shrink retains the actual transcript tail");
     ok &= check(resize_rows(deferred, 1), "the held session shrinks to one row");
     const auto clipped = presented(deferred);
-    ok &= check(clipped && !clipped->display_source &&
-            snapshot_row_text(*clipped, 0) == QStringLiteral("scroll-line-100"),
-        "a held shrink below the frame clips its trailing row and presents it natively");
-    ok &= check(resize_rows(deferred, 5) &&
-            presented_rows(deferred) == rows_t({-1, -1, -1, 100, 101}),
-        "held regrowth adapts the frozen frame again");
+    ok &= check(clipped && !deferred->synchronized_output_hold_active() &&
+            !deferred->latest_render_snapshot_handle()->frozen_basis &&
+            snapshot_row_text(*clipped, 0) == QStringLiteral("$"),
+        "a held shrink that cannot retain the prompt releases before showing the live one-row tail");
+    ok &= check(resize_rows(deferred, 5), "the released session regrows to five rows");
+    const auto regrown = presented(deferred);
+    ok &= check(regrown && !deferred->synchronized_output_hold_active() &&
+            snapshot_row_text(*regrown, 4) == QStringLiteral("$"),
+        "regrowth after early release keeps the prompt on the last displayed row");
     ok &= check(deferred_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
             deferred->latest_render_snapshot_handle() &&
             !deferred->latest_render_snapshot_handle()->frozen_basis &&
             presented(deferred) != nullptr,
         "the release presents the live frame");
 
-    // Growth before the hold acquires the two rows above the native view; a
-    // held growth keeps them and shows the further requested rows as slots.
+    // Partial acquired coverage still cannot authorize additional missing rows.
     std::unique_ptr<term::Terminal_session> partial;
     Scripted_backend* partial_backend = start(partial, deferred_config, 101);
     ok &= check(resize_rows(partial, 4) &&
-            partial->latest_render_snapshot_handle()->leading_row_count == 2 &&
+            term::render_snapshot_row_coverage_is_coherent(*partial->latest_render_snapshot_handle()) &&
             presented_rows(partial) == rows_t({98, 99, 100, 101}),
         "growth before the hold acquires the two rows above the native view");
     ok &= check(partial_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")) &&
             resize_rows(partial, 6) &&
-            presented_rows(partial) == rows_t({-1, -1, 98, 99, 100, 101}) &&
+            !partial->synchronized_output_hold_active() &&
+            presented_rows(partial) == rows_t({96, 97, 98, 99, 100, 101}) &&
             snapshot_row_text(*presented(partial), 2) == QStringLiteral("scroll-line-098"),
-        "held growth keeps the captured prefix and shows the rest as unused slots");
+        "held growth beyond partial coverage releases before acquiring the remaining history");
     ok &= check(partial_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
         "the partial-prefix session releases its hold");
 
@@ -23180,22 +23180,21 @@ bool test_frozen_frame_availability()
     const auto scrolled = immediate->latest_render_snapshot_handle();
     ok &= check(scrolled && scrolled->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
             scrolled->frozen_basis && scrolled->viewport.offset_from_tail == 3 &&
-            scrolled->leading_row_count == 4 &&
+            term::render_snapshot_row_coverage_is_coherent(*scrolled) &&
             presented_rows(immediate) == rows_t({12, 13, 14, 15, 16, 17}) &&
             snapshot_row_text(*presented(immediate), 0) == QStringLiteral("scroll-line-012"),
         "a held scroll presents the captured rows above its window");
 
-    // The toggle is not part of a frozen basis: a held frame keeps its mapping
-    // and the release presents the live frame under the new toggle.
-    immediate->set_companion_presentation(true);
-    ok &= check(immediate->latest_render_snapshot_handle()->viewport.presentation.policy ==
-            term::Terminal_presentation_policy::AUTOMATIC,
-        "a toggle change during the hold leaves the held frame's mapping");
+    // Live cursor movement and ED0 change the live semantic end, but cannot
+    // change the endpoint or row contents of the publication being held.
+    ok &= check(immediate_backend->emit_output(QByteArrayLiteral("\r\x1b[1A\x1b[Jlive")) &&
+            immediate->latest_render_snapshot_handle()->viewport.presentation.content_end_row_exclusive == 21 &&
+            !snapshot_contains_text(*immediate->latest_render_snapshot_handle(), QStringLiteral("live")),
+        "a held frame retains its frozen end while an erase changes the live tail");
     ok &= check(immediate_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
-            immediate->latest_render_snapshot_handle()->viewport.presentation.policy ==
-                term::Terminal_presentation_policy::COMPANION &&
+            immediate->latest_render_snapshot_handle()->viewport.presentation.content_end_row_exclusive == 20 &&
             !immediate->latest_render_snapshot_handle()->frozen_basis,
-        "the release presents the live frame under the new toggle");
+        "release publishes the current semantic end from the live model");
 
     // Under the default policy nothing beyond the frame's own rows is
     // captured, so a held scroll is deferred and the published frame kept.
@@ -23243,7 +23242,7 @@ QString displayed_first_row(const std::unique_ptr<term::Terminal_session>& sessi
 // A held growth that leaves a detached view beyond the new maximum needs
 // rows the hold did not capture, so its frozen frame cannot be presented.
 // The growth then ends the application hold early, and the ordinary release
-// publishes the live frame at the new grid (DESIGN 5.7). The application's
+// publishes the live frame at the new grid. The application's
 // later ESU, a stale-hold timeout and a fresh BSU behave as after any
 // release.
 bool test_incompatible_held_growth_releases_early()
@@ -23266,7 +23265,7 @@ bool test_incompatible_held_growth_releases_early()
     const auto released_display = term::make_presented_snapshot(released);
     ok &= check(!session->synchronized_output_hold_active() && !session->render_publication_blocked() &&
             released && released->grid_size.rows == 6 && !released->frozen_basis &&
-            released->viewport.presentation.policy == term::Terminal_presentation_policy::AUTOMATIC &&
+            released->viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
             term::presentation_max_offset_from_tail(released->viewport) == 96 &&
             released->viewport.offset_from_tail == 96 && released_display &&
             snapshot_row_text(*released_display, 0) == QStringLiteral("scroll-line-000"),
@@ -23377,7 +23376,7 @@ bool test_early_release_keeps_deferred_scroll_and_selection()
 // reaches the published frame as a host resize does once its output is
 // ingested: a frozen frame the new grid can present is adapted and the hold
 // continues, and one it cannot present ends the hold early with the live
-// frame (DESIGN 5.7). A later host resize to the grid the parser already
+// frame. A later host resize to the grid the parser already
 // applied publishes nothing new.
 bool test_parser_resize_inside_hold_reconciles_like_host_resize()
 {
@@ -23411,8 +23410,8 @@ bool test_parser_resize_inside_hold_reconciles_like_host_resize()
             top->latest_render_snapshot_handle()->grid_size.rows == 6,
         "the application's later ESU is harmless");
 
-    // At the tail the frozen frame lacks only leading rows, which become
-    // unused slots, so the hold continues on the adapted frame.
+    // At the tail growth also requires uncaptured history, so the hold ends
+    // before the replacement frame acquires those real rows.
     std::unique_ptr<term::Terminal_session> tail;
     Scripted_backend* tail_backend = start_two_row_history_session(tail, 0);
     if (tail_backend == nullptr) {
@@ -23422,23 +23421,18 @@ bool test_parser_resize_inside_hold_reconciles_like_host_resize()
         "the tail session holds an update, resizes the text area and writes");
     const auto adapted = tail->latest_render_snapshot_handle();
     const auto adapted_display = term::make_presented_snapshot(adapted);
-    bool slots_above = adapted_display != nullptr;
-    for (int row = 0; slots_above && row < 4; ++row) {
-        slots_above = snapshot_row_text(*adapted_display, row).isEmpty();
-    }
-    ok &= check(tail->synchronized_output_hold_active() &&
-            adapted->grid_size.rows == 6 && adapted->frozen_basis &&
+    ok &= check(!tail->synchronized_output_hold_active() && adapted_display &&
+            adapted->grid_size.rows == 6 && !adapted->frozen_basis &&
             term::presentation_max_offset_from_tail(adapted->viewport) == 96 &&
-            slots_above &&
-            snapshot_row_text(*adapted_display, 4) == QStringLiteral("scroll-line-100") &&
-            snapshot_row_text(*adapted_display, 5) == QStringLiteral("$"),
-        "a parser resize the hold can present adapts the frozen frame and keeps the hold");
+            snapshot_row_text(*adapted_display, 0) == QStringLiteral("scroll-line-096") &&
+            snapshot_row_text(*adapted_display, 5) == QStringLiteral("$ held"),
+        "a parser resize requiring uncaptured history releases before presenting its complete current tail");
     ok &= check(tail->resize(QSizeF(200.0, 120.0), {6, 20}).code ==
                 term::Terminal_session_result_code::ACCEPTED &&
-            tail->synchronized_output_hold_active() &&
+            !tail->synchronized_output_hold_active() &&
             tail->latest_render_snapshot_handle()->grid_size.rows == 6 &&
-            !snapshot_contains_text(*tail->latest_render_snapshot_handle(), QStringLiteral("held")),
-        "a later host resize to the same grid keeps the held frame");
+            snapshot_contains_text(*tail->latest_render_snapshot_handle(), QStringLiteral("held")),
+        "a later host resize to the same grid retains the coherent released frame");
     ok &= check(tail_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
             !tail->latest_render_snapshot_handle()->frozen_basis &&
             snapshot_contains_text(*tail->latest_render_snapshot_handle(), QStringLiteral("$ held")),
@@ -23465,7 +23459,9 @@ bool test_held_alternate_growth_keeps_its_hold()
     ok &= check(session->synchronized_output_hold_active() && held && held->frozen_basis &&
             held->grid_size.rows == 6 &&
             held->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
-            term::make_presented_snapshot(held) == held,
+            held->viewport.presentation.policy == term::Terminal_presentation_policy::NATIVE &&
+            term::make_presented_snapshot(held) &&
+            snapshot_row_text(*term::make_presented_snapshot(held), 0) == QStringLiteral("alt"),
         "an alternate-screen growth adapts the held frame and keeps the hold");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l\x1b[?1049l")) &&
             !session->latest_render_snapshot_handle()->frozen_basis,
@@ -23489,48 +23485,47 @@ bool test_mapping_change_without_native_geometry_change_repaints()
 {
     bool ok = true;
 
-    std::unique_ptr<term::Terminal_session> automatic;
-    Scripted_backend* automatic_backend = make_session(automatic);
+    std::unique_ptr<term::Terminal_session> growing;
+    Scripted_backend* growing_backend = make_session(growing);
     term::Terminal_launch_config launch_config = valid_launch_config();
     launch_config.initial_grid_size = {2, 20};
-    ok &= check(automatic->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
-        "vacancy-consumption session starts");
-    ok &= check(automatic_backend->emit_output(QByteArrayLiteral("a\r\n$ ")),
-        "vacancy-consumption session writes a prompt");
-    automatic->resize(QSizeF(200.0, 120.0), {6, 20});
-    const auto before = automatic->latest_render_snapshot_handle();
-    ok &= check(automatic_backend->emit_output(QByteArrayLiteral("x\r\n")),
-        "output moves the cursor into the vacancy");
-    const auto after = automatic->latest_render_snapshot_handle();
+    ok &= check(growing->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "content-end session starts");
+    ok &= check(growing_backend->emit_output(QByteArrayLiteral("a\r\n$ ")),
+        "content-end session writes a prompt");
+    growing->resize(QSizeF(200.0, 120.0), {6, 20});
+    const auto before = growing->latest_render_snapshot_handle();
+    ok &= check(growing_backend->emit_output(QByteArrayLiteral("x\r\n")),
+        "output extends the current content end");
+    const auto after = growing->latest_render_snapshot_handle();
     ok &= check(before && after &&
             term::viewport_mappings_match(before->viewport, after->viewport) &&
-            before->viewport.presentation.hidden_rows == 4 &&
-            after->viewport.presentation.hidden_rows == 3 &&
+            before->viewport.presentation.content_end_row_exclusive == 2 &&
+            after->viewport.presentation.content_end_row_exclusive == 3 &&
             !term::snapshots_share_row_identity_space(*before, *after) &&
             full_repaint(*after),
-        "output consuming vacancy repaints every row at an unchanged native viewport");
+        "output extending the content end repaints every row at an unchanged native viewport");
 
-    std::unique_ptr<term::Terminal_session> companion;
-    Scripted_backend* companion_backend = make_session(companion);
+    std::unique_ptr<term::Terminal_session> clear_page;
+    Scripted_backend* clear_backend = make_session(clear_page);
     launch_config.initial_grid_size = {4, 20};
-    ok &= check(companion->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
-        "insertion-change session starts");
-    companion->set_companion_presentation(true);
-    ok &= check(companion_backend->emit_output(QByteArrayLiteral("l0\r\nl1\r\nl2\r\n$ ")),
-        "insertion-change session writes four rows");
-    companion->resize(QSizeF(200.0, 40.0), {2, 20});
-    companion->resize(QSizeF(200.0, 80.0), {4, 20});
-    const auto displaced = companion->latest_render_snapshot_handle();
-    ok &= check(companion_backend->emit_output(QByteArrayLiteral("\x1b[2J")),
-        "whole-screen erasure revokes the resize-displaced rows");
-    const auto cleared = companion->latest_render_snapshot_handle();
+    ok &= check(clear_page->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "clear-page session starts");
+    ok &= check(clear_backend->emit_output(QByteArrayLiteral("l0\r\nl1\r\nl2\r\n$ ")),
+        "clear-page session writes four rows");
+    clear_page->resize(QSizeF(200.0, 40.0), {2, 20});
+    clear_page->resize(QSizeF(200.0, 80.0), {4, 20});
+    const auto displaced = clear_page->latest_render_snapshot_handle();
+    ok &= check(clear_backend->emit_output(QByteArrayLiteral("\x1b[2J")),
+        "whole-screen erasure establishes the current clear page");
+    const auto cleared = clear_page->latest_render_snapshot_handle();
     ok &= check(displaced && cleared &&
             displaced->viewport.scrollback_rows == cleared->viewport.scrollback_rows &&
-            displaced->viewport.presentation.insertion_row == 0 &&
-            cleared->viewport.presentation.insertion_row == 2 &&
+            displaced->viewport.presentation.clear_page_start_row == 0 &&
+            cleared->viewport.presentation.clear_page_start_row == 2 &&
             !term::snapshots_share_row_identity_space(*displaced, *cleared) &&
             full_repaint(*cleared),
-        "a Companion insertion change at constant S repaints every row");
+        "a clear-page boundary change at constant history repaints every row");
 
     term::Terminal_session_config evicting_config;
     evicting_config.scrollback_limit = 3;
@@ -23553,6 +23548,96 @@ bool test_mapping_change_without_native_geometry_change_repaints()
     return ok;
 }
 
+// Consumer capacity is independent of the native grid: a small canvas needs
+// offsets beyond raw history, and a large canvas can need rows after the native
+// source window. A held frame must not fill a newly requested interval with live
+// rows from a later state.
+bool test_canvas_capacity_uses_its_own_range_and_frozen_coverage()
+{
+    bool ok = true;
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {24, 20};
+
+    std::unique_ptr<term::Terminal_session> small;
+    Scripted_backend* small_backend = make_session(small);
+    ok &= check(small->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+            small_backend->emit_output(numbered_scroll_lines(31) + QByteArrayLiteral("$ ")),
+        "a native 24-row session fills eight history rows and its live screen");
+    small->set_canvas_presentation_rows(6);
+    (void)small->scroll_canvas_presentation_lines(1000, 6);
+    const auto small_source = small->latest_render_snapshot_handle();
+    const auto small_display = term::make_presented_snapshot(small_source, 6, 26);
+    ok &= check(small_source && small_source->grid_size.rows == 24 &&
+            small_source->viewport.scrollback_rows == 8 && small_source->viewport.offset_from_tail == 8 &&
+            small_source->presentation_rows == 6 && small_source->presentation_offset_from_tail == 26 &&
+            small_display && snapshot_row_text(*small_display, 0) == QStringLiteral("scroll-line-000") &&
+            snapshot_row_text(*small_display, 5) == QStringLiteral("scroll-line-005"),
+        "a six-row canvas reaches the first rows at offset 26 while native offset stays bounded by eight");
+
+    std::unique_ptr<term::Terminal_session> large;
+    Scripted_backend* large_backend = make_session(large);
+    ok &= check(large->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+            large_backend->emit_output(numbered_scroll_lines(1023) + QByteArrayLiteral("$ ")) &&
+            large_backend->emit_output(QByteArrayLiteral("\x1b[H\x1b[2J$ ")),
+        "a native 24-row session retains 1000 history rows and starts a one-row clear page");
+    large->set_canvas_presentation_rows(100);
+    (void)large->scroll_canvas_presentation_lines(120, 100);
+    const auto large_source = large->latest_render_snapshot_handle();
+    const auto large_display = term::make_presented_snapshot(large_source, 100, 120);
+    ok &= check(large_source && large_source->grid_size.rows == 24 &&
+            large_source->viewport.offset_from_tail == 120 &&
+            large_source->viewport.presentation.content_end_row_exclusive == 1001 &&
+            large_source->viewport.presentation.clear_page_start_row == 1000 &&
+            term::render_snapshot_row_coverage_is_coherent(*large_source) &&
+            large_display && snapshot_row_text(*large_display, 0) == QStringLiteral("scroll-line-880") &&
+            snapshot_row_text(*large_display, 99) == QStringLiteral("scroll-line-979"),
+        "a 100-row canvas receives the required 880..979 interval across the end of the native source window");
+
+    ok &= check(large_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[2;1Hhidden")) &&
+            large->synchronized_output_hold_active() &&
+            large->latest_render_snapshot_handle()->viewport.presentation.content_end_row_exclusive == 1001 &&
+            !snapshot_contains_text(*large->latest_render_snapshot_handle(), QStringLiteral("hidden")),
+        "live output inside a hold does not change the captured content end or row contents");
+    large->set_canvas_presentation_rows(200);
+    const auto released = large->latest_render_snapshot_handle();
+    const auto expanded = released
+        ? term::make_presented_snapshot(released, 200, released->presentation_offset_from_tail)
+        : nullptr;
+    ok &= check(!large->synchronized_output_hold_active() && released && !released->frozen_basis &&
+            released->viewport.presentation.content_end_row_exclusive == 1002 && expanded,
+        "requesting uncaptured rows ends the hold before acquiring a coherent larger consumer frame");
+    std::unique_ptr<term::Terminal_session> held_offset;
+    auto* held_backend = make_session(held_offset);
+    launch_config.initial_grid_size = {6, 20};
+    ok &= check(held_offset->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+            held_backend->emit_output(numbered_scroll_lines(15) + QByteArrayLiteral("$ ")),
+        "the held consumer offset fixture has H10, E16 and native capacity six");
+    held_offset->set_canvas_presentation_rows(2);
+    (void)held_offset->scroll_canvas_presentation_lines(3, 2);
+    const auto captured = held_offset->latest_render_snapshot_handle();
+    const auto captured_display = term::make_presented_snapshot(captured, 2, 3);
+    ok &= check(held_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\r\nhidden")),
+        "hidden output advances the live endpoint and detached anchor");
+    held_offset->set_canvas_presentation_rows(3);
+    const auto held_publication = held_offset->latest_render_snapshot_handle();
+    const auto held_display = term::make_presented_snapshot(held_publication,
+        held_publication->presentation_rows, held_publication->presentation_offset_from_tail);
+    ok &= check(held_offset->synchronized_output_hold_active() && held_publication->frozen_basis &&
+            held_publication->viewport.presentation == captured->viewport.presentation &&
+            held_publication->presentation_rows == 2 && held_publication->presentation_offset_from_tail == 3 &&
+            captured_display && held_display &&
+            held_display->visible_line_provenance == captured_display->visible_line_provenance,
+        "capacity-only publication retains frozen consumer coordinates despite hidden output");
+    ok &= check(held_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")), "the offset fixture releases its hold");
+    const auto resumed = held_offset->latest_render_snapshot_handle();
+    const auto resumed_display = term::make_presented_snapshot(resumed, 2, resumed->presentation_offset_from_tail);
+    ok &= check(resumed_display && captured_display &&
+            resumed_display->visible_line_provenance.front().retained_line_id ==
+                captured_display->visible_line_provenance.front().retained_line_id,
+        "release resolves the frozen consumer's detached row by retained identity");
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -23567,6 +23652,10 @@ int main(int argc, char** argv)
     ok &= test_early_release_keeps_deferred_scroll_and_selection();
     ok &= test_held_alternate_growth_keeps_its_hold();
     ok &= test_parser_resize_inside_hold_reconciles_like_host_resize();
+    ok &= test_canvas_capacity_uses_its_own_range_and_frozen_coverage();
+    if (argc == 2 && std::string_view(argv[1]) == "--content-end-only") {
+        return ok ? 0 : 1;
+    }
     ok &= test_resize_after_output_ending_in_escape_prefix_is_applied();
     ok &= test_key_after_output_ending_in_escape_prefix_is_written();
     ok &= test_carried_callback_ending_in_two_byte_escape_claims_its_epoch();

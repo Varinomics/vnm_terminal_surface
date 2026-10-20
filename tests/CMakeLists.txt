@@ -356,8 +356,8 @@ vnm_terminal_add_test(vnm_terminal_content_tail_projection
     terminal_content_tail_projection/terminal_content_tail_projection_tests.cpp
 )
 
-vnm_terminal_add_test(vnm_terminal_resize_vacancy
-    resize_vacancy/resize_vacancy_tests.cpp
+vnm_terminal_add_test(vnm_terminal_content_end
+    content_end/content_end_tests.cpp
 )
 
 target_link_libraries(vnm_terminal_sixel_placement PRIVATE

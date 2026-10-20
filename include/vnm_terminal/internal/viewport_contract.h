@@ -11,26 +11,23 @@ enum class Terminal_buffer_id
     ALTERNATE,
 };
 
-// How a frame presents the primary screen's native rows. NATIVE shows them
-// as they are, AUTOMATIC hides the trailing resize vacancy, and COMPANION
-// relocates the unwritten tail into history. The alternate screen is always
-// NATIVE.
+// The alternate screen keeps its native layout. A primary transcript ends at
+// its current semantic content and places its latest cleared page at the tail.
 enum class Terminal_presentation_policy
 {
     NATIVE,
-    AUTOMATIC,
-    COMPANION,
+    CONTENT_TAIL,
 };
 
-// The policy inputs of a frame's mapping record. Native S, H and the
-// presented offset o stay in the viewport fields; hidden_rows is P, the
-// trailing grid rows the presentation never shows, and insertion_row is
-// Companion's I = S - K, before which its P padding rows are re-inserted.
+// Immutable native logical boundaries, acquired with the frame's rows. The
+// end includes occupied cells/images and the logical cursor even when hidden.
+// The latest explicit page clear establishes the boundary before that page;
+// consumer capacity determines how much identity-free padding precedes it.
 struct Terminal_presentation_mapping
 {
-    Terminal_presentation_policy policy        = Terminal_presentation_policy::NATIVE;
-    int                          hidden_rows   = 0;
-    int                          insertion_row = 0;
+    Terminal_presentation_policy policy = Terminal_presentation_policy::NATIVE;
+    int                          content_end_row_exclusive = 0;
+    int                          clear_page_start_row = 0;
 
     bool operator==(const Terminal_presentation_mapping&) const = default;
 };
@@ -91,46 +88,49 @@ inline bool viewport_mappings_match(
         left.offset_from_tail == right.offset_from_tail;
 }
 
-// The mapping record's policy and its P and I. The Companion toggle takes
-// precedence; resize vacancy selects AUTOMATIC with P = V; the alternate
-// screen is always NATIVE. Companion relocates at least the vacancy, since
-// styled vacancy can be occupied down to the bottom row.
 inline Terminal_presentation_mapping make_presentation_mapping(
     Terminal_buffer_id active_buffer,
-    bool               companion_enabled,
-    int                visible_rows,
     int                scrollback_rows,
-    int                resize_vacancy_rows,
     int                content_bottom_row_exclusive,
-    int                resize_displaced_scrollback_rows)
+    int                clear_page_start_row)
 {
     if (active_buffer == Terminal_buffer_id::ALTERNATE) {
         return {};
     }
 
-    if (companion_enabled) {
-        return {
-            Terminal_presentation_policy::COMPANION,
-            std::max(visible_rows - content_bottom_row_exclusive, resize_vacancy_rows),
-            scrollback_rows - resize_displaced_scrollback_rows,
-        };
-    }
-
-    if (resize_vacancy_rows > 0) {
-        return {Terminal_presentation_policy::AUTOMATIC, resize_vacancy_rows, 0};
-    }
-
-    return {};
+    return {
+        Terminal_presentation_policy::CONTENT_TAIL,
+        scrollback_rows + content_bottom_row_exclusive,
+        clear_page_start_row,
+    };
 }
 
-// The policy maximum of the presented offset. NATIVE and COMPANION keep the
-// native S; AUTOMATIC never scrolls its hidden rows into view.
+inline int presentation_padding_rows(const Terminal_viewport_state& viewport)
+{
+    if (viewport.presentation.policy != Terminal_presentation_policy::CONTENT_TAIL) {
+        return 0;
+    }
+
+    const auto& mapping = viewport.presentation;
+    return std::max(0, viewport.visible_rows -
+        (mapping.content_end_row_exclusive - mapping.clear_page_start_row));
+}
+
+inline long long presentation_stream_end_row_exclusive(const Terminal_viewport_state& viewport)
+{
+    if (viewport.presentation.policy == Terminal_presentation_policy::CONTENT_TAIL) {
+        return static_cast<long long>(viewport.presentation.content_end_row_exclusive) +
+            presentation_padding_rows(viewport);
+    }
+    return static_cast<long long>(viewport.scrollback_rows) + viewport.visible_rows;
+}
+
+// Every allowed window ends at or before the same semantic end. The padding
+// before a short cleared page retains access to older history when scrolling.
 inline int presentation_max_offset_from_tail(const Terminal_viewport_state& viewport)
 {
-    const int scrollback_rows = std::max(0, viewport.scrollback_rows);
-    return viewport.presentation.policy == Terminal_presentation_policy::AUTOMATIC
-        ? std::max(0, scrollback_rows - viewport.presentation.hidden_rows)
-        : scrollback_rows;
+    return static_cast<int>(std::max(
+        0LL, presentation_stream_end_row_exclusive(viewport) - viewport.visible_rows));
 }
 
 inline int presentation_clamped_offset_from_tail(const Terminal_viewport_state& viewport)
@@ -138,26 +138,21 @@ inline int presentation_clamped_offset_from_tail(const Terminal_viewport_state& 
     return std::clamp(viewport.offset_from_tail, 0, presentation_max_offset_from_tail(viewport));
 }
 
-// The presentation stream lays the policy's rows out in display order: display
-// row d of the window shows stream row S - o + d. AUTOMATIC shifts native rows
-// down by P, leaving structural unused space above native row zero; COMPANION
-// inserts its P padding rows before insertion_row.
-inline int presentation_stream_row_for_logical_row(
-    const Terminal_presentation_mapping& mapping,
-    int                                  logical_row)
+// Native [0,Q), padding of P slots, then native [Q,E). P is derived for this
+// consumer, so a phone and desktop can share E/Q without sharing their height.
+inline long long presentation_stream_row_for_logical_row(
+    const Terminal_viewport_state& viewport,
+    int                            logical_row)
 {
-    switch (mapping.policy) {
-        case Terminal_presentation_policy::NATIVE:    return logical_row;
-        case Terminal_presentation_policy::AUTOMATIC: return logical_row + mapping.hidden_rows;
-        case Terminal_presentation_policy::COMPANION:
-            return logical_row < mapping.insertion_row ? logical_row : logical_row + mapping.hidden_rows;
-        default:                                      return logical_row;
+    if (viewport.presentation.policy == Terminal_presentation_policy::CONTENT_TAIL &&
+        logical_row >= viewport.presentation.clear_page_start_row)
+    {
+        return static_cast<long long>(logical_row) + presentation_padding_rows(viewport);
     }
+    return logical_row;
 }
 
-// The native logical row the window requests at display_row, or -1 for an
-// identity-free slot: AUTOMATIC's unused space above native row zero, or
-// Companion's relocated padding.
+// A native logical row, or -1 for identity-free padding before the page.
 inline int presentation_requested_logical_row(
     const Terminal_viewport_state& viewport,
     int                            display_row)
@@ -170,24 +165,22 @@ inline int presentation_requested_logical_row(
         return display_row;
     }
 
-    const Terminal_presentation_mapping& mapping = viewport.presentation;
-    const int stream_row =
-        viewport.scrollback_rows - presentation_clamped_offset_from_tail(viewport) + display_row;
-    switch (mapping.policy) {
-        case Terminal_presentation_policy::NATIVE:
-            return stream_row;
-        case Terminal_presentation_policy::AUTOMATIC:
-            return stream_row >= mapping.hidden_rows ? stream_row - mapping.hidden_rows : -1;
-        case Terminal_presentation_policy::COMPANION:
-            if (stream_row < mapping.insertion_row) {
-                return stream_row;
-            }
-            return stream_row < mapping.insertion_row + mapping.hidden_rows
-                ? -1
-                : stream_row - mapping.hidden_rows;
-        default:
-            return stream_row;
+    const auto& mapping = viewport.presentation;
+    const long long stream_row = presentation_stream_end_row_exclusive(viewport) -
+        viewport.visible_rows - presentation_clamped_offset_from_tail(viewport) + display_row;
+    if (stream_row < 0) {
+        return -1;
     }
+    if (mapping.policy != Terminal_presentation_policy::CONTENT_TAIL ||
+        stream_row < mapping.clear_page_start_row)
+    {
+        return static_cast<int>(stream_row);
+    }
+
+    const int padding_rows = presentation_padding_rows(viewport);
+    return stream_row < static_cast<long long>(mapping.clear_page_start_row) + padding_rows
+        ? -1
+        : static_cast<int>(stream_row - padding_rows);
 }
 
 // The display row presenting native logical_row, outside [0, H) when the
@@ -202,15 +195,17 @@ inline std::optional<int> presentation_display_row_for_logical_row(
     }
 
     const Terminal_presentation_mapping& mapping = viewport.presentation;
-    if (mapping.policy != Terminal_presentation_policy::NATIVE &&
-        logical_row >= viewport.scrollback_rows + viewport.visible_rows - mapping.hidden_rows)
+    if (logical_row < 0 ||
+        (mapping.policy == Terminal_presentation_policy::CONTENT_TAIL &&
+         logical_row >= mapping.content_end_row_exclusive))
     {
         return std::nullopt;
     }
 
-    const int first_stream_row =
-        viewport.scrollback_rows - presentation_clamped_offset_from_tail(viewport);
-    return presentation_stream_row_for_logical_row(mapping, logical_row) - first_stream_row;
+    const long long first_stream_row = presentation_stream_end_row_exclusive(viewport) -
+        viewport.visible_rows - presentation_clamped_offset_from_tail(viewport);
+    return static_cast<int>(
+        presentation_stream_row_for_logical_row(viewport, logical_row) - first_stream_row);
 }
 
 // The presented offset that shows native logical_row at display_row, clamped
@@ -220,11 +215,11 @@ inline int presentation_offset_for_logical_row(
     int                            logical_row,
     int                            display_row)
 {
-    const int stream_row = presentation_stream_row_for_logical_row(viewport.presentation, logical_row);
-    return std::clamp(
-        viewport.scrollback_rows - stream_row + display_row,
-        0,
-        presentation_max_offset_from_tail(viewport));
+    const long long stream_row = presentation_stream_row_for_logical_row(viewport, logical_row);
+    return static_cast<int>(std::clamp(
+        presentation_stream_end_row_exclusive(viewport) - viewport.visible_rows - stream_row + display_row,
+        0LL,
+        static_cast<long long>(presentation_max_offset_from_tail(viewport))));
 }
 
 // The row a detached view keeps in place (DESIGN 5.5): the first display row
@@ -252,53 +247,30 @@ inline std::optional<Terminal_presentation_anchor> presentation_first_displayed_
     return std::nullopt;
 }
 
-// The native rows the window requests above the native view, which starts at
-// logical row S - o: the rows a frame acquires besides its own.
-inline int presentation_leading_row_count(const Terminal_viewport_state& viewport)
+struct Terminal_presentation_row_range
 {
-    if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
-        return 0;
-    }
+    int first_row = 0;
+    int row_count = 0;
+};
 
-    const int native_first_row = viewport.scrollback_rows - viewport.offset_from_tail;
-    int first_requested_row = native_first_row;
-    for (int row = 0; row < viewport.visible_rows; ++row) {
-        const int requested_row = presentation_requested_logical_row(viewport, row);
-        if (requested_row >= 0) {
-            first_requested_row = std::min(first_requested_row, requested_row);
-        }
-    }
-    return native_first_row - first_requested_row;
-}
-
-// Availability of the window against one contiguous coverage of native rows.
-// A frozen basis resolves its missing leading rows as unused slots at their
-// display positions; any other missing row leaves the window unresolvable.
-inline bool presentation_window_resolvable(
-    const Terminal_viewport_state& viewport,
-    int                            first_covered_row,
-    int                            covered_rows,
-    bool                           frozen_basis)
+// Padding has no native identity. Removing it from a displayed window leaves
+// one contiguous native interval, which can extend on either side of a
+// differently sized consumer's native source window.
+inline Terminal_presentation_row_range presentation_requested_row_range(
+    const Terminal_viewport_state& viewport)
 {
+    Terminal_presentation_row_range range;
     for (int row = 0; row < viewport.visible_rows; ++row) {
         const int requested_row = presentation_requested_logical_row(viewport, row);
         if (requested_row < 0) {
             continue;
         }
-
-        // Compared as distances, so coverage ending at the largest logical
-        // row cannot overflow.
-        if (requested_row < first_covered_row) {
-            if (!frozen_basis) {
-                return false;
-            }
-            continue;
+        if (range.row_count == 0) {
+            range.first_row = requested_row;
         }
-        if (requested_row - first_covered_row >= covered_rows) {
-            return false;
-        }
+        range.row_count = requested_row - range.first_row + 1;
     }
-    return true;
+    return range;
 }
 
 struct Terminal_viewport_result

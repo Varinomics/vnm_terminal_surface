@@ -2526,11 +2526,9 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
     return ok;
 }
 
-// Presented frames under AUTOMATIC (the vacancy a grow leaves) and COMPANION
-// (the toggle) drive rendering and every consumer: IME, links, selection,
-// search, mouse reports and the stale-input guard. In this fixture both
-// policies present the same rows, so one oracle serves both.
-bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
+// One primary presentation drives IME, links, selection, search, mouse reports
+// and the stale-input guard, including when the mapping becomes the identity.
+bool test_presentation_render_and_input(QGuiApplication& app)
 {
     QRectF notified_cursor_rect;
     int ime_notifications = 0;
@@ -2569,7 +2567,7 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
     }
     const auto native = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     const auto exported_before = vnm_terminal::export_terminal_canvas_frame(fixture.surface);
-    if (!check(native && native->resize_displaced_scrollback_rows == 2 &&
+    if (!check(native && native->viewport.scrollback_rows == 2 &&
             native->native_content_bottom_row_exclusive == 2 && native->cursor.position.row == 1 &&
             exported_before.frame, "the native tail keeps its cursor and two occupied rows"))
     {
@@ -2598,9 +2596,6 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
         ++ime_notifications;
         notified_cursor_rect = fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF();
     });
-    if (companion) {
-        fixture.surface.set_content_tail_presentation_enabled(true);
-    }
     bool ok = check(focus_ready, "the IME notification fixture has active input focus");
     const bool normal_frame_ready = pump_until(app, [&] {
             return fixture.window.isExposed() && completed_frames > 0 && render_matches_current();
@@ -2634,17 +2629,14 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
     }
     const auto exported_after = vnm_terminal::export_terminal_canvas_frame(fixture.surface);
     const auto native_after = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    // The toggle publishes a frame whose mapping record names the Companion
-    // policy; its native rows and cursor are those of the earlier frame.
+    // Rendering retains native source rows, cursor and archive identities.
     ok &= check(native_after &&
-            native_after->viewport.presentation.policy == (companion
-                ? term::Terminal_presentation_policy::COMPANION
-                : term::Terminal_presentation_policy::AUTOMATIC) &&
+            native_after->viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
             native_after->visible_line_provenance == native->visible_line_provenance &&
             native_after->cursor.position == native->cursor.position &&
             exported_after.frame && exported_after.frame->cells == exported_before.frame->cells &&
             exported_after.frame->cursor.row == exported_before.frame->cursor.row &&
-            exported_after.frame->leading_rows == exported_before.frame->leading_rows &&
+            exported_after.frame->row_coverage == exported_before.frame->row_coverage &&
             fixture.surface.viewport_visible_rows() == 6 && fixture.surface.viewport_offset_from_tail() == 0,
         "presentation leaves the native publication, canvas export and viewport contract unchanged");
     ok &= check(report.rendered_snapshot->cursor.position.row == 5 &&
@@ -2735,63 +2727,116 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
         "stale rendered input leaves replacement text unselected");
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[2J\x1b[Hfirst\r\nold middle\r\nthird"));
     ok &= check(draw_current(), "three native rows are committed before a middle-row overwrite");
-    if (companion) {
-        // Companion relocates the application's blank rows too; AUTOMATIC
-        // hides only resize vacancy, which ED 2 retires.
-        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
-            point_in_grid_cell(fixture.surface, 3, 0), Qt::LeftButton, Qt::LeftButton,
-            Qt::ShiftModifier, true, "the unchanged first row anchors a range gesture");
-        backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1HNEW middle"));
-        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
-            point_in_grid_cell(fixture.surface, 5, 5), Qt::NoButton, Qt::LeftButton,
-            Qt::ShiftModifier, true, "extension observes an overwritten middle row before accepting the range");
-        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
-            point_in_grid_cell(fixture.surface, 5, 5), Qt::LeftButton, Qt::NoButton,
-            Qt::ShiftModifier, true, "release preserves the same middle-row provenance requirement");
-        ok &= check(fixture.surface.selected_text().isEmpty(),
-            "unchanged endpoints cannot authorize copying an unseen replacement between them");
-    }
-    else {
-        const auto erased = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot;
-        ok &= check(erased && !erased->display_source && snapshot_row_text(*erased, 0) == QStringLiteral("first") &&
-                fixture.surface.scrollback_rows() == 2,
-            "whole-screen erasure retires the vacancy, so the native frame is displayed");
-    }
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+        point_in_grid_cell(fixture.surface, 3, 0), Qt::LeftButton, Qt::LeftButton,
+        Qt::ShiftModifier, true, "the unchanged first row anchors a range gesture");
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1HNEW middle"));
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
+        point_in_grid_cell(fixture.surface, 5, 5), Qt::NoButton, Qt::LeftButton,
+        Qt::ShiftModifier, true, "extension observes an overwritten middle row before accepting the range");
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+        point_in_grid_cell(fixture.surface, 5, 5), Qt::LeftButton, Qt::NoButton,
+        Qt::ShiftModifier, true, "release preserves the same middle-row provenance requirement");
+    ok &= check(fixture.surface.selected_text().isEmpty(),
+        "unchanged endpoints cannot authorize copying an unseen replacement between them");
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[6;1Hbottom\x1b[?1000h\x1b[?1006h"));
     ok &= check(draw_current(), "a fully occupied grid commits its identity presentation");
-    if (companion) {
-        // Companion's identity mode: with the toggle on, input follows the
-        // committed frame even when its mapping is the identity.
-        fixture.surface.scroll_to_offset_from_tail(1);
-        ok &= check(draw_current(), "the identity presentation browses one row of history");
-        const auto before_history_click = backend_ptr->writes.size();
-        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
-            point_in_grid_cell(fixture.surface, 0, 0), Qt::LeftButton, Qt::LeftButton,
-            Qt::NoModifier, true, "a history click remains a local selection gesture in identity mode");
-        fixture.surface.cancel_pointer_gesture();
-        ok &= check(backend_ptr->writes.size() == before_history_click,
-            "identity-mode history rows never produce application mouse reports");
-        const auto before_native_click = backend_ptr->writes.size();
-        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
-            point_in_grid_cell(fixture.surface, 1, 0), Qt::LeftButton, Qt::LeftButton,
-            Qt::NoModifier, true, "a displayed native row below history accepts mouse input");
-        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
-            point_in_grid_cell(fixture.surface, 1, 0), Qt::LeftButton, Qt::NoButton,
-            Qt::NoModifier, true, "identity-mode release retains the admitted native mouse position");
-        const QByteArray native_click_reports = joined_writes_since(backend_ptr->writes, before_native_click);
-        if (native_click_reports != sgr_mouse_report(0, 0, 0, 'M') + sgr_mouse_report(0, 0, 0, 'm')) {
-            std::cerr << "identity-mode reports: \"" << native_click_reports.toStdString() << "\"\n";
-        }
-        ok &= check(native_click_reports == sgr_mouse_report(0, 0, 0, 'M') + sgr_mouse_report(0, 0, 0, 'm'),
-            "identity-mode mouse reports subtract the history offset exactly once");
+    fixture.surface.scroll_to_offset_from_tail(1);
+    ok &= check(draw_current(), "the identity presentation browses one row of history");
+    const auto before_history_click = backend_ptr->writes.size();
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+        point_in_grid_cell(fixture.surface, 0, 0), Qt::LeftButton, Qt::LeftButton,
+        Qt::NoModifier, true, "a history click remains a local selection gesture in identity mode");
+    fixture.surface.cancel_pointer_gesture();
+    ok &= check(backend_ptr->writes.size() == before_history_click,
+        "identity-mode history rows never produce application mouse reports");
+    const auto before_native_click = backend_ptr->writes.size();
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+        point_in_grid_cell(fixture.surface, 1, 0), Qt::LeftButton, Qt::LeftButton,
+        Qt::NoModifier, true, "a displayed native row below history accepts mouse input");
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+        point_in_grid_cell(fixture.surface, 1, 0), Qt::LeftButton, Qt::NoButton,
+        Qt::NoModifier, true, "identity-mode release retains the admitted native mouse position");
+    const QByteArray native_click_reports = joined_writes_since(backend_ptr->writes, before_native_click);
+    if (native_click_reports != sgr_mouse_report(0, 0, 0, 'M') + sgr_mouse_report(0, 0, 0, 'm')) {
+        std::cerr << "identity-mode reports: \"" << native_click_reports.toStdString() << "\"\n";
     }
+    ok &= check(native_click_reports == sgr_mouse_report(0, 0, 0, 'M') + sgr_mouse_report(0, 0, 0, 'm'),
+        "identity-mode mouse reports subtract the history offset exactly once");
     fixture.surface.scroll_to_offset_from_tail(0);
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1H"));
-    fixture.surface.set_content_tail_presentation_enabled(false);
-    ok &= check(draw_current(), "desktop ownership restores the native presentation");
+    ok &= check(draw_current(), "the full content page retains its native identity mapping");
     const auto restored = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot;
     ok &= check(restored && !restored->display_source && restored->cursor.position.row == 1,
-        "disabling the mode restores the native cursor row without a resize");
+        "an identity mapping preserves the native cursor row without a resize");
+    return ok;
+}
+
+// A prompt redraw may shorten the transcript without changing either native
+// geometry or history. The publication must move every consumer together.
+bool test_redraw_shrinks_published_content_end(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
+    fixture.surface.set_cursor_blink_enabled(false);
+    pump_events(app);
+    const auto metrics = current_cell_metrics(fixture.surface);
+    fixture.surface.setSize(QSizeF(20.5 * metrics.width, 6.5 * metrics.height));
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(12) +
+        QByteArrayLiteral("old first\r\nold second\r\nprompt>")};
+    bool started = false;
+    auto* output = start_surface_with_backend(fixture.surface, std::move(backend),
+        {QStringLiteral("redraw-content-end-fixture")}, &started);
+    if (!check(started && fixture.surface.scroll_to_offset_from_tail(3),
+            "redraw fixture starts with a detached viewport"))
+    {
+        return false;
+    }
+    const auto before = committed_display_frame(app, fixture.window, fixture.surface);
+    const auto native_before = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    if (!check(before && native_before && !before->visible_line_provenance.empty(),
+            "the detached frame has an immutable row identity"))
+    {
+        return false;
+    }
+    const int maximum_before = fixture.surface.scrollback_rows();
+    const auto first_id = before->visible_line_provenance.front().retained_line_id;
+    int viewport_notifications = 0;
+    QObject::connect(&fixture.surface, &VNM_TerminalSurface::viewport_changed,
+        &fixture.surface, [&] { ++viewport_notifications; });
+    output->emit_output(QByteArrayLiteral("\x1b[1A\r\x1b[Jprompt>"));
+    const auto after = committed_display_frame(app, fixture.window, fixture.surface);
+    const auto native_after = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    bool ok = check(after && native_after &&
+            native_after->grid_size.rows == native_before->grid_size.rows &&
+            native_after->grid_size.columns == native_before->grid_size.columns &&
+            native_after->viewport.scrollback_rows == native_before->viewport.scrollback_rows &&
+            native_after->viewport.presentation.content_end_row_exclusive ==
+                native_before->viewport.presentation.content_end_row_exclusive - 1 &&
+            fixture.surface.scrollback_rows() == maximum_before - 1 && viewport_notifications > 0 &&
+            fixture.surface.viewport_offset_from_tail() == 2 &&
+            after->visible_line_provenance.front().retained_line_id == first_id,
+        "ED redraw shrinks the notified range and preserves the detached row at unchanged native geometry");
+    (void)fixture.surface.scroll_to_offset_from_tail(0);
+    const auto tail = committed_display_frame(app, fixture.window, fixture.surface);
+    ok &= check(tail && tail->cursor.position.row == 5 && snapshot_row_text(*tail, 5) == QStringLiteral("prompt>") &&
+            std::abs(fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF().top() -
+                5 * current_cell_metrics(fixture.surface).height) < 0.001,
+        "the same shortened endpoint places the painted prompt and input cursor on the final display row");
+    output->emit_output(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
+    (void)committed_display_frame(app, fixture.window, fixture.surface);
+    const auto write_start = output->writes.size();
+    const auto prompt = point_in_grid_cell(fixture.surface, 5, 0);
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, prompt,
+        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+        "the redrawn displayed prompt accepts native mouse input");
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, prompt,
+        Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+        "the redrawn prompt release keeps the same native row");
+    ok &= check(joined_writes_since(output->writes, write_start) ==
+            sgr_mouse_report(0, 4, 0, 'M') + sgr_mouse_report(0, 4, 0, 'm'),
+        "input uses the shortened frame's native cursor row four, not displayed row five");
     return ok;
 }
 
@@ -7481,8 +7526,13 @@ bool test_control_wheel_zoom_keeps_scroll_range_on_written_rows(QGuiApplication&
         ok &= check_scroll_range(phase);
         ok &= check_lines_per_notch(phase);
     }
-    ok &= check(fixture.surface.font_size() == initial_font_size,
-        "the zoom sequence returns to the starting font size");
+    // Wheel steps traverse platform rendering sizes and clamp at the zoom
+    // limits. Equal counts need not restore the stored scalar size. Restore
+    // it explicitly so this range gate also checks the exact original grid.
+    fixture.surface.set_font_size(initial_font_size);
+    pump_events(app, 2);
+    ok &= check_scroll_range("after restoring the starting font size");
+    ok &= check_lines_per_notch("after restoring the starting font size");
 
     return ok;
 }
@@ -7559,8 +7609,8 @@ bool test_resize_keeps_presented_range_on_written_rows(QGuiApplication& app)
 bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
 {
     // A pointer gesture addresses the frame the user saw. When output changes
-    // the mapping (here the cursor retires one vacant row) and the replacement
-    // frame is not painted yet, the committed frame no longer shares the
+    // the mapping (here the cursor advances the content endpoint) and the
+    // replacement is not painted yet, the committed frame no longer shares the
     // display identity space, so the gesture cannot lease rows from it.
     Surface_fixture fixture;
     fixture.surface.set_cursor_blink_enabled(false);
@@ -7584,7 +7634,7 @@ bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
             snapshot_row_text(*presented, 3) == QStringLiteral("older"),
         "the committed frame presents history above the prompt");
 
-    backend_ptr->emit_output(QByteArrayLiteral("\x1b[4;1H\x1b[2;3H"));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[4;3H"));
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
         point_in_grid_cell(fixture.surface, 3, 0), Qt::LeftButton, Qt::LeftButton,
         Qt::ShiftModifier, false,
@@ -7595,7 +7645,7 @@ bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
 
     const auto replaced = committed_display_frame(app, fixture.window, fixture.surface);
     ok &= check(replaced && snapshot_row_text(*replaced, 1) == QStringLiteral("older"),
-        "the replacement frame presents the two retired rows below the prompt");
+        "the replacement frame follows the new logical cursor endpoint");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
         point_in_grid_cell(fixture.surface, 1, 0), Qt::LeftButton, Qt::LeftButton,
         Qt::ShiftModifier, true, "a gesture on the painted replacement frame is leased");
@@ -22202,7 +22252,7 @@ bool test_async_surface_resize_receipt_updates_geometry_snapshot(QGuiApplication
         true,
         "the pending-resize fixture completes a visible selection");
 
-    // The growth leaves vacant rows, so the visible overlays are on the
+    // The growth leaves native rows below the endpoint, so visible overlays are on the
     // presented frame, whose rows may come from above the native view.
     const auto pre_output_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
@@ -22345,9 +22395,7 @@ int main(int argc, char** argv)
     QGuiApplication app(argc, argv);
 
     if (app.arguments().contains(QStringLiteral("--content-tail-presentation"))) {
-        bool ok = test_presentation_render_and_input(app, true);
-        ok &= test_presentation_render_and_input(app, false);
-        return ok ? 0 : 1;
+        return test_presentation_render_and_input(app) ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--resize-frontier-only"))) {
         bool ok = test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
@@ -22366,6 +22414,7 @@ int main(int argc, char** argv)
     }
     if (app.arguments().contains(QStringLiteral("--resize-presentation-only"))) {
         bool ok = test_resize_keeps_presented_range_on_written_rows(app);
+        ok &= test_redraw_shrinks_published_content_end(app);
         ok &= test_resize_short_session_keeps_unused_space_above(app);
         ok &= test_incompatible_held_growth_releases_early(app);
         ok &= test_held_layout_changes_use_the_current_layout(app);

@@ -242,7 +242,7 @@ void Terminal_touch_controller::touch_event(QTouchEvent& event)
                     const QRectF rect = terminal_touch_handle_rect(
                         endpoint, presentation->cell_metrics,
                         QSizeF(selection.source.columns * presentation->cell_metrics.width,
-                            selection.source.rows * presentation->cell_metrics.height));
+                            selection.visible_rows.size() * presentation->cell_metrics.height));
                     if (endpoint.visible && rect.adjusted(-10.0, -10.0, 10.0, 10.0).contains(position())) {
                         m_handle = handle;
                         m_handle_offset = position() - QPointF(
@@ -360,19 +360,20 @@ terminal_selection_point_t Terminal_touch_controller::point_for_position(
     const QPointF local_position = position() - m_handle_offset;
     const qreal row_position = local_position.y() -
         (m_gesture == Gesture::HANDLE ? presentation.cell_metrics.height * 0.5 : 0.0);
+    const int visible_rows = (int)presentation.selection.visible_rows.size();
     int row = std::clamp((int)std::floor(row_position / presentation.cell_metrics.height),
-        0, presentation.selection.source.rows - 1);
+        0, visible_rows - 1);
     if (m_gesture == Gesture::HANDLE &&
         presentation.selection.visible_rows[static_cast<std::size_t>(row)].retained_line_id == 0U)
     {
-        for (int distance = 1; distance < presentation.selection.source.rows; ++distance) {
+        for (int distance = 1; distance < visible_rows; ++distance) {
             const int before = row - distance;
             const int after = row + distance;
             if (before >= 0 && presentation.selection.visible_rows[static_cast<std::size_t>(before)].retained_line_id != 0U) {
                 row = before;
                 break;
             }
-            if (after < presentation.selection.source.rows &&
+            if (after < visible_rows &&
                 presentation.selection.visible_rows[static_cast<std::size_t>(after)].retained_line_id != 0U)
             {
                 row = after;
@@ -394,8 +395,7 @@ void Terminal_touch_controller::send(Terminal_touch_selection_action action, int
         action == Terminal_touch_selection_action::BEGIN_HANDLE ||
         action == Terminal_touch_selection_action::MOVE_HANDLE ||
         action == Terminal_touch_selection_action::SCROLL_EXTEND;
-    if (target_required && (!presentation || presentation->selection.visible_rows.size() !=
-            (std::size_t)presentation->selection.source.rows))
+    if (target_required && (!presentation || presentation->selection.visible_rows.empty()))
     {
         if (action == Terminal_touch_selection_action::MOVE_HANDLE ||
             action == Terminal_touch_selection_action::SCROLL_EXTEND)
@@ -423,17 +423,8 @@ void Terminal_touch_controller::send(Terminal_touch_selection_action action, int
     request.handle     = m_handle;
     request.expected_selection_generation = m_generation;
     request.scroll_lines = scroll_lines;
-    if (presentation && presentation->selection.composition) {
-        const auto& composition = *presentation->selection.composition;
-        const qreal row_height = presentation->cell_metrics.height;
-        const QRectF visible = viewport();
-        request.presentation = terminal_touch_selection_presentation_t{
-            k_terminal_touch_selection_presentation_version,
-            (int)std::clamp(composition.leading_rows - std::floor(visible.top() / row_height),
-                0.0, (qreal)composition.leading_capacity),
-            (int)std::clamp(std::ceil(visible.bottom() / row_height) - composition.leading_rows,
-                1.0, (qreal)request.source.rows),
-        };
+    if (presentation) {
+        request.presentation = presentation->selection.presentation;
     }
     if (!pinned_target && (action == Terminal_touch_selection_action::SELECT_WORD ||
         action == Terminal_touch_selection_action::INSPECT_WORD))

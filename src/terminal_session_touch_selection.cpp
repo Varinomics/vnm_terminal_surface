@@ -82,21 +82,24 @@ std::optional<Terminal_selection_range> word_range(
 
 } // namespace
 
-void Terminal_session::populate_touch_selection_projection(Terminal_render_snapshot& snapshot) const
+void Terminal_session::populate_touch_selection_projection(
+    Terminal_render_snapshot& snapshot, int source_rows) const
 {
-    if (snapshot.leading_rows_snapshot) {
-        if (!render_snapshot_leading_rows_are_coherent(snapshot)) {
-            snapshot.leading_rows_snapshot.reset();
-            snapshot.leading_row_count = 0;
+    if (source_rows == 0) {
+        source_rows = snapshot.grid_size.rows;
+    }
+    if (snapshot.row_coverage_snapshot) {
+        auto updated = std::make_shared<Terminal_render_snapshot>(*snapshot.row_coverage_snapshot);
+        updated->metadata = snapshot.metadata;
+        snapshot.row_coverage_snapshot = updated;
+        if (!render_snapshot_row_coverage_is_coherent(snapshot)) {
+            snapshot.row_coverage_snapshot.reset();
         }
         else {
-            Terminal_render_snapshot updated = *snapshot.leading_rows_snapshot;
-            updated.metadata = snapshot.metadata;
             if (!m_selection.has_selection() || !m_selection.visual_lease()) {
-                updated.selection_spans.clear();
+                updated->selection_spans.clear();
             }
-            populate_touch_selection_projection(updated);
-            snapshot.leading_rows_snapshot = std::make_shared<const Terminal_render_snapshot>(std::move(updated));
+            populate_touch_selection_projection(*updated, source_rows);
         }
     }
     if (snapshot.visible_line_provenance.size() != (std::size_t)snapshot.grid_size.rows) {
@@ -111,9 +114,12 @@ void Terminal_session::populate_touch_selection_projection(Terminal_render_snaps
             ? Terminal_selection_buffer::ALTERNATE_SCREEN
             : Terminal_selection_buffer::PRIMARY_SCREEN,
         m_selection_content_basis.grid_reflow_generation,
-        snapshot.grid_size.rows,
+        source_rows,
         snapshot.grid_size.columns,
     };
+    projection.presentation = terminal_touch_selection_presentation_t{
+        k_terminal_touch_selection_presentation_version, snapshot.grid_size.rows,
+        snapshot.viewport.offset_from_tail};
     projection.selection_generation = m_selection.generation();
     projection.has_selection = m_selection.has_selection();
     projection.touch_handles_visible = m_touch_handles_visible &&
@@ -172,8 +178,9 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
         if (presentation.record_version != k_terminal_touch_selection_presentation_version) {
             return fail(Terminal_touch_selection_status::UNAVAILABLE, "Terminal selection is unavailable.");
         }
-        if (presentation.top_padding_rows < 0 || presentation.top_padding_rows > 32'768 ||
-            presentation.visible_native_rows < 1 || presentation.visible_native_rows > source->grid_size.rows)
+        if (presentation.visible_rows < 1 ||
+            presentation.visible_rows > 32'768 / source->grid_size.columns ||
+            presentation.offset_from_tail < 0)
         {
             return fail(Terminal_touch_selection_status::INVALID_REQUEST, "Invalid terminal presentation.");
         }
@@ -236,11 +243,10 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
     }
     int logical_row = -1;
     int visual_row = -1;
-    // A request with its own presentation record composes the native frame
-    // itself; otherwise the request addresses the frame this session presents.
-    const bool presented_rows = !request.presentation;
-    auto display_snapshot = presented_rows
-        ? make_presented_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
+    const int display_rows = request.presentation ? request.presentation->visible_rows : 0;
+    const int display_offset = request.presentation ? request.presentation->offset_from_tail : -1;
+    auto display_snapshot = make_presented_snapshot(
+        m_latest_render_snapshot, display_rows, display_offset);
     const Terminal_render_snapshot* snapshot = display_snapshot.get();
     if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
             (std::size_t)snapshot->grid_size.rows)
@@ -256,9 +262,15 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
             return fail(Terminal_touch_selection_status::INVALID_REQUEST, "Invalid selection scroll distance.");
         }
         const auto before = snapshot->viewport.offset_from_tail;
-        (void)scroll_published_viewport_lines(request.scroll_lines);
-        display_snapshot = presented_rows
-            ? make_presented_snapshot(m_latest_render_snapshot) : m_latest_render_snapshot;
+        if (request.presentation) {
+            (void)scroll_canvas_presentation_lines(
+                request.scroll_lines, display_rows, display_offset);
+        }
+        else {
+            (void)scroll_published_viewport_lines(request.scroll_lines);
+        }
+        display_snapshot = make_presented_snapshot(m_latest_render_snapshot, display_rows,
+            request.presentation ? m_canvas_viewport_controller.state().offset_from_tail : -1);
         snapshot = display_snapshot.get();
         if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
                 (std::size_t)snapshot->grid_size.rows)
@@ -268,29 +280,15 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
         if (snapshot->viewport.offset_from_tail == before && render_publication_blocked()) {
             return fail(Terminal_touch_selection_status::UNAVAILABLE, "Terminal scrolling is temporarily unavailable.");
         }
-        int leading_rows = 0;
-        int displayed_leading_rows = 0;
-        if (request.presentation && snapshot->leading_rows_snapshot) {
-            leading_rows = snapshot->leading_row_count;
-            displayed_leading_rows = std::min(leading_rows, request.presentation->top_padding_rows);
-            snapshot = snapshot->leading_rows_snapshot.get();
+        visual_row = request.scroll_lines > 0 ? 0 : snapshot->grid_size.rows - 1;
+        const int direction = request.scroll_lines > 0 ? 1 : -1;
+        while (visual_row >= 0 && visual_row < snapshot->grid_size.rows &&
+            snapshot->visible_line_provenance[static_cast<std::size_t>(visual_row)].retained_line_id == 0U)
+        {
+            visual_row += direction;
         }
-        visual_row = request.scroll_lines > 0
-            ? leading_rows - displayed_leading_rows
-            : request.presentation
-                ? std::min(snapshot->grid_size.rows - 1,
-                    leading_rows + request.presentation->visible_native_rows - 1)
-                : snapshot->grid_size.rows - 1;
-        if (presented_rows) {
-            const int direction = request.scroll_lines > 0 ? 1 : -1;
-            while (visual_row >= 0 && visual_row < snapshot->grid_size.rows &&
-                snapshot->visible_line_provenance[static_cast<std::size_t>(visual_row)].retained_line_id == 0U)
-            {
-                visual_row += direction;
-            }
-            if (visual_row < 0 || visual_row >= snapshot->grid_size.rows) {
-                return fail(Terminal_touch_selection_status::UNAVAILABLE, "The displayed terminal rows are unavailable.");
-            }
+        if (visual_row < 0 || visual_row >= snapshot->grid_size.rows) {
+            return fail(Terminal_touch_selection_status::UNAVAILABLE, "The displayed terminal rows are unavailable.");
         }
         logical_row = (int)snapshot->visible_line_provenance[(std::size_t)visual_row].logical_row;
     }
@@ -303,22 +301,6 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
                 visual_row = row;
                 logical_row = (int)candidate.logical_row;
                 break;
-            }
-        }
-        if (visual_row < 0 && request.presentation && snapshot->leading_rows_snapshot) {
-            const auto& leading = *snapshot->leading_rows_snapshot;
-            const int first_visible = snapshot->leading_row_count -
-                std::min(snapshot->leading_row_count, request.presentation->top_padding_rows);
-            for (int row = first_visible; row < snapshot->leading_row_count; ++row) {
-                const auto& candidate = leading.visible_line_provenance[(std::size_t)row];
-                if (candidate.retained_line_id == request.target.row.retained_line_id &&
-                    candidate.content_generation == request.target.row.content_generation)
-                {
-                    visual_row = row;
-                    logical_row = (int)candidate.logical_row;
-                    snapshot = &leading;
-                    break;
-                }
             }
         }
         if (logical_row < 0 && !render_publication_blocked()) {

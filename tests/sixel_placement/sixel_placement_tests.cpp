@@ -2178,13 +2178,13 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
             model.scrollback_size() == 5 && returned.viewport.offset_from_tail == 0 &&
             returned.cursor.position.row == 7,
         "portrait return preserves the recorded native cursor and shared viewport");
-    ok &= check(returned.leading_row_count == 5 && returned.leading_rows_snapshot,
+    ok &= check(returned.row_coverage_snapshot && term::render_snapshot_row_coverage_is_coherent(returned),
         "the five resize-displaced rows remain available as a separate projection");
-    if (!returned.leading_rows_snapshot) {
+    if (!returned.row_coverage_snapshot) {
         return false;
     }
-    const auto& combined = *returned.leading_rows_snapshot;
-    if (!check(original.visible_row_images.size() == 29U && combined.visible_row_images.size() == 29U,
+    const auto& combined = *returned.row_coverage_snapshot;
+    if (!check(original.visible_row_images.size() == 29U && combined.visible_row_images.size() == 13U,
             "both source projections carry the static image slices"))
     {
         return false;
@@ -2196,7 +2196,7 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
     }
     int original_image_height = 0;
     int returned_image_height = 0;
-    for (int row = 0; row < 29; ++row) {
+    for (int row = 0; row < 13; ++row) {
         const auto& before = original.visible_row_images[(std::size_t)row];
         const auto& after  = combined.visible_row_images[(std::size_t)row];
         if (before) {
@@ -2214,42 +2214,38 @@ bool test_short_image_rotation_preserves_native_rows_and_resize_history()
     request.sequence = 3U;
     request.viewport.offset_from_tail = 1;
     const auto scrolled = model.render_snapshot(request);
-    ok &= check(scrolled.leading_row_count == 4 && scrolled.leading_rows_snapshot &&
-            scrolled.leading_rows_snapshot->visible_line_provenance.front().retained_line_id ==
+    ok &= check(scrolled.viewport.offset_from_tail == 0 && scrolled.row_coverage_snapshot &&
+            scrolled.row_coverage_snapshot->visible_line_provenance.front().retained_line_id ==
                 combined.visible_line_provenance.front().retained_line_id,
-        "one history step transfers one supplemental row into the ordinary viewport");
+        "a transcript shorter than the consumer has no scrollable tail beyond its content");
     model.ingest(QByteArrayLiteral("\x1b[8;45HX"));
     ok &= check(model.row_text(7).startsWith(QStringLiteral("Type relay-production-input from Companion: X")) &&
             model.cursor_position() == term::terminal_grid_position_t{7, 45},
         "absolute native input after portrait growth writes beside its unchanged prompt");
     model.ingest(QByteArrayLiteral("\x1b[?1049h"));
-    ok &= check(!model.render_snapshot(4U).leading_rows_snapshot,
+    ok &= check(!model.render_snapshot(4U).row_coverage_snapshot,
         "alternate-screen output does not expose primary resize history");
     model.ingest(QByteArrayLiteral("\x1b[?1049l"));
-    ok &= check(model.render_snapshot(5U).leading_row_count == 5,
+    ok &= check(model.render_snapshot(5U).row_coverage_snapshot != nullptr,
         "returning to unchanged primary output retains its resize history");
     model.set_scrollback_limit(3);
-    ok &= check(model.render_snapshot(6U).leading_row_count == 3,
+    ok &= check(model.render_snapshot(6U).row_coverage_snapshot && model.scrollback_size() == 3,
         "retained-history eviction bounds the available resize suffix");
     model.ingest(QByteArrayLiteral("\x1b[2J"));
-    ok &= check(!model.render_snapshot(7U).leading_rows_snapshot && model.scrollback_size() == 3,
+    ok &= check(!model.render_snapshot(7U).row_coverage_snapshot && model.scrollback_size() == 3,
         "an explicit screen clear removes resize presentation eligibility without deleting history");
-    const std::vector<std::pair<QByteArray, const char*>> invalidations{
-        {QByteArrayLiteral("\x1b[H\x1b[J"), "whole-screen ED0 ends resize-prefix eligibility"},
-        {QByteArrayLiteral("\x1b[6;20H\x1b[1J\x1b[H"), "whole-screen ED1 ends resize-prefix eligibility"},
-        {QByteArrayLiteral("\x1b[3J"), "history clear ends resize-prefix eligibility"},
-        {QByteArrayLiteral("\x1b[6;1H\r\n"), "ordinary scrolling ends resize-prefix eligibility"},
-    };
-    for (const auto& [clear, assertion] : invalidations) {
-        auto cleared = make_model(6, 20);
-        cleared.ingest(QByteArrayLiteral("old\r\nsecond\r\nthird\r\nfourth\r\nprompt> "));
-        cleared.resize({2, 20});
-        cleared.resize({6, 20});
-        ok &= check(cleared.render_snapshot(8U).leading_row_count == 3,
-            "clear and output invalidation fixtures begin with resize-displaced rows");
-        cleared.ingest(clear);
-        ok &= check(!cleared.render_snapshot(9U).leading_rows_snapshot, assertion);
-    }
+    auto erased = make_model(6, 20);
+    erased.ingest(QByteArrayLiteral("old\r\nsecond\r\nthird\r\nfourth\r\nprompt> "));
+    erased.resize({2, 20});
+    erased.resize({6, 20});
+    erased.ingest(QByteArrayLiteral("\x1b[H\x1b[J"));
+    const auto redraw = erased.render_snapshot(8U);
+    ok &= check(redraw.row_coverage_snapshot && redraw.native_content_bottom_row_exclusive == 1 &&
+            redraw.viewport.presentation.clear_page_start_row == 0,
+        "ordinary ED0 redraw preserves archived rows and shortens only the current endpoint");
+    erased.ingest(QByteArrayLiteral("\x1b[3J"));
+    ok &= check(!erased.render_snapshot(9U).row_coverage_snapshot && erased.scrollback_size() == 0,
+        "history erasure removes its actual coverage without a separate resize eligibility state");
     return ok;
 }
 
