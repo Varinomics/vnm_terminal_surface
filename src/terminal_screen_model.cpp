@@ -4150,14 +4150,25 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
         std::optional<std::size_t> cursor_offset;
         std::optional<std::size_t> saved_offset;
         bool contains_latent_wide_cell = false;
+        int  last_source_text_columns  = 0;
         for (std::size_t index = first; index <= last; ++index) {
             const Terminal_screen_row& source = state.rows[index];
             int count = (int)source.cells.size();
-            while (count > 0 &&
-                !source.cells[(std::size_t)count - 1U].occupied &&
-                !source.cells[(std::size_t)count - 1U].protected_cell)
-            {
-                --count;
+            if (m_config.backend_owns_screen_buffers) {
+                // ConPTY's reflow packs a line's text without its trailing
+                // spaces, written or not, and copies the attributes past the
+                // text apart from it (textBuffer.cpp TextBuffer::Reflow).
+                while (count > 0 && is_space_cell(source.cells[(std::size_t)count - 1U])) {
+                    --count;
+                }
+            }
+            else {
+                while (count > 0 &&
+                    !source.cells[(std::size_t)count - 1U].occupied &&
+                    !source.cells[(std::size_t)count - 1U].protected_cell)
+                {
+                    --count;
+                }
             }
             // Preserve written cells beyond an earlier wide-glyph wrap gap.
             count = std::max(count, source.soft_wrap_columns);
@@ -4173,6 +4184,9 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 (int)index == old_saved.position.row)
             {
                 count = std::max(count, old_saved.position.column + 1);
+            }
+            if (index == last) {
+                last_source_text_columns = count;
             }
 
             std::size_t origin_span_index = 0U;
@@ -4436,6 +4450,18 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             offset = end_offset;
         }
         map_position(cells.size(), std::min(column, columns - 1), column == columns);
+        if (m_config.backend_owns_screen_buffers) {
+            // Past the text, the line's last source row keeps its attributes in
+            // the row the text ends on, as ConPTY's reflow copies them.
+            const std::vector<Cell>& tail = state.rows[last].cells;
+            for (int source_column = last_source_text_columns, target_column = column;
+                 source_column < static_cast<int>(tail.size()) && target_column < columns;
+                 ++source_column, ++target_column)
+            {
+                row.cells[static_cast<std::size_t>(target_column)] =
+                    tail[static_cast<std::size_t>(source_column)];
+            }
+        }
         finish_row_provenance(row);
         finish_row_vacancy(row);
         rows.push_back(std::move(row));
@@ -4481,9 +4507,7 @@ void Terminal_screen_model::resize_buffer_state(
         for (int row = static_cast<int>(state.rows.size()) - 1; row >= content_rows; --row) {
             const Terminal_screen_row& candidate = state.rows[static_cast<std::size_t>(row)];
             const bool holds_text = candidate.soft_wrap_columns > 0 ||
-                std::any_of(candidate.cells.begin(), candidate.cells.end(), [](const Cell& cell) {
-                    return cell.occupied && !cell.wide_continuation && cell.text != QStringLiteral(" ");
-                });
+                !std::all_of(candidate.cells.begin(), candidate.cells.end(), is_space_cell);
             if (holds_text) {
                 content_rows = row + 1;
             }
@@ -4542,9 +4566,8 @@ void Terminal_screen_model::resize_buffer_state(
 // ConPTY resizes its inactive main buffer once, to the size then current, when
 // the buffer is used again: on return from the alternate buffer and before an
 // active alternate buffer is replaced (screenInfo.cpp _handleDeferredResize).
-// One resize to that size leaves the same rows as its two steps, width and
-// then height. A primary already at that size stays as it is, margins
-// included, as ConPTY's does.
+// A primary already at that size stays as it is, margins included, as
+// ConPTY's does.
 void Terminal_screen_model::resize_deferred_primary()
 {
     if (grid_sizes_match(primary_grid_size(), m_config.grid_size)) {
@@ -4570,6 +4593,13 @@ void Terminal_screen_model::resize_primary_state(terminal_grid_size_t grid_size)
         resize_buffer_state(primary, {primary_size.rows, grid_size.columns}, true);
     }
     resize_buffer_state(primary, grid_size, true);
+}
+
+// A space, written or not, whatever its attributes: ConPTY's reflow measures a
+// line's text up to its last other character (Row.cpp ROW::MeasureRight).
+bool Terminal_screen_model::is_space_cell(const Cell& cell)
+{
+    return cell.text == QStringLiteral(" ");
 }
 
 terminal_grid_size_t Terminal_screen_model::primary_grid_size() const

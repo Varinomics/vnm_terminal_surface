@@ -6107,6 +6107,10 @@ bool write_native_cmd_screen_files(const QTemporaryDir& dir)
         // overwrites the third line and two lines stay below the cursor.
         write_file(QStringLiteral("below.txt"), QByteArrayLiteral(
             "line1\r\nline2\r\nline3\r\nline4\r\nline5\x1b[3A")) &&
+        // The same, with spaces written to column 35 on the line the prompt
+        // overwrites: the prompt row keeps them after its text.
+        write_file(QStringLiteral("padded.txt"), QByteArrayLiteral(
+            "line1\r\nline2\r\nline3                              \r\nline4\r\nline5\x1b[3A")) &&
         write_file(QStringLiteral("enter.txt"), QByteArrayLiteral("\x1b[?1049h")) &&
         write_file(QStringLiteral("leave.txt"), QByteArrayLiteral("\x1b[?1049l")) &&
         // A restore right after entering the alternate screen, and a restore
@@ -6574,6 +6578,16 @@ bool test_native_cmd_alternate_resize()
             false,
             {},
         },
+        // ConPTY trims written spaces from a line before it packs the line
+        // (textBuffer.cpp TextBuffer::Reflow), so a line padded past the new
+        // width stays one row.
+        {
+            "padded line above the cursor, shorter and narrower",
+            QByteArrayLiteral("type padded.txt"),
+            {{5, 30}},
+            false,
+            {},
+        },
     };
 
     bool ok = true;
@@ -6678,34 +6692,41 @@ bool test_native_cmd_alternate_saved_cursor()
 // ConPTY reflows its main buffer on every resize and keeps the last rows that
 // hold text or the cursor, up to a screen from the cursor down (textBuffer.cpp
 // TextBuffer::Reflow). With lines below the cursor, a shrink drops rows from
-// the top. The resize runs while the probe holds the console, so cmd's prompt
-// cannot redraw in between.
+// the top. The reflow trims written spaces from a line before packing it, so
+// a padded line stays one row. The resize runs while the probe holds the
+// console, so cmd's prompt cannot redraw in between.
 bool test_native_cmd_primary_resize_with_text_below_the_cursor()
 {
-    const std::string label = "native cmd primary resize with text below the cursor";
-    QTemporaryDir dir;
-    if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": files are written")) {
-        return false;
-    }
+    bool ok = true;
+    for (const char* setup : {"type below.txt", "type padded.txt"}) {
+        const std::string label =
+            std::string("native cmd primary resize with text below the cursor, ") + setup;
+        QTemporaryDir dir;
+        if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": files are written")) {
+            ok = false;
+            continue;
+        }
 
-    Native_cmd_screen screen;
-    if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+        Native_cmd_screen screen;
+        if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+            screen.stop();
+            ok = false;
+            continue;
+        }
+
+        ok &= check(screen.run(setup), label + ": cmd leaves lines below its prompt");
+        const std::optional<Conpty_buffer_report> conpty = screen.probe_resize({5, 30});
+        ok &= check(conpty.has_value() && screen.probe_model().has_value(),
+            label + ": the probe reports ConPTY's buffer after the resize");
+        if (conpty.has_value() && screen.probe_model().has_value()) {
+            ok &= check(conpty->grid_size.rows == 5 && conpty->grid_size.columns == 30,
+                label + ": ConPTY has the shorter and narrower size");
+            ok &= screens_match(*screen.probe_model(), *conpty,
+                label + ": every row and the cursor equal ConPTY's");
+        }
+
         screen.stop();
-        return false;
     }
-
-    bool ok = check(screen.run("type below.txt"), label + ": cmd leaves lines below its prompt");
-    const std::optional<Conpty_buffer_report> conpty = screen.probe_resize({5, 30});
-    ok &= check(conpty.has_value() && screen.probe_model().has_value(),
-        label + ": the probe reports ConPTY's buffer after the resize");
-    if (conpty.has_value() && screen.probe_model().has_value()) {
-        ok &= check(conpty->grid_size.rows == 5 && conpty->grid_size.columns == 30,
-            label + ": ConPTY has the shorter and narrower size");
-        ok &= screens_match(*screen.probe_model(), *conpty,
-            label + ": every row and the cursor equal ConPTY's");
-    }
-
-    screen.stop();
     return ok;
 }
 

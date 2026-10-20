@@ -3,6 +3,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <variant>
@@ -623,6 +624,50 @@ bool test_backend_owned_primary_resize_keeps_text_below_the_cursor()
     far.resize({2, 6});
     ok &= check(rows_are(far, {"a", "b"}) && far.scrollback_size() == 0,
         "rows more than a screen below the cursor are cut");
+
+    // The reflow trims written spaces from a line before packing it, so the
+    // padded line stays one row when the grid narrows below its spaces.
+    const QByteArray padded = QByteArrayLiteral("a\r\nb\r\nc    \r\nd\x1b[2;1H");
+    term::Terminal_screen_model narrowed = make_backend_owned_model(4, 6);
+    narrowed.ingest(padded);
+    narrowed.resize({3, 3});
+    ok &= check(rows_are(narrowed, {"b", "c", "d"}) && narrowed.cursor_position().row == 0,
+        "a padded line narrower than its spaces stays one row");
+
+    term::Terminal_screen_model narrowed_deferred = make_backend_owned_model(4, 6);
+    narrowed_deferred.ingest(padded + QByteArrayLiteral("\x1b[?1049h"));
+    narrowed_deferred.resize({3, 3});
+    narrowed_deferred.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(rows_are(narrowed_deferred, {"b", "c", "d"}),
+        "the deferred resize keeps the padded line one row too");
+    return ok;
+}
+
+// ConPTY copies a line's attributes apart from its text: past the text they
+// continue in the row the text ends on (textBuffer.cpp TextBuffer::Reflow).
+bool test_backend_owned_reflow_keeps_trailing_attributes()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(2, 6);
+    model.ingest(QByteArrayLiteral("abcdefgh\x1b[31m\x1b[K\x1b[0m\x1b[H"));
+    model.resize({2, 10});
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(50U);
+    const auto red_at = [&](
+            int row,
+            int column)
+        {
+            return std::any_of(snapshot.cells.begin(), snapshot.cells.end(),
+                [&](const term::Terminal_render_cell& cell) {
+                    return
+                        cell.position.row == row && cell.position.column == column &&
+                        foreground_rgba_for_cell(snapshot, cell) == k_red_rgba;
+                });
+        };
+    bool ok = check(model.row_text(0) == QStringLiteral("abcdefgh"),
+        "widening joins the wrapped line");
+    ok &= check(red_at(0, 8) && red_at(0, 9),
+        "the erased cells after the text keep their style after the joined text");
+    ok &= check(!red_at(1, 0) && !red_at(1, 1),
+        "they do not wrap into a row of their own");
     return ok;
 }
 
@@ -727,6 +772,7 @@ int main()
     ok &= test_backend_owned_alternate_screen_starts_at_the_entry_cursor();
     ok &= test_backend_owned_saved_cursors_live_apart_from_the_screens();
     ok &= test_backend_owned_primary_resize_keeps_text_below_the_cursor();
+    ok &= test_backend_owned_reflow_keeps_trailing_attributes();
     ok &= test_resize_normalizes_saved_origin_mode_and_noop();
     ok &= test_resize_preserves_primary_wide_cells_crossing_right_edge();
     ok &= test_viewport_alternate_screen_policy_hooks();
