@@ -1356,6 +1356,23 @@ set_tests_properties(vnm_terminal_surface_host PROPERTIES
     TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
 
+# Fractional display scaling makes neighbouring font sizes round up to the same
+# device-pixel advance even where whole-pixel hinting keeps them apart at 100%.
+add_test(
+    NAME vnm_terminal_surface_host_control_wheel_zoom_scaled
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_scaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --control-wheel-zoom-only
+)
+set_tests_properties(vnm_terminal_surface_host_control_wheel_zoom_scaled PROPERTIES
+    LABELS "conformance;surface;input;wheel"
+    TIMEOUT 60
+)
+
 if(WIN32)
     add_test(
         NAME vnm_terminal_surface_content_tail_presentation
@@ -1895,8 +1912,26 @@ vnm_terminal_add_test(vnm_terminal_terminal_modes
     terminal_modes/private_modes_tests.cpp
 )
 
-vnm_terminal_add_test(vnm_terminal_wheel_gesture
+add_executable(vnm_terminal_wheel_gesture
     wheel_gesture/wheel_gesture_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_wheel_gesture PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_wheel_gesture PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_wheel_gesture
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_wheel_gesture>"
 )
 
 vnm_terminal_add_test(vnm_terminal_viewport
@@ -2293,6 +2328,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_behavior_smoke
     vnm_terminal_parser_randomized
     vnm_terminal_qt_posture
+    vnm_terminal_wheel_gesture
     vnm_terminal_backend_session
     vnm_terminal_touch_selection
     vnm_terminal_backend_output_capture

@@ -7331,8 +7331,9 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             return;
         }
 
-        const qreal requested_font_size = term::font_size_after_wheel_zoom(m_font_size, steps);
-        const qreal previous_font_size  = m_font_size;
+        const qreal requested_font_size =
+            term::VNM_TerminalSurface_render_bridge::font_size_after_wheel_zoom(*this, steps);
+        const qreal previous_font_size = m_font_size;
         apply_font_size(requested_font_size);
         if (term::has_vertical_wheel_delta(*event) ||
             !same_property_value(previous_font_size, m_font_size))
@@ -9916,6 +9917,21 @@ term::VNM_TerminalSurface_render_bridge::cell_metrics(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     return surface.m_private->cell_metrics;
+}
+
+qreal term::VNM_TerminalSurface_render_bridge::font_size_after_wheel_zoom(
+    const VNM_TerminalSurface& surface,
+    int                        steps)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return term::font_size_after_wheel_zoom(
+        surface.m_font_size,
+        steps,
+        surface.m_font_family,
+        surface.m_private->render_device_pixel_ratio,
+        surface.m_font_advance_policy,
+        surface.m_private->render_logical_dpi,
+        terminal_text_renderer_policy(surface.m_text_renderer_mode));
 }
 
 term::Ime_preedit_state term::VNM_TerminalSurface_render_bridge::ime_preedit_state(
