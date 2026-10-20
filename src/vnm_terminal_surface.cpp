@@ -5,6 +5,7 @@
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/interaction_trace.h"
+#include "vnm_terminal/internal/msdf_availability_work.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
@@ -3260,6 +3261,10 @@ struct VNM_TerminalSurface::Private
     QTimer                                                 row_timestamp_tooltip_timer;
     QTimer                                                 msdf_availability_completion_timer;
     std::shared_ptr<Msdf_availability_completion>          msdf_availability_completion;
+
+    std::shared_ptr<term::Msdf_availability_work>
+                                                           msdf_availability_work;
+
     int                                                    msdf_availability_completion_polls_remaining = 0;
     std::optional<QPointF>                                 row_timestamp_tooltip_pointer_position;
     bool                                                   row_timestamp_tooltip_request_active  = false;
@@ -3451,6 +3456,7 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
 VNM_TerminalSurface::~VNM_TerminalSurface()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    m_private->msdf_availability_work.reset();
     m_private->cancel_clipboard_paste();
 
     if (m_interaction_diagnostics_enabled) {
@@ -3564,14 +3570,17 @@ void VNM_TerminalSurface::start_msdf_availability_check()
 {
     // Bake the font's MSDF atlas on a worker thread to learn, truthfully,
     // whether MSDF can render this font. Coverage is size-independent, so the
-    // family alone determines availability. A generation counter discards stale
-    // results when the font changes again before a check finishes.
+    // family alone determines availability. Coalesce pending font selections;
+    // the generation still rejects an active check's result after a font change.
     const QFont font(m_font_family);
     const unsigned long long generation = ++m_msdf_availability_generation;
 
     if (!m_msdf_text_checking) {
         m_msdf_text_checking = true;
         emit msdf_text_checking_changed();
+    }
+    if (generation != m_msdf_availability_generation) {
+        return;
     }
 
     auto completion = std::make_shared<Msdf_availability_completion>();
@@ -3582,20 +3591,34 @@ void VNM_TerminalSurface::start_msdf_availability_check()
         k_msdf_availability_completion_poll_ms;
     m_private->msdf_availability_completion_timer.start();
 
+    if (m_private->msdf_availability_work == nullptr) {
+        m_private->msdf_availability_work = std::make_shared<term::Msdf_availability_work>();
+    }
     QPointer<VNM_TerminalSurface> self = this;
-    QThreadPool::globalInstance()->start([self, font, generation, completion]() {
-        const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
-        const auto post_result = vnm::qt::post(
-            qApp,
-            [self, available, generation]() {
-                if (self) {
-                    self->apply_msdf_availability_result(available, generation);
-                }
+    const bool start_worker = m_private->msdf_availability_work->submit([
+            self, font, generation, completion
+        ]()
+        {
+            const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
+            const auto post_result = vnm::qt::post(
+                qApp,
+                [self, available, generation]() {
+                    if (self) {
+                        self->apply_msdf_availability_result(available, generation);
+                    }
+                });
+            completion->dispatch_result.store(
+                static_cast<int>(post_result),
+                std::memory_order_release);
+        });
+    if (start_worker) {
+        QThreadPool::globalInstance()->start([
+                work = std::weak_ptr(m_private->msdf_availability_work)
+            ]()
+            {
+                term::Msdf_availability_work::run(work);
             });
-        completion->dispatch_result.store(
-            static_cast<int>(post_result),
-            std::memory_order_release);
-    });
+    }
 }
 
 void VNM_TerminalSurface::handle_msdf_availability_completion_timeout()
