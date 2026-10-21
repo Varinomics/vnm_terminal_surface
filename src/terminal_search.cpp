@@ -1,7 +1,6 @@
 #include "vnm_terminal/internal/terminal_search.h"
 
 #include <QByteArray>
-#include <QLatin1StringView>
 #include <QThreadPool>
 #include <Qt>
 
@@ -197,27 +196,21 @@ std::optional<std::vector<search_match_span_t>> search_row(
     const qsizetype latin1_units = column_count >= row.source_width
         ? row.identity_latin1_text.size()
         : std::min(row.identity_latin1_text.size(), static_cast<qsizetype>(std::max(0, column_count)));
-    const bool use_latin1_search = complex == nullptr && query.latin1_exact;
-    const QLatin1StringView latin1_text(row.identity_latin1_text.constData(), latin1_units);
-    // Qt's Latin-1 search rejects non-Latin-1 needles before case folding.
-    // Preserve UTF-16 matching for queries such as the Kelvin sign.
-    const QString expanded_latin1_text = complex == nullptr && !query.latin1_exact
+    const QString latin1_text = complex == nullptr
         ? QString::fromLatin1(row.identity_latin1_text.constData(), latin1_units)
         : QString();
     const QStringView text = complex != nullptr
         ? QStringView(complex->units.data(),
               static_cast<qsizetype>(searchable_unit_count(*complex, column_count)))
-        : QStringView(expanded_latin1_text);
-    const qsizetype text_size = complex != nullptr ? text.size() : latin1_text.size();
-    if (query.utf16.isEmpty() || query.utf16.size() > text_size) {
+        : QStringView(latin1_text);
+    if (query.utf16.isEmpty() || query.utf16.size() > text.size()) {
         return matches;
     }
 
     qsizetype search_from = 0;
-    while (search_from <= text_size - query.utf16.size()) {
-        const qsizetype found = use_latin1_search
-            ? latin1_text.indexOf(QLatin1StringView(query.latin1), search_from, query.case_sensitivity)
-            : text.indexOf(query.utf16, search_from, query.case_sensitivity);
+    while (search_from <= text.size() - query.utf16.size()) {
+        const qsizetype found =
+            text.indexOf(query.utf16, search_from, query.case_sensitivity);
         if (found < 0) {
             break;
         }
