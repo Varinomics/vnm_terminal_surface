@@ -7,6 +7,7 @@
 #include <QImage>
 #include <QString>
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -397,19 +398,46 @@ bool test_decoded_ascii_cells_share_immutable_text()
 {
     bool ok = true;
     constexpr std::size_t ascii_count = 95U;
+    struct ascii_encoding_fixture_t
+    {
+        bool leading_blank;
+        bool styled;
+        bool hyperlinked;
+    };
+    constexpr std::array<ascii_encoding_fixture_t, 6> fixtures{{
+        {false, false, false},
+        {true,  false, false},
+        {false, true,  false},
+        {true,  true,  false},
+        {false, false, true},
+        {true,  true,  true},
+    }};
 
-    for (bool leading_blank : {false, true}) {
+    for (const auto& fixture : fixtures) {
         term::Terminal_history_ring ring({4096U, 4096U});
-        const std::size_t first_ascii = leading_blank ? 1U : 0U;
+        const std::size_t first_ascii = fixture.leading_blank ? 1U : 0U;
         term::Terminal_history_row_record record = make_base_record(
             31U,
             7U,
             term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
             static_cast<int>(first_ascii + 2U * ascii_count));
+        if (fixture.styled) {
+            record.style_table.push_back(red_style());
+        }
+        if (fixture.hyperlinked) {
+            record.hyperlink_identity_keys.emplace(
+                k_first_hyperlink_ref,
+                QByteArrayLiteral("uri:https://example.test/ascii"));
+        }
         record.cells.resize(first_ascii);
         for (int copy = 0; copy < 2; ++copy) {
             for (ushort code_unit = 0x20U; code_unit <= 0x7eU; ++code_unit) {
-                record.cells.push_back(make_cell(QString(QChar(code_unit)), 1, true));
+                record.cells.push_back(make_cell(
+                    QString(QChar(code_unit)),
+                    1,
+                    true,
+                    fixture.styled ? 1U : term::k_default_terminal_style_id,
+                    fixture.hyperlinked ? k_first_hyperlink_ref : term::k_no_terminal_hyperlink_id));
             }
         }
 
@@ -417,15 +445,15 @@ bool test_decoded_ascii_cells_share_immutable_text()
         auto decoded = append_and_decode(ring, record, make_identity(5U, 31U), append);
         if (!check(decoded.status == term::Terminal_history_row_record_codec_status::OK &&
                 records_equal(decoded.record, record),
-            "every printable ASCII character round-trips through both history encodings"))
+            "printable ASCII round-trips through compact and decorated history encodings"))
         {
             return false;
         }
         ok &= check(append.payload_kind ==
-                (leading_blank
+                (fixture.leading_blank || fixture.styled || fixture.hyperlinked
                     ? term::Terminal_history_row_record_payload_kind::GENERIC_COMPACT
                     : term::Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII),
-            "a leading unoccupied cell selects the generic ASCII opcode path");
+            "leading blanks and decorations select the generic history encoding");
 
         bool shared_text = true;
         for (std::size_t index = 0U; index < ascii_count; ++index) {

@@ -1582,13 +1582,29 @@ static int qsg_atlas_text_run_cell_span(
     return std::max(1, measure_utf8_width(run.text.toUtf8()).cells);
 }
 
-QByteArray prepared_text_cache_key(
-    const Terminal_render_text_run& run,
+QByteArray prepared_text_cache_font_key(
     const QFont&                    font,
     terminal_cell_metrics_t         cell_metrics,
     qreal                           device_pixel_ratio,
-    std::uint64_t                   font_epoch,
-    bool                            cursor_text_run)
+    std::uint64_t                   font_epoch)
+{
+    QByteArray key;
+    append_key_uint64(key, font_epoch);
+    append_key_string(key, font.toString());
+    append_key_cell_metrics(key, cell_metrics);
+    const qreal normalized_device_pixel_ratio =
+        (!std::isfinite(device_pixel_ratio) || device_pixel_ratio <= 0.0)
+            ? 1.0
+            : std::max<qreal>(1.0, device_pixel_ratio);
+    append_key_qreal(key, normalized_device_pixel_ratio);
+    return key;
+}
+
+QByteArray prepared_text_cache_key(
+    const Terminal_render_text_run& run,
+    terminal_cell_metrics_t         cell_metrics,
+    bool                            cursor_text_run,
+    const QByteArray&               font_key)
 {
     QByteArray key;
     // Shaping depends on the text and font/layout metrics, not on the cell
@@ -1604,14 +1620,7 @@ QByteArray prepared_text_cache_key(
     append_key_int(key, qsg_atlas_text_run_cell_span(run, cell_metrics));
     append_key_qreal(key, run.rect.left() - run.baseline_origin.x());
     append_key_bool(key, cursor_text_run);
-    append_key_uint64(key, font_epoch);
-    append_key_string(key, font.toString());
-    append_key_cell_metrics(key, cell_metrics);
-    const qreal normalized_device_pixel_ratio =
-        (!std::isfinite(device_pixel_ratio) || device_pixel_ratio <= 0.0)
-            ? 1.0
-            : std::max<qreal>(1.0, device_pixel_ratio);
-    append_key_qreal(key, normalized_device_pixel_ratio);
+    key.append(font_key);
     return key;
 }
 
@@ -3595,7 +3604,8 @@ private:
         const std::vector<Terminal_render_text_run>& runs,
         qreal                                        opacity,
         Atlas_prepare_result&                       result,
-        bool                                        cursor_text_run)
+        bool                                        cursor_text_run,
+        QByteArray&                                 prepared_text_font_key)
     {
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::append_text_pass");
 
@@ -3608,7 +3618,8 @@ private:
                 opacity,
                 result,
                 static_cast<int>(index),
-                cursor_text_run);
+                cursor_text_run,
+                prepared_text_font_key);
         }
         ranges.glyph.count =
             static_cast<quint32>(m_glyph_instances.size()) -
@@ -4217,11 +4228,13 @@ private:
         result.render.images.rejected = render_frame.stats.images_rejected;
         m_selection_pass  = append_rect_pass(render_frame.selection_rects, opacity);
         m_graphic_pass    = append_graphic_pass(render_frame, opacity);
+        QByteArray prepared_text_font_key;
         const atlas_text_pass_ranges_t text_passes = append_text_pass(
             render_frame.text_runs,
             opacity,
             result,
-            false);
+            false,
+            prepared_text_font_key);
         m_text_pass      = text_passes.glyph;
         m_msdf_text_pass = text_passes.msdf;
         m_decoration_pass = append_decoration_pass(render_frame.decorations, opacity);
@@ -4230,7 +4243,8 @@ private:
             render_frame.cursor_text_runs,
             opacity,
             result,
-            true);
+            true,
+            prepared_text_font_key);
         m_cursor_text_pass      = cursor_text_passes.glyph;
         m_msdf_cursor_text_pass = cursor_text_passes.msdf;
         prune_prepared_text_cache(result.producer);
@@ -6085,7 +6099,8 @@ private:
         qreal                            opacity,
         Atlas_prepare_result&           result,
         int                              text_run_index,
-        bool                             cursor_text_run)
+        bool                             cursor_text_run,
+        QByteArray&                      prepared_text_font_key)
     {
         ++result.producer.text_runs_considered;
         if (run.text.isEmpty()) {
@@ -6177,14 +6192,19 @@ private:
         }
 
         const bool cache_usable = prepared_text_cache_key_is_usable(run);
-        const QByteArray cache_key = cache_usable
-            ? prepared_text_cache_key(
-                run,
+        if (cache_usable && prepared_text_font_key.isEmpty()) {
+            prepared_text_font_key = prepared_text_cache_font_key(
                 m_frame.font,
                 m_frame.cell_metrics,
                 m_frame.device_pixel_ratio,
-                m_frame.font_epoch,
-                cursor_text_run)
+                m_frame.font_epoch);
+        }
+        const QByteArray cache_key = cache_usable
+            ? prepared_text_cache_key(
+                run,
+                m_frame.cell_metrics,
+                cursor_text_run,
+                prepared_text_font_key)
             : QByteArray();
         if (cache_usable) {
             ++result.producer.shape_cache_lookups;

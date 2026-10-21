@@ -3,8 +3,10 @@
 #include "vnm_terminal/terminal_touch_selection.h"
 
 #include <QByteArray>
+#include <QChar>
 #include <QImage>
 #include <QString>
+#include <QStringView>
 #include <QtGlobal>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +51,43 @@ inline constexpr bool terminal_canvas_grid_fits_cell_budget(
     return rows > 0 && columns > 0 &&
         static_cast<std::size_t>(rows) <=
             k_terminal_canvas_max_cells / static_cast<std::size_t>(columns);
+}
+
+// Count without encoding so canvas budget checks do not allocate per cell.
+// Malformed UTF-16 or an unrepresentable byte count has no result; callers
+// retain their own invalid-text policy.
+inline std::optional<qsizetype> terminal_canvas_text_utf8_size(QStringView text)
+{
+    qsizetype bytes = 0;
+    for (qsizetype offset = 0; offset < text.size(); ++offset) {
+        const QChar code_unit = text.at(offset);
+        qsizetype scalar_bytes = 1;
+        if (code_unit.unicode() >= 0x80U) {
+            if (code_unit.unicode() < 0x800U) {
+                scalar_bytes = 2;
+            }
+            else
+            if (code_unit.isHighSurrogate()) {
+                if (offset + 1 == text.size() || !text.at(offset + 1).isLowSurrogate()) {
+                    return std::nullopt;
+                }
+                ++offset;
+                scalar_bytes = 4;
+            }
+            else
+            if (code_unit.isLowSurrogate()) {
+                return std::nullopt;
+            }
+            else {
+                scalar_bytes = 3;
+            }
+        }
+        if (scalar_bytes > std::numeric_limits<qsizetype>::max() - bytes) {
+            return std::nullopt;
+        }
+        bytes += scalar_bytes;
+    }
+    return bytes;
 }
 
 enum class Terminal_canvas_cursor_shape

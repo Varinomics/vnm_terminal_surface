@@ -360,7 +360,8 @@ bool test_color_modes()
             "\x1b[38:2::12:34:56;48:2::200:150:100mH"
             "\x1b[38:5:196mI"
             "\x1b[38:2:99:12:34:56mJ"
-            "\x1b[38:5:999:196mK"));
+            "\x1b[38:5:999:196mK"
+            "\x1b[38:2:::12:34:56mL"));
     ok &= check(diagnostic_count(result) == 0, "color SGR has no diagnostics");
 
     const term::Terminal_render_snapshot snapshot = model.render_snapshot(3U);
@@ -406,6 +407,9 @@ bool test_color_modes()
     ok &= check(foreground_rgba_for_cell(snapshot, cell_at(snapshot, 0, 10)) ==
         k_bright_red_rgba,
         "colon 256-color foreground uses last atom");
+    ok &= check(foreground_rgba_for_cell(snapshot, cell_at(snapshot, 0, 11)) ==
+        k_truecolor_fg_rgba,
+        "colon truecolor preserves multiple leading omitted atoms");
     return ok;
 }
 
@@ -682,6 +686,15 @@ bool test_malformed_sgr_is_atomic()
     ok &= check(cell_at(truecolor_colon_snapshot, 0, 0).style_id ==
         term::k_default_terminal_style_id,
         "colon truecolor missing component keeps default style");
+
+    model         = make_model();
+    colon_result  = model.ingest(QByteArrayLiteral("\x1b[1;38:2:99:12:34:56:78mX"));
+    ok           &= check(diagnostic_count(colon_result) == 1,
+        "colon truecolor rejects a fifth supplied atom after the mode");
+    const term::Terminal_render_snapshot excess_truecolor_snapshot = model.render_snapshot(10U);
+    ok &= check(cell_at(excess_truecolor_snapshot, 0, 0).style_id ==
+        term::k_default_terminal_style_id,
+        "excess truecolor atoms apply no partial bold or color");
     return ok;
 }
 

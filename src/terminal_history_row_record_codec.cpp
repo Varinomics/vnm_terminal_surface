@@ -414,6 +414,19 @@ public:
         return true;
     }
 
+    bool read_view(std::uint32_t byte_count, QByteArrayView& bytes)
+    {
+        if (!size_fits_qsizetype(byte_count) || !can_read(byte_count)) {
+            return false;
+        }
+
+        bytes = QByteArrayView(
+            reinterpret_cast<const char*>(m_bytes.data() + m_offset),
+            static_cast<qsizetype>(byte_count));
+        m_offset += byte_count;
+        return true;
+    }
+
     bool read_raw(std::size_t byte_count, uchar* bytes)
     {
         if (!can_read(byte_count)) {
@@ -1082,7 +1095,7 @@ Terminal_history_row_record_codec_status read_table_length(
 
 bool occupied_cell_has_printable_ascii_text(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     return
         cell.occupied            &&
@@ -1137,7 +1150,7 @@ bool cell_is_default_printable_ascii(
 
 bool cell_is_default_printable_ascii(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     return
         occupied_cell_has_printable_ascii_text(cell, text_bytes) &&
@@ -1147,7 +1160,7 @@ bool cell_is_default_printable_ascii(
 
 Terminal_history_row_record_codec_status validate_cell_text(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     if (!cell.occupied || cell.wide_continuation) {
         return Terminal_history_row_record_codec_status::OK;
@@ -1157,8 +1170,7 @@ Terminal_history_row_record_codec_status validate_cell_text(
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
 
-    const Terminal_utf8_width_result width =
-        measure_utf8_width(QByteArrayView(text_bytes.constData(), text_bytes.size()));
+    const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
     if (width.status != Terminal_unicode_width_status::OK) {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
@@ -2226,8 +2238,7 @@ Terminal_history_row_record_codec_status read_extended_value(
 Terminal_history_row_record_codec_status read_extended_cell(
     Byte_reader&                  reader,
     const row_record_header_t&     header,
-    Terminal_history_row_cell&     cell,
-    QByteArray&                    encoded_text)
+    Terminal_history_row_cell&     cell)
 {
     std::uint8_t tag0 = 0U;
     if (!reader.read_u8(tag0)) {
@@ -2339,12 +2350,19 @@ Terminal_history_row_record_codec_status read_extended_cell(
             : Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
 
-    if (!reader.read_bytes(text_byte_count, encoded_text)) {
+    QByteArrayView encoded_text;
+    if (!reader.read_view(text_byte_count, encoded_text)) {
         return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
     }
 
     if (cell_is_default_printable_ascii(cell, encoded_text)) {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+
+    if (occupied_cell_has_printable_ascii_text(cell, encoded_text)) {
+        cell.text = printable_ascii_cell_text(
+            QChar(static_cast<ushort>(static_cast<unsigned char>(encoded_text[0]))));
+        return Terminal_history_row_record_codec_status::OK;
     }
 
     const Terminal_history_row_record_codec_status text_status =
@@ -2380,7 +2398,6 @@ Terminal_history_row_record_codec_status read_cell_stream(
         }
 
         Terminal_history_row_cell cell;
-        QByteArray encoded_text;
         if (opcode == k_opcode_default_blank) {
             if (remaining_wide_continuations > 0) {
                 return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
@@ -2421,8 +2438,7 @@ Terminal_history_row_record_codec_status read_cell_stream(
                 read_extended_cell(
                     reader,
                     header,
-                    cell,
-                    encoded_text);
+                    cell);
             if (status != Terminal_history_row_record_codec_status::OK) {
                 return status;
             }
