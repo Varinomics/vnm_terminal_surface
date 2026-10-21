@@ -112,8 +112,6 @@ struct Csi_dispatch_parts
     QByteArray parameter_bytes;
     QByteArray private_marker;
     QByteArray intermediates;
-    QByteArray final_bytes;
-    QByteArray raw_bytes;
 };
 
 Parser_action make_screen_mutation_action(Screen_mutation mutation)
@@ -370,49 +368,12 @@ bool color_component_is_valid(int value)
     return value >= 0 && value <= 255;
 }
 
-std::vector<int> flat_csi_parameters(QByteArrayView parameter_bytes)
-{
-    if (parameter_bytes.empty()) {
-        return {};
-    }
-
-    std::vector<Sgr_parameter_group> groups;
-    if (!parse_sgr_parameter_groups(parameter_bytes, groups)) {
-        return {};
-    }
-
-    std::vector<int> parameters;
-    parameters.reserve(groups.size());
-    for (const Sgr_parameter_group& group : groups) {
-        if (group.atoms.size() != 1U) {
-            return {};
-        }
-
-        parameters.push_back(group.atoms.front().has_value ? group.atoms.front().value : 0);
-    }
-
-    return parameters;
-}
-
 bool parse_csi_dispatch_parts(
     QByteArrayView         bytes,
     qsizetype              csi_begin,
     qsizetype              final_offset,
     Csi_dispatch_parts&    parts)
 {
-    qsizetype raw_begin = csi_begin - 1;
-    if (csi_begin                     >= 2     &&
-        byte_at(bytes, csi_begin - 2) == 0x1bU &&
-        byte_at(bytes, csi_begin - 1) == '[')
-    {
-        raw_begin = csi_begin - 2;
-    }
-
-    parts.raw_bytes   = QByteArray(
-        bytes.data() + raw_begin,
-        final_offset - raw_begin + 1);
-    parts.final_bytes = QByteArray(1, static_cast<char>(byte_at(bytes, final_offset)));
-
     bool parsing_intermediates = false;
     for (qsizetype i = csi_begin; i < final_offset; ++i) {
         const unsigned char byte = byte_at(bytes, i);
@@ -455,19 +416,30 @@ bool parse_csi_dispatch_parts(
     return true;
 }
 
-Parser_action make_csi_dispatch_action_from_parts(const Csi_dispatch_parts& parts)
+Parser_action make_csi_dispatch_action_from_parts(
+    const Csi_dispatch_parts& parts,
+    QByteArrayView            bytes,
+    qsizetype                 csi_begin,
+    qsizetype                 final_offset)
 {
+    qsizetype raw_begin = csi_begin - 1;
+    if (csi_begin                     >= 2     &&
+        byte_at(bytes, csi_begin - 2) == 0x1bU &&
+        byte_at(bytes, csi_begin - 1) == '[')
+    {
+        raw_begin = csi_begin - 2;
+    }
+
     return {
         Parser_control_sequence{
             Parser_sequence_family::CSI,
             Parser_control_sequence_action::DISPATCH,
-            flat_csi_parameters(parts.parameter_bytes),
             parts.private_marker,
             parts.intermediates,
-            parts.final_bytes,
+            QByteArray(1, static_cast<char>(byte_at(bytes, final_offset))),
             parts.parameter_bytes,
             Parser_string_terminator::NONE,
-            parts.raw_bytes,
+            QByteArray(bytes.data() + raw_begin, final_offset - raw_begin + 1),
         },
     };
 }
@@ -581,7 +553,8 @@ std::optional<Terminal_color_ref> color_ref_from_sgr_color_atoms(
         return std::nullopt;
     }
 
-    std::vector<int> values_after_mode;
+    std::array<int, 4> values_after_mode{};
+    std::size_t value_count = 0U;
     if (layout == Sgr_color_atom_layout::SEMICOLON) {
         if (atoms.size() != 4U) {
             return std::nullopt;
@@ -591,7 +564,7 @@ std::optional<Terminal_color_ref> color_ref_from_sgr_color_atoms(
             if (!atoms[i].has_value) {
                 return std::nullopt;
             }
-            values_after_mode.push_back(atoms[i].value);
+            values_after_mode[value_count++] = atoms[i].value;
         }
     }
     else {
@@ -605,15 +578,18 @@ std::optional<Terminal_color_ref> color_ref_from_sgr_color_atoms(
             }
 
             seen_value_after_mode = true;
-            values_after_mode.push_back(atoms[i].value);
+            if (value_count == values_after_mode.size()) {
+                return std::nullopt;
+            }
+            values_after_mode[value_count++] = atoms[i].value;
         }
     }
 
-    if (values_after_mode.size() < 3U || values_after_mode.size() > 4U) {
+    if (value_count < 3U) {
         return std::nullopt;
     }
 
-    const std::size_t first_component = values_after_mode.size() - 3U;
+    const std::size_t first_component = value_count - 3U;
     const int         red             = values_after_mode[first_component];
     const int         green           = values_after_mode[first_component + 1U];
     const int         blue            = values_after_mode[first_component + 2U];
@@ -728,7 +704,7 @@ bool append_colon_color_operation(
             sequence);
 }
 
-Sgr_parse_result parse_sgr_sequence(QByteArrayView parameter_bytes)
+Sgr_parse_result parse_sgr_sequence(QByteArray parameter_bytes)
 {
     Sgr_parse_result result;
 
@@ -738,7 +714,7 @@ Sgr_parse_result parse_sgr_sequence(QByteArrayView parameter_bytes)
         return result;
     }
 
-    result.sequence.raw_parameters = QByteArray(parameter_bytes.data(), parameter_bytes.size());
+    result.sequence.raw_parameters = std::move(parameter_bytes);
 
     for (std::size_t i = 0; i < groups.size(); ++i) {
         const Sgr_parameter_group& group = groups[i];
@@ -1777,7 +1753,8 @@ void Terminal_byte_stream_parser::finish_csi_sequence(
     }
 
     if (final_byte != 'm') {
-        actions.push_back(make_csi_dispatch_action_from_parts(parts));
+        actions.push_back(make_csi_dispatch_action_from_parts(
+            parts, bytes, csi_begin, final_offset));
         return;
     }
 
@@ -1789,7 +1766,7 @@ void Terminal_byte_stream_parser::finish_csi_sequence(
         return;
     }
 
-    Sgr_parse_result result = parse_sgr_sequence(parts.parameter_bytes);
+    Sgr_parse_result result = parse_sgr_sequence(std::move(parts.parameter_bytes));
     if (!result.ok) {
         actions.push_back(make_malformed_recovery_diagnostic(
             QStringLiteral("SGR"),

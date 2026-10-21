@@ -1297,7 +1297,8 @@ private:
     void reset_tab_stops();
 
     void put_scalar(
-        QString                        text);
+        QString                        text,
+        char32_t                       codepoint);
 
     void put_text(
         QString                        text);
@@ -1692,7 +1693,7 @@ private:
         const retained_row_record_t&   retained_record);
 
     static retained_row_record_t retained_row_record_from_history_row_record(
-        const Terminal_history_row_record& history_record);
+        Terminal_history_row_record history_record);
 
     void materialize_retained_row_hyperlinks(
         retained_row_record_t&         row,

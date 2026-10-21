@@ -891,18 +891,6 @@ QString qstring_from_utf8_hex(
     return QString::fromUtf8(bytes);
 }
 
-void append_parameter_list(std::ostringstream& out, const std::vector<int>& parameters)
-{
-    out << '[';
-    for (std::size_t i = 0U; i < parameters.size(); ++i) {
-        if (i > 0U) {
-            out << ',';
-        }
-        out << parameters[i];
-    }
-    out << ']';
-}
-
 void append_color_ref(std::ostringstream& out, const term::Terminal_color_ref& color)
 {
     out << static_cast<int>(color.kind) << '/'
@@ -939,9 +927,8 @@ std::string action_summary(const term::Parser_action& action)
             const term::Parser_control_sequence& sequence =
                 std::get<term::Parser_control_sequence>(action.payload);
             out << "control:" << static_cast<int>(sequence.family) << ':'
-                << static_cast<int>(sequence.action) << ':';
-            append_parameter_list(out, sequence.parameters);
-            out << ':' << byte_array_hex(sequence.private_marker)
+                << static_cast<int>(sequence.action)
+                << ':' << byte_array_hex(sequence.private_marker)
                 << ':' << byte_array_hex(sequence.intermediates)
                 << ':' << byte_array_hex(sequence.final_bytes)
                 << ':' << byte_array_hex(sequence.payload)

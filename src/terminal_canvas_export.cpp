@@ -198,8 +198,9 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
 
         QString text;
         source_cell.text.append_to(text);
+        const auto counted_text_bytes = terminal_canvas_text_utf8_size(text);
         const std::size_t cell_text_utf8_bytes =
-            static_cast<std::size_t>(text.toUtf8().size());
+            static_cast<std::size_t>(counted_text_bytes ? *counted_text_bytes : text.toUtf8().size());
         if (cell_text_utf8_bytes >
             static_cast<std::size_t>(k_terminal_canvas_max_frame_text_utf8_bytes) -
                 frame_text_utf8_bytes)

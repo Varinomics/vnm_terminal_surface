@@ -133,7 +133,6 @@ auto fields(const term::Parser_control_sequence& sequence)
     return std::tie(
         sequence.family,
         sequence.action,
-        sequence.parameters,
         sequence.private_marker,
         sequence.intermediates,
         sequence.final_bytes,
