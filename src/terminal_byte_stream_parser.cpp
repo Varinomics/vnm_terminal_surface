@@ -368,30 +368,6 @@ bool color_component_is_valid(int value)
     return value >= 0 && value <= 255;
 }
 
-std::vector<int> flat_csi_parameters(QByteArrayView parameter_bytes)
-{
-    if (parameter_bytes.empty()) {
-        return {};
-    }
-
-    std::vector<Sgr_parameter_group> groups;
-    if (!parse_sgr_parameter_groups(parameter_bytes, groups)) {
-        return {};
-    }
-
-    std::vector<int> parameters;
-    parameters.reserve(groups.size());
-    for (const Sgr_parameter_group& group : groups) {
-        if (group.atoms.size() != 1U) {
-            return {};
-        }
-
-        parameters.push_back(group.atoms.front().has_value ? group.atoms.front().value : 0);
-    }
-
-    return parameters;
-}
-
 bool parse_csi_dispatch_parts(
     QByteArrayView         bytes,
     qsizetype              csi_begin,
@@ -458,7 +434,6 @@ Parser_action make_csi_dispatch_action_from_parts(
         Parser_control_sequence{
             Parser_sequence_family::CSI,
             Parser_control_sequence_action::DISPATCH,
-            flat_csi_parameters(parts.parameter_bytes),
             parts.private_marker,
             parts.intermediates,
             QByteArray(1, static_cast<char>(byte_at(bytes, final_offset))),

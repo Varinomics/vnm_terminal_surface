@@ -143,8 +143,8 @@ bool test_printable_and_control_ir()
     const auto&               csi_sequence = std::get<term::Parser_control_sequence>(csi.payload);
     ok &= check(csi_sequence.family == term::Parser_sequence_family::CSI,
         "CSI fixture family");
-    ok &= check(csi_sequence.parameters.size() == 1U && csi_sequence.parameters[0] == 6,
-        "CSI fixture parameters");
+    ok &= check(csi_sequence.payload == QByteArrayLiteral("6"),
+        "CSI fixture parameter payload");
     ok &= check(csi_sequence.final_bytes == QByteArrayLiteral("n"), "CSI fixture final byte");
     ok &= check(csi_sequence.raw_bytes == QByteArray("\x1b[6n", 4), "CSI fixture raw bytes");
 
@@ -154,9 +154,8 @@ bool test_printable_and_control_ir()
         std::get<term::Parser_control_sequence>(csi_private.payload);
     ok &= check(csi_private_sequence.private_marker == QByteArrayLiteral("?"),
         "CSI fixture private marker");
-    ok &= check(csi_private_sequence.parameters.size() == 1U &&
-        csi_private_sequence.parameters[0] == 25,
-        "CSI fixture private parameters");
+    ok &= check(csi_private_sequence.payload == QByteArrayLiteral("25"),
+        "CSI fixture private parameter payload");
 
     const term::Parser_action csi_intermediate =
         dispatch_parser_fixture(QByteArray("\x1b[!p", 4));
@@ -169,11 +168,8 @@ bool test_printable_and_control_ir()
         dispatch_parser_fixture(QByteArray("\x1b[1;4;31m", 9));
     const auto& csi_multi_sequence =
         std::get<term::Parser_control_sequence>(csi_multi.payload);
-    ok &= check(csi_multi_sequence.parameters.size() == 3U &&
-        csi_multi_sequence.parameters[0] == 1 &&
-        csi_multi_sequence.parameters[1] == 4 &&
-        csi_multi_sequence.parameters[2] == 31,
-        "CSI fixture multiple parameters");
+    ok &= check(csi_multi_sequence.payload == QByteArrayLiteral("1;4;31"),
+        "CSI fixture multiple parameter payload");
 
     const term::Parser_action csi_ignore = term::make_csi_control_sequence_action(
         term::Parser_control_sequence_action::IGNORE,
@@ -213,6 +209,47 @@ bool test_printable_and_control_ir()
     ok &= check(dcs_end_of_input_sequence.terminator ==
         term::Parser_string_terminator::END_OF_INPUT,
         "DCS end-of-input terminator");
+
+    return ok;
+}
+
+bool test_parser_csi_parameter_payload()
+{
+    bool ok = true;
+    const std::vector<QByteArray> parameter_payloads = {
+        QByteArrayLiteral(""),
+        QByteArrayLiteral("0"),
+        QByteArrayLiteral(";"),
+        QByteArrayLiteral("0;0"),
+        QByteArrayLiteral(";2"),
+        QByteArrayLiteral("1;;3"),
+        QByteArrayLiteral("1:2"),
+        QByteArrayLiteral("1::2"),
+    };
+
+    for (const QByteArray& payload : parameter_payloads) {
+        const QByteArray bytes = QByteArrayLiteral("\x1b[") + payload + 'H';
+        term::Terminal_byte_stream_parser parser;
+        const std::vector<term::Parser_action> actions = ingest_all(parser, bytes);
+        ok &= check(actions.size() == 1U, "CSI parameter payload emits one action");
+        if (actions.size() != 1U) {
+            continue;
+        }
+
+        const auto* sequence = std::get_if<term::Parser_control_sequence>(&actions[0].payload);
+        ok &= check(sequence != nullptr, "CSI parameter payload emits a control sequence");
+        if (sequence == nullptr) {
+            continue;
+        }
+
+        ok &= check(sequence->family == term::Parser_sequence_family::CSI &&
+                sequence->action == term::Parser_control_sequence_action::DISPATCH &&
+                sequence->final_bytes == QByteArrayLiteral("H"),
+            "CSI parameter payload preserves dispatch");
+        ok &= check(sequence->payload == payload,
+            "CSI payload preserves omitted values, explicit zeros and colon groups");
+        ok &= check(sequence->raw_bytes == bytes, "CSI parameter payload preserves raw bytes");
+    }
 
     return ok;
 }
@@ -576,6 +613,7 @@ int main()
 {
     bool ok = true;
     ok &= test_printable_and_control_ir();
+    ok &= test_parser_csi_parameter_payload();
     ok &= test_parser_printable_ascii_classification();
     ok &= test_string_terminators_and_dcs_discard();
     ok &= test_terminal_reply_ir();
