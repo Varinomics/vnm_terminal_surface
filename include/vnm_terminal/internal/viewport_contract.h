@@ -12,7 +12,7 @@ enum class Terminal_buffer_id
 };
 
 // How a frame presents the primary screen's native rows. NATIVE shows them
-// as they are, AUTOMATIC hides the trailing resize vacancy, and COMPANION
+// as they are, AUTOMATIC replaces trailing resize vacancy with history, and COMPANION
 // relocates the unwritten tail into history. The alternate screen is always
 // NATIVE.
 enum class Terminal_presentation_policy
@@ -92,9 +92,12 @@ inline bool viewport_mappings_match(
 }
 
 // The mapping record's policy and its P and I. The Companion toggle takes
-// precedence; resize vacancy selects AUTOMATIC with P = V; the alternate
-// screen is always NATIVE. Companion relocates at least the vacancy, since
-// styled vacancy can be occupied down to the bottom row.
+// precedence; resize vacancy selects AUTOMATIC with P = min(V, S); the
+// alternate screen is always NATIVE. Automatic displacement needs real
+// history above the native screen: without it, growth must leave the first
+// output at the top instead of inserting blank rows before it. Companion
+// relocates at least the vacancy, since styled vacancy can be occupied down
+// to the bottom row.
 inline Terminal_presentation_mapping make_presentation_mapping(
     Terminal_buffer_id active_buffer,
     bool               companion_enabled,
@@ -117,7 +120,7 @@ inline Terminal_presentation_mapping make_presentation_mapping(
     }
 
     if (resize_vacancy_rows > 0) {
-        return {Terminal_presentation_policy::AUTOMATIC, resize_vacancy_rows, 0};
+        return {Terminal_presentation_policy::AUTOMATIC, std::min(resize_vacancy_rows, scrollback_rows), 0};
     }
 
     return {};
@@ -140,7 +143,7 @@ inline int presentation_clamped_offset_from_tail(const Terminal_viewport_state& 
 
 // The presentation stream lays the policy's rows out in display order: display
 // row d of the window shows stream row S - o + d. AUTOMATIC shifts native rows
-// down by P, leaving structural unused space above native row zero; COMPANION
+// down by P, bringing available history into the enlarged window; COMPANION
 // inserts its P padding rows before insertion_row.
 inline int presentation_stream_row_for_logical_row(
     const Terminal_presentation_mapping& mapping,

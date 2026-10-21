@@ -5,6 +5,7 @@
 #include "../../src/native_backend_io_core.h"
 #include "../../src/native_backend_cleanup_owner.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
@@ -6196,17 +6197,20 @@ std::optional<Conpty_buffer_report> read_conpty_buffer_report(const QString& pat
 class Native_cmd_screen
 {
 public:
-    bool start(const QTemporaryDir& dir, term::terminal_grid_size_t grid_size)
+    bool start(const QTemporaryDir& dir, term::terminal_grid_size_t grid_size, bool plain_cmd = false)
     {
         m_dir = dir.path();
-        auto launch = launch_config(qEnvironmentVariable("ComSpec"),
-            {QStringLiteral("/d"), QStringLiteral("/q"), QStringLiteral("/k"),
-             QStringLiteral("prompt PROMPT$G")});
+        m_prompt = plain_cmd ? QDir::toNativeSeparators(m_dir).toUtf8() + '>' : QByteArray("PROMPT>");
+        const QStringList arguments = plain_cmd
+            ? QStringList{QStringLiteral("/d")}
+            : QStringList{QStringLiteral("/d"), QStringLiteral("/q"), QStringLiteral("/k"),
+                  QStringLiteral("prompt PROMPT$G")};
+        auto launch = launch_config(qEnvironmentVariable("ComSpec"), arguments);
         launch.working_directory = m_dir;
         launch.initial_grid_size = grid_size;
         return
             m_session.start(launch).code == term::Terminal_session_result_code::ACCEPTED &&
-            wait_for([&] { return output().endsWith("PROMPT>"); });
+            wait_for([&] { return output().endsWith(m_prompt); });
     }
 
     void stop()
@@ -6255,11 +6259,11 @@ public:
     // Types a command line and waits for the prompt that follows it.
     bool run(const QByteArray& command)
     {
-        const std::size_t prompts = count_occurrences(output(), "PROMPT>");
+        const std::size_t prompts = count_occurrences(output(), m_prompt);
         return
             m_session.write_user_bytes(command + "\r").code ==
                 term::Terminal_session_result_code::ACCEPTED &&
-            wait_for([&] { return count_occurrences(output(), "PROMPT>") > prompts; });
+            wait_for([&] { return count_occurrences(output(), m_prompt) > prompts; });
     }
 
     // Runs the probe and returns what it read while it waits, with the session
@@ -6350,9 +6354,9 @@ private:
             ? read_conpty_buffer_report(report_path)
             : std::nullopt;
         m_probe_model = m_session.latest_render_snapshot();
-        const std::size_t prompts = count_occurrences(output(), "PROMPT>");
+        const std::size_t prompts = count_occurrences(output(), m_prompt);
         (void)write_gate_file(release_path);
-        (void)wait_for([&] { return count_occurrences(output(), "PROMPT>") > prompts; });
+        (void)wait_for([&] { return count_occurrences(output(), m_prompt) > prompts; });
         return report;
     }
 
@@ -6374,6 +6378,7 @@ private:
             return config;
         }()};
     QString                                          m_dir;
+    QByteArray                                       m_prompt;
     std::optional<term::Terminal_render_snapshot>    m_probe_model;
 };
 
@@ -6422,6 +6427,55 @@ bool screens_match(
         }
     }
     return check(match, label);
+}
+
+// A fresh CMD has no history to pull above its banner when its initial grid
+// grows. Compare ConPTY, the native model and the renderer's presentation so
+// an otherwise correct native resize cannot conceal a leading display gap.
+bool test_native_cmd_startup_growth()
+{
+    bool ok = true;
+    for (const int rows : {42, 43}) {
+        for (const bool hold_probe : {false, true}) {
+            const std::string label = "startup growth to " + std::to_string(rows) +
+                (hold_probe ? " with probe holding the console" : " with cmd reading input");
+            QTemporaryDir dir;
+            if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": fixture files")) {
+                return false;
+            }
+            Native_cmd_screen screen;
+            if (!check(screen.start(dir, {31, 118}, true), label + ": cmd starts")) {
+                screen.stop();
+                return false;
+            }
+            const auto initial = screen.session().latest_render_snapshot_handle();
+            const QString banner = snapshot_row_texts(*initial).front();
+            ok &= check(!banner.isEmpty() && initial->viewport.scrollback_rows == 0,
+                label + ": the banner begins at row zero without history");
+            std::optional<Conpty_buffer_report> report;
+            if (hold_probe) {
+                report = screen.probe_resize({rows, 118});
+            }
+            else {
+                ok &= check(screen.resize({rows, 118}), label + ": resize applied");
+                report = screen.probe();
+            }
+            ok &= check(report.has_value(), label + ": native buffer report available");
+            if (report.has_value()) {
+                ok &= screens_match(*screen.probe_model(), *report, label + ": model equals ConPTY");
+                const auto presented = term::make_presented_snapshot(
+                    std::make_shared<const term::Terminal_render_snapshot>(*screen.probe_model()));
+                ok &= check(presented != nullptr, label + ": renderer projection available");
+                if (presented) {
+                    ok &= check(snapshot_row_texts(*presented).front() == banner &&
+                            presented->cursor.position == screen.probe_model()->cursor.position,
+                        label + ": the displayed banner and cursor retain their native rows");
+                }
+            }
+            screen.stop();
+        }
+    }
+    return ok;
 }
 
 struct Native_cmd_alternate_case
@@ -6734,6 +6788,11 @@ bool test_native_cmd_primary_resize_with_text_below_the_cursor()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-startup-growth") {
+        bool ok = test_native_cmd_startup_growth();
+        ok &= wait_for_console_host_children_to_exit("native cmd startup growth");
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-alternate-resize") {
         bool ok = test_native_cmd_alternate_resize();
         ok &= wait_for_console_host_children_to_exit("native cmd alternate resize");

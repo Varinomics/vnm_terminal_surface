@@ -23240,6 +23240,56 @@ QString displayed_first_row(const std::unique_ptr<term::Terminal_session>& sessi
     return presented ? snapshot_row_text(*presented, 0) : QStringLiteral("<unpresentable>");
 }
 
+// With less history than new rows, the display also needs trailing rows
+// absent from the frozen frame. The normal early release must publish the
+// live grid rather than inventing padding or leaving the old size displayed.
+bool test_short_history_held_growth_releases_early()
+{
+    bool ok = true;
+    for (const int history : {0, 2}) {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        auto launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {2, 20};
+        if (!check(session->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(numbered_scroll_lines(history + 1) + QByteArrayLiteral("$ ")),
+                "the short-history session starts with its first output at the top"))
+        {
+            return false;
+        }
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")) &&
+                session->synchronized_output_hold_active() &&
+                session->resize(QSizeF(200.0, 120.0), {6, 20}).code == term::Terminal_session_result_code::ACCEPTED,
+            "the short-history session holds output while growing from two to six rows");
+        const auto released = session->latest_render_snapshot_handle();
+        const auto displayed = term::make_presented_snapshot(released);
+        ok &= check(!session->synchronized_output_hold_active() && !session->render_publication_blocked() &&
+                released && !released->frozen_basis && released->grid_size.rows == 6 && displayed &&
+                snapshot_row_text(*displayed, 0) == QStringLiteral("scroll-line-000") &&
+                snapshot_row_text(*displayed, history + 1) == QStringLiteral("$ held") &&
+                displayed->cursor.position.row == history + 1,
+            "short-history growth releases to the live grid with output at the top and uncovered rows below");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
+                !session->synchronized_output_hold_active() &&
+                displayed_first_row(session) == QStringLiteral("scroll-line-000"),
+            "the later ESU keeps the released short-history presentation");
+
+        // The frozen basis now owns all six rows. Shrinking it can preserve
+        // the hold, and must adapt vacancy rather than the bounded shift.
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")) &&
+                session->resize(QSizeF(200.0, 100.0), {5, 20}).code == term::Terminal_session_result_code::ACCEPTED,
+            "the short-history session starts another hold and shrinks one row");
+        const auto shrunk = session->latest_render_snapshot_handle();
+        ok &= check(session->synchronized_output_hold_active() && shrunk && shrunk->frozen_basis &&
+                shrunk->grid_size.rows == 5 && shrunk->viewport.presentation.hidden_rows == history &&
+                displayed_first_row(session) == QStringLiteral("scroll-line-000"),
+            "a covered held shrink retains the bounded history shift and first displayed row");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "the covered shrink releases normally");
+    }
+    return ok;
+}
+
 // A held growth that leaves a detached view beyond the new maximum needs
 // rows the hold did not capture, so its frozen frame cannot be presented.
 // The growth then ends the application hold early, and the ordinary release
@@ -23495,8 +23545,8 @@ bool test_mapping_change_without_native_geometry_change_repaints()
     launch_config.initial_grid_size = {2, 20};
     ok &= check(automatic->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
         "vacancy-consumption session starts");
-    ok &= check(automatic_backend->emit_output(QByteArrayLiteral("a\r\n$ ")),
-        "vacancy-consumption session writes a prompt");
+    ok &= check(automatic_backend->emit_output(numbered_scroll_lines(5) + QByteArrayLiteral("$ ")),
+        "vacancy-consumption session writes a prompt with enough history to fill the growth");
     automatic->resize(QSizeF(200.0, 120.0), {6, 20});
     const auto before = automatic->latest_render_snapshot_handle();
     ok &= check(automatic_backend->emit_output(QByteArrayLiteral("x\r\n")),
@@ -23565,6 +23615,7 @@ int main(int argc, char** argv)
         ok &= test_saved_primary_anchor_survives_constant_s_eviction();
         ok &= test_detached_anchor_keeps_first_displayed_row();
         ok &= test_frozen_frame_availability();
+        ok &= test_short_history_held_growth_releases_early();
         ok &= test_incompatible_held_growth_releases_early();
         ok &= test_early_release_keeps_deferred_scroll_and_selection();
         ok &= test_held_alternate_growth_keeps_its_hold();

@@ -480,7 +480,7 @@ bool test_policy_inputs()
 
     const auto automatic = term::make_presentation_mapping(primary, false, 6, 10, 4, 2, 3);
     ok &= check(automatic.policy == Policy::AUTOMATIC && automatic.hidden_rows == 4,
-        "resize vacancy selects the automatic mapping with P = V");
+        "available history fills the entire resize vacancy");
 
     const auto companion = term::make_presentation_mapping(primary, true, 6, 10, 0, 2, 3);
     ok &= check(companion.policy == Policy::COMPANION && companion.hidden_rows == 4 &&
@@ -535,8 +535,8 @@ bool test_automatic_requested_positions()
         term::Terminal_buffer_id::PRIMARY, false, 6, 2, 4, 2, 0);
     ok &= check(term::presentation_max_offset_from_tail(short_history) == 0,
         "too little history leaves no scroll range");
-    ok &= check(requested_rows(short_history, 0) == std::vector<int>({-1, -1, 0, 1, 2, 3}),
-        "structural unused space sits above the first native row");
+    ok &= check(requested_rows(short_history, 0) == std::vector<int>({0, 1, 2, 3, 4, 5}),
+        "short history starts at the first retained row without leading blanks");
     ok &= check(term::presentation_leading_row_count(short_history) == 2,
         "only native rows are acquired");
     return ok;
@@ -602,8 +602,8 @@ bool test_automatic_model_presentation()
     mixed.resize({6, 4});
     const auto mixed_native = std::make_shared<const term::Terminal_render_snapshot>(
         mixed.render_snapshot(request_for(mixed, 0, false)));
-    ok &= expect_presented(term::make_presented_snapshot(mixed_native), {-1, -1, -1, 0, 1, 2},
-        {QString(), QString(), QString(), QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("X")},
+    ok &= expect_presented(term::make_presented_snapshot(mixed_native), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("X"), QString(), QString(), QString()},
         "the mixed row after the second narrowing");
     return ok;
 }
@@ -617,8 +617,8 @@ bool test_short_or_missing_history()
     empty_history.resize({6, 8});
     const auto empty_native = std::make_shared<const term::Terminal_render_snapshot>(
         empty_history.render_snapshot(request_for(empty_history, 0, false)));
-    ok &= expect_presented(term::make_presented_snapshot(empty_native), {-1, -1, -1, -1, 0, 1},
-        {QString(), QString(), QString(), QString(), QStringLiteral("a"), QStringLiteral("b")},
+    ok &= expect_presented(term::make_presented_snapshot(empty_native), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("a"), QStringLiteral("b"), QString(), QString(), QString(), QString()},
         "growth without history");
     ok &= check(term::presentation_max_offset_from_tail(empty_native->viewport) == 0,
         "growth without history has no scroll range");
@@ -628,8 +628,8 @@ bool test_short_or_missing_history()
     disabled.resize({6, 8});
     const auto disabled_native = std::make_shared<const term::Terminal_render_snapshot>(
         disabled.render_snapshot(request_for(disabled, 0, false)));
-    ok &= expect_presented(term::make_presented_snapshot(disabled_native), {-1, -1, -1, -1, 0, 1},
-        {QString(), QString(), QString(), QString(), QStringLiteral("l2"), QStringLiteral("$")},
+    ok &= expect_presented(term::make_presented_snapshot(disabled_native), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("l2"), QStringLiteral("$"), QString(), QString(), QString(), QString()},
         "history disabled");
 
     auto too_little = make_sized_model(2, 8);
@@ -637,9 +637,9 @@ bool test_short_or_missing_history()
     too_little.resize({6, 8});
     const auto too_little_native = std::make_shared<const term::Terminal_render_snapshot>(
         too_little.render_snapshot(request_for(too_little, 0, false)));
-    ok &= expect_presented(term::make_presented_snapshot(too_little_native), {-1, -1, 0, 1, 2, 3},
-        {QString(), QString(), QStringLiteral("l0"), QStringLiteral("l1"),
-         QStringLiteral("l2"), QStringLiteral("$")},
+    ok &= expect_presented(term::make_presented_snapshot(too_little_native), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("l0"), QStringLiteral("l1"), QStringLiteral("l2"), QStringLiteral("$"),
+         QString(), QString()},
         "too little history");
 
     auto past_content = history_prompt_model();
@@ -647,18 +647,18 @@ bool test_short_or_missing_history()
     const auto past_native = std::make_shared<const term::Terminal_render_snapshot>(
         past_content.render_snapshot(request_for(past_content, 0, false)));
     ok &= expect_presented(term::make_presented_snapshot(past_native),
-        {-1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5},
-        {QString(), QString(), QString(), QString(), QString(), QString(),
-         QStringLiteral("l0"), QStringLiteral("l1"), QStringLiteral("l2"),
-         QStringLiteral("l3"), QStringLiteral("l4"), QStringLiteral("$")},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+        {QStringLiteral("l0"), QStringLiteral("l1"), QStringLiteral("l2"),
+         QStringLiteral("l3"), QStringLiteral("l4"), QStringLiteral("$"),
+         QString(), QString(), QString(), QString(), QString(), QString()},
         "growth past the content");
 
     auto cleared_history = history_prompt_model();
     cleared_history.ingest(QByteArrayLiteral("\x1b[3J"));
     const auto cleared_native = std::make_shared<const term::Terminal_render_snapshot>(
         cleared_history.render_snapshot(request_for(cleared_history, 0, false)));
-    ok &= expect_presented(term::make_presented_snapshot(cleared_native), {-1, -1, -1, -1, 0, 1},
-        {QString(), QString(), QString(), QString(), QStringLiteral("l4"), QStringLiteral("$")},
+    ok &= expect_presented(term::make_presented_snapshot(cleared_native), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("l4"), QStringLiteral("$"), QString(), QString(), QString(), QString()},
         "ED 3 alone after growth");
     return ok;
 }
@@ -747,6 +747,15 @@ bool test_availability()
          QStringLiteral("r100"), QStringLiteral("r101")},
         "frozen growth with a partial captured prefix");
 
+    // A bounded shift exposes trailing rows the held two-row frame never
+    // captured. They must remain unavailable, even when the mapping is identity.
+    for (const int history : {0, 2}) {
+        const auto short_history = std::make_shared<const term::Terminal_render_snapshot>(
+            frozen_frame(history, 0, 4));
+        ok &= check(term::make_presented_snapshot(short_history) == nullptr,
+            "frozen growth with short history cannot invent uncovered trailing rows");
+    }
+
     auto live = frozen_frame(100, 0, 4);
     live.purpose      = term::Terminal_render_snapshot_purpose::CONTENT;
     live.frozen_basis = false;
@@ -812,14 +821,14 @@ bool test_residual_absolute_rows_and_status_redraw()
 {
     bool ok = true;
 
-    // Absolute-row output after growth lands V rows lower on the display;
-    // placement on the bottom row retires the vacancy and the view shifts.
+    // Without history, absolute-row output stays at its native row after
+    // growth, including when a bottom-row write retires the vacancy.
     auto model = make_sized_model(2, 8);
     model.ingest(QByteArrayLiteral("a\r\nb"));
     model.resize({6, 8});
     model.ingest(QByteArrayLiteral("\x1b[1;1HTOP\x1b[2;2H"));
-    ok &= expect_presented(presented_now(model), {-1, -1, -1, -1, 0, 1},
-        {QString(), QString(), QString(), QString(), QStringLiteral("TOP"), QStringLiteral("b")},
+    ok &= expect_presented(presented_now(model), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("TOP"), QStringLiteral("b"), QString(), QString(), QString(), QString()},
         "absolute-row output above the vacancy");
     model.ingest(QByteArrayLiteral("\x1b[6;1HSTATUS\x1b[2;2H"));
     ok &= expect_presented(presented_now(model), {0, 1, 2, 3, 4, 5},
@@ -849,8 +858,8 @@ bool test_residual_absolute_rows_and_status_redraw()
             term::make_presented_snapshot(alternate_native) == alternate_native,
         "the alternate screen presents its native rows");
     alternate.ingest(QByteArrayLiteral("\x1b[?1049l"));
-    ok &= expect_presented(presented_now(alternate), {-1, -1, -1, -1, 0, 1},
-        {QString(), QString(), QString(), QString(), QStringLiteral("a"), QStringLiteral("b")},
+    ok &= expect_presented(presented_now(alternate), {0, 1, 2, 3, 4, 5},
+        {QStringLiteral("a"), QStringLiteral("b"), QString(), QString(), QString(), QString()},
         "leaving the alternate screen restores the primary presentation");
     return ok;
 }

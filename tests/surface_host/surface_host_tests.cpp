@@ -2529,10 +2529,15 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
 
 // Presented frames under AUTOMATIC (the vacancy a grow leaves) and COMPANION
 // (the toggle) drive rendering and every consumer: IME, links, selection,
-// search, mouse reports and the stale-input guard. In this fixture both
-// policies present the same rows, so one oracle serves both.
+// search, mouse reports and the stale-input guard. The short history fills
+// only part of the resize vacancy under AUTOMATIC; COMPANION relocates all of it.
 bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
 {
+    const int header_row = companion ? 2 : 0;
+    const int prompt_row = header_row + 3;
+    const std::vector<int> displayed_rows = companion
+        ? std::vector<int>{-1, -1, 0, 1, 2, 3}
+        : std::vector<int>{0, 1, 2, 3, 4, 5};
     QRectF notified_cursor_rect;
     int ime_notifications = 0;
     int completed_frames = 0;
@@ -2648,14 +2653,14 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
             exported_after.frame->leading_rows == exported_before.frame->leading_rows &&
             fixture.surface.viewport_visible_rows() == 6 && fixture.surface.viewport_offset_from_tail() == 0,
         "presentation leaves the native publication, canvas export and viewport contract unchanged");
-    ok &= check(report.rendered_snapshot->cursor.position.row == 5 &&
-            report.rendered_snapshot->display_row_logical_rows == std::vector<int>({-1, -1, 0, 1, 2, 3}),
-        "the displayed tail ends at the last written native row with exact prefix identities");
+    ok &= check(report.rendered_snapshot->cursor.position.row == prompt_row &&
+            report.rendered_snapshot->display_row_logical_rows == displayed_rows,
+        "the displayed rows retain the policy's exact prefix and native identities");
     ok &= check(std::abs(fixture.surface.inputMethodQuery(Qt::ImCursorRectangle).toRectF().top() -
-            5 * report.rendered_touch_cell_metrics.height) < 0.001,
+            prompt_row * report.rendered_touch_cell_metrics.height) < 0.001,
         "IME placement follows the committed displayed cursor");
     const bool ime_notified = pump_until(app, [&] {
-            return std::abs(notified_cursor_rect.top() - 5 * report.rendered_touch_cell_metrics.height) < 0.001;
+            return std::abs(notified_cursor_rect.top() - prompt_row * report.rendered_touch_cell_metrics.height) < 0.001;
         });
     if (!ime_notified) {
         const auto latest_report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
@@ -2668,25 +2673,26 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
                   << " completed_frames=" << completed_frames
                   << " notifications=" << ime_notifications
                   << " notified_top=" << notified_cursor_rect.top()
-                  << " expected_top=" << 5 * report.rendered_touch_cell_metrics.height
+                  << " expected_top=" << prompt_row * report.rendered_touch_cell_metrics.height
                   << " render_count=" << latest_report.render_count
                   << " drew=" << latest_report.drew << '\n';
     }
     ok &= check(ime_notified,
         "the committed projection notifies the platform IME of its changed cursor rectangle");
-    const QPointF header = point_in_grid_cell(fixture.surface, 2, 0);
+    const QPointF header = point_in_grid_cell(fixture.surface, header_row, 0);
     ok &= check(fixture.surface.explicit_hyperlink_at(header.x(), header.y()) ==
             QByteArrayLiteral("https://example.test/header") &&
-            fixture.surface.explicit_hyperlink_at(header.x(), metrics.height / 2).isEmpty(),
+            fixture.surface.explicit_hyperlink_at(
+                header.x(), (companion ? 0.5 : 5.5) * metrics.height).isEmpty(),
         "hyperlink hit testing resolves the retained header and excludes padding");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, header,
         Qt::LeftButton, Qt::LeftButton, Qt::ShiftModifier, true,
         "selection begins on the displayed retained header");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
-        point_in_grid_cell(fixture.surface, 2, 5), Qt::NoButton, Qt::LeftButton,
+        point_in_grid_cell(fixture.surface, header_row, 5), Qt::NoButton, Qt::LeftButton,
         Qt::ShiftModifier, true, "selection extends on the same retained row");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
-        point_in_grid_cell(fixture.surface, 2, 5), Qt::LeftButton, Qt::NoButton,
+        point_in_grid_cell(fixture.surface, header_row, 5), Qt::LeftButton, Qt::NoButton,
         Qt::ShiftModifier, true, "selection finishes on the displayed retained header");
     ok &= check(fixture.surface.selected_text() == QStringLiteral("header"),
         "desktop selection copies the displayed prefix text");
@@ -2698,13 +2704,13 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
     ok &= check(draw_current(), "search highlights return to the composed tail");
     const auto searched = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot;
     ok &= check(searched && std::any_of(searched->search_match_spans.begin(), searched->search_match_spans.end(),
-            [](const auto& span) { return span.row == 2; }),
+            [header_row](const auto& span) { return span.row == header_row; }),
         "search highlighting includes the projected prefix snapshot");
     fixture.surface.clear_search();
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
     ok &= check(draw_current(), "mouse reporting modes are rendered before pointer input");
     const auto first_write = backend_ptr->writes.size();
-    const QPointF prompt = point_in_grid_cell(fixture.surface, 5, 0);
+    const QPointF prompt = point_in_grid_cell(fixture.surface, prompt_row, 0);
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress, prompt,
         Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
         "the displayed prompt accepts application mouse input");
@@ -2713,10 +2719,10 @@ bool test_presentation_render_and_input(QGuiApplication& app, bool companion)
         "application mouse release retains the native row");
     ok &= check(joined_writes_since(backend_ptr->writes, first_write) ==
             sgr_mouse_report(0, 1, 0, 'M') + sgr_mouse_report(0, 1, 0, 'm'),
-        "backend reports address native row one rather than displayed row five");
+        "backend reports address the prompt's native row one");
     const auto before_unreported_rows = backend_ptr->writes.size();
-    for (const int displayed_row : {0, 2}) {
-        // Display row 0 is an unused slot, display row 2 a history row.
+    for (const int displayed_row : {0, companion ? 2 : 1}) {
+        // These rows are history, or Companion's unused leading slot.
         QMouseEvent press(QEvent::MouseButtonPress, point_in_grid_cell(fixture.surface, displayed_row, 0),
             point_in_grid_cell(fixture.surface, displayed_row, 0), point_in_grid_cell(fixture.surface, displayed_row, 0),
             Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);

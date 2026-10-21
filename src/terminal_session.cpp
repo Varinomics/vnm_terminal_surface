@@ -1250,28 +1250,32 @@ Terminal_viewport_state viewport_adapted_to_grid(
 
 // A geometry-adapted frame keeps its rows top-anchored: the rows appended at
 // the bottom are resize vacancy and clipping drops the trailing rows first
-// (DESIGN 5.7). Its mapping record follows from the frozen basis' record: P
-// moves by the row change under AUTOMATIC and COMPANION alike, and a NATIVE
-// frame that grows hides its appended rows.
+// (DESIGN 5.7). Automatic displacement follows the frozen resize vacancy,
+// bounded by its history just like a live frame. Companion instead adapts
+// its relocated unwritten tail from the frozen mapping record.
 Terminal_presentation_mapping presentation_adapted_to_grid(
-    const Terminal_viewport_state& viewport,
-    int                            row_delta)
+    const Terminal_render_snapshot& public_snapshot,
+    int                             row_delta)
 {
+    const auto& viewport = public_snapshot.viewport;
     if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
         return {};
     }
 
     const Terminal_presentation_mapping& mapping = viewport.presentation;
-    const int hidden_rows = std::max(0, mapping.hidden_rows + row_delta);
     if (mapping.policy == Terminal_presentation_policy::COMPANION) {
+        const int hidden_rows = std::max(0, mapping.hidden_rows + row_delta);
         return {Terminal_presentation_policy::COMPANION, hidden_rows, mapping.insertion_row};
     }
 
-    if (hidden_rows > 0) {
-        return {Terminal_presentation_policy::AUTOMATIC, hidden_rows, 0};
-    }
-
-    return {};
+    return make_presentation_mapping(
+        viewport.active_buffer,
+        false,
+        viewport.visible_rows + row_delta,
+        viewport.scrollback_rows,
+        std::max(0, public_snapshot.resize_vacancy_rows + row_delta),
+        public_snapshot.native_content_bottom_row_exclusive,
+        public_snapshot.resize_displaced_scrollback_rows);
 }
 
 Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
@@ -1326,7 +1330,7 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
         std::clamp(snapshot.cursor.position.column, 0, grid_size.columns - 1);
 
     const int row_delta = grid_size.rows - public_snapshot.grid_size.rows;
-    snapshot.viewport.presentation = presentation_adapted_to_grid(public_snapshot.viewport, row_delta);
+    snapshot.viewport.presentation = presentation_adapted_to_grid(public_snapshot, row_delta);
     if (snapshot.viewport.active_buffer == Terminal_buffer_id::PRIMARY) {
         snapshot.uncovered_trailing_rows =
             std::clamp(public_snapshot.uncovered_trailing_rows + row_delta, 0, grid_size.rows);
