@@ -7570,7 +7570,7 @@ bool test_resize_keeps_presented_range_on_written_rows(QGuiApplication& app)
 bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
 {
     // A pointer gesture addresses the frame the user saw. When output changes
-    // the mapping (here the cursor retires one vacant row) and the replacement
+    // the mapping (here the cursor retires two vacant rows) and the replacement
     // frame is not painted yet, the committed frame no longer shares the
     // display identity space, so the gesture cannot lease rows from it.
     Surface_fixture fixture;
@@ -7583,7 +7583,9 @@ bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
     };
     bool ok = check(resize_rows(2), "the input-identity fixture starts at two rows");
     auto backend = std::make_unique<Scripted_backend>();
-    backend->outputs_during_start = {QByteArrayLiteral("older\r\nnewer\r\n$ ")};
+    // Four history rows fill the growth, so retiring vacancy really changes
+    // the mapping instead of leaving its displacement bounded by history.
+    backend->outputs_during_start = {QByteArrayLiteral("h0\r\nh1\r\nh2\r\nolder\r\nnewer\r\n$ ")};
     bool started = false;
     auto* backend_ptr = start_surface_with_backend(
         fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
@@ -7592,10 +7594,19 @@ bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
     }
     const auto presented = committed_display_frame(app, fixture.window, fixture.surface);
     ok &= check(presented && presented->display_source &&
+            presented->viewport.scrollback_rows == 4 && presented->viewport.presentation.hidden_rows == 4 &&
             snapshot_row_text(*presented, 3) == QStringLiteral("older"),
         "the committed frame presents history above the prompt");
 
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[4;1H\x1b[2;3H"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(presented && latest &&
+            term::grid_sizes_match(presented->grid_size, latest->grid_size) &&
+            term::viewport_mappings_match(presented->viewport, latest->viewport) &&
+            latest->viewport.presentation.hidden_rows == 2 &&
+            latest->viewport.presentation != presented->viewport.presentation,
+        "retiring vacancy changes the mapping without changing the native viewport");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
         point_in_grid_cell(fixture.surface, 3, 0), Qt::LeftButton, Qt::LeftButton,
         Qt::ShiftModifier, false,
@@ -8018,13 +8029,22 @@ bool test_input_before_paint_addresses_the_committed_frame(QGuiApplication& app)
         };
         ok &= check(resize_rows(projected ? 2 : 6), "the unpainted fixture sets its starting rows");
         auto backend = std::make_unique<Scripted_backend>();
-        backend->outputs_during_start = {QByteArrayLiteral("older\r\nnewer\r\n$ ")};
+        // Keep distinct display positions for native and projected input:
+        // the projected case has enough real history to fill its growth.
+        backend->outputs_during_start = {projected
+            ? QByteArrayLiteral("h0\r\nh1\r\nh2\r\nolder\r\nnewer\r\n$ ")
+            : QByteArrayLiteral("older\r\nnewer\r\n$ ")};
         bool started = false;
         (void)start_surface_with_backend(
             fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
         ok &= check(started && (!projected || resize_rows(6)), "the unpainted fixture starts");
         ok &= check(!term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot,
             "no frame has been painted");
+        const auto handed = term::make_presented_snapshot(
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface));
+        ok &= check(handed && static_cast<bool>(handed->display_source) == projected &&
+                snapshot_row_text(*handed, projected ? 3 : 0) == QStringLiteral("older"),
+            "the handed frame puts the selectable row at its native or projected position");
         ok &= check(select_row(fixture.surface, projected ? 3 : 0, 4),
             projected
                 ? "before the first paint a gesture addresses the presented frame handed to the renderer"
