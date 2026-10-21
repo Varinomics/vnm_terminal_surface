@@ -242,10 +242,15 @@ std::optional<QString> parse_osc_title_text(
     QString                        source_sequence,
     std::vector<Parser_action>&    actions)
 {
-    const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
-    if (width.codepoints.size() > k_title_scalar_limit) {
+    std::size_t scalar_count = 0U;
+    for (qsizetype offset = 0; offset < text_bytes.size();) {
+        const Terminal_utf8_decode_step step = decode_utf8_scalar(text_bytes, offset);
+        offset += step.ok ? step.bytes_consumed : 1;
+        ++scalar_count;
+    }
+    if (scalar_count > k_title_scalar_limit) {
         actions.push_back(make_title_limit_diagnostic(
-            width.codepoints.size(),
+            scalar_count,
             std::move(source_sequence)));
         return std::nullopt;
     }
