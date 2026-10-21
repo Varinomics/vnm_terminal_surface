@@ -269,7 +269,8 @@ bool native_canvas_selection_contract()
             if (variant == 0) {
                 frame->presentation.reset();
             }
-            else if (variant == 1) {
+            else
+            if (variant == 1) {
                 frame->presentation->record_version = 99U;
             }
             else {

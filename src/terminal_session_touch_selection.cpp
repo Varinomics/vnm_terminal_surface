@@ -248,11 +248,17 @@ Terminal_touch_selection_result Terminal_session::apply_touch_selection(
     // A request names the presentation of the frame its gesture addressed.
     // A receiver without a supported presentation record displays the native
     // publication and names none; its rows are the native snapshot's.
-    const auto displayed_frame = [this, &request, display_rows](int offset) {
-        return request.presentation
-            ? make_presented_snapshot(m_latest_render_snapshot, display_rows, offset)
-            : m_latest_render_snapshot;
-    };
+    const auto displayed_frame = [
+            this,
+            &request,
+            display_rows
+        ](
+            int offset)
+        {
+            return request.presentation
+                ? make_presented_snapshot(m_latest_render_snapshot, display_rows, offset)
+                : m_latest_render_snapshot;
+        };
     auto display_snapshot = displayed_frame(display_offset);
     const Terminal_render_snapshot* snapshot = display_snapshot.get();
     if (snapshot == nullptr || snapshot->visible_line_provenance.size() !=
