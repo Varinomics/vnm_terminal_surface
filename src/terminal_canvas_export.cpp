@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/qt_window_metrics.h"
+#include "vnm_terminal/internal/terminal_ascii_cell_text.h"
 #include "vnm_terminal/internal/terminal_canvas_content_extent.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
@@ -196,8 +197,10 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
             };
         }
 
-        QString text;
-        source_cell.text.append_to(text);
+        const auto printable_ascii = source_cell.text.single_printable_ascii_char();
+        QString text = printable_ascii
+            ? term::printable_ascii_cell_text(*printable_ascii)
+            : source_cell.text.to_qstring();
         const auto counted_text_bytes = terminal_canvas_text_utf8_size(text);
         const std::size_t cell_text_utf8_bytes =
             static_cast<std::size_t>(counted_text_bytes ? *counted_text_bytes : text.toUtf8().size());
