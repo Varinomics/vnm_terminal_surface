@@ -414,7 +414,9 @@ bool test_decoded_ascii_cells_share_immutable_text()
     }};
 
     for (const auto& fixture : fixtures) {
-        term::Terminal_history_ring ring({4096U, 4096U});
+        // A ring limits each record to one eighth of its capacity. The
+        // decorated rows need more bytes than the two plain-ASCII fixtures.
+        term::Terminal_history_ring ring({16384U, 4096U});
         const std::size_t first_ascii = fixture.leading_blank ? 1U : 0U;
         term::Terminal_history_row_record record = make_base_record(
             31U,
@@ -443,6 +445,11 @@ bool test_decoded_ascii_cells_share_immutable_text()
 
         term::Terminal_history_row_record_append_result append;
         auto decoded = append_and_decode(ring, record, make_identity(5U, 31U), append);
+        if (!check(append.status == term::Terminal_history_row_record_codec_status::OK,
+            "ASCII sharing fixture encodes within the ring's per-record limit"))
+        {
+            return false;
+        }
         if (!check(decoded.status == term::Terminal_history_row_record_codec_status::OK &&
                 records_equal(decoded.record, record),
             "printable ASCII round-trips through compact and decorated history encodings"))
