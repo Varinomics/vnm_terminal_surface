@@ -128,6 +128,8 @@ struct terminal_canvas_content_extent_t
     int                   offset_from_tail = 0;
     Terminal_canvas_buffer active_buffer =
         Terminal_canvas_buffer::PRIMARY_BUFFER;
+
+    bool operator==(const terminal_canvas_content_extent_t&) const = default;
 };
 
 enum class Terminal_canvas_style_attribute : std::uint16_t
@@ -207,6 +209,8 @@ struct Terminal_canvas_cursor
     Terminal_canvas_cursor_shape shape         = Terminal_canvas_cursor_shape::BLOCK;
     bool                         visible       = false;
     bool                         blink_enabled = false;
+
+    bool operator==(const Terminal_canvas_cursor&) const = default;
 };
 
 inline constexpr std::uint16_t k_terminal_canvas_images_version = 1U;
