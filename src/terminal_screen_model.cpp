@@ -3709,7 +3709,7 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
         "Terminal_screen_model::Primary_backing_buffer::append_retained_history_record");
 
     Terminal_history_row_record history_record =
-        Terminal_screen_model::history_row_record_from_retained_record(row);
+        Terminal_screen_model::history_row_record_from_retained_record(std::move(row));
 
     terminal_history_row_record_identity_t identity;
     identity.epoch        = k_terminal_history_retained_identity_epoch;
@@ -10235,20 +10235,20 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
 }
 
 Terminal_history_row_record Terminal_screen_model::history_row_record_from_retained_record(
-    const retained_row_record_t& retained_record)
+    retained_row_record_t&& retained_record)
 {
     Terminal_history_row_record history_record;
-    history_record.provenance = retained_record.row.retained_line_provenance;
-    history_record.content_origin_spans = retained_record.row.content_origin_spans;
-    history_record.style_table = retained_record.style_table;
-    history_record.hyperlink_identity_keys = retained_record.hyperlink_identity_keys;
-    history_record.metadata = retained_record.metadata;
-    history_record.image_slice = retained_record.row.image_slice;
+    history_record.provenance              = retained_record.row.retained_line_provenance;
+    history_record.content_origin_spans    = std::move(retained_record.row.content_origin_spans);
+    history_record.style_table             = std::move(retained_record.style_table);
+    history_record.hyperlink_identity_keys = std::move(retained_record.hyperlink_identity_keys);
+    history_record.metadata                = retained_record.metadata;
+    history_record.image_slice             = std::move(retained_record.row.image_slice);
     history_record.cells.reserve(retained_record.row.cells.size());
 
-    for (const Cell& cell : retained_record.row.cells) {
+    for (Cell& cell : retained_record.row.cells) {
         history_record.cells.push_back({
-            cell.text,
+            std::move(cell.text),
             cell.display_width,
             cell.wide_continuation,
             cell.occupied,

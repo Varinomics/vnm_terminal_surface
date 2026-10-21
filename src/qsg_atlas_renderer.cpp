@@ -8339,17 +8339,17 @@ static Glyph_lcd_order qsg_atlas_lcd_order_for_kind(Glyph_coverage_kind kind)
     return Glyph_lcd_order::UNKNOWN;
 }
 
-static void qsg_atlas_append_rgba_pixel(
-    QByteArray& bytes,
-    int         red,
-    int         green,
-    int         blue,
-    int         alpha)
+static void qsg_atlas_write_rgba_pixel(
+    char*& pixel,
+    int    red,
+    int    green,
+    int    blue,
+    int    alpha)
 {
-    bytes.append(static_cast<char>(std::clamp(red,   0, 255)));
-    bytes.append(static_cast<char>(std::clamp(green, 0, 255)));
-    bytes.append(static_cast<char>(std::clamp(blue,  0, 255)));
-    bytes.append(static_cast<char>(std::clamp(alpha, 0, 255)));
+    *pixel++ = static_cast<char>(std::clamp(red,   0, 255));
+    *pixel++ = static_cast<char>(std::clamp(green, 0, 255));
+    *pixel++ = static_cast<char>(std::clamp(blue,  0, 255));
+    *pixel++ = static_cast<char>(std::clamp(alpha, 0, 255));
 }
 
 Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
@@ -8381,14 +8381,15 @@ Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
     }
 
     tile.bytes_per_line = image.width() * 4;
-    tile.bytes.reserve(tile.bytes_per_line * image.height());
+    tile.bytes.resize(static_cast<qsizetype>(tile.bytes_per_line) * image.height());
+    char* pixel = tile.bytes.data();
 
     if (tile.coverage_kind == Glyph_coverage_kind::COLOR_IMAGE) {
         for (int y = 0; y < image.height(); ++y) {
             for (int x = 0; x < image.width(); ++x) {
                 const QColor color = image.pixelColor(x, y);
-                qsg_atlas_append_rgba_pixel(
-                    tile.bytes,
+                qsg_atlas_write_rgba_pixel(
+                    pixel,
                     color.red(),
                     color.green(),
                     color.blue(),
@@ -8405,8 +8406,8 @@ Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
             const uchar* const line = image.constScanLine(y);
             for (int x = 0; x < image.width(); ++x) {
                 const int coverage = line[x];
-                qsg_atlas_append_rgba_pixel(
-                    tile.bytes,
+                qsg_atlas_write_rgba_pixel(
+                    pixel,
                     coverage,
                     coverage,
                     coverage,
@@ -8421,8 +8422,8 @@ Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
             const QColor color = image.pixelColor(x, y);
             if (tile.coverage_kind == Glyph_coverage_kind::GRAYSCALE_MASK) {
                 const int coverage = qGray(color.rgb());
-                qsg_atlas_append_rgba_pixel(
-                    tile.bytes,
+                qsg_atlas_write_rgba_pixel(
+                    pixel,
                     coverage,
                     coverage,
                     coverage,
@@ -8431,8 +8432,8 @@ Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
             else {
                 const int combined_coverage =
                     std::max({color.red(), color.green(), color.blue()});
-                qsg_atlas_append_rgba_pixel(
-                    tile.bytes,
+                qsg_atlas_write_rgba_pixel(
+                    pixel,
                     color.red(),
                     color.green(),
                     color.blue(),

@@ -1690,7 +1690,7 @@ private:
         const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id);
 
     static Terminal_history_row_record history_row_record_from_retained_record(
-        const retained_row_record_t&   retained_record);
+        retained_row_record_t&& retained_record);
 
     static retained_row_record_t retained_row_record_from_history_row_record(
         Terminal_history_row_record history_record);
