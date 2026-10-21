@@ -4515,14 +4515,16 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     ok &= check(!backend->writes.empty() && backend->writes.back() == expected_key_bytes,
         "blocked detach resize forwards encoded key event");
 
+    // A covered shrink keeps the hold active even with history disabled.
     const term::Terminal_session_result resize_result =
-        session->resize(QSizeF(120.0, 80.0), {4, 12});
+        session->resize(QSizeF(120.0, 40.0), {2, 12});
     const std::optional<term::Terminal_render_snapshot> resize_snapshot =
         session->latest_render_snapshot();
     ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
         "blocked detach resize is accepted");
-    ok &= check(resize_snapshot.has_value()             &&
-        resize_snapshot->grid_size.rows    == 4         &&
+    ok &= check(session->synchronized_output_hold_active() &&
+        resize_snapshot.has_value()                     &&
+        resize_snapshot->grid_size.rows    == 2         &&
         resize_snapshot->grid_size.columns == 12        &&
         resize_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         resize_snapshot->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
@@ -4537,7 +4539,7 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     const std::optional<term::Terminal_render_snapshot> detached_snapshot =
         session->latest_render_snapshot();
     ok &= check(detached_snapshot.has_value()             &&
-        detached_snapshot->grid_size.rows    == 4         &&
+        detached_snapshot->grid_size.rows    == 2         &&
         detached_snapshot->grid_size.columns == 12        &&
         snapshot_cells_fit_grid(*detached_snapshot)       &&
         detached_snapshot->selection_spans.empty()        &&
@@ -5354,15 +5356,16 @@ bool test_selection_line_lease_negative_source_paths()
             "missing provenance backend emits base content");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
             "missing provenance backend holds synchronized output");
+        // A covered shrink invalidates provenance while retaining the hold.
         const term::Terminal_session_result resize_result =
-            session->resize(QSizeF(120.0, 80.0), {4, 12});
+            session->resize(QSizeF(120.0, 40.0), {2, 12});
         const std::optional<term::Terminal_render_snapshot> geometry_snapshot =
             session->latest_render_snapshot();
         const std::optional<term::terminal_selection_source_identity_t> geometry_source =
             session->published_selection_source_identity();
         ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
             "missing provenance synchronized resize is accepted");
-        ok &= check(geometry_snapshot.has_value() &&
+        ok &= check(session->synchronized_output_hold_active() && geometry_snapshot.has_value() &&
             geometry_snapshot->visible_line_provenance.empty(),
             "missing provenance fixture publishes geometry without line descriptors");
 
@@ -13063,14 +13066,16 @@ bool test_synchronized_output_defers_content_until_release()
     ok &= check(session->render_snapshot_generation() == prefix_generation,
         "continued synchronized output keeps render publication held");
 
-    ok &= check(session->resize(QSizeF(1000.0, 500.0), {25, 100}).code ==
+    // Change width without requesting uncaptured rows; this hold must last
+    // until ESU so deferred content and resize invalidation are exercised.
+    ok &= check(session->resize(QSizeF(1000.0, 480.0), {24, 100}).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "resize during synchronized output is accepted");
     const std::optional<term::Terminal_render_snapshot> resized_held_snapshot =
         session->latest_render_snapshot();
-    ok &= check(resized_held_snapshot.has_value() &&
+    ok &= check(session->synchronized_output_hold_active() && resized_held_snapshot.has_value() &&
         prefix_snapshot.has_value() &&
-        resized_held_snapshot->grid_size.rows == 25 &&
+        resized_held_snapshot->grid_size.rows == 24 &&
         resized_held_snapshot->grid_size.columns == 100 &&
         snapshot_row_text(*resized_held_snapshot, 0) == QStringLiteral("A") &&
         !snapshot_contains_text(*resized_held_snapshot, QStringLiteral("B")) &&
@@ -13080,7 +13085,7 @@ bool test_synchronized_output_defers_content_until_release()
     ok &= check(resized_held_snapshot.has_value() &&
         resized_held_snapshot->dirty_row_ranges.size() == 1U &&
         resized_held_snapshot->dirty_row_ranges.front().first_row == 0 &&
-        resized_held_snapshot->dirty_row_ranges.front().row_count == 25,
+        resized_held_snapshot->dirty_row_ranges.front().row_count == 24,
         "synchronized-output resize geometry snapshot requests public repaint");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026lD")),
@@ -13088,7 +13093,7 @@ bool test_synchronized_output_defers_content_until_release()
     const std::optional<term::Terminal_render_snapshot> released_snapshot =
         session->latest_render_snapshot();
     ok &= check(released_snapshot.has_value() &&
-        released_snapshot->grid_size.rows == 25 &&
+        released_snapshot->grid_size.rows == 24 &&
         released_snapshot->grid_size.columns == 100 &&
         snapshot_row_text(*released_snapshot, 0) == QStringLiteral("ABCD") &&
         session->render_snapshot_generation() == prefix_generation + 2U,
@@ -13097,12 +13102,12 @@ bool test_synchronized_output_defers_content_until_release()
         session->last_model_ingest_result();
     ok &= check(released_result.has_value() &&
         released_result->viewport_changed &&
-        released_result->dirty_rows.size() == 25U,
+        released_result->dirty_rows.size() == 24U,
         "synchronized output release preserves resize invalidation");
     ok &= check(released_snapshot.has_value() &&
         released_snapshot->dirty_row_ranges.size() == 1U &&
         released_snapshot->dirty_row_ranges.front().first_row == 0 &&
-        released_snapshot->dirty_row_ranges.front().row_count == 25,
+        released_snapshot->dirty_row_ranges.front().row_count == 24,
         "synchronized output release publishes preserved resize invalidation");
 
     std::unique_ptr<term::Terminal_session> not_started_force_release_session;

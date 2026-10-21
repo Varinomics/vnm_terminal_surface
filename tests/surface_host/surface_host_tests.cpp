@@ -8071,10 +8071,10 @@ bool test_input_before_paint_addresses_the_committed_frame(QGuiApplication& app)
     return ok;
 }
 
-bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
+bool test_resize_short_session_keeps_output_at_top(QGuiApplication& app)
 {
-    // Two written rows and no history: growth leaves unused space above them,
-    // never below, and a partial shrink keeps them on the bottom rows.
+    // Two written rows and no history: growth leaves output at the top,
+    // and a partial shrink keeps the remaining unused space below it.
     Surface_fixture fixture;
     fixture.surface.set_cursor_blink_enabled(false);
     pump_events(app);
@@ -8099,9 +8099,8 @@ bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
         bool rows_ok = frame != nullptr && fixture.surface.scrollback_rows() == 0;
         for (int row = 0; frame && row < rows; ++row) {
             const QString expected =
-                row == rows - 2 ? QStringLiteral("first") :
-                row == rows - 1 ? QStringLiteral("prompt$") :
-                                  QString();
+                row == 0 ? QStringLiteral("first")   :
+                row == 1 ? QStringLiteral("prompt$") : QString();
             const QString actual = snapshot_row_text(*frame, row);
             if (actual != expected) {
                 std::cerr << step << ": row " << row << " expected \"" << expected.toStdString()
@@ -8110,7 +8109,7 @@ bool test_resize_short_session_keeps_unused_space_above(QGuiApplication& app)
             }
         }
         step_ok &= check(rows_ok,
-            "the written rows end on the bottom row with unused space only above them");
+            "the written rows start at the top with unused space below them");
         return step_ok;
     };
     ok &= check_rows(6, "growth 2 -> 6");
@@ -22676,7 +22675,7 @@ int main(int argc, char** argv)
     }
     if (app.arguments().contains(QStringLiteral("--resize-presentation-only"))) {
         bool ok = test_resize_keeps_presented_range_on_written_rows(app);
-        ok &= test_resize_short_session_keeps_unused_space_above(app);
+        ok &= test_resize_short_session_keeps_output_at_top(app);
         ok &= test_incompatible_held_growth_releases_early(app);
         ok &= test_held_layout_changes_use_the_current_layout(app);
         return ok ? 0 : 1;
