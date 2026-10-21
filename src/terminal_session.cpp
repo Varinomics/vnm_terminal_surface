@@ -3226,21 +3226,6 @@ void Terminal_session::sync_canvas_scroll_intent_from_native()
     sync_viewport_controller_to_snapshot(m_canvas_viewport_controller, viewport);
 }
 
-// The canvas follows the native scroll intent, then reveals the current match
-// in its own capacity: a match the native view shows can lie outside a smaller
-// canvas.
-void Terminal_session::reveal_search_match_in_canvas(int match_row)
-{
-    const Terminal_viewport_state canvas = m_canvas_viewport_controller.state();
-    if (m_canvas_presentation_rows <= 0 || canvas.active_buffer != Terminal_buffer_id::PRIMARY) {
-        return;
-    }
-    const int line_delta = presentation_reveal_offset(canvas, match_row) - canvas.offset_from_tail;
-    if (line_delta != 0) {
-        (void)m_canvas_viewport_controller.scroll_lines(line_delta);
-    }
-}
-
 Terminal_viewport_scroll_result Terminal_session::scroll_canvas_presentation_lines(
     int line_delta, int rows, std::optional<int> published_offset)
 {
@@ -10611,7 +10596,17 @@ bool Terminal_session::reveal_current_search_match(QString message)
         const Terminal_viewport_state viewport_before =
             m_public_viewport_controller.viewport();
         const int match_row = static_cast<int>(match->public_row);
-        const int target_offset = presentation_reveal_offset(viewport_before, match_row);
+        const std::optional<int> display_row =
+            presentation_display_row_for_logical_row(viewport_before, match_row);
+        int target_offset = viewport_before.offset_from_tail;
+        if (display_row.has_value() &&
+            (*display_row < 0 || *display_row >= viewport_before.visible_rows))
+        {
+            target_offset = presentation_offset_for_logical_row(
+                viewport_before,
+                match_row,
+                *display_row < 0 ? 0 : viewport_before.visible_rows - 1);
+        }
 
         const Terminal_public_viewport_controller controller_before =
             m_public_viewport_controller;
@@ -10622,7 +10617,6 @@ bool Terminal_session::reveal_current_search_match(QString message)
                 Terminal_viewport_scroll_action::VIEWPORT_MOVED;
         const auto canvas_before = m_canvas_viewport_controller;
         sync_canvas_scroll_intent_from_native();
-        reveal_search_match_in_canvas(match_row);
         if (!publish_public_projection_scroll_snapshot(
                 next_sequence(),
                 std::move(message),
@@ -10647,12 +10641,21 @@ bool Terminal_session::reveal_current_search_match(QString message)
     }
 
     Terminal_screen_model_result search_result;
-    const bool primary_match = match->identity.buffer_id == Terminal_buffer_id::PRIMARY;
-    const int  match_row     = static_cast<int>(match->public_row);
-    if (primary_match) {
+    if (match->identity.buffer_id == Terminal_buffer_id::PRIMARY) {
         const Terminal_viewport_state viewport_before = m_viewport_controller.state();
-        const int line_delta =
-            presentation_reveal_offset(viewport_before, match_row) - viewport_before.offset_from_tail;
+        const int match_row = static_cast<int>(match->public_row);
+        const std::optional<int> display_row =
+            presentation_display_row_for_logical_row(viewport_before, match_row);
+        int bounded_target = viewport_before.offset_from_tail;
+        if (display_row.has_value() &&
+            (*display_row < 0 || *display_row >= viewport_before.visible_rows))
+        {
+            bounded_target = presentation_offset_for_logical_row(
+                viewport_before,
+                match_row,
+                *display_row < 0 ? 0 : viewport_before.visible_rows - 1);
+        }
+        const int line_delta = bounded_target - viewport_before.offset_from_tail;
         if (line_delta != 0) {
             const Terminal_viewport_scroll_result scroll_result =
                 m_viewport_controller.scroll_lines(line_delta);
@@ -10662,9 +10665,6 @@ bool Terminal_session::reveal_current_search_match(QString message)
     }
 
     sync_canvas_scroll_intent_from_native();
-    if (primary_match) {
-        reveal_search_match_in_canvas(match_row);
-    }
     m_render_snapshot_model_result = search_result;
     const std::uint64_t generation_before = m_render_snapshot_generation;
     publish_render_snapshot(
@@ -10710,20 +10710,10 @@ bool Terminal_session::publish_bounded_safe_search_viewport(
 
     const int current_first_public_row =
         first_public_row_for_viewport(m_latest_render_snapshot->viewport);
-    const bool natively_visible =
-        m_latest_render_snapshot->viewport.active_buffer == source.active_buffer &&
+    if (m_latest_render_snapshot->viewport.active_buffer == source.active_buffer &&
         match.public_row >= current_first_public_row                       &&
-        match.public_row < current_first_public_row + visible_rows;
-    // A smaller canvas can leave a natively visible match outside its rows.
-    bool canvas_visible = true;
-    if (natively_visible && m_canvas_presentation_rows > 0) {
-        Terminal_viewport_state canvas = m_latest_render_snapshot->viewport;
-        canvas.visible_rows     = m_canvas_viewport_controller.state().visible_rows;
-        canvas.offset_from_tail = m_canvas_viewport_controller.state().offset_from_tail;
-        canvas_visible = presentation_reveal_offset(canvas, static_cast<int>(match.public_row)) ==
-            presentation_clamped_offset_from_tail(canvas);
-    }
-    if (natively_visible && canvas_visible) {
+        match.public_row < current_first_public_row + visible_rows)
+    {
         const std::vector<Terminal_render_search_match_span> visible_spans =
             m_search.spans_for_snapshot(
                 *m_latest_render_snapshot,
@@ -10741,14 +10731,12 @@ bool Terminal_session::publish_bounded_safe_search_viewport(
             std::move(message));
     }
 
-    const std::int64_t first_safe_public_row = natively_visible
-        ? current_first_public_row
-        : std::clamp<std::int64_t>(
-            match.public_row < current_first_public_row
-                ? match.public_row
-                : match.public_row - visible_rows + 1,
-            0,
-            std::max<std::int64_t>(0, total_rows - visible_rows));
+    const std::int64_t first_safe_public_row = std::clamp<std::int64_t>(
+        match.public_row < current_first_public_row
+            ? match.public_row
+            : match.public_row - visible_rows + 1,
+        0,
+        std::max<std::int64_t>(0, total_rows - visible_rows));
     const std::optional<std::vector<terminal_history_handle_t>> expected_handles =
         m_search.source_row_handles(first_safe_public_row, visible_rows);
     if (!expected_handles.has_value() ||
@@ -10838,8 +10826,6 @@ bool Terminal_session::publish_bounded_safe_search_viewport(
         ? snapshot.presentation_rows : visible_rows;
     canvas_viewport.offset_from_tail = std::min(snapshot.viewport.offset_from_tail,
         presentation_max_offset_from_tail(canvas_viewport));
-    canvas_viewport.offset_from_tail =
-        presentation_reveal_offset(canvas_viewport, static_cast<int>(match.public_row));
     snapshot.presentation_offset_from_tail = m_canvas_presentation_rows > 0
         ? canvas_viewport.offset_from_tail : -1;
     snapshot.color_state                = safe_basis.color_state;
