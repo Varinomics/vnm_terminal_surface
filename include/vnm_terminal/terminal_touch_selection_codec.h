@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <optional>
 
 namespace vnm_terminal::touch_selection_codec {
@@ -103,8 +104,8 @@ inline QJsonObject encode_presentation(const terminal_touch_selection_presentati
     return {
         {QStringLiteral("presence"), QLatin1String(k_presentation_presence)},
         {QStringLiteral("version"), presentation.record_version},
-        {QStringLiteral("top_padding_rows"), presentation.top_padding_rows},
-        {QStringLiteral("visible_native_rows"), presentation.visible_native_rows},
+        {QStringLiteral("visible_rows"), presentation.visible_rows},
+        {QStringLiteral("offset_from_tail"), presentation.offset_from_tail},
     };
 }
 
@@ -123,13 +124,13 @@ inline std::optional<terminal_touch_selection_presentation_t> decode_presentatio
     if (result.record_version != k_terminal_touch_selection_presentation_version) {
         return result;
     }
-    const auto padding = integer(object.value(QStringLiteral("top_padding_rows")), 0, 32'768);
-    const auto visible = integer(object.value(QStringLiteral("visible_native_rows")), 1, 32'768);
-    if (object.size() != 4 || !padding || !visible) {
+    const auto visible = integer(object.value(QStringLiteral("visible_rows")), 1, 32'768);
+    const auto offset = integer(object.value(QStringLiteral("offset_from_tail")), 0, std::numeric_limits<int>::max());
+    if (object.size() != 4 || !visible || !offset) {
         return std::nullopt;
     }
-    result.top_padding_rows = *padding;
-    result.visible_native_rows = *visible;
+    result.visible_rows = *visible;
+    result.offset_from_tail = *offset;
     return result;
 }
 
@@ -358,7 +359,7 @@ inline std::optional<vnm_terminal::Terminal_canvas_selection> decode_frame(const
     result.has_selection = object.value(QStringLiteral("has_selection")).toBool();
     result.touch_handles_visible = object.value(QStringLiteral("touch_handles_visible")).toBool();
     const auto rows = object.value(QStringLiteral("rows")).toArray();
-    if (rows.size() != source->rows) {
+    if (rows.empty() || rows.size() > 32'768 / source->columns) {
         return std::nullopt;
     }
     for (const auto& encoded : rows) {
@@ -376,7 +377,7 @@ inline std::optional<vnm_terminal::Terminal_canvas_selection> decode_frame(const
             return std::nullopt;
         }
         const bool visible = array[2].toBool();
-        const auto row = integer(array[0], visible ? 0 : -32'768, visible ? source->rows - 1 : 32'768);
+        const auto row = integer(array[0], visible ? 0 : -32'768, visible ? (int)rows.size() - 1 : 32'768);
         const auto column = integer(array[1], visible ? 0 : -32'768, visible ? source->columns : 32'768);
         if (!row || !column) {
             return std::nullopt;
@@ -391,7 +392,7 @@ inline std::optional<vnm_terminal::Terminal_canvas_selection> decode_frame(const
     result.start = *start;
     result.end = *end;
     const auto spans = object.value(QStringLiteral("spans")).toArray();
-    if (spans.size() > source->rows) {
+    if (spans.size() > rows.size()) {
         return std::nullopt;
     }
     int previous_row = -1;
@@ -400,7 +401,7 @@ inline std::optional<vnm_terminal::Terminal_canvas_selection> decode_frame(const
         if (array.size() != 3) {
             return std::nullopt;
         }
-        const auto row = integer(array[0], previous_row + 1, source->rows - 1);
+        const auto row = integer(array[0], previous_row + 1, (int)rows.size() - 1);
         const auto first = integer(array[1], 0, source->columns - 1);
         const auto count = integer(array[2], 1, first ? source->columns - *first : 0);
         if (!row || !first || !count) {
@@ -420,7 +421,8 @@ inline std::optional<vnm_terminal::Terminal_canvas_selection> decode_frame(const
         (QLatin1String(name) == QLatin1String("background_rgba")
             ? result.background_rgba : result.foreground_rgba) = static_cast<quint32>(number);
     }
-    return vnm_terminal::terminal_canvas_selection_is_valid(result, source->rows, source->columns)
+    return vnm_terminal::terminal_canvas_selection_is_valid(
+        result, (int)rows.size(), source->columns, source->rows)
         ? std::optional(result) : std::nullopt;
 }
 

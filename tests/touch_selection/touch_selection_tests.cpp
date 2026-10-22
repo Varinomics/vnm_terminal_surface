@@ -8,6 +8,7 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
@@ -67,10 +68,13 @@ touch::Terminal_touch_selection_request request_at(
     request.source     = snapshot.touch_selection->source;
     request.target     = {snapshot.touch_selection->visible_rows[(std::size_t)row], column};
     request.expected_selection_generation = snapshot.touch_selection->selection_generation;
+    // As the touch controller does: the request names the presentation of the
+    // frame it addressed, or none when that frame displays native rows.
+    request.presentation = snapshot.touch_selection->presentation;
     return request;
 }
 
-bool resize_leading_rows_selection_contract()
+bool consumer_capacity_selection_contract()
 {
     auto backend = std::make_unique<Touch_backend>();
     auto* output = backend.get();
@@ -78,188 +82,78 @@ bool resize_leading_rows_selection_contract()
     config.selection_viewport_projection_enabled = true;
     term::Terminal_session session(std::move(backend), config);
     term::Terminal_launch_config launch;
-    launch.argv = {QStringLiteral("resize-history-selection-fixture")};
+    launch.argv = {QStringLiteral("consumer-capacity-selection")};
     launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
     bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
-        "resize history selection fixture starts");
+        "consumer selection fixture starts");
     output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
     session.process_backend_callback_events();
-    session.resize(QSizeF(200.0, 40.0), {2, 20});
-    session.resize(QSizeF(200.0, 120.0), {6, 20});
-    auto snapshot = session.latest_render_snapshot_handle();
-    ok &= check(snapshot && snapshot->leading_row_count == 3 && snapshot->leading_rows_snapshot &&
-            snapshot->leading_rows_snapshot->touch_selection,
-        "resize history and ordinary rows share one published selection source");
-    if (!ok) {
-        return false;
-    }
-    auto word = request_at(*snapshot->leading_rows_snapshot,
-        touch::Terminal_touch_selection_action::SELECT_WORD, 0, 2, 101U);
-    word.presentation = touch::terminal_touch_selection_presentation_t{
-        touch::k_terminal_touch_selection_presentation_version, 4, 2};
-    ok &= check(touch::touch_selection_codec::decode_request(
-            touch::touch_selection_codec::encode_request(word)) == word,
-        "selection presentation is an independently versioned optional request record");
-    auto unsupported = word;
-    unsupported.presentation->record_version = 99U;
-    const auto decoded_unsupported = touch::touch_selection_codec::decode_request(
-        touch::touch_selection_codec::encode_request(unsupported));
-    ok &= check(decoded_unsupported &&
-            session.apply_touch_selection(*decoded_unsupported).status == touch::Terminal_touch_selection_status::UNAVAILABLE,
-        "an unknown presentation version leaves ordinary selection available without guessing its geometry");
-    auto undisplayed = word;
-    undisplayed.presentation->top_padding_rows = 1;
-    ok &= check(session.apply_touch_selection(undisplayed).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
-        "a retained word outside the displayed prefix cannot be selected through the supplemental projection");
-    const auto native_cursor = snapshot->cursor.position;
-    const auto selected = session.apply_touch_selection(word);
-    ok &= check(selected.status == touch::Terminal_touch_selection_status::OK &&
-            session.selected_text().text == QStringLiteral("header") &&
-            session.viewport_state().offset_from_tail == 0 &&
-            session.latest_render_snapshot_handle()->cursor.position == native_cursor,
-        "a displayed resize-history word selects without moving the shared viewport or native cursor");
-    snapshot = session.latest_render_snapshot_handle();
-    if (!check(snapshot && snapshot->leading_rows_snapshot && snapshot->leading_rows_snapshot->touch_selection,
-            "selecting retained content preserves its separate projection"))
+    (void)session.resize(QSizeF(200.0, 60.0), {3, 20});
+    session.set_canvas_presentation_rows(6);
+    const auto source = session.latest_render_snapshot_handle();
+    auto shown = term::make_presented_snapshot(source, 6, 0);
+    if (!check(shown && shown->touch_selection && source->row_coverage_snapshot &&
+            shown->touch_selection->source.rows == 3 && shown->touch_selection->visible_rows.size() == 6U &&
+            shown->display_row_logical_rows == std::vector<int>({0, 1, 2, 3, 4, -1}),
+            "a taller consumer retains native source identity and displays one trailing unused slot"))
     {
         return false;
     }
-    const auto& selection = *snapshot->leading_rows_snapshot->touch_selection;
-    ok &= check(selection.has_selection && selection.touch_handles_visible &&
-            selection.spans == std::vector<touch::terminal_canvas_selection_span_t>{{0, 0, 6}},
-        "the same selection engine projects its highlight onto retained leading content");
-    auto begin = request_at(*snapshot->leading_rows_snapshot,
-        touch::Terminal_touch_selection_action::BEGIN_HANDLE, 0, 6, 102U);
+    auto coverage = *source->row_coverage_snapshot->touch_selection;
+    // Presentation and word-query capabilities travel independently of the
+    // base selection frame.
+    coverage.presentation.reset();
+    coverage.word_query_version.reset();
+    ok &= check(touch::touch_selection_codec::decode_frame(
+            touch::touch_selection_codec::encode_frame(coverage)) == coverage,
+        "arbitrary row coverage selection transports its source height separately from its row count");
+    auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 0, 2, 101U);
+    word.presentation = shown->touch_selection->presentation;
+    ok &= check(word.presentation && word.presentation->visible_rows == 6 &&
+            word.presentation->offset_from_tail == 0 &&
+            touch::touch_selection_codec::decode_request(touch::touch_selection_codec::encode_request(word)) == word,
+        "the request carries the exact common producer capacity and offset");
+    auto unsupported = word;
+    unsupported.presentation->record_version = 99U;
+    ok &= check(session.apply_touch_selection(unsupported).status == touch::Terminal_touch_selection_status::UNAVAILABLE,
+        "an unsupported presentation request cannot guess displayed geometry");
+    auto undisplayed = word;
+    undisplayed.presentation->visible_rows = 2;
+    ok &= check(session.apply_touch_selection(undisplayed).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
+        "a retained word outside this consumer's displayed interval cannot be selected");
+    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::OK &&
+            session.selected_text().text == QStringLiteral("header") && session.viewport_state().offset_from_tail == 0,
+        "the displayed acquired row selects without changing native geometry or offset");
+    shown = term::make_presented_snapshot(session.latest_render_snapshot_handle(), 6, 0);
+    ok &= check(shown->touch_selection->start.row == 0 &&
+            shown->touch_selection->spans == std::vector<touch::terminal_canvas_selection_span_t>{{0, 0, 6}},
+        "the retained word's highlight and handles share its displayed row");
+    auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 0, 6, 102U);
     begin.presentation = word.presentation;
     begin.handle = touch::Terminal_selection_handle::END;
     ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
-        "a leading-row selection accepts ordinary handle extension");
+        "the acquired row supports handle extension");
     auto scroll = begin;
     scroll.request_id = 103U;
     scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
-    scroll.scroll_lines = 1;
-    // The grow left four vacant rows, so the shared view's range is the
-    // AUTOMATIC one, max(0, S - P) = 0 rows here (DESIGN 5.4 Bounds); every
-    // history row is already among the acquired leading rows.
-    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
-            session.viewport_state().offset_from_tail == 0 &&
-            session.selected_text().text == QStringLiteral("header"),
-        "older-history extension follows the displayed leading edge within the presented range");
-    snapshot = session.latest_render_snapshot_handle();
-    scroll.request_id = 104U;
-    scroll.expected_selection_generation = snapshot->touch_selection->selection_generation;
-    scroll.scroll_lines = -1;
-    scroll.target.column = 7;
-    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
-            session.selected_text().text ==
-                QStringLiteral("header alpha\nsecond beta\nthird gamma\nfourth delta\nprompt>"),
-        "newer-history extension reaches the phone's actual visible native edge");
-    snapshot = session.latest_render_snapshot_handle();
-    auto copy = request_at(*snapshot, touch::Terminal_touch_selection_action::COPY, 0, 0, 105U);
-    copy.presentation = word.presentation;
-    ok &= check(session.apply_touch_selection(copy).text == session.selected_text().text,
-        "copy uses original retained text across the supplemental and native rows");
-    auto stale = word;
-    stale.request_id = 106U;
-    output->output(QByteArrayLiteral("\x1b[2J"));
-    session.process_backend_callback_events();
-    ok &= check(session.apply_touch_selection(stale).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
-        "cleared resize presentation cannot authorize selection from an obsolete leading frame");
-    return ok;
-}
-
-// The phone composes the rows a shrink displaced into history above its
-// native frame. With the Companion toggle off and no resize vacancy the
-// desktop presents natively, and the frame still carries those rows.
-bool shrink_only_phone_prefix_contract()
-{
-    auto backend = std::make_unique<Touch_backend>();
-    auto* output = backend.get();
-    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
-    config.selection_viewport_projection_enabled = true;
-    term::Terminal_session session(std::move(backend), config);
-    term::Terminal_launch_config launch;
-    launch.argv = {QStringLiteral("shrink-only-phone-prefix-fixture")};
-    launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
-    bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
-        "shrink-only phone prefix fixture starts");
-    output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
-    session.process_backend_callback_events();
-    session.resize(QSizeF(200.0, 60.0), {3, 20});
-    const auto snapshot = session.latest_render_snapshot_handle();
-    if (!check(snapshot &&
-            snapshot->viewport.presentation.policy == term::Terminal_presentation_policy::NATIVE &&
-            snapshot->leading_row_count == 2 && snapshot->leading_rows_snapshot &&
-            snapshot->leading_rows_snapshot->touch_selection &&
-            term::make_presented_snapshot(snapshot) == snapshot,
-            "a shrink-only native frame keeps the displaced rows for the phone and presents natively"))
-    {
-        return false;
-    }
-    auto word = request_at(*snapshot->leading_rows_snapshot,
-        touch::Terminal_touch_selection_action::SELECT_WORD, 0, 2, 111U);
-    word.presentation = touch::terminal_touch_selection_presentation_t{
-        touch::k_terminal_touch_selection_presentation_version, 2, 3};
-    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::OK &&
-            session.selected_text().text == QStringLiteral("header"),
-        "the phone selects a displaced word while the desktop presents natively");
-    return ok;
-}
-
-bool desktop_content_tail_selection_contract()
-{
-    auto backend = std::make_unique<Touch_backend>();
-    auto* output = backend.get();
-    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
-    config.selection_viewport_projection_enabled = true;
-    term::Terminal_session session(std::move(backend), config);
-    term::Terminal_launch_config launch;
-    launch.argv = {QStringLiteral("desktop-content-tail-selection")};
-    launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
-    bool ok = check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
-        "desktop content-tail selection fixture starts");
-    session.set_companion_presentation(true);
-    output->output(QByteArrayLiteral("header alpha\r\nsecond beta\r\nthird gamma\r\nfourth delta\r\nprompt> "));
-    session.process_backend_callback_events();
-    session.resize(QSizeF(200.0, 40.0), {2, 20});
-    session.resize(QSizeF(200.0, 120.0), {6, 20});
-    auto shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
-    if (!check(shown && shown->touch_selection && shown->display_row_logical_rows.front() == -1,
-            "the desktop projection carries padding and retained touch rows"))
-    {
-        return false;
-    }
-    auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 1, 2, 201U);
-    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::OK &&
-            session.selected_text().text == QStringLiteral("header") && !word.presentation,
-        "desktop touch selects the displayed prefix without a phone presentation request");
-    shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
-    auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 1, 6, 202U);
-    begin.handle = touch::Terminal_selection_handle::END;
-    ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
-        "the desktop selection begins its end-handle gesture");
-    auto scroll = begin;
-    scroll.request_id = 203U;
-    scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
-    scroll.scroll_lines = 1;
-    ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
-            session.viewport_state().offset_from_tail == 1 && session.selected_text().text == QStringLiteral("header"),
-        "desktop upward extension skips the relocated padding band");
-    scroll.request_id = 204U;
-    scroll.expected_selection_generation = session.latest_render_snapshot_handle()->touch_selection->selection_generation;
     scroll.scroll_lines = -1;
     scroll.target.column = 7;
     ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
             session.selected_text().text == QStringLiteral("header alpha\nsecond beta\nthird gamma\nfourth delta\nprompt>"),
-        "desktop downward extension reaches the last written row without selecting the unwritten suffix");
+        "extension reaches this consumer's actual tail without selecting padding");
+    output->output(QByteArrayLiteral("\x1b[2J"));
+    session.process_backend_callback_events();
+    ok &= check(session.apply_touch_selection(word).status == touch::Terminal_touch_selection_status::STALE_SOURCE,
+        "an explicit clear cannot authorize a word outside the newly displayed page");
     return ok;
 }
 
-// Desktop touch on an AUTOMATIC presentation: the grow left four vacant rows
+// Desktop touch addresses the same current-content mapping as exported views.
+// After growth the grid has four unused rows
 // below the prompt, so the displayed rows are history and the written tail.
 // Selection addresses the displayed rows, and scroll-extension moves within
 // the presented range in both directions.
-bool desktop_automatic_selection_contract()
+bool desktop_content_end_selection_contract()
 {
     auto backend = std::make_unique<Touch_backend>();
     auto* output = backend.get();
@@ -304,13 +198,122 @@ bool desktop_automatic_selection_contract()
             session.viewport_state().offset_from_tail == 1,
         "upward extension scrolls the presented range by one row");
     scroll.request_id = 304U;
-    scroll.expected_selection_generation = session.latest_render_snapshot_handle()->touch_selection->selection_generation;
+    // The next request names the frame the scroll produced, as the touch
+    // controller does with each rendered frame.
+    shown = term::make_presented_snapshot(session.latest_render_snapshot_handle());
+    scroll.expected_selection_generation = shown->touch_selection->selection_generation;
+    scroll.presentation = shown->touch_selection->presentation;
     scroll.scroll_lines = -1;
     scroll.target.column = 7;
     ok &= check(session.apply_touch_selection(scroll).status == touch::Terminal_touch_selection_status::OK &&
             session.viewport_state().offset_from_tail == 0 &&
             session.selected_text().text == QStringLiteral("line-7\nline-8\nline-9\nprompt>"),
         "downward extension reaches the written tail without selecting the vacated rows");
+    return ok;
+}
+
+// A canvas whose frame carries no supported presentation record (absent, an
+// unknown version, or NATIVE) displays the native publication, and its touch
+// requests carry no presentation. The session addresses those requests to the
+// native rows the canvas showed, also after a handle scrolls the view.
+bool native_canvas_selection_contract()
+{
+    bool ok = true;
+    for (int variant = 0; variant < 3; ++variant) {
+        const std::string name = variant == 0 ? "absent" : variant == 1 ? "unknown" : "native";
+        auto backend = std::make_unique<Touch_backend>();
+        auto* output = backend.get();
+        auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+        config.selection_viewport_projection_enabled = true;
+        term::Terminal_session session(std::move(backend), config);
+        term::Terminal_launch_config launch;
+        launch.argv = {QStringLiteral("native-canvas-selection")};
+        launch.initial_grid_size = term::terminal_grid_size_t{6, 20};
+        ok &= check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+            "native canvas selection fixture starts");
+        QByteArray lines;
+        for (int line = 0; line < 13; ++line) {
+            lines += QStringLiteral("w%1\r\n").arg(line, 2, 10, QLatin1Char('0')).toUtf8();
+        }
+        output->output(lines + QByteArrayLiteral("prompt>"));
+        session.process_backend_callback_events();
+        // History 12 and content end 14 in six native rows; the native view at
+        // offset 3 shows rows 9..14, the content-tail view rows 5..10.
+        session.resize(QSizeF(200.0, 40.0), {2, 20});
+        session.resize(QSizeF(200.0, 120.0), {6, 20});
+        (void)session.scroll_published_viewport_to_offset_from_tail(3);
+        const auto native = session.latest_render_snapshot_handle();
+        if (!check(native && native->viewport.scrollback_rows == 12 &&
+                native->viewport.presentation.content_end_row_exclusive == 14 &&
+                native->viewport.offset_from_tail == 3,
+                "the native view shows rows 9..14 of a content end of 14"))
+        {
+            return false;
+        }
+
+        VNM_TerminalSurface exporter;
+        const auto exporter_metrics = term::VNM_TerminalSurface_render_bridge::cell_metrics(exporter);
+        exporter.setWidth(20 * exporter_metrics.width);
+        exporter.setHeight(6 * exporter_metrics.height);
+        VNM_TerminalCanvas canvas;
+        // The canvas receives the session's publication with its presentation
+        // record withheld, unknown, or explicitly native.
+        const auto show_natively = [&]() -> std::shared_ptr<const term::Terminal_render_snapshot> {
+            term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                exporter, session.latest_render_snapshot_handle());
+            const auto exported = touch::export_terminal_canvas_frame(exporter);
+            if (!exported.frame || !exported.frame->presentation) {
+                return nullptr;
+            }
+            auto frame = std::make_shared<touch::Terminal_canvas_frame>(*exported.frame);
+            if (variant == 0) {
+                frame->presentation.reset();
+            }
+            else
+            if (variant == 1) {
+                frame->presentation->record_version = 99U;
+            }
+            else {
+                frame->presentation->policy = touch::Terminal_canvas_presentation_policy::NATIVE;
+                frame->presentation->content_end_row_exclusive = 0;
+                frame->presentation->clear_page_start_row = 0;
+            }
+            return canvas.set_canvas_frame(frame)
+                ? term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas) : nullptr;
+        };
+        auto shown = show_natively();
+        if (!check(shown && shown->touch_selection && !shown->touch_selection->presentation &&
+                shown->visible_line_provenance.size() == 6U &&
+                shown->visible_line_provenance[2].logical_row == 11,
+                name + ": the canvas displays native rows 9..14 and its touch frame names no presentation"))
+        {
+            return false;
+        }
+        auto word = request_at(*shown, touch::Terminal_touch_selection_action::SELECT_WORD, 2, 1, 401U);
+        const auto selected = session.apply_touch_selection(word);
+        ok &= check(selected.status == touch::Terminal_touch_selection_status::OK &&
+                session.selected_text().text == QStringLiteral("w11"),
+            name + ": a word the native canvas displays is selected");
+
+        shown = show_natively();
+        if (!check(shown && shown->touch_selection, name + ": the canvas shows the new selection")) {
+            return false;
+        }
+        auto begin = request_at(*shown, touch::Terminal_touch_selection_action::BEGIN_HANDLE, 2, 0, 402U);
+        begin.handle = touch::Terminal_selection_handle::START;
+        ok &= check(session.apply_touch_selection(begin).status == touch::Terminal_touch_selection_status::OK,
+            name + ": the native canvas begins a start-handle gesture");
+        auto scroll = begin;
+        scroll.request_id = 403U;
+        scroll.action = touch::Terminal_touch_selection_action::SCROLL_EXTEND;
+        scroll.scroll_lines = 1;
+        scroll.target.column = 0;
+        const auto scrolled = session.apply_touch_selection(scroll);
+        ok &= check(scrolled.status == touch::Terminal_touch_selection_status::OK &&
+                session.latest_render_snapshot_handle()->viewport.offset_from_tail == 4 &&
+                session.selected_text().text == QStringLiteral("w08\nw09\nw10\nw11"),
+            name + ": an upward handle scroll extends to the top native row the canvas then shows");
+    }
     return ok;
 }
 
@@ -1185,19 +1188,11 @@ bool optional_projection_contract()
     frame->selection = initial;
     ok &= check(canvas.set_canvas_frame(frame) && canvas.canvas_frame()->selection.has_value(),
         "valid optional source installs before any selection exists");
-    auto composed = initial;
-    composed.composition = touch::terminal_touch_selection_composition_t{1, 1};
-    ok &= check(composed != initial &&
-            touch::touch_selection_codec::encode_frame(composed) == touch::touch_selection_codec::encode_frame(initial),
-        "local composition participates in selection equality without changing the selection wire record");
-    const auto installed_generation = canvas.frame_generation();
-    frame->selection = composed;
-    ok &= check(canvas.set_canvas_frame(frame) && canvas.frame_generation() != installed_generation &&
-            canvas.canvas_frame()->selection && canvas.canvas_frame()->selection->composition == composed.composition,
-        "composition-only changes install a new canvas generation even when source identity and sequence are unchanged");
-    composed.composition->leading_capacity = 0;
-    ok &= check(!touch::terminal_canvas_selection_is_valid(composed, 2, 12),
-        "local composition cannot claim more displayed leading rows than its capacity");
+    auto presented = initial;
+    presented.presentation = touch::terminal_touch_selection_presentation_t{2, 2, 0};
+    ok &= check(presented != initial &&
+            touch::touch_selection_codec::encode_frame(presented) == touch::touch_selection_codec::encode_frame(initial),
+        "local rendered geometry is independent from the native selection wire record");
     for (int defect = 0; defect < 4; ++defect) {
         auto malformed = initial;
         if (defect == 0) { malformed.visible_rows[0].retained_line_id = 0U; }
@@ -1401,10 +1396,9 @@ int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
     bool ok = owner_selection_contract();
-    ok &= resize_leading_rows_selection_contract();
-    ok &= shrink_only_phone_prefix_contract();
-    ok &= desktop_content_tail_selection_contract();
-    ok &= desktop_automatic_selection_contract();
+    ok &= consumer_capacity_selection_contract();
+    ok &= desktop_content_end_selection_contract();
+    ok &= native_canvas_selection_contract();
     ok &= touch_intent_contract();
     ok &= direct_word_hold_contract();
     ok &= cursor_hold_contract();

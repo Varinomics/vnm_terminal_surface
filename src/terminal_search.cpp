@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_search.h"
 
 #include <QByteArray>
+#include <QLatin1StringMatcher>
 #include <QLatin1StringView>
 #include <QStringView>
 #include <QThreadPool>
@@ -14,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -71,6 +73,9 @@ struct Search_query_text
     QByteArray  latin1;
     bool        latin1_exact = false;
     Qt::CaseSensitivity case_sensitivity = Qt::CaseSensitive;
+
+    // The matcher borrows immutable latin1 storage, shared by query copies and moves.
+    std::optional<QLatin1StringMatcher> latin1_matcher;
 };
 
 struct Search_corpus
@@ -119,6 +124,11 @@ Search_query_text make_search_query_text(const QString& query, bool case_sensiti
         [](QChar code_unit) { return code_unit.unicode() <= 0x00ffU; });
     if (text.latin1_exact) {
         text.latin1 = query.toLatin1();
+        if (!case_sensitive && query.size() > 1) {
+            text.latin1_matcher.emplace(
+                QLatin1StringView(text.latin1.constData(), text.latin1.size()),
+                text.case_sensitivity);
+        }
     }
     return text;
 }
@@ -196,19 +206,19 @@ std::optional<std::vector<search_match_span_t>> search_row(
     const qsizetype latin1_units = column_count >= row.source_width
         ? row.identity_latin1_text.size()
         : std::min(row.identity_latin1_text.size(), static_cast<qsizetype>(std::max(0, column_count)));
-    // Non-Latin-1 queries can case-fold to Latin-1 (for example U+212A to k),
-    // so keep their UTF-16 search path.
-    const bool use_latin1_view = complex == nullptr && query.latin1_exact;
+    // Keep Qt's UTF-16 character search for a one-code-unit query. Non-Latin-1
+    // queries also need that path to retain case folds such as U+212A to k.
+    const bool use_latin1_matcher = complex == nullptr && query.latin1_matcher.has_value();
     const QLatin1StringView latin1_view(
         row.identity_latin1_text.constData(), latin1_units);
-    const QString latin1_text = complex == nullptr && !use_latin1_view
+    const QString latin1_text = complex == nullptr && !use_latin1_matcher
         ? QString::fromLatin1(row.identity_latin1_text.constData(), latin1_units)
         : QString();
     const QStringView text = complex != nullptr
         ? QStringView(complex->units.data(),
               static_cast<qsizetype>(searchable_unit_count(*complex, column_count)))
         : QStringView(latin1_text);
-    const qsizetype text_size = use_latin1_view
+    const qsizetype text_size = use_latin1_matcher
         ? latin1_view.size()
         : text.size();
     if (query.utf16.isEmpty() || query.utf16.size() > text_size) {
@@ -217,8 +227,8 @@ std::optional<std::vector<search_match_span_t>> search_row(
 
     qsizetype search_from = 0;
     while (search_from <= text_size - query.utf16.size()) {
-        const qsizetype found = use_latin1_view
-            ? latin1_view.indexOf(query.utf16, search_from, query.case_sensitivity)
+        const qsizetype found = use_latin1_matcher
+            ? query.latin1_matcher->indexIn(latin1_view, search_from)
             : text.indexOf(query.utf16, search_from, query.case_sensitivity);
         if (found < 0) {
             break;
@@ -545,7 +555,8 @@ struct Terminal_search_controller::Shared_state
 
     std::vector<Terminal_render_search_match_span> spans_for_snapshot(
         const Terminal_render_snapshot& snapshot,
-        std::uint64_t                   active_buffer_epoch) const
+        std::uint64_t                   active_buffer_epoch,
+        terminal_grid_size_t            native_grid_size) const
     {
         std::lock_guard<std::mutex> lock(result_mutex);
         std::vector<Terminal_render_search_match_span> spans;
@@ -554,7 +565,7 @@ struct Terminal_search_controller::Shared_state
             result.source_identity.active_buffer_epoch != active_buffer_epoch       ||
             result.source_identity.row_origin_generation !=
                 snapshot.metadata.row_origin_generation                            ||
-            !grid_sizes_match(result.source_identity.grid_size, snapshot.grid_size))
+            !grid_sizes_match(result.source_identity.grid_size, native_grid_size))
         {
             return spans;
         }
@@ -1381,7 +1392,19 @@ Terminal_search_controller::spans_for_snapshot(
     std::uint64_t                   active_buffer_epoch) const
 {
     return !m_searching && m_source_available && !m_query.isEmpty()
-        ? m_shared->spans_for_snapshot(snapshot, active_buffer_epoch)
+        ? m_shared->spans_for_snapshot(snapshot, active_buffer_epoch, snapshot.grid_size)
+        : std::vector<Terminal_render_search_match_span>{};
+}
+
+std::vector<Terminal_render_search_match_span>
+Terminal_search_controller::spans_for_row_coverage(
+    const Terminal_render_snapshot& source,
+    std::uint64_t                   active_buffer_epoch) const
+{
+    return !m_searching && m_source_available && !m_query.isEmpty() &&
+            render_snapshot_row_coverage_is_coherent(source)
+        ? m_shared->spans_for_snapshot(*source.row_coverage_snapshot,
+            active_buffer_epoch, source.grid_size)
         : std::vector<Terminal_render_search_match_span>{};
 }
 

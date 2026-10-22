@@ -184,7 +184,7 @@ bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
     auto wide_row = search_test_row(3U, 2, u"");
     wide_row.text.append_cell_text(QStringView(u"\u00c4"), 2, 4);
     source.active_rows.push_back(std::move(wide_row));
-    source.active_rows.push_back(search_test_row(4U, 3, u"\u00c9 \u00e9"));
+    source.active_rows.push_back(search_test_row(4U, 3, u"\u00c9x \u00e9X"));
     search.update_source(std::move(source));
     search.set_query(QStringLiteral("Alpha"), 0);
     bool ok = check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
@@ -216,6 +216,13 @@ bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
     ok &= check(search.result_state().match_count == 2 && latin1_match &&
         latin1_match->first_column == 0 && latin1_match->column_count == 1,
         "insensitive Latin-1 matches retain exact single-column spans");
+    search.set_query(QStringLiteral("\u00e9x"), 3);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "insensitive Latin-1 substring match completes");
+    const auto latin1_substring_match = search.current_match();
+    ok &= check(search.result_state().match_count == 2 && latin1_substring_match &&
+        latin1_substring_match->first_column == 0 && latin1_substring_match->column_count == 2,
+        "insensitive Latin-1 substrings retain exact column spans");
     return ok;
 }
 

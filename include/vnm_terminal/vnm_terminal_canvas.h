@@ -33,6 +33,8 @@ class VNM_TerminalCanvas : public QQuickItem
         WRITE set_authoritative_cell_metrics_enabled
         NOTIFY authoritative_cell_metrics_enabled_changed)
     Q_PROPERTY(int rows READ rows NOTIFY frame_changed)
+    Q_PROPERTY(int presentationRows READ presentation_rows
+        WRITE set_presentation_rows NOTIFY presentation_rows_changed)
     Q_PROPERTY(int columns READ columns NOTIFY frame_changed)
     Q_PROPERTY(qreal cellHeight READ cell_height NOTIFY frame_changed)
     Q_PROPERTY(bool contentExtentAvailable
@@ -85,6 +87,10 @@ public:
     void set_authoritative_cell_metrics_enabled(bool enabled);
 
     int rows() const;
+    // Consumer capacity; zero uses the frame's native rows. A new capacity
+    // takes effect only when the immutable frame covers its requested rows.
+    int presentation_rows() const;
+    void set_presentation_rows(int rows);
     int columns() const;
     qreal cell_height() const;
     bool content_extent_available() const;
@@ -133,6 +139,7 @@ signals:
     void font_size_changed();
     void authoritative_cell_metrics_enabled_changed();
     void frame_changed();
+    void presentation_rows_changed();
     void render_status_changed();
     void render_error_changed();
     void cursor_blink_phase_changed(bool visible);
@@ -173,4 +180,5 @@ private:
     bool                     m_font_italic = false;
     qreal                    m_font_size = 13.0;
     bool                     m_authoritative_cell_metrics_enabled = false;
+    int                      m_presentation_rows = 0;
 };

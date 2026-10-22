@@ -166,7 +166,10 @@ Qt properties expose the host-visible state:
 - `rows` and `columns` are the grid size derived from item geometry and font
   metrics.
 - `scrollbackRows`, `viewportVisibleRows`, `viewportOffsetFromTail`, and
-  `viewportAtTail` describe the published primary-screen viewport. During an
+  `viewportAtTail` describe the published primary-screen presentation.
+  `scrollbackRows` is its maximum offset from the tail, rather than the count
+  of archived rows. A prompt redraw can change this maximum without changing
+  the native grid or archive. During an
   opt-in immediate synchronized-output hold, these properties describe only the
   public projection. If that projection is invalidated before release, the
   values freeze at the last visible public state until live content is
@@ -307,6 +310,18 @@ hidden synchronized output under the default deferred policy, or an
 already-boundary request with no accepted deferred intent. Large offset requests
 may clamp to the available scrollback and still return `true` if the viewport
 moved.
+
+Canvas hosts also have C++-only public methods:
+
+- `set_canvas_presentation_rows(int rows)` requests coherent row coverage for
+  an independently sized canvas without resizing the terminal backend. Zero
+  removes that demand; positive values obey the public canvas cell budget.
+  `canvas_presentation_rows()` reports the current demand.
+- `scroll_canvas_presentation_wheel(int wheel_steps, int rows)` applies a
+  canvas wheel gesture using its own visible row capacity. Primary-screen
+  consumers share scroll intent with each capacity clamped by the same
+  presentation mapping. Alternate-screen gestures use the ordinary application
+  mouse or alternate-scroll route. Returning to the tail resets both views.
 
 Under `IMMEDIATE_PUBLIC_PROJECTION`, valid synchronized-output holds are an
 exception to the default hidden-output behavior: `scroll_viewport_lines()` and
@@ -469,6 +484,15 @@ Canvas frames carry an optional, independently versioned selection record.
 An absent, unknown, or invalid selection record leaves terminal text available
 while disabling selection from that record. The optional word-query capability
 has its own version and does not change the canvas frame version.
+Selection requests for a content-tail presentation carry its rendered row
+capacity and offset in the independently versioned presentation record. Hosts
+must transport that record together with the source and row identities. Native
+frames without supported presentation metadata (absent, unknown, or `NATIVE`)
+keep native selection requests: a request without a presentation record
+addresses the native publication's rows, including after a handle scrolls the
+view. The desktop surface names its rendered presentation in every request that
+addresses rows; an actual projected request cannot be downgraded to native
+coordinates.
 
 ## Clipboard Policy
 
@@ -712,8 +736,26 @@ grid and renders them through the surface's image renderer. Images share the
 enclosing publication's lifetime. Missing, unknown, invalid, or over-limit image
 records leave text available; unavailable status never represents a partial
 image as complete. Transport owners set their decoded-byte budgets. The existing
-content-extent record describes text and cursor state, while the canvas's
-presentation bottom also includes visible image rows. Renderer diagnostics are
+content-extent record describes native text and visible cursor state. The
+independent presentation record supplies the primary screen's current content
+endpoint, including written spaces, styles, images, and the logical cursor
+even when cursor painting is disabled. It also carries the clear-page boundary,
+consumer viewport, native coverage, and frozen-publication status. An explicit
+clear starts a page. The document runs from the later of the first retained
+row and that page to the content end: when it fits the consumer's rows it
+starts on the top row with unused slots after it, as a cleared or fresh screen
+does, and a longer document ends on the bottom row. History before the page
+stays in the scroll range. The alternate screen retains native geometry.
+
+`VNM_TerminalCanvas::presentationRows` selects a local row capacity for a
+supported content-tail frame; zero uses the native frame capacity. The optional
+row-coverage attachment contains an arbitrary native logical interval from
+the same publication, so it can supply rows before or after the native window.
+Missing required coverage rejects a new frame or capacity projection and keeps
+the last coherent displayed frame, including its selection coordinates. Hosts
+must request sufficient coverage from the owning surface and negotiate these
+optional records independently. Unknown presentation versions use the native
+frame without a local remapping. Renderer diagnostics are
 exposed through the public `qsg_atlas` serializer.
 Internal headers carry no source- or binary-stability guarantee and may change
 without notice.
