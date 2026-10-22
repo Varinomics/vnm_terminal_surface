@@ -300,7 +300,6 @@ struct Parser_control_sequence
 {
     Parser_sequence_family         family     = Parser_sequence_family::NONE;
     Parser_control_sequence_action action     = Parser_control_sequence_action::DISPATCH;
-    std::vector<int>               parameters;
     QByteArray                     private_marker;
     QByteArray                     intermediates;
     QByteArray                     final_bytes;
@@ -497,7 +496,6 @@ inline Parser_action make_escape_dispatch_action(QByteArray final_bytes, QByteAr
             Parser_control_sequence_action::DISPATCH,
             {},
             {},
-            {},
             std::move(final_bytes),
             {},
             Parser_string_terminator::NONE,
@@ -531,7 +529,6 @@ inline Parser_action make_csi_control_sequence_action(
         Parser_control_sequence{
             Parser_sequence_family::CSI,
             action,
-            std::move(parameters),
             std::move(private_marker),
             std::move(intermediates),
             std::move(final_bytes),
@@ -569,7 +566,6 @@ inline Parser_action make_string_sequence_action(
         Parser_control_sequence{
             family,
             Parser_control_sequence_action::DISPATCH,
-            {},
             {},
             {},
             {},

@@ -14,11 +14,13 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 
 #include <QByteArray>
+#include <QChar>
 #include <QColor>
 #include <QGuiApplication>
 #include <QImage>
 #include <QSizeF>
 #include <QString>
+#include <QStringView>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -721,6 +723,42 @@ bool test_wide_style_export_is_explicit_and_lossless()
     return ok;
 }
 
+bool test_utf8_text_byte_count()
+{
+    bool ok = true;
+    constexpr std::array<char32_t, 13> codepoints{
+        0x0000U, 0x007fU, 0x0080U, 0x07ffU, 0x0800U, 0xd7ffU, 0xe000U,
+        0xffffU, 0x10000U, 0x1f600U, 0x10ffffU, 0x0301U, 0x754cU,
+    };
+    QString mixed;
+    for (const char32_t codepoint : codepoints) {
+        const QString text = QString::fromUcs4(&codepoint, 1);
+        const auto bytes = vnm_terminal::terminal_canvas_text_utf8_size(QStringView(text));
+        ok &= check(bytes.has_value() && *bytes == text.toUtf8().size(),
+            "UTF-8 count matches Qt encoding across scalar and surrogate boundaries");
+        mixed += text;
+    }
+    const auto mixed_bytes = vnm_terminal::terminal_canvas_text_utf8_size(QStringView(mixed));
+    ok &= check(mixed_bytes.has_value() && *mixed_bytes == mixed.toUtf8().size(),
+        "mixed text counts embedded NUL, combining marks and supplementary scalars");
+    const auto empty_bytes = vnm_terminal::terminal_canvas_text_utf8_size(QStringView{});
+    ok &= check(empty_bytes.has_value() && *empty_bytes == 0,
+        "empty text has an exact zero UTF-8 byte count");
+
+    const std::array<QString, 5> malformed{
+        QString(QChar(0xd800U)),
+        QString(QChar(0xdc00U)),
+        QString(QChar(0xd800U)) + QLatin1Char('x'),
+        QString(QChar(0xdc00U)) + QChar(0xd800U),
+        QString(QChar(0xd800U)) + QChar(0xd800U) + QChar(0xdc00U),
+    };
+    for (const QString& text : malformed) {
+        ok &= check(!vnm_terminal::terminal_canvas_text_utf8_size(QStringView(text)).has_value(),
+            "malformed UTF-16 leaves replacement or rejection policy to the caller");
+    }
+    return ok;
+}
+
 bool test_text_bounds_fail_closed_without_truncation()
 {
     bool                ok = true;
@@ -789,6 +827,17 @@ bool test_text_bounds_fail_closed_without_truncation()
         vnm_terminal::Terminal_canvas_export_status::
             FRAME_TEXT_UTF8_BYTE_LIMIT_EXCEEDED,
         "aggregate UTF-8 byte limit plus one fails explicitly");
+
+    const QString malformed_text =
+        QString(QChar(0xd800U)) + QLatin1Char('x') + QChar(0xdc00U);
+    auto malformed_frame = make_snapshot(1, 1);
+    malformed_frame->cells.push_back(make_cell(0, 0, malformed_text));
+    const auto malformed_result = export_snapshot(surface, std::move(malformed_frame));
+    ok &= check(
+        malformed_result.status == vnm_terminal::Terminal_canvas_export_status::OK &&
+            malformed_result.frame != nullptr && malformed_result.frame->cells.size() == 1U &&
+            malformed_result.frame->cells.front().text == malformed_text,
+        "export preserves its existing Qt replacement-count policy for malformed UTF-16");
     return ok;
 }
 
@@ -1367,6 +1416,7 @@ int main(int argc, char** argv)
     ok &= test_sparse_style_ids_preserve_colors_and_attributes();
     ok &= test_wide_style_export_is_explicit_and_lossless();
     ok &= test_historical_styles_do_not_prevent_small_visible_frame_export();
+    ok &= test_utf8_text_byte_count();
     ok &= test_text_bounds_fail_closed_without_truncation();
     ok &= test_row_images_export_with_publication();
     ok &= test_row_coverage_preserves_native_source_and_bounds();

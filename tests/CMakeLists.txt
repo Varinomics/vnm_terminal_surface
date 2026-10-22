@@ -2261,6 +2261,18 @@ if(WIN32)
             "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
     )
     add_test(
+        NAME vnm_terminal_windows_native_cmd_startup_growth
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-startup-growth
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_startup_growth PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 180
+    )
+    add_test(
         NAME vnm_terminal_windows_native_cmd_resize
         COMMAND
             "${CMAKE_COMMAND}" -E env

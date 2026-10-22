@@ -3677,14 +3677,14 @@ Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_reco
         retained_history.index[index].history_handle;
     const Terminal_history_ring_read_scope read =
         retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
-    const Terminal_history_row_record_decode_result decoded =
+    Terminal_history_row_record_decode_result decoded =
         decode_terminal_history_row_record(read, image_decode, handle);
     if (decoded.status != Terminal_history_row_record_codec_status::OK) {
         throw_retained_history_storage_failure();
     }
 
     return Terminal_screen_model::retained_row_record_from_history_row_record(
-        decoded.record);
+        std::move(decoded.record));
 }
 
 std::optional<terminal_history_handle_t>
@@ -3709,7 +3709,7 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
         "Terminal_screen_model::Primary_backing_buffer::append_retained_history_record");
 
     Terminal_history_row_record history_record =
-        Terminal_screen_model::history_row_record_from_retained_record(row);
+        Terminal_screen_model::history_row_record_from_retained_record(std::move(row));
 
     terminal_history_row_record_identity_t identity;
     identity.epoch        = k_terminal_history_retained_identity_epoch;
@@ -5275,9 +5275,9 @@ void Terminal_screen_model::reset_tab_stops()
     m_tab_stops = default_tab_stops(k_terminal_screen_model_max_columns);
 }
 
-void Terminal_screen_model::put_scalar(QString text)
+void Terminal_screen_model::put_scalar(QString text, char32_t codepoint)
 {
-    const Terminal_utf8_width_result width = measure_utf8_width(text.toUtf8());
+    const Terminal_codepoint_width width = width_for_codepoint(codepoint);
     if (width.cells <= 0) {
         append_zero_width_scalar(std::move(text));
         return;
@@ -5319,12 +5319,16 @@ void Terminal_screen_model::put_text(QString text)
             i + 1 < text.size() &&
             text[i + 1].isLowSurrogate())
         {
-            put_scalar(QString(current) + text[i + 1]);
+            put_scalar(
+                QString(current) + text[i + 1],
+                QChar::surrogateToUcs4(current, text[i + 1]));
             i += 2;
             continue;
         }
 
-        put_scalar(QString(current));
+        // A lone surrogate encoded by QString has one replacement cell.
+        const char32_t codepoint = current.isSurrogate() ? 0xfffdU : current.unicode();
+        put_scalar(QString(current), codepoint);
         ++i;
     }
 }
@@ -10076,20 +10080,20 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
 }
 
 Terminal_history_row_record Terminal_screen_model::history_row_record_from_retained_record(
-    const retained_row_record_t& retained_record)
+    retained_row_record_t&& retained_record)
 {
     Terminal_history_row_record history_record;
-    history_record.provenance = retained_record.row.retained_line_provenance;
-    history_record.content_origin_spans = retained_record.row.content_origin_spans;
-    history_record.style_table = retained_record.style_table;
-    history_record.hyperlink_identity_keys = retained_record.hyperlink_identity_keys;
-    history_record.metadata = retained_record.metadata;
-    history_record.image_slice = retained_record.row.image_slice;
+    history_record.provenance              = retained_record.row.retained_line_provenance;
+    history_record.content_origin_spans    = std::move(retained_record.row.content_origin_spans);
+    history_record.style_table             = std::move(retained_record.style_table);
+    history_record.hyperlink_identity_keys = std::move(retained_record.hyperlink_identity_keys);
+    history_record.metadata                = retained_record.metadata;
+    history_record.image_slice             = std::move(retained_record.row.image_slice);
     history_record.cells.reserve(retained_record.row.cells.size());
 
-    for (const Cell& cell : retained_record.row.cells) {
+    for (Cell& cell : retained_record.row.cells) {
         history_record.cells.push_back({
-            cell.text,
+            std::move(cell.text),
             cell.display_width,
             cell.wide_continuation,
             cell.occupied,
@@ -10104,23 +10108,23 @@ Terminal_history_row_record Terminal_screen_model::history_row_record_from_retai
 
 Terminal_screen_model::retained_row_record_t
 Terminal_screen_model::retained_row_record_from_history_row_record(
-    const Terminal_history_row_record& history_record)
+    Terminal_history_row_record history_record)
 {
     retained_row_record_t retained_record;
     retained_record.row.retained_line_provenance = history_record.provenance;
-    retained_record.row.content_origin_spans = history_record.content_origin_spans;
-    retained_record.style_table = history_record.style_table;
-    retained_record.hyperlink_identity_keys = history_record.hyperlink_identity_keys;
+    retained_record.row.content_origin_spans = std::move(history_record.content_origin_spans);
+    retained_record.style_table = std::move(history_record.style_table);
+    retained_record.hyperlink_identity_keys = std::move(history_record.hyperlink_identity_keys);
     retained_record.metadata = history_record.metadata;
-    retained_record.row.image_slice = history_record.image_slice;
+    retained_record.row.image_slice = std::move(history_record.image_slice);
     retained_record.row.cells.reserve(history_record.cells.size());
 
     for (std::size_t index = 0; index < history_record.cells.size(); ++index) {
-        const Terminal_history_row_cell& cell = history_record.cells[index];
+        Terminal_history_row_cell& cell = history_record.cells[index];
         Cell restored_cell;
-        restored_cell.text = cell.text;
+        restored_cell.text = std::move(cell.text);
         restored_cell.text_category = Terminal_render_cell_text::category_for_text(
-            QStringView(cell.text));
+            QStringView(restored_cell.text));
         restored_cell.display_width = cell.display_width;
         restored_cell.wide_continuation = cell.wide_continuation;
         restored_cell.occupied = cell.occupied;
@@ -10138,7 +10142,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
             // Editing can move a clipped-wide cell away from the right margin.
             // Its original width is recoverable from the retained Unicode;
             // display_width alone would erase it during materialization.
-            const QByteArray text_bytes = cell.text.toUtf8();
+            const QByteArray text_bytes = restored_cell.text.toUtf8();
             const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
             if (width.status == Terminal_unicode_width_status::OK &&
                 width.cells > restored_cell.display_width)

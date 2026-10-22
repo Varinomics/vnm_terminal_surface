@@ -7966,6 +7966,14 @@ bool test_input_before_mapping_change_is_painted(QGuiApplication& app)
         "the committed frame presents history above the prompt");
 
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[4;3H"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const auto latest = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(presented && latest &&
+            term::grid_sizes_match(presented->grid_size, latest->grid_size) &&
+            term::viewport_mappings_match(presented->viewport, latest->viewport) &&
+            latest->viewport.presentation.content_end_row_exclusive ==
+                presented->viewport.presentation.content_end_row_exclusive + 2,
+        "the cursor changes the content endpoint without changing the native viewport");
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
         point_in_display_cell(fixture.surface, 1, 0), Qt::LeftButton, Qt::LeftButton,
         Qt::ShiftModifier, false,
@@ -8400,6 +8408,11 @@ bool test_input_before_paint_addresses_the_committed_frame(QGuiApplication& app)
             "no frame has been painted");
         // Either way the short transcript starts on the top row: natively,
         // or through a mapping that brings older back from history.
+        const auto handed = term::make_presented_snapshot(
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface));
+        ok &= check(handed && static_cast<bool>(handed->display_source) == projected &&
+                snapshot_row_text(*handed, 0) == QStringLiteral("older"),
+            "the handed frame exposes the selectable row through the intended mapping");
         ok &= check(select_row(fixture.surface, 0, 4),
             projected
                 ? "before the first paint a gesture addresses the presented frame handed to the renderer"

@@ -717,6 +717,73 @@ bool test_retained_row_local_metadata_remaps_snapshot_values()
     return ok;
 }
 
+bool test_snapshot_metadata_tracks_independent_style_and_hyperlink_runs()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({3, 20});
+    model.ingest(
+        QByteArrayLiteral("\x1b[31m\x1b]8;id=one;https://one.example\x1b\\AA")
+        + QByteArrayLiteral("\x1b[32mBB\x1b]8;id=two;https://two.example\x1b\\CC")
+        + QByteArrayLiteral("\x1b[0mDD\x1b]8;;\x1b\\EE")
+        + QByteArrayLiteral("\x1b[31m\x1b]8;id=one;https://one.example\x1b\\FF")
+        + QByteArrayLiteral("\x1b[0m\x1b]8;;\x1b\\\r\n")
+        + QByteArrayLiteral("\x1b[32m\x1b]8;id=two;https://two.example\x1b\\GG")
+        + QByteArrayLiteral("\x1b[0m\x1b]8;;\x1b\\\r\n")
+        + QByteArrayLiteral("\x1b[31m\x1b]8;id=one;https://one.example\x1b\\HH")
+        + QByteArrayLiteral("\x1b[0m\x1b]8;;\x1b\\\r\nTAIL\r\nEND"));
+
+    const term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 19U, model.scrollback_size()));
+    ok &= check(model.scrollback_size() == 2 &&
+            term::validate_render_snapshot(snapshot).status ==
+                term::Terminal_render_snapshot_status::OK &&
+            row_text(snapshot, 0) == QStringLiteral("AABBCCDDEEFF") &&
+            row_text(snapshot, 1) == QStringLiteral("GG") &&
+            row_text(snapshot, 2) == QStringLiteral("HH"),
+        "metadata run fixture spans two retained rows and an active row");
+
+    struct expected_run_t
+    {
+        int                         row;
+        int                         first_column;
+        int                         palette_index;
+        term::Terminal_hyperlink_id hyperlink_id;
+    };
+    const std::array<expected_run_t, 8U> expected_runs = {{
+        {0,  0,  1, 1U},
+        {0,  2,  2, 1U},
+        {0,  4,  2, 2U},
+        {0,  6, -1, 2U},
+        {0,  8, -1, 0U},
+        {0, 10,  1, 1U},
+        {1,  0,  2, 2U},
+        {2,  0,  1, 1U},
+    }};
+    for (const expected_run_t& run : expected_runs) {
+        for (int offset = 0; offset < 2; ++offset) {
+            const term::Terminal_render_cell* cell =
+                cell_at(snapshot, run.row, run.first_column + offset);
+            ok &= check(cell != nullptr, "metadata run exposes each occupied cell");
+            if (cell == nullptr) {
+                continue;
+            }
+            const bool style_matches = run.palette_index < 0
+                ? cell->style_id == term::k_default_terminal_style_id
+                : foreground_palette_index(snapshot.styles, cell->style_id) ==
+                    run.palette_index;
+            ok &= check(style_matches && cell->hyperlink_id == run.hyperlink_id,
+                "snapshot preserves independent style and hyperlink runs across row ID domains");
+        }
+    }
+    ok &= check(snapshot.hyperlinks.size() == 2U &&
+            snapshot.hyperlinks[0].hyperlink_id == 1U &&
+            snapshot.hyperlinks[0].uri == QByteArrayLiteral("https://one.example") &&
+            snapshot.hyperlinks[1].hyperlink_id == 2U &&
+            snapshot.hyperlinks[1].uri == QByteArrayLiteral("https://two.example"),
+        "snapshot hyperlink metadata retains first-use order and deduplicates returning links");
+    return ok;
+}
+
 bool test_retained_row_local_hyperlink_ref_one_stays_distinct_from_active_id_one()
 {
     bool ok = true;
@@ -3987,6 +4054,7 @@ int main()
     bool ok = true;
     ok &= test_owned_styled_wide_hyperlink_scrollback_snapshot();
     ok &= test_retained_row_local_metadata_remaps_snapshot_values();
+    ok &= test_snapshot_metadata_tracks_independent_style_and_hyperlink_runs();
     ok &= test_retained_row_local_hyperlink_ref_one_stays_distinct_from_active_id_one();
     ok &= test_retained_row_local_hyperlink_ref_one_dedupes_across_retained_rows();
     ok &= test_full_projection_remaps_row_local_metadata_across_snapshots();

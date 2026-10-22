@@ -526,6 +526,12 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
 #if VNM_TERMINAL_PROFILING_ENABLED
             const bool profile_enabled = m_profile_stats.enabled;
 #endif
+            // Retained source IDs are local to this row. Snapshot IDs stay
+            // stable after their first resolution while its cells are appended.
+            Terminal_style_id     previous_source_style_id = k_default_terminal_style_id;
+            Terminal_style_id     previous_snapshot_style_id = k_default_terminal_style_id;
+            Terminal_hyperlink_id previous_source_hyperlink_id = k_no_terminal_hyperlink_id;
+            Terminal_hyperlink_id previous_snapshot_hyperlink_id = k_no_terminal_hyperlink_id;
             for (int column = 0; column < column_count; ++column) {
                 const Cell& cell = visual_row[static_cast<std::size_t>(column)];
                 if (!cell.occupied) {
@@ -601,19 +607,37 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
                 }
 #endif
 
-                const Terminal_style_id style_id =
-                    snapshot_style_id_for_cell(
+                Terminal_style_id style_id = previous_snapshot_style_id;
+                if (cell.style_id != previous_source_style_id) {
+                    style_id = snapshot_style_id_for_cell(
                         snapshot,
                         cell.style_id,
                         row_local_styles,
                         snapshot_style_ids);
-                const Terminal_hyperlink_id hyperlink_id =
-                    snapshot_hyperlink_id_for_cell(
+                    // An unresolved nondefault ID must keep reaching the
+                    // resolver's bounds check and assertion on later cells.
+                    if (cell.style_id == k_default_terminal_style_id ||
+                        style_id != k_default_terminal_style_id)
+                    {
+                        previous_source_style_id = cell.style_id;
+                        previous_snapshot_style_id = style_id;
+                    }
+                }
+                Terminal_hyperlink_id hyperlink_id = previous_snapshot_hyperlink_id;
+                if (cell.hyperlink_id != previous_source_hyperlink_id) {
+                    hyperlink_id = snapshot_hyperlink_id_for_cell(
                         snapshot.hyperlinks,
                         snapshot_hyperlink_ids,
                         cell.hyperlink_id,
                         row_local_identity_keys,
                         active_identity_keys_by_id);
+                    if (cell.hyperlink_id == k_no_terminal_hyperlink_id ||
+                        hyperlink_id != k_no_terminal_hyperlink_id)
+                    {
+                        previous_source_hyperlink_id = cell.hyperlink_id;
+                        previous_snapshot_hyperlink_id = hyperlink_id;
+                    }
+                }
 
                 snapshot.cells.push_back({
                     { snapshot_row, column },

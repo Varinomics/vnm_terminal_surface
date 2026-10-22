@@ -322,6 +322,8 @@ Receive_result Duplex_channel::receive(std::uint8_t* out_buffer, std::size_t in_
     message.msg_control    = control;
     message.msg_controllen = sizeof(control);
 
+    // Once recvmsg installs the rights, collecting them must not allocate.
+    result.descriptors.reserve(k_max_transferred_descriptors);
     ssize_t received = 0;
     do {
         received = recvmsg(m_impl->fd, &message, MSG_CMSG_CLOEXEC);
