@@ -804,6 +804,16 @@ if(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT)
         USE_SYSTEM_LIBS "${VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_USE_SYSTEM_LIBS}")
 endif()
 
+add_executable(vnm_terminal_msdf_scene_scale
+    msdf_scene_scale/msdf_scene_scale_tests.cpp
+)
+set_target_properties(vnm_terminal_msdf_scene_scale PROPERTIES AUTOMOC OFF)
+target_include_directories(vnm_terminal_msdf_scene_scale PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vnm_terminal_msdf_scene_scale PRIVATE Qt6::Gui Qt6::GuiPrivate)
+target_compile_definitions(vnm_terminal_msdf_scene_scale PRIVATE
+    VNM_TERMINAL_MSDF_SHADER_DIR="${PROJECT_SOURCE_DIR}/resources/shaders"
+)
+
 add_executable(vnm_terminal_qsg_atlas
     qsg_atlas/atlas_tests.cpp
 )
@@ -1150,6 +1160,20 @@ if(WIN32)
 endif()
 
 if(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE)
+    add_test(
+        NAME vnm_terminal_msdf_scene_scale
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_windows_qpa_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_msdf_scene_scale>"
+    )
+    set_tests_properties(vnm_terminal_msdf_scene_scale PROPERTIES
+        LABELS "qsg;atlas;msdf;scene-scale"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30
+    )
+
     set(vnm_terminal_qsg_atlas_smoke_backends)
     if(WIN32)
         list(APPEND vnm_terminal_qsg_atlas_smoke_backends

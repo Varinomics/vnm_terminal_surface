@@ -26,6 +26,7 @@ layout(location = 1) smooth in vec4 fragment_color;
 layout(location = 2) smooth in vec4 fragment_background_color;
 layout(location = 3) smooth in vec4 fragment_uv_bounds;
 layout(location = 4) smooth in vec4 fragment_frame_rect;
+layout(location = 5) smooth in float fragment_px_range;
 
 layout(location = 0) out vec4 output_color;
 
@@ -56,11 +57,11 @@ vec4 sample_glyph(vec2 uv, vec2 uv_min, vec2 uv_max)
 
 float glyph_alpha_from_texel(vec4 texel)
 {
-    float sd = (median(texel.rgb) - 0.5) * px_range;
+    float sd = (median(texel.rgb) - 0.5) * fragment_px_range;
     float alpha = clamp(sd + 0.5, 0.0, 1.0);
 
     if (texel.a > 0.0) {
-        float sd_sdf = (texel.a - 0.5) * px_range;
+        float sd_sdf = (texel.a - 0.5) * fragment_px_range;
         alpha = min(alpha, clamp(sd_sdf + 0.5, 0.0, 1.0));
     }
 

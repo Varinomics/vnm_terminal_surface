@@ -24,6 +24,7 @@ layout(location = 1) smooth out vec4 fragment_color;
 layout(location = 2) smooth out vec4 fragment_background_color;
 layout(location = 3) smooth out vec4 fragment_uv_bounds;
 layout(location = 4) smooth out vec4 fragment_frame_rect;
+layout(location = 5) smooth out float fragment_px_range;
 
 vec2 frame_position(vec2 local_position)
 {
@@ -54,4 +55,6 @@ void main()
     fragment_frame_rect = vec4(
         instance_frame_rect.xy + transform_delta,
         frame_max - frame_min);
+    // Coverage stays one target pixel wide when the scene scales a retained layout.
+    fragment_px_range = px_range * (frame_max.y - frame_min.y) / instance_frame_rect.w;
 }
