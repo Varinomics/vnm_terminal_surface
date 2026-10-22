@@ -52,25 +52,41 @@ QVariantMap terminal_color_scheme_preview(QStringView scheme_name)
     return preview;
 }
 
-bool terminal_canvas_color_scheme_available(const Terminal_canvas_frame& frame)
+namespace {
+
+bool style_color_references_available(
+    const std::vector<Terminal_canvas_style>& styles,
+    const std::optional<Terminal_canvas_color_references>& references)
 {
-    if (!frame.color_references ||
-        frame.color_references->record_version != k_terminal_canvas_color_references_version ||
-        frame.styles.empty() ||
-        frame.styles.size() > terminal_canvas_style_limit(frame) ||
-        frame.color_references->styles.size() != frame.styles.size() ||
-        frame.color_references->styles.front().foreground != k_terminal_canvas_color_default ||
-        frame.color_references->styles.front().background != k_terminal_canvas_color_default)
+    if (!references ||
+        references->record_version != k_terminal_canvas_color_references_version ||
+        styles.empty() || references->styles.size() != styles.size() ||
+        references->styles.front().foreground != k_terminal_canvas_color_default ||
+        references->styles.front().background != k_terminal_canvas_color_default)
     {
         return false;
     }
-    return std::all_of(
-        frame.color_references->styles.begin(),
-        frame.color_references->styles.end(),
-        [](const auto& refs) {
-            return refs.foreground <= k_terminal_canvas_color_rgba &&
-                refs.background <= k_terminal_canvas_color_rgba;
-        });
+    return std::all_of(references->styles.begin(), references->styles.end(), [](const auto& refs) {
+        return refs.foreground <= k_terminal_canvas_color_rgba &&
+            refs.background <= k_terminal_canvas_color_rgba;
+    });
+}
+
+bool has_available_coverage(const Terminal_canvas_frame& frame)
+{
+    return frame.row_coverage &&
+        frame.row_coverage->record_version == k_terminal_canvas_row_coverage_version &&
+        frame.row_coverage->status == Terminal_canvas_row_coverage_status::AVAILABLE;
+}
+
+} // namespace
+
+bool terminal_canvas_color_scheme_available(const Terminal_canvas_frame& frame)
+{
+    return frame.styles.size() <= terminal_canvas_style_limit(frame) &&
+        style_color_references_available(frame.styles, frame.color_references) &&
+        (!has_available_coverage(frame) || style_color_references_available(
+            frame.row_coverage->styles, frame.row_coverage->color_references));
 }
 
 bool apply_terminal_canvas_color_scheme(
@@ -88,13 +104,23 @@ bool apply_terminal_canvas_color_scheme(
         }
         return ref == k_terminal_canvas_color_default ? fallback : colors.palette_rgba[ref];
     };
-    for (std::size_t index = 0; index < frame.styles.size(); ++index) {
-        auto& style = frame.styles[index];
-        const auto& refs = frame.color_references->styles[index];
-        style.foreground_rgba = resolve(
-            refs.foreground, style.foreground_rgba, colors.default_foreground_rgba);
-        style.background_rgba = resolve(
-            refs.background, style.background_rgba, colors.default_background_rgba);
+    const auto apply_styles = [&resolve, &colors](
+        std::vector<Terminal_canvas_style>& styles,
+        const Terminal_canvas_color_references& references)
+    {
+        for (std::size_t index = 0; index < styles.size(); ++index) {
+            auto& style = styles[index];
+            const auto& refs = references.styles[index];
+            style.foreground_rgba = resolve(
+                refs.foreground, style.foreground_rgba, colors.default_foreground_rgba);
+            style.background_rgba = resolve(
+                refs.background, style.background_rgba, colors.default_background_rgba);
+        }
+    };
+    // Validate both tables before changing either: they share one displayed palette.
+    apply_styles(frame.styles, *frame.color_references);
+    if (has_available_coverage(frame)) {
+        apply_styles(frame.row_coverage->styles, *frame.row_coverage->color_references);
     }
     frame.default_foreground_rgba = colors.default_foreground_rgba;
     frame.default_background_rgba = colors.default_background_rgba;

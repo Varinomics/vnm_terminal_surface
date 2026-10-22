@@ -247,6 +247,36 @@ bool test_frame_preserves_canvas_authority_and_prior_immutability()
         changed_desktop.styles[1].foreground_rgba == local_frame.styles[1].foreground_rgba &&
         changed_desktop.styles[1].background_rgba == local_frame.styles[1].background_rgba,
         "desktop palette changes cannot change a companion's selected local scheme");
+    auto covered_frame = *first.frame;
+    vnm_terminal::Terminal_canvas_row_coverage coverage;
+    coverage.first_logical_row = 0;
+    coverage.rows = covered_frame.rows;
+    coverage.styles = covered_frame.styles;
+    coverage.color_references = covered_frame.color_references;
+    coverage.cells = covered_frame.cells;
+    covered_frame.row_coverage = coverage;
+    const auto unmodified_covered_frame = covered_frame;
+    ok &= check(vnm_terminal::apply_terminal_canvas_color_scheme(covered_frame, QStringLiteral("Vintage")) &&
+        covered_frame.row_coverage->styles == covered_frame.styles &&
+        covered_frame.row_coverage->styles[1].background_rgba == coverage.styles[1].background_rgba &&
+        covered_frame.row_coverage->styles[1].attributes == coverage.styles[1].attributes &&
+        covered_frame.row_coverage->cells == coverage.cells &&
+        unmodified_covered_frame.row_coverage->styles == coverage.styles,
+        "selected scheme resolves native and coverage palettes equally without changing explicit RGB, rows or source ownership");
+    auto missing_coverage_colors = unmodified_covered_frame;
+    missing_coverage_colors.row_coverage->color_references.reset();
+    const auto native_styles_before = missing_coverage_colors.styles;
+    ok &= check(!vnm_terminal::apply_terminal_canvas_color_scheme(
+            missing_coverage_colors, QStringLiteral("Vintage")) &&
+        missing_coverage_colors.styles == native_styles_before &&
+        missing_coverage_colors.row_coverage->styles == coverage.styles,
+        "unavailable coverage selectors reject the whole recoloring before either table changes");
+    auto unknown_coverage_colors = unmodified_covered_frame;
+    ++unknown_coverage_colors.row_coverage->color_references->record_version;
+    ok &= check(!vnm_terminal::apply_terminal_canvas_color_scheme(
+            unknown_coverage_colors, QStringLiteral("Vintage")) &&
+        unknown_coverage_colors.styles == unmodified_covered_frame.styles,
+        "unknown coverage color versions cannot leave a partially recolored frame");
     auto unknown_colors = *first.frame;
     unknown_colors.color_references->record_version += 1U;
     ok &= check(!vnm_terminal::apply_terminal_canvas_color_scheme(unknown_colors, local_scheme) &&
