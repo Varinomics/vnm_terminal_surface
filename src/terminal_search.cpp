@@ -1,6 +1,8 @@
 #include "vnm_terminal/internal/terminal_search.h"
 
 #include <QByteArray>
+#include <QLatin1StringView>
+#include <QStringView>
 #include <QThreadPool>
 #include <Qt>
 
@@ -100,11 +102,9 @@ Search_corpus_row make_search_corpus_row(Terminal_search_source_row& source)
         return row;
     }
 
-    row.identity_latin1_text.reserve(
-        static_cast<qsizetype>(source.text.units.size()));
-    for (char16_t code_unit : source.text.units) {
-        row.identity_latin1_text.push_back(static_cast<char>(code_unit));
-    }
+    row.identity_latin1_text = QStringView(
+        source.text.units.data(),
+        static_cast<qsizetype>(source.text.units.size())).toLatin1();
     return row;
 }
 
@@ -196,21 +196,30 @@ std::optional<std::vector<search_match_span_t>> search_row(
     const qsizetype latin1_units = column_count >= row.source_width
         ? row.identity_latin1_text.size()
         : std::min(row.identity_latin1_text.size(), static_cast<qsizetype>(std::max(0, column_count)));
-    const QString latin1_text = complex == nullptr
+    // Non-Latin-1 queries can case-fold to Latin-1 (for example U+212A to k),
+    // so keep their UTF-16 search path.
+    const bool use_latin1_view = complex == nullptr && query.latin1_exact;
+    const QLatin1StringView latin1_view(
+        row.identity_latin1_text.constData(), latin1_units);
+    const QString latin1_text = complex == nullptr && !use_latin1_view
         ? QString::fromLatin1(row.identity_latin1_text.constData(), latin1_units)
         : QString();
     const QStringView text = complex != nullptr
         ? QStringView(complex->units.data(),
               static_cast<qsizetype>(searchable_unit_count(*complex, column_count)))
         : QStringView(latin1_text);
-    if (query.utf16.isEmpty() || query.utf16.size() > text.size()) {
+    const qsizetype text_size = use_latin1_view
+        ? latin1_view.size()
+        : text.size();
+    if (query.utf16.isEmpty() || query.utf16.size() > text_size) {
         return matches;
     }
 
     qsizetype search_from = 0;
-    while (search_from <= text.size() - query.utf16.size()) {
-        const qsizetype found =
-            text.indexOf(query.utf16, search_from, query.case_sensitivity);
+    while (search_from <= text_size - query.utf16.size()) {
+        const qsizetype found = use_latin1_view
+            ? latin1_view.indexOf(query.utf16, search_from, query.case_sensitivity)
+            : text.indexOf(query.utf16, search_from, query.case_sensitivity);
         if (found < 0) {
             break;
         }
@@ -815,7 +824,7 @@ private:
         const auto add_row = [&](
             const Search_corpus_row& row,
             search_match_row_key_t   key) -> bool {
-            const auto row_matches = search_row(
+            auto row_matches = search_row(
                 row,
                 query,
                 columns,
@@ -923,7 +932,7 @@ private:
             }
             const Search_corpus_row& row =
                 corpus.primary_retained_rows[retained_index];
-            const auto row_matches = search_row(
+            auto row_matches = search_row(
                 row,
                 query,
                 columns,
@@ -957,7 +966,7 @@ private:
             }
             const Search_corpus_row& row =
                 active_rows[static_cast<std::size_t>(active_row)];
-            const auto row_matches = search_row(
+            auto row_matches = search_row(
                 row,
                 query,
                 columns,

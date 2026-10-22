@@ -175,7 +175,7 @@ bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
 {
     term::Terminal_search_controller search;
     term::Terminal_search_source_update source;
-    source.identity.grid_size = {3, 20};
+    source.identity.grid_size = {4, 20};
     source.identity.active_buffer_epoch = 1U;
     source.revision = 1U;
     source.reset_active_rows = true;
@@ -184,6 +184,7 @@ bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
     auto wide_row = search_test_row(3U, 2, u"");
     wide_row.text.append_cell_text(QStringView(u"\u00c4"), 2, 4);
     source.active_rows.push_back(std::move(wide_row));
+    source.active_rows.push_back(search_test_row(4U, 3, u"\u00c9 \u00e9"));
     search.update_source(std::move(source));
     search.set_query(QStringLiteral("Alpha"), 0);
     bool ok = check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
@@ -208,6 +209,13 @@ bool test_case_mode_rescans_and_preserves_unicode_cell_spans()
     const auto match = search.current_match();
     ok &= check(match && match->first_column == 2 && match->column_count == 2,
         "insensitive Unicode matches retain the original cell span");
+    search.set_query(QStringLiteral("\u00e9"), 3);
+    ok &= check(search.wait_for_completion_for_testing(std::chrono::seconds(5)),
+        "insensitive Latin-1 match completes");
+    const auto latin1_match = search.current_match();
+    ok &= check(search.result_state().match_count == 2 && latin1_match &&
+        latin1_match->first_column == 0 && latin1_match->column_count == 1,
+        "insensitive Latin-1 matches retain exact single-column spans");
     return ok;
 }
 
