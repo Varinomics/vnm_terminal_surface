@@ -88,11 +88,15 @@ bool test_projected_coverage_colors_and_optional_selector_admission()
     original->row_coverage.emplace();
     auto& coverage = *original->row_coverage;
     coverage.rows = 4;
-    coverage.styles = original->styles;
-    coverage.color_references = original->color_references;
+    coverage.styles = {original->styles[0], original->styles[2], original->styles[1]};
+    coverage.color_references.emplace();
+    coverage.color_references->styles = {
+        {}, {terminal::k_terminal_canvas_color_rgba, terminal::k_terminal_canvas_color_default},
+        {3U, terminal::k_terminal_canvas_color_default},
+    };
     for (int row = 0; row < 4; ++row) {
-        coverage.cells.push_back({row, 0, 1, 1U, QStringLiteral("C")});
-        coverage.cells.push_back({row, 1, 1, 2U, QStringLiteral("R")});
+        coverage.cells.push_back({row, 0, 1, 2U, QStringLiteral("C")});
+        coverage.cells.push_back({row, 1, 1, 1U, QStringLiteral("R")});
     }
     original->presentation.emplace();
     auto& presentation = *original->presentation;
@@ -128,7 +132,7 @@ bool test_projected_coverage_colors_and_optional_selector_admission()
             "every presented row uses the selected palette and preserves explicit RGB");
     }
     ok &= check(original->row_coverage->styles.front().foreground_rgba == 0xffffffffU &&
-            original->row_coverage->styles[1].foreground_rgba == 0xffcdcd00U,
+            original->row_coverage->styles[2].foreground_rgba == 0xffcdcd00U,
         "theme application leaves the shared source frame unchanged");
     for (bool unknown : {false, true}) {
         auto legacy = std::make_shared<terminal::Terminal_canvas_frame>(*original);
