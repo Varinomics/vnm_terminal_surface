@@ -6,7 +6,6 @@
 #include <QImage>
 #include <QMatrix4x4>
 #include <QOffscreenSurface>
-#include <QtCore/qfloat16.h>
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 #include <rhi/qshader.h>
@@ -49,19 +48,20 @@ bool test_scene_scale(
     const QSize target_size(target_extent, target_extent);
 
     // A linear signed-distance field has an exact one-pixel coverage ramp.
-    // Floating-point texels and texel-center UV bounds avoid normalized-texture
-    // quantization. A fractional edge phase also distinguishes minification
+    // Full-float texels avoid half-float sampler rounding on Metal, and
+    // texel-center UV bounds avoid normalized-texture quantization.
+    // A fractional edge phase also distinguishes minification
     // from a sharper ramp that happens to cross between two pixel centers.
     const QSize atlas_size(64, 2);
-    std::array<qfloat16, 64 * 2 * 4> atlas_pixels;
+    std::array<float, 64 * 2 * 4> atlas_pixels;
     for (int y = 0; y < atlas_size.height(); ++y) {
         for (int x = 0; x < atlas_size.width(); ++x) {
             const int offset = (y * atlas_size.width() + x) * 4;
-            const qfloat16 distance(static_cast<float>(x) / 64.0f);
+            const float distance = static_cast<float>(x) / 64.0f;
             atlas_pixels[offset]     = distance;
             atlas_pixels[offset + 1] = distance;
             atlas_pixels[offset + 2] = distance;
-            atlas_pixels[offset + 3] = sdf_alpha ? distance : qfloat16(0.0f);
+            atlas_pixels[offset + 3] = sdf_alpha ? distance : 0.0f;
         }
     }
 
@@ -104,7 +104,7 @@ bool test_scene_scale(
     std::unique_ptr<QRhiBuffer> invert_buffer(rhi.newBuffer(
         QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(k_invert)));
     std::unique_ptr<QRhiTexture> atlas(rhi.newTexture(
-        QRhiTexture::RGBA16F, atlas_size));
+        QRhiTexture::RGBA32F, atlas_size));
     std::unique_ptr<QRhiTexture> target_texture(rhi.newTexture(
         QRhiTexture::RGBA8, target_size, 1,
         QRhiTexture::RenderTarget | QRhiTexture::UsedAsTransferSource));
