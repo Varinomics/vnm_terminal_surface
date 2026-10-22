@@ -71,28 +71,17 @@ struct terminal_selection_point_t
     bool operator==(const terminal_selection_point_t&) const = default;
 };
 
-inline constexpr std::uint16_t k_terminal_touch_selection_presentation_version = 1U;
+inline constexpr std::uint16_t k_terminal_touch_selection_presentation_version = 2U;
 
-// Phone padding and clipping are independent of the native terminal geometry.
-// Carry their row extents so selection autoscroll uses the edges actually shown.
+// Consumer capacity is independent of the native source geometry. Selection
+// autoscroll uses the same presentation producer and capacity as the drawn frame.
 struct terminal_touch_selection_presentation_t
 {
     std::uint16_t record_version = k_terminal_touch_selection_presentation_version;
-    int top_padding_rows = 0;
-    int visible_native_rows = 1;
+    int visible_rows = 1;
+    int offset_from_tail = 0;
 
     bool operator==(const terminal_touch_selection_presentation_t&) const = default;
-};
-
-// Local canvas composition only; selection codecs deliberately omit this.
-// Keep it with the rendered row identities so a newer installed frame cannot
-// supply the padding or row shift for an older frame's touch request.
-struct terminal_touch_selection_composition_t
-{
-    int leading_capacity = 0;
-    int leading_rows = 0;
-
-    bool operator==(const terminal_touch_selection_composition_t&) const = default;
 };
 
 struct Terminal_touch_selection_request
@@ -163,30 +152,28 @@ struct Terminal_canvas_selection
     // A separate optional capability attachment carries this on the wire.
     // The existing selection record remains version 1 and keeps its shape.
     std::optional<std::uint16_t> word_query_version;
-    std::optional<terminal_touch_selection_composition_t> composition;
+    // Local rendered metadata, omitted from selection frame codecs. Requests
+    // carry the viewport that supplied their row identities.
+    std::optional<terminal_touch_selection_presentation_t> presentation;
 
     bool operator==(const Terminal_canvas_selection&) const = default;
 };
 
 inline bool terminal_canvas_selection_is_valid(
-    const Terminal_canvas_selection& selection, int rows, int columns)
+    const Terminal_canvas_selection& selection, int rows, int columns, int source_rows = 0)
 {
     if (selection.record_version != k_terminal_canvas_selection_version) {
         return true;
     }
-    if (selection.source.session_epoch == 0U || selection.source.rows != rows ||
+    if (source_rows == 0) {
+        source_rows = rows;
+    }
+    if (selection.source.session_epoch == 0U || selection.source.rows != source_rows ||
         selection.source.columns != columns || selection.selection_generation == 0U ||
         selection.visible_rows.size() != (std::size_t)rows || selection.spans.size() > (std::size_t)rows ||
         (selection.source.buffer != Terminal_selection_buffer::PRIMARY_SCREEN &&
             selection.source.buffer != Terminal_selection_buffer::ALTERNATE_SCREEN) ||
         (!selection.has_selection && (selection.touch_handles_visible || !selection.spans.empty())))
-    {
-        return false;
-    }
-    if (selection.composition &&
-        (selection.composition->leading_capacity < 0 || selection.composition->leading_capacity > 32'768 ||
-            selection.composition->leading_rows < 0 || selection.composition->leading_rows >= rows ||
-            selection.composition->leading_rows > selection.composition->leading_capacity))
     {
         return false;
     }

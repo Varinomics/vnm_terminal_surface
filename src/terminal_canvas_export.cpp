@@ -5,6 +5,7 @@
 #include "vnm_terminal/internal/qt_window_metrics.h"
 #include "vnm_terminal/internal/terminal_ascii_cell_text.h"
 #include "vnm_terminal/internal/terminal_canvas_content_extent.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
@@ -109,14 +110,6 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
     if (!term::is_valid_cell_metrics(cell_metrics) ||
         !std::isfinite(surface.width()) || surface.width() <= 0.0 ||
         !std::isfinite(surface.height()) || surface.height() <= 0.0)
-    {
-        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
-    }
-    const term::Terminal_metrics_result authoritative_grid =
-        term::grid_size_for_geometry(surface.size(), cell_metrics);
-    if (authoritative_grid.status != term::Terminal_metrics_status::OK ||
-        authoritative_grid.grid_size.rows != snapshot->grid_size.rows ||
-        authoritative_grid.grid_size.columns != snapshot->grid_size.columns)
     {
         return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
     }
@@ -229,8 +222,7 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
         term::terminal_canvas_content_bottom_row_exclusive(
             snapshot->grid_size.rows,
             occupied_bottom,
-            snapshot->cursor.visible,
-            snapshot->cursor.position.row);
+            snapshot->cursor.visible ? snapshot->cursor.position.row : -1);
     content_extent.scrollback_rows = snapshot->viewport.scrollback_rows;
     content_extent.offset_from_tail = snapshot->viewport.offset_from_tail;
     content_extent.active_buffer =
@@ -273,27 +265,22 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
 }
 
 vnm_terminal::Terminal_canvas_presentation canvas_presentation(
-    const term::Terminal_render_snapshot& snapshot,
-    int                                   leading_rows)
+    const term::Terminal_render_snapshot& snapshot)
 {
     using namespace vnm_terminal;
     Terminal_canvas_presentation presentation;
-    switch (snapshot.viewport.presentation.policy) {
-        case term::Terminal_presentation_policy::NATIVE:
-            presentation.policy = Terminal_canvas_presentation_policy::NATIVE;
-            break;
-        case term::Terminal_presentation_policy::AUTOMATIC:
-            presentation.policy = Terminal_canvas_presentation_policy::AUTOMATIC;
-            break;
-        case term::Terminal_presentation_policy::COMPANION:
-            presentation.policy = Terminal_canvas_presentation_policy::COMPANION;
-            break;
-    }
-    presentation.hidden_rows   = snapshot.viewport.presentation.hidden_rows;
-    presentation.insertion_row = snapshot.viewport.presentation.insertion_row;
-    presentation.covered_rows  = snapshot.grid_size.rows - snapshot.uncovered_trailing_rows;
-    presentation.leading_rows  = leading_rows;
-    presentation.frozen        = snapshot.frozen_basis;
+    presentation.policy = snapshot.viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL
+        ? Terminal_canvas_presentation_policy::CONTENT_TAIL
+        : Terminal_canvas_presentation_policy::NATIVE;
+    presentation.content_end_row_exclusive = snapshot.viewport.presentation.content_end_row_exclusive;
+    presentation.clear_page_start_row      = snapshot.viewport.presentation.clear_page_start_row;
+    presentation.covered_rows              = snapshot.grid_size.rows - snapshot.uncovered_trailing_rows;
+    presentation.visible_rows             = snapshot.presentation_rows > 0
+        ? snapshot.presentation_rows : snapshot.grid_size.rows;
+    presentation.offset_from_tail         = snapshot.presentation_offset_from_tail >= 0
+        ? snapshot.presentation_offset_from_tail : snapshot.viewport.offset_from_tail;
+    presentation.frozen                   = snapshot.frozen_basis;
+    presentation.logical_cursor_visible   = snapshot.modes.cursor_visible;
     return presentation;
 }
 
@@ -317,70 +304,52 @@ vnm_terminal::export_terminal_canvas_frame(
     if (snapshot == nullptr) {
         return {Terminal_canvas_export_status::NO_FRAME, {}};
     }
+    const auto authoritative_grid = term::grid_size_for_geometry(
+        surface.size(), term::VNM_TerminalSurface_render_bridge::cell_metrics(surface));
+    if (authoritative_grid.status != term::Terminal_metrics_status::OK ||
+        authoritative_grid.grid_size.rows != snapshot->grid_size.rows ||
+        authoritative_grid.grid_size.columns != snapshot->grid_size.columns)
+    {
+        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
+    }
+    const auto presentation = canvas_presentation(*snapshot);
+    if (!term::render_snapshot_presentable(
+            *snapshot, presentation.visible_rows, presentation.offset_from_tail))
+    {
+        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
+    }
     auto result = export_snapshot_frame(surface, snapshot, allow_wide_styles, snapshot->grid_size.rows);
     if (result.status != Terminal_canvas_export_status::OK) {
         return result;
     }
-    // The leading rows the frame's mapping presents must travel with it: a
-    // live frame supplies all it requests, and a frozen frame those its hold
-    // captured. Rows beyond them are a supplemental attachment for the phone,
-    // which composes them itself until batch 3.
-    const int required_leading_rows = term::presentation_leading_row_count(snapshot->viewport);
-    const int supplied_leading_rows =
-        snapshot->leading_rows_snapshot ? snapshot->leading_row_count : 0;
-    if (!snapshot->frozen_basis && supplied_leading_rows < required_leading_rows) {
-        return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
-    }
-    const int presented_leading_rows = std::min(supplied_leading_rows, required_leading_rows);
     auto frame = std::make_shared<Terminal_canvas_frame>(*result.frame);
-    int exported_leading_rows = 0;
-    if (snapshot->leading_rows_snapshot) {
-        Terminal_canvas_leading_rows leading;
-        const bool coherent_prefix = snapshot->leading_row_count > 0 &&
-            snapshot->leading_row_count < snapshot->grid_size.rows &&
-            snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
-            term::render_snapshot_leading_rows_are_coherent(*snapshot);
-        const auto prefix = coherent_prefix
-            ? export_snapshot_frame(
-                surface, snapshot->leading_rows_snapshot, allow_wide_styles, snapshot->leading_row_count)
-            : Terminal_canvas_export_result{Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
-        if (prefix.status == Terminal_canvas_export_status::OK) {
-            leading.rows = snapshot->leading_row_count;
-            leading.styles = prefix.frame->styles;
-            leading.color_references = prefix.frame->color_references;
-            leading.cells = prefix.frame->cells;
-            leading.images = prefix.frame->images;
-            leading.selection = prefix.frame->selection;
-            leading.wide_styles = prefix.frame->wide_styles;
-            if (!terminal_canvas_leading_rows_are_valid(leading, result.frame->rows, result.frame->columns)) {
-                leading = {};
-                leading.status = Terminal_canvas_leading_rows_status::INVALID;
-            }
+    if (snapshot->row_coverage_snapshot) {
+        if (!term::render_snapshot_row_coverage_is_coherent(*snapshot)) {
+            return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
         }
-        else {
-            leading.status = prefix.status == Terminal_canvas_export_status::INVALID_SOURCE_FRAME
-                ? Terminal_canvas_leading_rows_status::INVALID
-                : Terminal_canvas_leading_rows_status::OVER_LIMIT;
+        const auto& source_coverage = snapshot->row_coverage_snapshot;
+        const auto exported = export_snapshot_frame(
+            surface, source_coverage, allow_wide_styles, source_coverage->grid_size.rows);
+        if (exported.status != Terminal_canvas_export_status::OK) {
+            return exported;
         }
-        // Rows the mapping presents are part of the frame: failing to send
-        // them fails the export instead of sending a frame that presents
-        // differently. A supplemental prefix only becomes unavailable.
-        if (leading.status != Terminal_canvas_leading_rows_status::AVAILABLE &&
-            presented_leading_rows > 0)
+        Terminal_canvas_row_coverage coverage;
+        coverage.first_logical_row = term::render_snapshot_first_visible_logical_row(*source_coverage);
+        coverage.rows              = source_coverage->grid_size.rows;
+        coverage.styles            = exported.frame->styles;
+        coverage.color_references  = exported.frame->color_references;
+        coverage.cells             = exported.frame->cells;
+        coverage.images            = exported.frame->images;
+        coverage.selection         = exported.frame->selection;
+        coverage.wide_styles       = exported.frame->wide_styles;
+        if (!terminal_canvas_row_coverage_is_valid(
+                coverage, frame->rows, frame->columns, snapshot->viewport.scrollback_rows))
         {
-            return {
-                coherent_prefix && prefix.status != Terminal_canvas_export_status::OK
-                    ? prefix.status
-                    : Terminal_canvas_export_status::INVALID_SOURCE_FRAME,
-                {},
-            };
+            return {Terminal_canvas_export_status::INVALID_SOURCE_FRAME, {}};
         }
-        exported_leading_rows = leading.status == Terminal_canvas_leading_rows_status::AVAILABLE
-            ? leading.rows
-            : 0;
-        frame->leading_rows = std::move(leading);
+        frame->row_coverage = std::move(coverage);
     }
-    frame->presentation = canvas_presentation(*snapshot, exported_leading_rows);
+    frame->presentation = presentation;
     result.frame = std::move(frame);
     return result;
 }

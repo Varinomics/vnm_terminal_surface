@@ -5,9 +5,9 @@
 namespace vnm_terminal::internal {
 
 inline int terminal_canvas_content_bottom_row_exclusive(
-    int rows, int occupied_bottom, bool cursor_visible, int cursor_row)
+    int rows, int occupied_bottom, int cursor_row)
 {
-    const int cursor_bottom = cursor_visible && cursor_row >= 0 && cursor_row < rows
+    const int cursor_bottom = cursor_row >= 0 && cursor_row < rows
         ? cursor_row + 1
         : 0;
     return std::clamp(

@@ -71,6 +71,14 @@ release publishes the accumulated content.
 
 ## Release And Reconciliation
 
+Geometry and consumer-capacity changes may re-present the held publication only
+when its immutable row coverage contains every native row required by the
+shared content-end mapping. Missing rows do not become blank padding. If the
+frozen basis cannot supply the requested view, the session ends the hold before
+acquiring a coherent live frame. A capacity-only publication retains the held
+endpoint, clear-page boundary, and consumer offset; hidden output cannot move
+that published viewport.
+
 When a hold releases (mode reset, or forced release), the accumulated
 changes publish as one snapshot, and any public-projection scroll state
 reconciles against the newly published content. The outcome is recorded in

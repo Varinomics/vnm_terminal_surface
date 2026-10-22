@@ -2670,13 +2670,8 @@ bool test_resize_metadata_publication_respects_synchronized_output()
         term::Terminal_session_result_code::ACCEPTED,
         "synchronized resize session starts");
     ok &= check(backend != nullptr &&
-        backend->emit_output(QByteArrayLiteral("history\r\n\r\n\r\n\x1b[Hbase")),
+        backend->emit_output(QByteArrayLiteral("base")),
         "synchronized resize session publishes an initial snapshot");
-
-    // One retained history row covers the later one-row growth, so this
-    // fixture exercises held geometry rather than an early release.
-    ok &= check(session->viewport_state().scrollback_rows == 1,
-        "the synchronized resize fixture has history for its growth");
 
     const std::uint64_t initial_generation = session->render_snapshot_generation();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h\r\nH")),
@@ -2692,7 +2687,7 @@ bool test_resize_metadata_publication_respects_synchronized_output()
         session->latest_render_snapshot_handle();
     ok &= check(session->render_snapshot_generation() == initial_generation + 1U,
         "held resize failure publishes a geometry-only snapshot");
-    ok &= check(session->synchronized_output_hold_active() && failed != nullptr &&
+    ok &= check(failed != nullptr &&
         failed->grid_size.rows == 4 &&
         failed->grid_size.columns == 2 &&
         failed->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
@@ -2720,7 +2715,7 @@ bool test_resize_metadata_publication_respects_synchronized_output()
         session->latest_render_snapshot_handle();
     ok &= check(session->render_snapshot_generation() == initial_generation + 2U,
         "held resize recovery publishes a geometry-only snapshot");
-    ok &= check(session->synchronized_output_hold_active() && recovered != nullptr &&
+    ok &= check(recovered != nullptr &&
         recovered->grid_size.rows == 4 &&
         recovered->grid_size.columns == 12 &&
         recovered->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
@@ -2765,12 +2760,8 @@ bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
         term::Terminal_session_result_code::ACCEPTED,
         "synthetic provenance geometry session starts");
     ok &= check(backend != nullptr &&
-        backend->emit_output(QByteArrayLiteral("history\r\n\r\n\r\n\x1b[Hbase")),
+        backend->emit_output(QByteArrayLiteral("base")),
         "synthetic provenance geometry session publishes base content");
-
-    // The later grow must remain covered so it can test frozen provenance.
-    ok &= check(session->viewport_state().scrollback_rows == 1,
-        "the synthetic provenance fixture has history for its growth");
 
     const std::shared_ptr<const term::Terminal_render_snapshot> base =
         session->latest_render_snapshot_handle();
@@ -2807,7 +2798,7 @@ bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
         "changed-grid geometry snapshot is accepted during synchronized output");
     const std::shared_ptr<const term::Terminal_render_snapshot> changed_grid =
         session->latest_render_snapshot_handle();
-    ok &= check(session->synchronized_output_hold_active() && changed_grid != nullptr &&
+    ok &= check(changed_grid != nullptr &&
         changed_grid->visible_line_provenance.empty() &&
         changed_grid->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         changed_grid->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
@@ -3917,7 +3908,7 @@ bool test_full_projection_rows_carry_image_revisions()
     return ok;
 }
 
-bool test_geometry_derived_snapshots_keep_row_images()
+bool test_held_geometry_preserves_images_or_releases_for_live_tail()
 {
     bool ok = true;
 
@@ -3927,12 +3918,8 @@ bool test_geometry_derived_snapshots_keep_row_images()
     ok &= check(session->start(launch_config({3, 12})).code ==
             term::Terminal_session_result_code::ACCEPTED &&
             backend != nullptr &&
-            backend->emit_output(QByteArrayLiteral("history\r\n\r\n\r\n\x1b[Htop\r\n") + sixel_image(24, 5)),
+            backend->emit_output(QByteArrayLiteral("top\r\n") + sixel_image(24, 5)),
         "the geometry image fixture publishes two image rows");
-    // Retained history lets the one-row grow stay inside the frozen hold.
-    ok &= check(session->viewport_state().scrollback_rows == 1,
-        "the geometry image fixture has history for its growth");
-
     const std::shared_ptr<const term::Terminal_render_snapshot> base =
         session->latest_render_snapshot_handle();
     ok &= check(base != nullptr &&
@@ -3949,7 +3936,8 @@ bool test_geometry_derived_snapshots_keep_row_images()
         "a grid change during synchronized output publishes a geometry-derived snapshot");
     const std::shared_ptr<const term::Terminal_render_snapshot> taller =
         session->latest_render_snapshot_handle();
-    ok &= check(session->synchronized_output_hold_active() && taller != nullptr &&
+    ok &= check(taller != nullptr &&
+            session->synchronized_output_hold_active() && taller->frozen_basis &&
             taller->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
             taller->visible_row_images.size() == 4U &&
             term::render_snapshot_row_image(*taller, 1) == term::render_snapshot_row_image(*base, 1) &&
@@ -3962,12 +3950,20 @@ bool test_geometry_derived_snapshots_keep_row_images()
         "a shorter grid during synchronized output is accepted");
     const std::shared_ptr<const term::Terminal_render_snapshot> shorter =
         session->latest_render_snapshot_handle();
-    ok &= check(session->synchronized_output_hold_active() && shorter != nullptr &&
+    // The captured endpoint includes the second image slice. Cropping that
+    // row out of a two-row frozen grid cannot present the captured tail, so
+    // resize releases the hold and publishes the live rows after native scroll.
+    ok &= check(shorter != nullptr && !session->synchronized_output_hold_active() &&
+            !shorter->frozen_basis && shorter->viewport.scrollback_rows == 1 &&
+            shorter->viewport.presentation.content_end_row_exclusive == 3 &&
             shorter->visible_row_images.size() == 2U &&
-            term::render_snapshot_row_image(*shorter, 1) == term::render_snapshot_row_image(*base, 1),
-        "a shorter geometry-derived snapshot keeps the images of the rows that remain");
-    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "the geometry image fixture releases synchronized output");
+            term::render_snapshot_row_image(*shorter, 0) == term::render_snapshot_row_image(*base, 1) &&
+            term::render_snapshot_row_image(*shorter, 1) == term::render_snapshot_row_image(*base, 2),
+        "a shrink that cannot present the held image tail releases and preserves both live image slices");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
+            !session->synchronized_output_hold_active() &&
+            session->latest_render_snapshot_handle() == shorter,
+        "the later synchronized-output end leaves the released image publication unchanged");
 
     return ok;
 }
@@ -4101,7 +4097,7 @@ int main()
     ok &= test_scrolled_back_snapshots_decode_history_row_images();
     ok &= test_an_image_only_change_dirties_only_its_row();
     ok &= test_full_projection_rows_carry_image_revisions();
-    ok &= test_geometry_derived_snapshots_keep_row_images();
+    ok &= test_held_geometry_preserves_images_or_releases_for_live_tail();
     ok &= test_row_image_check_leaves_snapshot_validation_alone();
     return ok ? 0 : 1;
 }

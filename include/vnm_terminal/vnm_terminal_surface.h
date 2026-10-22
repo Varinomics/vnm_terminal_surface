@@ -651,15 +651,15 @@ public:
     int rows() const;
     int columns() const;
     // The presented scroll range: scrollback_rows() is the largest offset from
-    // the tail, which excludes trailing rows that resizing vacated.
+    // the tail of the current semantic content.
     int scrollback_rows() const;
     int viewport_visible_rows() const;
     int viewport_offset_from_tail() const;
     bool viewport_at_tail() const;
-    // The Companion toggle. Presentation only: native terminal geometry is
-    // unchanged, and the unwritten tail is relocated into history.
-    bool content_tail_presentation_enabled() const;
-    void set_content_tail_presentation_enabled(bool enabled);
+    // Acquire history for an exported consumer's row capacity without changing
+    // the backend grid. Zero requests only the native screen's presentation.
+    int canvas_presentation_rows() const;
+    void set_canvas_presentation_rows(int rows);
     Selection_state selection_state() const;
     QString search_query() const;
     Search_result_state search_result_state() const;
@@ -776,6 +776,9 @@ public:
     // projection scroll snapshot, while an invalidated hold accepts a deferred
     // release intent without consulting hidden live bounds.
     Q_INVOKABLE bool scroll_viewport_lines(int line_delta);
+    // A remote consumer supplies its painted row capacity without resizing the
+    // PTY. Alternate-screen wheel input keeps the ordinary application route.
+    bool scroll_canvas_presentation_wheel(int wheel_steps, int rows);
     wheel_scroll_diagnostic_result_t scroll_viewport_lines_with_diagnostics(
         int                    line_delta);
     wheel_scroll_diagnostic_result_t scroll_viewport_lines_with_diagnostics(

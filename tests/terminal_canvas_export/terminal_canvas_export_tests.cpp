@@ -942,7 +942,7 @@ bool test_row_images_export_with_publication()
     return ok;
 }
 
-bool test_leading_rows_preserve_base_frame_and_bound_the_attachment()
+bool test_row_coverage_preserves_native_source_and_bounds()
 {
     VNM_TerminalSurface surface;
     auto base = make_snapshot(6, 8);
@@ -951,61 +951,56 @@ bool test_leading_rows_preserve_base_frame_and_bound_the_attachment()
     base->cursor.position = {1, 4};
     base->cursor.visible = true;
     const auto plain = export_snapshot(surface, base);
-    auto combined = make_snapshot(6, 8);
+    auto combined = make_snapshot(2, 8);
     combined->viewport.scrollback_rows = 2;
     combined->viewport.offset_from_tail = 2;
     combined->viewport.follow_tail = false;
     combined->cells.push_back(make_cell(0, 0, QStringLiteral("old")));
-    combined->cells.push_back(make_cell(2, 0, QStringLiteral("live")));
     QImage pixels(10, 20, QImage::Format_RGBA8888_Premultiplied);
     pixels.fill(QColor(20, 40, 200));
     term::set_render_snapshot_row_image(*combined, 1,
         std::make_shared<const term::Terminal_image_slice>(
             term::Terminal_image_slice{pixels, 0, {10, 20}, 9U}));
-    base->leading_row_count = 2;
-    base->leading_rows_snapshot = combined;
+    base->row_coverage_snapshot = combined;
     const auto exported = export_snapshot(surface, base);
-    if (!check(plain.frame && exported.frame && exported.frame->leading_rows,
+    if (!check(plain.frame && exported.frame && exported.frame->row_coverage,
             "a separate retained-row projection exports an optional attachment"))
     {
         return false;
     }
-    const auto& leading = *exported.frame->leading_rows;
+    const auto& coverage = *exported.frame->row_coverage;
     bool ok = check(exported.frame->rows == plain.frame->rows &&
             exported.frame->cells == plain.frame->cells && exported.frame->styles == plain.frame->styles &&
             exported.frame->cursor.row == plain.frame->cursor.row &&
             exported.frame->content_extent->offset_from_tail == plain.frame->content_extent->offset_from_tail &&
             exported.frame->content_extent->content_bottom_row_exclusive ==
                 plain.frame->content_extent->content_bottom_row_exclusive,
-        "the optional prefix leaves native cells, cursor, geometry and viewport metadata unchanged");
-    if (!check(leading.rows == 2 && leading.cells.size() == 1U &&
-            leading.cells.front().text == QStringLiteral("old") && leading.images &&
-            leading.images->rows.size() == 1U && leading.images->rows.front().row == 1 &&
-            leading.images->rows.front().pixels == pixels &&
-            vnm_terminal::terminal_canvas_leading_rows_are_valid(leading, 6, 8),
+        "the optional coverage leaves native cells, cursor, geometry and viewport metadata unchanged");
+    if (!check(coverage.rows == 2 && coverage.cells.size() == 1U &&
+            coverage.cells.front().text == QStringLiteral("old") && coverage.images &&
+            coverage.images->rows.size() == 1U && coverage.images->rows.front().row == 1 &&
+            coverage.images->rows.front().pixels == pixels &&
+            vnm_terminal::terminal_canvas_row_coverage_is_valid(coverage, 6, 8, 2),
         "the attachment contains only preceding cells and exact image slices within its own bounds"))
     {
         return false;
     }
-    auto invalid = leading;
+    auto invalid = coverage;
     invalid.cells.front().row = invalid.rows;
-    ok &= check(!vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),
-        "a prefix cannot smuggle active rows beyond its declared extent");
-    invalid = leading;
+    ok &= check(!vnm_terminal::terminal_canvas_row_coverage_is_valid(invalid, 6, 8, 2),
+        "coverage cannot contain rows beyond its declared extent");
+    invalid = coverage;
     invalid.images->rows.front().row = invalid.rows;
-    ok &= check(!vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),
-        "prefix image rows obey the same declared extent");
-    invalid = leading;
+    ok &= check(!vnm_terminal::terminal_canvas_row_coverage_is_valid(invalid, 6, 8, 2),
+        "coverage image rows obey the same declared extent");
+    invalid = coverage;
     invalid.record_version = 99U;
-    ok &= check(vnm_terminal::terminal_canvas_leading_rows_are_valid(invalid, 6, 8),
-        "an unknown optional prefix version does not invalidate ordinary terminal data");
-    base->leading_row_count = 6;
+    ok &= check(vnm_terminal::terminal_canvas_row_coverage_is_valid(invalid, 6, 8, 2),
+        "an unknown optional coverage version does not invalidate ordinary terminal data");
+    combined->viewport.offset_from_tail = 3;
     const auto malformed = export_snapshot(surface, base);
-    ok &= check(malformed.frame && malformed.frame->leading_rows &&
-            malformed.frame->leading_rows->status == vnm_terminal::Terminal_canvas_leading_rows_status::INVALID &&
-            malformed.frame->cells == plain.frame->cells &&
-            exported.frame->leading_rows->rows == 2,
-        "an incoherent prefix becomes unavailable without damaging the base or prior immutable export");
+    ok &= check(!malformed.frame && exported.frame->row_coverage->rows == 2,
+        "incoherent coverage rejects the publication and preserves the prior immutable export");
     return ok;
 }
 
@@ -1041,7 +1036,7 @@ struct Receiver_session
     }
 };
 
-Receiver_session start_receiver_session(int rows, QByteArray output, bool companion)
+Receiver_session start_receiver_session(int rows, QByteArray output)
 {
     auto backend = std::make_unique<Receiver_backend>();
     Receiver_session result;
@@ -1053,7 +1048,6 @@ Receiver_session start_receiver_session(int rows, QByteArray output, bool compan
     launch.argv = {QStringLiteral("receiver-equivalence-fixture")};
     launch.initial_grid_size = term::terminal_grid_size_t{rows, 20};
     (void)result.session->start(launch);
-    result.session->set_companion_presentation(companion);
     result.write_output(std::move(output));
     return result;
 }
@@ -1141,7 +1135,6 @@ bool expect_receiver_matches_desktop(
     }
     const auto received = term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas);
     bool same = received != nullptr &&
-        received->display_row_logical_rows == desktop->display_row_logical_rows &&
         received->cursor.visible == desktop->cursor.visible &&
         (!desktop->cursor.visible || received->cursor.position == desktop->cursor.position) &&
         received->visible_line_provenance.size() == desktop->visible_line_provenance.size() &&
@@ -1163,8 +1156,13 @@ bool expect_receiver_matches_desktop(
                     desktop_image->cell_pixel_size.width == received_image->cell_pixel_size.width &&
                     desktop_image->cell_pixel_size.height == received_image->cell_pixel_size.height));
         if (same && !desktop->visible_line_provenance.empty()) {
-            same = received->visible_line_provenance[static_cast<std::size_t>(row)].retained_line_id ==
-                desktop->visible_line_provenance[static_cast<std::size_t>(row)].retained_line_id;
+            const auto& received_row = received->visible_line_provenance[static_cast<std::size_t>(row)];
+            const auto& desktop_row = desktop->visible_line_provenance[static_cast<std::size_t>(row)];
+            // An identity projection may leave display_row_logical_rows
+            // implicit. Compare the effective row identity in either form.
+            same = received_row.logical_row == desktop_row.logical_row &&
+                received_row.retained_line_id == desktop_row.retained_line_id &&
+                received_row.content_generation == desktop_row.content_generation;
         }
     }
     for (std::size_t index = 0; same && index < desktop->selection_spans.size(); ++index) {
@@ -1177,7 +1175,7 @@ bool expect_receiver_matches_desktop(
 
 // Leading rows whose text exceeds the frame budget: twelve maximal cells fit
 // the 96 KiB limit and the thirteenth does not.
-std::shared_ptr<term::Terminal_render_snapshot> oversized_prefix_frame(
+std::shared_ptr<term::Terminal_render_snapshot> oversized_coverage_frame(
     term::Terminal_presentation_mapping presentation,
     bool                                frozen)
 {
@@ -1187,7 +1185,7 @@ std::shared_ptr<term::Terminal_render_snapshot> oversized_prefix_frame(
     base->viewport.presentation    = presentation;
     base->frozen_basis             = frozen;
     base->cells.push_back(make_cell(0, 0, QStringLiteral("live")));
-    auto leading = make_snapshot(6, k_columns);
+    auto leading = make_snapshot(2, k_columns);
     leading->viewport.scrollback_rows  = 2;
     leading->viewport.offset_from_tail = 2;
     leading->viewport.follow_tail      = false;
@@ -1197,35 +1195,23 @@ std::shared_ptr<term::Terminal_render_snapshot> oversized_prefix_frame(
     for (int column = 0; column < k_columns; ++column) {
         leading->cells.push_back(make_cell(1, column, multibyte_cell_text));
     }
-    base->leading_row_count     = 2;
-    base->leading_rows_snapshot = leading;
+    base->row_coverage_snapshot = leading;
     return base;
 }
 
-// A prefix the mapping presents is part of the frame: when it cannot be
-// serialized the export fails instead of sending a frame that presents
-// differently. A prefix the mapping does not present stays an optional
-// attachment.
-bool test_required_prefix_export_failures_are_reported()
+// Coverage belongs to the same frame and cannot be silently dropped when its
+// encoded text exceeds the negotiated independent row attachment budget.
+bool test_required_coverage_export_failures_are_reported()
 {
     VNM_TerminalSurface surface;
     bool ok = true;
-    const auto live = export_snapshot(surface, oversized_prefix_frame(
-        {term::Terminal_presentation_policy::AUTOMATIC, 2, 0}, false));
-    ok &= check(live.status == vnm_terminal::Terminal_canvas_export_status::FRAME_TEXT_UTF8_BYTE_LIMIT_EXCEEDED &&
-            !live.frame,
-        "a live frame whose presented prefix exceeds the text limit fails export");
-    const auto frozen = export_snapshot(surface, oversized_prefix_frame(
-        {term::Terminal_presentation_policy::AUTOMATIC, 4, 0}, true));
-    ok &= check(frozen.status == vnm_terminal::Terminal_canvas_export_status::FRAME_TEXT_UTF8_BYTE_LIMIT_EXCEEDED &&
-            !frozen.frame,
-        "a frozen frame whose captured prefix exceeds the text limit fails export");
-    const auto supplemental = export_snapshot(surface, oversized_prefix_frame({}, false));
-    ok &= check(supplemental.status == vnm_terminal::Terminal_canvas_export_status::OK &&
-            supplemental.frame && supplemental.frame->leading_rows &&
-            supplemental.frame->leading_rows->status == vnm_terminal::Terminal_canvas_leading_rows_status::OVER_LIMIT &&
-            supplemental.frame->presentation && supplemental.frame->presentation->leading_rows == 0,
-        "a native frame's supplemental prefix over the limit stays an unavailable attachment");
+    for (bool frozen : {false, true}) {
+        const auto result = export_snapshot(surface, oversized_coverage_frame(
+            {term::Terminal_presentation_policy::CONTENT_TAIL, 4, 0}, frozen));
+        ok &= check(result.status == vnm_terminal::Terminal_canvas_export_status::FRAME_TEXT_UTF8_BYTE_LIMIT_EXCEEDED &&
+                !result.frame,
+            "required coverage over the text budget rejects the complete live or frozen publication");
+    }
     return ok;
 }
 
@@ -1233,156 +1219,102 @@ bool test_receiver_presents_through_the_producer()
 {
     VNM_TerminalSurface surface;
     bool ok = true;
+    Receiver_session fixture = start_receiver_session(2, numbered_lines(13) + QByteArrayLiteral("$ "));
+    resize_rows(fixture, 6);
+    fixture.session->set_selection_range({{9, 0}, {9, 4}, term::Terminal_selection_mode::NORMAL});
+    const auto tail = fixture.session->latest_render_snapshot_handle();
+    ok &= check(tail && tail->viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
+            tail->viewport.presentation.content_end_row_exclusive == 14 && tail->row_coverage_snapshot,
+        "current endpoint fourteen acquires history above a six-row native window");
+    ok &= expect_receiver_matches_desktop(surface, tail,
+        "export and receiver preserve the desktop's rows, cursor, selection and bounds");
+    (void)fixture.session->scroll_viewport_lines(3);
+    ok &= expect_receiver_matches_desktop(surface, fixture.session->latest_render_snapshot_handle(),
+        "a detached receiver uses the common mapping and retained identities");
 
-    // AUTOMATIC: S = 12, H = 6, P = 4, at the tail and three rows up, with a
-    // selection on an acquired row.
-    Receiver_session automatic = start_receiver_session(2, numbered_lines(13) + QByteArrayLiteral("$ "), false);
-    resize_rows(automatic, 6);
-    automatic.session->set_selection_range({{9, 0}, {9, 4}, term::Terminal_selection_mode::NORMAL});
-    const auto automatic_frame = automatic.session->latest_render_snapshot_handle();
-    ok &= check(automatic_frame &&
-            automatic_frame->viewport.presentation.policy == term::Terminal_presentation_policy::AUTOMATIC &&
-            automatic_frame->viewport.presentation.hidden_rows == 4 && automatic_frame->leading_row_count == 4,
-        "the automatic fixture hides four rows and acquires four rows above its view");
-    ok &= expect_receiver_matches_desktop(surface, automatic_frame,
-        "the receiver presents the automatic tail like the desktop");
-    (void)automatic.session->scroll_viewport_lines(3);
-    ok &= expect_receiver_matches_desktop(surface, automatic.session->latest_render_snapshot_handle(),
-        "the receiver presents a scrolled automatic view like the desktop");
-
-    // A missing live payload is an invalid frame.
-    auto source = std::make_shared<term::Terminal_render_snapshot>(*automatic_frame);
-    const auto exported = export_snapshot(surface, source);
+    const auto exported = export_snapshot(surface, std::make_shared<term::Terminal_render_snapshot>(*tail));
     VNM_TerminalCanvas canvas;
-    if (check(exported.frame && exported.frame->presentation,
-            "the automatic frame exports its mapping record"))
-    {
-        auto without_rows = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported.frame);
-        without_rows->leading_rows.reset();
-        ok &= check(!canvas.set_canvas_frame(without_rows),
-            "a frame whose record names leading rows it does not carry is invalid");
-        auto without_record_rows = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported.frame);
-        without_record_rows->leading_rows.reset();
-        without_record_rows->presentation->leading_rows = 0;
-        ok &= check(!canvas.set_canvas_frame(without_record_rows),
-            "a live frame that lacks a requested row is invalid");
-        auto unknown = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported.frame);
-        unknown->presentation->record_version = 99U;
-        ok &= check(canvas.set_canvas_frame(unknown) &&
-                canvas.scrollback_rows() == automatic_frame->viewport.scrollback_rows &&
-                !term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas)->display_source,
-            "an unknown record version leaves the native frame available");
+    if (!check(exported.frame && canvas.set_canvas_frame(exported.frame), "a complete publication is accepted")) {
+        return false;
     }
+    const auto projected = term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas);
+    ok &= check(projected->touch_selection && projected->touch_selection->presentation &&
+            projected->touch_selection->presentation->visible_rows == canvas.rows(),
+        "a content-tail frame carries its actual rendered selection coordinates");
+    auto missing = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported.frame);
+    missing->row_coverage.reset();
+    const auto accepted = canvas.canvas_frame();
+    ok &= check(!canvas.set_canvas_frame(missing) && canvas.canvas_frame() == accepted,
+        "missing required native coverage preserves the last coherent frame");
+    auto unknown = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported.frame);
+    unknown->presentation->record_version = 99U;
+    ok &= check(canvas.set_canvas_frame(unknown) && canvas.rows() == unknown->rows,
+        "an unsupported optional presentation retains native base geometry");
+    const auto unsupported = term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas);
+    ok &= check(!unsupported->display_source && unsupported->touch_selection &&
+            !unsupported->touch_selection->presentation,
+        "unsupported presentation keeps native selection usable without the optional capability");
+    auto legacy = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported.frame);
+    legacy->presentation.reset();
+    legacy->row_coverage.reset();
+    ok &= check(canvas.set_canvas_frame(legacy), "a legacy native frame remains accepted");
+    const auto legacy_snapshot = term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas);
+    ok &= check(!legacy_snapshot->display_source && legacy_snapshot->touch_selection &&
+            !legacy_snapshot->touch_selection->presentation,
+        "legacy native selection does not acquire an unsupported presentation request");
 
-    // Images on a native row and on an acquired row travel with their rows.
-    {
-        QImage native_pixels(10, 20, QImage::Format_RGBA8888_Premultiplied);
-        native_pixels.fill(QColor(200, 40, 20));
-        QImage leading_pixels(24, 16, QImage::Format_RGBA8888_Premultiplied);
-        leading_pixels.fill(QColor(20, 160, 90));
-        auto with_images = std::make_shared<term::Terminal_render_snapshot>(*automatic_frame);
-        term::set_render_snapshot_row_image(*with_images, 0,
-            std::make_shared<const term::Terminal_image_slice>(
-                term::Terminal_image_slice{native_pixels, 1, {10, 20}, 41U}));
-        auto leading_with_image =
-            std::make_shared<term::Terminal_render_snapshot>(*with_images->leading_rows_snapshot);
-        term::set_render_snapshot_row_image(*leading_with_image, 1,
-            std::make_shared<const term::Terminal_image_slice>(
-                term::Terminal_image_slice{leading_pixels, 3, {12, 16}, 42U}));
-        with_images->leading_rows_snapshot = leading_with_image;
-        ok &= expect_receiver_matches_desktop(surface, with_images,
-            "the receiver presents images on native and acquired rows like the desktop");
-    }
+    QImage pixels(10, 20, QImage::Format_RGBA8888_Premultiplied);
+    pixels.fill(QColor(20, 160, 90));
+    auto with_images = std::make_shared<term::Terminal_render_snapshot>(*tail);
+    auto coverage = std::make_shared<term::Terminal_render_snapshot>(*tail->row_coverage_snapshot);
+    term::set_render_snapshot_row_image(*coverage, 1,
+        std::make_shared<const term::Terminal_image_slice>(term::Terminal_image_slice{pixels, 3, {10, 20}, 42U}));
+    with_images->row_coverage_snapshot = coverage;
+    ok &= expect_receiver_matches_desktop(surface, with_images,
+        "images in acquired rows retain the same logical placement after export");
 
-    // Companion S = 12, H = 6, P = 4, o = 8 with K = 0 and with K = 8: both
-    // acquire no leading rows, but present differently.
-    Receiver_session companion_k0 = start_receiver_session(2, numbered_lines(13) + QByteArrayLiteral("$ "), true);
-    resize_rows(companion_k0, 6);
-    (void)companion_k0.session->scroll_viewport_lines(8);
-    const auto k0_frame = companion_k0.session->latest_render_snapshot_handle();
-    Receiver_session companion_k8 = start_receiver_session(10, numbered_lines(13) + QByteArrayLiteral("$ "), true);
-    resize_rows(companion_k8, 2);
-    resize_rows(companion_k8, 6);
-    (void)companion_k8.session->scroll_viewport_lines(8);
-    const auto k8_frame = companion_k8.session->latest_render_snapshot_handle();
-    ok &= check(k0_frame && k8_frame &&
-            k0_frame->viewport.scrollback_rows == 12 && k8_frame->viewport.scrollback_rows == 12 &&
-            k0_frame->viewport.presentation.hidden_rows == 4 && k8_frame->viewport.presentation.hidden_rows == 4 &&
-            k0_frame->viewport.presentation.insertion_row == 12 && k8_frame->viewport.presentation.insertion_row == 4 &&
-            k0_frame->viewport.offset_from_tail == 8 && k8_frame->viewport.offset_from_tail == 8 &&
-            k0_frame->leading_row_count == k8_frame->leading_row_count,
-        "the Companion fixtures differ only in K");
-    ok &= expect_receiver_matches_desktop(surface, k0_frame,
-        "the receiver presents Companion with K = 0 like the desktop");
-    ok &= expect_receiver_matches_desktop(surface, k8_frame,
-        "the receiver presents Companion with K = 8 like the desktop");
+    (void)fixture.session->scroll_published_viewport_to_offset_from_tail(0);
+    fixture.session->set_canvas_presentation_rows(12);
+    const auto larger = fixture.session->latest_render_snapshot_handle();
+    const auto larger_export = export_snapshot(surface, std::make_shared<term::Terminal_render_snapshot>(*larger));
+    canvas.set_presentation_rows(12);
+    const auto expected = term::make_presented_snapshot(larger, 12, 0);
+    ok &= check(expected && larger_export.frame && canvas.set_canvas_frame(larger_export.frame) &&
+            canvas.rows() == 12 && term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas)->display_row_logical_rows ==
+                expected->display_row_logical_rows,
+        "a taller consumer uses actual acquired rows without changing the native grid");
+    canvas.set_presentation_rows(30);
+    ok &= check(canvas.rows() == 12,
+        "a capacity change with missing history keeps the coherent prior frame");
 
-    // A record whose coverage misses a displayed row is invalid even when the
-    // mapping presents the native rows as they are: identity Companion here,
-    // and NATIVE below.
-    const auto expect_incomplete_coverage_rejected = [&](
-        const std::shared_ptr<const term::Terminal_render_snapshot>& frame,
-        const char* message)
-    {
-        auto source_frame = std::make_shared<term::Terminal_render_snapshot>(*frame);
-        const auto exported_frame = export_snapshot(surface, source_frame);
-        if (!check(exported_frame.frame && exported_frame.frame->presentation, message)) {
-            return false;
-        }
-        auto incomplete = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*exported_frame.frame);
-        incomplete->presentation->covered_rows = incomplete->rows - 1;
-        VNM_TerminalCanvas receiver;
-        return check(receiver.set_canvas_frame(exported_frame.frame) &&
-                !receiver.set_canvas_frame(incomplete), message);
-    };
-    ok &= expect_incomplete_coverage_rejected(k0_frame,
-        "an identity Companion record missing a displayed row is invalid");
-    Receiver_session native = start_receiver_session(6, numbered_lines(3) + QByteArrayLiteral("$ "), false);
-    const auto native_frame = native.session->latest_render_snapshot_handle();
-    ok &= check(native_frame &&
-            native_frame->viewport.presentation.policy == term::Terminal_presentation_policy::NATIVE,
-        "the native fixture presents natively");
-    ok &= expect_incomplete_coverage_rejected(native_frame,
-        "a NATIVE record missing a displayed row is invalid");
+    Receiver_session small = start_receiver_session(6, numbered_lines(5) + QByteArrayLiteral("$ "));
+    small.session->set_canvas_presentation_rows(2);
+    (void)small.session->scroll_canvas_presentation_lines(100, 2);
+    const auto smaller = small.session->latest_render_snapshot_handle();
+    const auto smaller_export = export_snapshot(surface, std::make_shared<term::Terminal_render_snapshot>(*smaller));
+    canvas.set_presentation_rows(2);
+    ok &= check(smaller_export.frame && smaller_export.frame->content_extent->scrollback_rows == 0 &&
+            smaller_export.frame->content_extent->offset_from_tail == 0 &&
+            smaller_export.frame->presentation->offset_from_tail == 4 &&
+            canvas.set_canvas_frame(smaller_export.frame) && canvas.scrollback_rows() == 4 &&
+            canvas.viewport_offset_from_tail() == 4 &&
+            row_text(*term::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas), 0) == QStringLiteral("line-00"),
+        "a short consumer reaches its entire range even when its offset exceeds native history");
 
-    // Insufficient history, and ED 3 after growth, leave structural slots.
-    Receiver_session short_history = start_receiver_session(2, QByteArrayLiteral("a\r\n$ "), false);
+    Receiver_session short_history = start_receiver_session(2, QByteArrayLiteral("a\r\n$ "));
     resize_rows(short_history, 6);
     ok &= expect_receiver_matches_desktop(surface, short_history.session->latest_render_snapshot_handle(),
-        "the receiver presents unused space above short history like the desktop");
-    (void)automatic.session->scroll_viewport_lines(-3);
-    automatic.write_output(QByteArrayLiteral("\x1b[3J"));
-    ok &= expect_receiver_matches_desktop(surface, automatic.session->latest_render_snapshot_handle(),
-        "the receiver presents ED 3 after growth like the desktop");
-
-    // Companion P covers styled and attribute-only vacancy.
-    Receiver_session styled = start_receiver_session(2, numbered_lines(13) + QByteArrayLiteral("$ "), true);
-    resize_rows(styled, 6);
-    styled.write_output(QByteArrayLiteral("\x1b[7m\x1b[J\x1b[0m"));
-    const auto styled_frame = styled.session->latest_render_snapshot_handle();
-    ok &= check(styled_frame && styled_frame->viewport.presentation.hidden_rows == 4,
-        "Companion hides the styled vacancy");
-    ok &= expect_receiver_matches_desktop(surface, styled_frame,
-        "the receiver presents styled Companion vacancy like the desktop");
-    Receiver_session attributed = start_receiver_session(2, numbered_lines(13) + QByteArrayLiteral("$ "), true);
-    resize_rows(attributed, 6);
-    attributed.write_output(QByteArrayLiteral("\x1b[3;1;6;20;7$r"));
-    const auto attributed_frame = attributed.session->latest_render_snapshot_handle();
-    ok &= check(attributed_frame && attributed_frame->viewport.presentation.hidden_rows == 4,
-        "Companion hides attribute-only vacancy");
-    ok &= expect_receiver_matches_desktop(surface, attributed_frame,
-        "the receiver presents attribute-only Companion vacancy like the desktop");
-
-    // A frozen frame shows its missing leading prefix as unused slots.
-    Receiver_session frozen = start_receiver_session(2, numbered_lines(13) + QByteArrayLiteral("$ "), false);
-    frozen.write_output(QByteArrayLiteral("\x1b[?2026h"));
-    resize_rows(frozen, 6);
-    const auto frozen_frame = frozen.session->latest_render_snapshot_handle();
-    ok &= check(frozen_frame && frozen_frame->frozen_basis,
-        "the held resize publishes a frozen frame");
-    ok &= expect_receiver_matches_desktop(surface, frozen_frame,
-        "the receiver presents the frozen frame's unused slots like the desktop");
-    frozen.write_output(QByteArrayLiteral("\x1b[?2026l"));
+        "short history places unused slots above the transcript");
+    fixture.write_output(QByteArrayLiteral("\x1b[2J\x1b[H$ "));
+    fixture.session->set_canvas_presentation_rows(0);
+    ok &= expect_receiver_matches_desktop(surface, fixture.session->latest_render_snapshot_handle(),
+        "explicit clear starts a page with leading space and a bottom prompt");
+    fixture.write_output(QByteArrayLiteral("\x1b[7m\x1b[J\x1b[0m"));
+    const auto styled = fixture.session->latest_render_snapshot_handle();
+    ok &= check(styled->native_content_bottom_row_exclusive == 6,
+        "styled erased cells remain semantic content through the last native row");
+    ok &= expect_receiver_matches_desktop(surface, styled,
+        "styled trailing content remains visible through the common mapping");
     return ok;
 }
 
@@ -1487,8 +1419,8 @@ int main(int argc, char** argv)
     ok &= test_utf8_text_byte_count();
     ok &= test_text_bounds_fail_closed_without_truncation();
     ok &= test_row_images_export_with_publication();
-    ok &= test_leading_rows_preserve_base_frame_and_bound_the_attachment();
+    ok &= test_row_coverage_preserves_native_source_and_bounds();
     ok &= test_receiver_presents_through_the_producer();
-    ok &= test_required_prefix_export_failures_are_reported();
+    ok &= test_required_coverage_export_failures_are_reported();
     return ok ? 0 : 1;
 }
