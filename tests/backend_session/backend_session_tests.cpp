@@ -4515,16 +4515,14 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     ok &= check(!backend->writes.empty() && backend->writes.back() == expected_key_bytes,
         "blocked detach resize forwards encoded key event");
 
-    // A covered shrink keeps the hold active even with history disabled.
     const term::Terminal_session_result resize_result =
-        session->resize(QSizeF(120.0, 40.0), {2, 12});
+        session->resize(QSizeF(120.0, 80.0), {4, 12});
     const std::optional<term::Terminal_render_snapshot> resize_snapshot =
         session->latest_render_snapshot();
     ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
         "blocked detach resize is accepted");
-    ok &= check(session->synchronized_output_hold_active() &&
-        resize_snapshot.has_value()                     &&
-        resize_snapshot->grid_size.rows    == 2         &&
+    ok &= check(resize_snapshot.has_value()             &&
+        resize_snapshot->grid_size.rows    == 4         &&
         resize_snapshot->grid_size.columns == 12        &&
         resize_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         resize_snapshot->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
@@ -4539,7 +4537,7 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     const std::optional<term::Terminal_render_snapshot> detached_snapshot =
         session->latest_render_snapshot();
     ok &= check(detached_snapshot.has_value()             &&
-        detached_snapshot->grid_size.rows    == 2         &&
+        detached_snapshot->grid_size.rows    == 4         &&
         detached_snapshot->grid_size.columns == 12        &&
         snapshot_cells_fit_grid(*detached_snapshot)       &&
         detached_snapshot->selection_spans.empty()        &&
@@ -4563,7 +4561,7 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     return ok;
 }
 
-bool test_hidden_safe_cursor_is_clamped_in_geometry_snapshot()
+bool test_hidden_cursor_endpoint_releases_incompatible_geometry()
 {
     bool ok = true;
 
@@ -4593,24 +4591,34 @@ bool test_hidden_safe_cursor_is_clamped_in_geometry_snapshot()
         "hidden-cursor geometry fixture mutates live content inside the hold");
     const term::Terminal_session_result resize_result =
         session->resize(QSizeF(50.0, 40.0), {2, 5});
-    const std::optional<term::Terminal_render_snapshot> derived_snapshot =
+    const std::optional<term::Terminal_render_snapshot> resized_snapshot =
         session->latest_render_snapshot();
     ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED &&
-            derived_snapshot.has_value() &&
-            derived_snapshot->basis ==
+            !session->synchronized_output_hold_active() &&
+            resized_snapshot.has_value() &&
+            !resized_snapshot->frozen_basis &&
+            resized_snapshot->basis ==
                 term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
-            derived_snapshot->purpose ==
-                term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
-            derived_snapshot->grid_size.rows == 2 &&
-            derived_snapshot->grid_size.columns == 5 &&
-            !derived_snapshot->cursor.visible &&
-            derived_snapshot->cursor.position.row == 1 &&
-            derived_snapshot->cursor.position.column == 4 &&
-            snapshot_contains_text(*derived_snapshot, QStringLiteral("SAFE")) &&
-            !snapshot_contains_text(*derived_snapshot, QStringLiteral("HIDDEN")),
-        "geometry derivation clamps hidden safe cursor without exposing held live state");
+            resized_snapshot->purpose ==
+                term::Terminal_render_snapshot_purpose::CONTENT &&
+            resized_snapshot->grid_size.rows == 2 &&
+            resized_snapshot->grid_size.columns == 5 &&
+            !resized_snapshot->cursor.visible &&
+            resized_snapshot->cursor.position.row == 1 &&
+            resized_snapshot->cursor.position.column == 1 &&
+            snapshot_row_text(*resized_snapshot, 0) == QStringLiteral("HIDDE") &&
+            snapshot_row_text(*resized_snapshot, 1) == QStringLiteral("N") &&
+            !snapshot_contains_text(*resized_snapshot, QStringLiteral("SAFE")),
+        "a hidden logical cursor endpoint that cannot fit releases the hold into coherent live geometry");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "hidden-cursor geometry fixture releases synchronized output");
+        "hidden-cursor geometry fixture accepts the later synchronized-output release");
+    const auto after_release = session->latest_render_snapshot();
+    ok &= check(after_release && !after_release->frozen_basis &&
+            !after_release->cursor.visible &&
+            snapshot_row_text(*after_release, 0) == QStringLiteral("HIDDE") &&
+            snapshot_row_text(*after_release, 1) == QStringLiteral("N") &&
+            !session->synchronized_output_hold_active(),
+        "the later release cannot restore the incompatible hidden-cursor frame");
     return ok;
 }
 
@@ -5356,16 +5364,15 @@ bool test_selection_line_lease_negative_source_paths()
             "missing provenance backend emits base content");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
             "missing provenance backend holds synchronized output");
-        // A covered shrink invalidates provenance while retaining the hold.
         const term::Terminal_session_result resize_result =
-            session->resize(QSizeF(120.0, 40.0), {2, 12});
+            session->resize(QSizeF(120.0, 80.0), {4, 12});
         const std::optional<term::Terminal_render_snapshot> geometry_snapshot =
             session->latest_render_snapshot();
         const std::optional<term::terminal_selection_source_identity_t> geometry_source =
             session->published_selection_source_identity();
         ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
             "missing provenance synchronized resize is accepted");
-        ok &= check(session->synchronized_output_hold_active() && geometry_snapshot.has_value() &&
+        ok &= check(geometry_snapshot.has_value() &&
             geometry_snapshot->visible_line_provenance.empty(),
             "missing provenance fixture publishes geometry without line descriptors");
 
@@ -9400,26 +9407,26 @@ bool test_public_projection_resize_and_memory_invalidation()
         resize_session->capture_public_projection_for_testing();
     ok &= check(resize_projection.has_value(),
         "resize invalidation captures public projection");
-    const term::Terminal_viewport_state resize_frozen_viewport =
-        resize_projection.has_value()
-            ? resize_projection->viewport()
-            : term::Terminal_viewport_state{};
     ok &= check(resize_backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
         "resize invalidation enters synchronized-output hold");
     ok &= check(resize_session->resize(QSizeF(200.0, 80.0), {4, 18}).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "resize invalidation applies synchronized-output resize");
 
-    const std::optional<term::Terminal_public_release_intent> resize_intent =
-        resize_session->public_release_intent_for_testing();
-    ok &= check(resize_intent.has_value() &&
-        !resize_intent->public_projection_valid &&
-        viewport_states_equal(resize_intent->public_viewport, resize_frozen_viewport) &&
-        resize_intent->public_projection_disable_reason ==
+    const auto resized_snapshot = resize_session->latest_render_snapshot();
+    ok &= check(!resize_session->synchronized_output_hold_active() &&
+        !resize_session->public_release_intent_for_testing().has_value() &&
+        resized_snapshot && !resized_snapshot->frozen_basis &&
+        resized_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        resized_snapshot->grid_size.rows == 4 &&
+        snapshot_contains_text(*resized_snapshot, QStringLiteral("held")) &&
+        resized_snapshot->public_scroll_diagnostics.public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED &&
-        resize_intent->diagnostic_reason ==
-            term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_GEOMETRY_INVALIDATED,
-        "synchronized-output resize invalidates public projection geometry while freezing public viewport");
+        resized_snapshot->public_scroll_diagnostics.diagnostic_reason ==
+            term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_GEOMETRY_INVALIDATED &&
+        resized_snapshot->public_scroll_diagnostics.release_reconciliation_result ==
+            term::Terminal_release_reconciliation_result::STICKY_TAIL,
+        "growth beyond frozen coverage releases the public projection and reconciles its tail into live geometry");
     ok &= check(!resize_session->public_projection_for_testing().has_value(),
         "resize invalidation removes copied projection rows");
 
@@ -10232,7 +10239,7 @@ bool test_public_projection_release_reconciliation()
     return ok;
 }
 
-bool test_public_projection_geometry_invalidation_composes_with_prior_invalidation()
+bool test_public_projection_geometry_release_preserves_prior_invalidation()
 {
     bool ok = true;
 
@@ -10262,22 +10269,14 @@ bool test_public_projection_geometry_invalidation_composes_with_prior_invalidati
 
         session->invalidate_public_projection_for_testing(prior_reason);
         ok &= check(session->resize(QSizeF(200.0, 80.0), {4, 16}).code ==
-                term::Terminal_session_result_code::ACCEPTED &&
-                session->resize(QSizeF(200.0, 80.0), {3, 16}).code ==
-                    term::Terminal_session_result_code::ACCEPTED,
-            "composed geometry invalidation fixture resizes away and back");
-        const std::optional<term::Terminal_public_release_intent> held_intent =
-            session->public_release_intent_for_testing();
-        ok &= check(held_intent.has_value() &&
-                held_intent->public_projection_disable_reason == prior_reason &&
-                held_intent->geometry_invalidated,
-            "composed geometry invalidation retains the first reason and sticky geometry fact");
-
-        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-            "composed geometry invalidation fixture releases the hold");
+                term::Terminal_session_result_code::ACCEPTED,
+            "composed geometry invalidation fixture grows beyond its frozen coverage");
         const std::optional<term::Terminal_render_snapshot> release =
             session->latest_render_snapshot();
         ok &= check(release.has_value() &&
+                !release->frozen_basis &&
+                !session->synchronized_output_hold_active() &&
+                !session->public_release_intent_for_testing().has_value() &&
                 release->public_scroll_diagnostics.public_projection_disable_reason ==
                     prior_reason &&
                 release->public_scroll_diagnostics.diagnostic_reason ==
@@ -10285,7 +10284,18 @@ bool test_public_projection_geometry_invalidation_composes_with_prior_invalidati
                         DETACHED_ANCHOR_GEOMETRY_CHANGED &&
                 release->public_scroll_diagnostics.release_reconciliation_result ==
                     term::Terminal_release_reconciliation_result::RETAINED_ID_BEST_EFFORT,
-            "composed geometry invalidation cannot release an exact anchor after resize away and back");
+            "early geometry release retains the first invalidation reason and reconciles the detached row by identity");
+        ok &= check(session->resize(QSizeF(200.0, 80.0), {3, 16}).code ==
+                term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "composed geometry invalidation fixture returns to its original size and accepts the later release");
+        const auto returned = session->latest_render_snapshot();
+        ok &= check(returned && !returned->frozen_basis &&
+                returned->grid_size.rows == 3 &&
+                returned->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+                !session->synchronized_output_hold_active() &&
+                !session->public_release_intent_for_testing().has_value(),
+            "resizing back and the later release cannot restore the invalidated frozen projection");
     }
 
     return ok;
@@ -13066,16 +13076,14 @@ bool test_synchronized_output_defers_content_until_release()
     ok &= check(session->render_snapshot_generation() == prefix_generation,
         "continued synchronized output keeps render publication held");
 
-    // Change width without requesting uncaptured rows; this hold must last
-    // until ESU so deferred content and resize invalidation are exercised.
-    ok &= check(session->resize(QSizeF(1000.0, 480.0), {24, 100}).code ==
+    ok &= check(session->resize(QSizeF(1000.0, 500.0), {25, 100}).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "resize during synchronized output is accepted");
     const std::optional<term::Terminal_render_snapshot> resized_held_snapshot =
         session->latest_render_snapshot();
-    ok &= check(session->synchronized_output_hold_active() && resized_held_snapshot.has_value() &&
+    ok &= check(resized_held_snapshot.has_value() &&
         prefix_snapshot.has_value() &&
-        resized_held_snapshot->grid_size.rows == 24 &&
+        resized_held_snapshot->grid_size.rows == 25 &&
         resized_held_snapshot->grid_size.columns == 100 &&
         snapshot_row_text(*resized_held_snapshot, 0) == QStringLiteral("A") &&
         !snapshot_contains_text(*resized_held_snapshot, QStringLiteral("B")) &&
@@ -13085,7 +13093,7 @@ bool test_synchronized_output_defers_content_until_release()
     ok &= check(resized_held_snapshot.has_value() &&
         resized_held_snapshot->dirty_row_ranges.size() == 1U &&
         resized_held_snapshot->dirty_row_ranges.front().first_row == 0 &&
-        resized_held_snapshot->dirty_row_ranges.front().row_count == 24,
+        resized_held_snapshot->dirty_row_ranges.front().row_count == 25,
         "synchronized-output resize geometry snapshot requests public repaint");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026lD")),
@@ -13093,7 +13101,7 @@ bool test_synchronized_output_defers_content_until_release()
     const std::optional<term::Terminal_render_snapshot> released_snapshot =
         session->latest_render_snapshot();
     ok &= check(released_snapshot.has_value() &&
-        released_snapshot->grid_size.rows == 24 &&
+        released_snapshot->grid_size.rows == 25 &&
         released_snapshot->grid_size.columns == 100 &&
         snapshot_row_text(*released_snapshot, 0) == QStringLiteral("ABCD") &&
         session->render_snapshot_generation() == prefix_generation + 2U,
@@ -13102,12 +13110,12 @@ bool test_synchronized_output_defers_content_until_release()
         session->last_model_ingest_result();
     ok &= check(released_result.has_value() &&
         released_result->viewport_changed &&
-        released_result->dirty_rows.size() == 24U,
+        released_result->dirty_rows.size() == 25U,
         "synchronized output release preserves resize invalidation");
     ok &= check(released_snapshot.has_value() &&
         released_snapshot->dirty_row_ranges.size() == 1U &&
         released_snapshot->dirty_row_ranges.front().first_row == 0 &&
-        released_snapshot->dirty_row_ranges.front().row_count == 24,
+        released_snapshot->dirty_row_ranges.front().row_count == 25,
         "synchronized output release publishes preserved resize invalidation");
 
     std::unique_ptr<term::Terminal_session> not_started_force_release_session;
@@ -22894,10 +22902,9 @@ bool test_stop_failure_preserves_commitment_and_prior_geometry()
     return ok;
 }
 
-// Every live and held entry point bounds the presented offset by the policy
-// maximum (DESIGN 5.4 Bounds): ten output lines and a prompt at two rows leave
-// nine history rows; growth to six rows hides four vacant rows, so AUTOMATIC
-// allows five and COMPANION nine.
+// Every live and held entry point uses the current content end. Ten output
+// lines and a prompt end at logical row 11, so a six-row consumer can scroll
+// five rows from the tail, while a two-row consumer can scroll nine.
 bool test_presentation_bounds_at_session_entry_points()
 {
     bool ok = true;
@@ -22915,28 +22922,33 @@ bool test_presentation_bounds_at_session_entry_points()
     session->resize(QSizeF(200.0, 120.0), {6, 20});
     const term::Terminal_viewport_state grown = session->viewport_state();
     ok &= check(grown.scrollback_rows == 9 &&
-            grown.presentation.policy == term::Terminal_presentation_policy::AUTOMATIC &&
-            grown.presentation.hidden_rows == 4 &&
+            grown.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
+            grown.presentation.content_end_row_exclusive == 11 &&
             term::presentation_max_offset_from_tail(grown) == 5,
-        "growth hides the vacated rows from the live scroll range");
+        "growth does not extend the semantic end or the live scroll range");
 
     const auto offset = [&] { return session->viewport_state().offset_from_tail; };
     (void)session->scroll_viewport_lines(100);
-    ok &= check(offset() == 5, "line scrolling stops at the automatic maximum");
+    ok &= check(offset() == 5, "line scrolling stops at the content-end maximum");
     (void)session->scroll_published_viewport_to_offset_from_tail(50);
-    ok &= check(offset() == 5, "offset scrolling clamps to the automatic maximum");
+    ok &= check(offset() == 5, "offset scrolling clamps to the content-end maximum");
     (void)session->scroll_published_viewport_lines(-2);
     ok &= check(offset() == 3, "published line scrolling moves inside the range");
     (void)session->scroll_viewport_lines_from_published_state(100, session->viewport_state());
     ok &= check(offset() == 5 && session->latest_render_snapshot_handle()->viewport.offset_from_tail == 5,
         "scrolling from the published state publishes the bounded offset");
 
-    session->set_companion_presentation(true);
-    (void)session->scroll_viewport_lines(100);
-    ok &= check(offset() == 9, "the Companion range keeps the native scrollback");
-    session->set_companion_presentation(false);
-    ok &= check(offset() == 5 && term::presentation_max_offset_from_tail(session->viewport_state()) == 5,
-        "turning the toggle off keeps the view on the first history row at the automatic maximum");
+    session->set_canvas_presentation_rows(2);
+    (void)session->scroll_canvas_presentation_lines(100, 2);
+    const auto canvas_source = session->latest_render_snapshot_handle();
+    const auto canvas = term::make_presented_snapshot(canvas_source, 2, 9);
+    ok &= check(offset() == 5 && canvas_source && canvas_source->grid_size.rows == 6 &&
+            canvas_source->presentation_rows == 2 && canvas_source->presentation_offset_from_tail == 9 &&
+            canvas && snapshot_row_text(*canvas, 0) == QStringLiteral("scroll-line-000") &&
+            snapshot_row_text(*canvas, 1) == QStringLiteral("scroll-line-001"),
+        "a smaller consumer reaches the same first history row with its own offset and native source geometry");
+    (void)session->scroll_canvas_presentation_lines(-100, 2);
+    session->set_canvas_presentation_rows(0);
 
     (void)session->scroll_published_viewport_to_offset_from_tail(0);
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
@@ -22954,7 +22966,7 @@ bool test_presentation_bounds_at_session_entry_points()
 
 // The saved primary view keeps its first displayed row while the alternate
 // screen is active, even when a resize archives rows and history at its limit
-// evicts as many, leaving S unchanged (DESIGN 5.5, saved primary).
+// evicts as many, leaving the history count unchanged.
 bool test_saved_primary_anchor_survives_constant_s_eviction()
 {
     bool ok = true;
@@ -22999,9 +23011,9 @@ bool test_saved_primary_anchor_survives_constant_s_eviction()
 }
 
 // A detached view keeps its first displayed row at the same display position
-// when the mapping or S changes (DESIGN 5.5): host and parser resizes, output
-// consuming vacancy, the saved primary view, and a Companion view whose first
-// rows are padding. A position the new mapping cannot show clamps.
+// when the content end or history changes: host and parser resizes, output,
+// the saved primary view, and an explicitly cleared page. A position the new
+// mapping cannot show clamps.
 bool test_detached_anchor_keeps_first_displayed_row()
 {
     bool ok = true;
@@ -23028,12 +23040,12 @@ bool test_detached_anchor_keeps_first_displayed_row()
     host->resize(QSizeF(200.0, 120.0), {6, 20});
     ok &= check(host->viewport_state().offset_from_tail == 2 &&
             displayed(host, 0) == QStringLiteral("scroll-line-003"),
-        "a host resize that hides four vacant rows keeps the first displayed row");
+        "a host resize keeps the first displayed row");
     ok &= check(host_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
-            host->viewport_state().presentation.hidden_rows == 3 &&
+            host->viewport_state().presentation.content_end_row_exclusive == 12 &&
             host->viewport_state().offset_from_tail == 3 &&
             displayed(host, 0) == QStringLiteral("scroll-line-003"),
-        "output consuming one vacant row keeps the first displayed row");
+        "output extending the content end keeps the first displayed row");
     (void)host->scroll_viewport_lines(-2);
     ok &= check(displayed(host, 0) == QStringLiteral("scroll-line-005"),
         "the view moves to scroll-line-005 one row above the tail");
@@ -23058,39 +23070,32 @@ bool test_detached_anchor_keeps_first_displayed_row()
         "the anchor session enters the alternate screen");
     saved->resize(QSizeF(200.0, 120.0), {6, 20});
     ok &= check(saved_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")) &&
-            saved->viewport_state().presentation.hidden_rows == 4 &&
+            saved->viewport_state().presentation.content_end_row_exclusive == 11 &&
             saved->viewport_state().offset_from_tail == 2 &&
             displayed(saved, 0) == QStringLiteral("scroll-line-003"),
         "the saved primary view returns with its first displayed row");
 
-    // Shrinking four rows to two displaces two rows into history (K = 2) and
-    // regrowing leaves two vacant rows, so Companion inserts two padding rows
-    // before native row I = 7. Two rows up, the view starts with that padding.
-    std::unique_ptr<term::Terminal_session> companion;
-    Scripted_backend* companion_backend = start(companion, 4);
-    companion->set_companion_presentation(true);
-    companion->resize(QSizeF(200.0, 40.0), {2, 20});
-    companion->resize(QSizeF(200.0, 80.0), {4, 20});
-    (void)companion->scroll_viewport_lines(2);
-    ok &= check(companion->viewport_state().presentation.insertion_row == 7 &&
-            companion->viewport_state().presentation.hidden_rows == 2 &&
-            displayed(companion, 0).isEmpty() && displayed(companion, 1).isEmpty() &&
-            displayed(companion, 2) == QStringLiteral("scroll-line-007"),
-        "the Companion view starts with two padding rows above scroll-line-007");
-    ok &= check(companion_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
-            companion->viewport_state().presentation.hidden_rows == 1 &&
-            companion->viewport_state().offset_from_tail == 3 &&
-            displayed(companion, 2) == QStringLiteral("scroll-line-007"),
-        "the first row below the padding keeps its display position");
+    std::unique_ptr<term::Terminal_session> cleared;
+    Scripted_backend* cleared_backend = start(cleared, 4);
+    ok &= check(cleared_backend->emit_output(QByteArrayLiteral("\x1b[H\x1b[2J$ ")),
+        "the shell explicitly clears the current page");
+    (void)cleared->scroll_viewport_lines(2);
+    ok &= check(cleared->viewport_state().presentation.clear_page_start_row == 7 &&
+            displayed(cleared, 0) == QStringLiteral("scroll-line-005") &&
+            displayed(cleared, 1) == QStringLiteral("scroll-line-006") &&
+            displayed(cleared, 2) == QStringLiteral("$") && displayed(cleared, 3).isEmpty(),
+        "scrolling up from a cleared page shows the retained history directly above it");
+    ok &= check(cleared_backend->emit_output(QByteArrayLiteral("x\r\n")) &&
+            cleared->viewport_state().presentation.clear_page_start_row == 7 &&
+            cleared->viewport_state().offset_from_tail == 2 &&
+            displayed(cleared, 0) == QStringLiteral("scroll-line-005"),
+        "output within the clear page preserves the first history row and the page boundary");
     return ok;
 }
 
-// Held frames take their mapping record and coverage from their frozen basis
-// (DESIGN 5.7), independently of retained-row provenance. The worked example:
-// S = 100, the frame's own rows 100 and 101 at two rows, and held growth to
-// six rows under the default deferred policy with no captured prefix present
-// four unused slots and then rows 100 and 101, with the AUTOMATIC maximum 96
-// and native S 100.
+// Held frames take their content end, clear page and coverage from one frozen
+// basis. Growth requiring uncaptured real history releases the hold; page
+// padding is created only by E/Q/N, never by absence of captured rows.
 bool test_frozen_frame_availability()
 {
     bool ok = true;
@@ -23129,44 +23134,47 @@ bool test_frozen_frame_availability()
         "the default-policy session holds an update and grows from two to six rows");
     const auto adapted = deferred->latest_render_snapshot_handle();
     const auto adapted_display = presented(deferred);
-    ok &= check(adapted && adapted->frozen_basis && adapted_display &&
-            adapted_display->display_row_logical_rows == rows_t({-1, -1, -1, -1, 100, 101}) &&
+    ok &= check(adapted && !adapted->frozen_basis && !deferred->synchronized_output_hold_active() && adapted_display &&
+            adapted_display->display_row_logical_rows == rows_t({96, 97, 98, 99, 100, 101}) &&
             snapshot_row_text(*adapted_display, 4) == QStringLiteral("scroll-line-100") &&
             snapshot_row_text(*adapted_display, 5) == QStringLiteral("$") &&
             adapted->viewport.scrollback_rows == 100 &&
             term::presentation_max_offset_from_tail(adapted->viewport) == 96,
-        "held growth without a captured prefix shows unused slots above the frame's rows");
+        "held growth acquires missing real history only after releasing the frozen basis");
 
     ok &= check(resize_rows(deferred, 3) &&
-            presented_rows(deferred) == rows_t({-1, 100, 101}),
-        "a held shrink adapts the frozen frame to one unused slot");
+            presented_rows(deferred) == rows_t({99, 100, 101}),
+        "a subsequent shrink retains the actual transcript tail");
     ok &= check(resize_rows(deferred, 1), "the held session shrinks to one row");
     const auto clipped = presented(deferred);
-    ok &= check(clipped && !clipped->display_source &&
-            snapshot_row_text(*clipped, 0) == QStringLiteral("scroll-line-100"),
-        "a held shrink below the frame clips its trailing row and presents it natively");
-    ok &= check(resize_rows(deferred, 5) &&
-            presented_rows(deferred) == rows_t({-1, -1, -1, 100, 101}),
-        "held regrowth adapts the frozen frame again");
+    ok &= check(clipped && !deferred->synchronized_output_hold_active() &&
+            !deferred->latest_render_snapshot_handle()->frozen_basis &&
+            snapshot_row_text(*clipped, 0) == QStringLiteral("$"),
+        "a held shrink that cannot retain the prompt releases before showing the live one-row tail");
+    ok &= check(resize_rows(deferred, 5), "the released session regrows to five rows");
+    const auto regrown = presented(deferred);
+    ok &= check(regrown && !deferred->synchronized_output_hold_active() &&
+            snapshot_row_text(*regrown, 4) == QStringLiteral("$"),
+        "regrowth after early release keeps the prompt on the last displayed row");
     ok &= check(deferred_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
             deferred->latest_render_snapshot_handle() &&
             !deferred->latest_render_snapshot_handle()->frozen_basis &&
             presented(deferred) != nullptr,
         "the release presents the live frame");
 
-    // Growth before the hold acquires the two rows above the native view; a
-    // held growth keeps them and shows the further requested rows as slots.
+    // Partial acquired coverage still cannot authorize additional missing rows.
     std::unique_ptr<term::Terminal_session> partial;
     Scripted_backend* partial_backend = start(partial, deferred_config, 101);
     ok &= check(resize_rows(partial, 4) &&
-            partial->latest_render_snapshot_handle()->leading_row_count == 2 &&
+            term::render_snapshot_row_coverage_is_coherent(*partial->latest_render_snapshot_handle()) &&
             presented_rows(partial) == rows_t({98, 99, 100, 101}),
         "growth before the hold acquires the two rows above the native view");
     ok &= check(partial_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")) &&
             resize_rows(partial, 6) &&
-            presented_rows(partial) == rows_t({-1, -1, 98, 99, 100, 101}) &&
+            !partial->synchronized_output_hold_active() &&
+            presented_rows(partial) == rows_t({96, 97, 98, 99, 100, 101}) &&
             snapshot_row_text(*presented(partial), 2) == QStringLiteral("scroll-line-098"),
-        "held growth keeps the captured prefix and shows the rest as unused slots");
+        "held growth beyond partial coverage releases before acquiring the remaining history");
     ok &= check(partial_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
         "the partial-prefix session releases its hold");
 
@@ -23185,22 +23193,21 @@ bool test_frozen_frame_availability()
     const auto scrolled = immediate->latest_render_snapshot_handle();
     ok &= check(scrolled && scrolled->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
             scrolled->frozen_basis && scrolled->viewport.offset_from_tail == 3 &&
-            scrolled->leading_row_count == 4 &&
+            term::render_snapshot_row_coverage_is_coherent(*scrolled) &&
             presented_rows(immediate) == rows_t({12, 13, 14, 15, 16, 17}) &&
             snapshot_row_text(*presented(immediate), 0) == QStringLiteral("scroll-line-012"),
         "a held scroll presents the captured rows above its window");
 
-    // The toggle is not part of a frozen basis: a held frame keeps its mapping
-    // and the release presents the live frame under the new toggle.
-    immediate->set_companion_presentation(true);
-    ok &= check(immediate->latest_render_snapshot_handle()->viewport.presentation.policy ==
-            term::Terminal_presentation_policy::AUTOMATIC,
-        "a toggle change during the hold leaves the held frame's mapping");
+    // Live cursor movement and ED0 change the live semantic end, but cannot
+    // change the endpoint or row contents of the publication being held.
+    ok &= check(immediate_backend->emit_output(QByteArrayLiteral("\r\x1b[1A\x1b[Jlive")) &&
+            immediate->latest_render_snapshot_handle()->viewport.presentation.content_end_row_exclusive == 21 &&
+            !snapshot_contains_text(*immediate->latest_render_snapshot_handle(), QStringLiteral("live")),
+        "a held frame retains its frozen end while an erase changes the live tail");
     ok &= check(immediate_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
-            immediate->latest_render_snapshot_handle()->viewport.presentation.policy ==
-                term::Terminal_presentation_policy::COMPANION &&
+            immediate->latest_render_snapshot_handle()->viewport.presentation.content_end_row_exclusive == 20 &&
             !immediate->latest_render_snapshot_handle()->frozen_basis,
-        "the release presents the live frame under the new toggle");
+        "release publishes the current semantic end from the live model");
 
     // Under the default policy nothing beyond the frame's own rows is
     // captured, so a held scroll is deferred and the published frame kept.
@@ -23245,10 +23252,12 @@ QString displayed_first_row(const std::unique_ptr<term::Terminal_session>& sessi
     return presented ? snapshot_row_text(*presented, 0) : QStringLiteral("<unpresentable>");
 }
 
-// With less history than new rows, the display also needs trailing rows
-// absent from the frozen frame. The normal early release must publish the
-// live grid rather than inventing padding or leaving the old size displayed.
-bool test_short_history_held_growth_releases_early()
+// A short document stays on the top row when the grid grows inside a
+// synchronized hold, at the release and through a later held shrink: the
+// rows growth adds are blank below the output, never blank rows above it.
+// Ported from master's short-history growth fix, which kept a fresh CMD
+// banner at the top; the content-end presentation gives the same outcome.
+bool test_short_history_held_growth_keeps_output_at_the_top()
 {
     bool ok = true;
     for (const int history : {0, 2}) {
@@ -23262,35 +23271,46 @@ bool test_short_history_held_growth_releases_early()
         {
             return false;
         }
+        const int prompt_row = history + 1;
+        const auto output_at_top = [&](const QString& prompt, const std::string& step) {
+            const auto displayed = term::make_presented_snapshot(session->latest_render_snapshot_handle());
+            bool rows_ok = displayed && displayed->cursor.position.row == prompt_row &&
+                snapshot_row_text(*displayed, 0) == QStringLiteral("scroll-line-000") &&
+                snapshot_row_text(*displayed, prompt_row) == prompt;
+            for (int row = prompt_row + 1; displayed && row < displayed->grid_size.rows; ++row) {
+                rows_ok = rows_ok && snapshot_row_text(*displayed, row).isEmpty();
+            }
+            if (!rows_ok) {
+                std::cerr << "history " << history << ", " << step << ":";
+                for (int row = 0; displayed && row < displayed->grid_size.rows; ++row) {
+                    std::cerr << " \"" << snapshot_row_text(*displayed, row).toStdString() << '"';
+                }
+                std::cerr << '\n';
+            }
+            return check(rows_ok, "the short document starts on the top row with blank rows below it");
+        };
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")) &&
                 session->synchronized_output_hold_active() &&
                 session->resize(QSizeF(200.0, 120.0), {6, 20}).code == term::Terminal_session_result_code::ACCEPTED,
-            "the short-history session holds output while growing from two to six rows");
-        const auto released = session->latest_render_snapshot_handle();
-        const auto displayed = term::make_presented_snapshot(released);
-        ok &= check(!session->synchronized_output_hold_active() && !session->render_publication_blocked() &&
-                released && !released->frozen_basis && released->grid_size.rows == 6 && displayed &&
-                snapshot_row_text(*displayed, 0) == QStringLiteral("scroll-line-000") &&
-                snapshot_row_text(*displayed, history + 1) == QStringLiteral("$ held") &&
-                displayed->cursor.position.row == history + 1,
-            "short-history growth releases to the live grid with output at the top and uncovered rows below");
+            "the short-history session grows from two to six rows inside a hold");
+        const auto grown = session->latest_render_snapshot_handle();
+        ok &= check(grown && grown->grid_size.rows == 6, "the grown publication has six rows");
+        // Whether the hold survives the growth, the prompt row shows either the
+        // held frame's prompt or the released output.
+        ok &= output_at_top(session->synchronized_output_hold_active()
+                ? QStringLiteral("$") : QStringLiteral("$ held"),
+            "growth inside the hold");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
-                !session->synchronized_output_hold_active() &&
-                displayed_first_row(session) == QStringLiteral("scroll-line-000"),
-            "the later ESU keeps the released short-history presentation");
+                !session->synchronized_output_hold_active(),
+            "the short-history session releases its hold");
+        ok &= output_at_top(QStringLiteral("$ held"), "after the release");
 
-        // The frozen basis now owns all six rows. Shrinking it can preserve
-        // the hold, and must adapt vacancy rather than the bounded shift.
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")) &&
                 session->resize(QSizeF(200.0, 100.0), {5, 20}).code == term::Terminal_session_result_code::ACCEPTED,
             "the short-history session starts another hold and shrinks one row");
-        const auto shrunk = session->latest_render_snapshot_handle();
-        ok &= check(session->synchronized_output_hold_active() && shrunk && shrunk->frozen_basis &&
-                shrunk->grid_size.rows == 5 && shrunk->viewport.presentation.hidden_rows == history &&
-                displayed_first_row(session) == QStringLiteral("scroll-line-000"),
-            "a covered held shrink retains the bounded history shift and first displayed row");
+        ok &= output_at_top(QStringLiteral("$ held"), "a held shrink");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-            "the covered shrink releases normally");
+            "the held shrink releases normally");
     }
     return ok;
 }
@@ -23298,7 +23318,7 @@ bool test_short_history_held_growth_releases_early()
 // A held growth that leaves a detached view beyond the new maximum needs
 // rows the hold did not capture, so its frozen frame cannot be presented.
 // The growth then ends the application hold early, and the ordinary release
-// publishes the live frame at the new grid (DESIGN 5.7). The application's
+// publishes the live frame at the new grid. The application's
 // later ESU, a stale-hold timeout and a fresh BSU behave as after any
 // release.
 bool test_incompatible_held_growth_releases_early()
@@ -23321,7 +23341,7 @@ bool test_incompatible_held_growth_releases_early()
     const auto released_display = term::make_presented_snapshot(released);
     ok &= check(!session->synchronized_output_hold_active() && !session->render_publication_blocked() &&
             released && released->grid_size.rows == 6 && !released->frozen_basis &&
-            released->viewport.presentation.policy == term::Terminal_presentation_policy::AUTOMATIC &&
+            released->viewport.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
             term::presentation_max_offset_from_tail(released->viewport) == 96 &&
             released->viewport.offset_from_tail == 96 && released_display &&
             snapshot_row_text(*released_display, 0) == QStringLiteral("scroll-line-000"),
@@ -23432,7 +23452,7 @@ bool test_early_release_keeps_deferred_scroll_and_selection()
 // reaches the published frame as a host resize does once its output is
 // ingested: a frozen frame the new grid can present is adapted and the hold
 // continues, and one it cannot present ends the hold early with the live
-// frame (DESIGN 5.7). A later host resize to the grid the parser already
+// frame. A later host resize to the grid the parser already
 // applied publishes nothing new.
 bool test_parser_resize_inside_hold_reconciles_like_host_resize()
 {
@@ -23466,8 +23486,8 @@ bool test_parser_resize_inside_hold_reconciles_like_host_resize()
             top->latest_render_snapshot_handle()->grid_size.rows == 6,
         "the application's later ESU is harmless");
 
-    // At the tail the frozen frame lacks only leading rows, which become
-    // unused slots, so the hold continues on the adapted frame.
+    // At the tail growth also requires uncaptured history, so the hold ends
+    // before the replacement frame acquires those real rows.
     std::unique_ptr<term::Terminal_session> tail;
     Scripted_backend* tail_backend = start_two_row_history_session(tail, 0);
     if (tail_backend == nullptr) {
@@ -23477,23 +23497,18 @@ bool test_parser_resize_inside_hold_reconciles_like_host_resize()
         "the tail session holds an update, resizes the text area and writes");
     const auto adapted = tail->latest_render_snapshot_handle();
     const auto adapted_display = term::make_presented_snapshot(adapted);
-    bool slots_above = adapted_display != nullptr;
-    for (int row = 0; slots_above && row < 4; ++row) {
-        slots_above = snapshot_row_text(*adapted_display, row).isEmpty();
-    }
-    ok &= check(tail->synchronized_output_hold_active() &&
-            adapted->grid_size.rows == 6 && adapted->frozen_basis &&
+    ok &= check(!tail->synchronized_output_hold_active() && adapted_display &&
+            adapted->grid_size.rows == 6 && !adapted->frozen_basis &&
             term::presentation_max_offset_from_tail(adapted->viewport) == 96 &&
-            slots_above &&
-            snapshot_row_text(*adapted_display, 4) == QStringLiteral("scroll-line-100") &&
-            snapshot_row_text(*adapted_display, 5) == QStringLiteral("$"),
-        "a parser resize the hold can present adapts the frozen frame and keeps the hold");
+            snapshot_row_text(*adapted_display, 0) == QStringLiteral("scroll-line-096") &&
+            snapshot_row_text(*adapted_display, 5) == QStringLiteral("$ held"),
+        "a parser resize requiring uncaptured history releases before presenting its complete current tail");
     ok &= check(tail->resize(QSizeF(200.0, 120.0), {6, 20}).code ==
                 term::Terminal_session_result_code::ACCEPTED &&
-            tail->synchronized_output_hold_active() &&
+            !tail->synchronized_output_hold_active() &&
             tail->latest_render_snapshot_handle()->grid_size.rows == 6 &&
-            !snapshot_contains_text(*tail->latest_render_snapshot_handle(), QStringLiteral("held")),
-        "a later host resize to the same grid keeps the held frame");
+            snapshot_contains_text(*tail->latest_render_snapshot_handle(), QStringLiteral("held")),
+        "a later host resize to the same grid retains the coherent released frame");
     ok &= check(tail_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
             !tail->latest_render_snapshot_handle()->frozen_basis &&
             snapshot_contains_text(*tail->latest_render_snapshot_handle(), QStringLiteral("$ held")),
@@ -23520,7 +23535,9 @@ bool test_held_alternate_growth_keeps_its_hold()
     ok &= check(session->synchronized_output_hold_active() && held && held->frozen_basis &&
             held->grid_size.rows == 6 &&
             held->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
-            term::make_presented_snapshot(held) == held,
+            held->viewport.presentation.policy == term::Terminal_presentation_policy::NATIVE &&
+            term::make_presented_snapshot(held) &&
+            snapshot_row_text(*term::make_presented_snapshot(held), 0) == QStringLiteral("alt"),
         "an alternate-screen growth adapts the held frame and keeps the hold");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l\x1b[?1049l")) &&
             !session->latest_render_snapshot_handle()->frozen_basis,
@@ -23544,48 +23561,47 @@ bool test_mapping_change_without_native_geometry_change_repaints()
 {
     bool ok = true;
 
-    std::unique_ptr<term::Terminal_session> automatic;
-    Scripted_backend* automatic_backend = make_session(automatic);
+    std::unique_ptr<term::Terminal_session> growing;
+    Scripted_backend* growing_backend = make_session(growing);
     term::Terminal_launch_config launch_config = valid_launch_config();
     launch_config.initial_grid_size = {2, 20};
-    ok &= check(automatic->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
-        "vacancy-consumption session starts");
-    ok &= check(automatic_backend->emit_output(numbered_scroll_lines(5) + QByteArrayLiteral("$ ")),
-        "vacancy-consumption session writes a prompt with enough history to fill the growth");
-    automatic->resize(QSizeF(200.0, 120.0), {6, 20});
-    const auto before = automatic->latest_render_snapshot_handle();
-    ok &= check(automatic_backend->emit_output(QByteArrayLiteral("x\r\n")),
-        "output moves the cursor into the vacancy");
-    const auto after = automatic->latest_render_snapshot_handle();
+    ok &= check(growing->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "content-end session starts");
+    ok &= check(growing_backend->emit_output(QByteArrayLiteral("a\r\n$ ")),
+        "content-end session writes a prompt");
+    growing->resize(QSizeF(200.0, 120.0), {6, 20});
+    const auto before = growing->latest_render_snapshot_handle();
+    ok &= check(growing_backend->emit_output(QByteArrayLiteral("x\r\n")),
+        "output extends the current content end");
+    const auto after = growing->latest_render_snapshot_handle();
     ok &= check(before && after &&
             term::viewport_mappings_match(before->viewport, after->viewport) &&
-            before->viewport.presentation.hidden_rows == 4 &&
-            after->viewport.presentation.hidden_rows == 3 &&
+            before->viewport.presentation.content_end_row_exclusive == 2 &&
+            after->viewport.presentation.content_end_row_exclusive == 3 &&
             !term::snapshots_share_row_identity_space(*before, *after) &&
             full_repaint(*after),
-        "output consuming vacancy repaints every row at an unchanged native viewport");
+        "output extending the content end repaints every row at an unchanged native viewport");
 
-    std::unique_ptr<term::Terminal_session> companion;
-    Scripted_backend* companion_backend = make_session(companion);
+    std::unique_ptr<term::Terminal_session> clear_page;
+    Scripted_backend* clear_backend = make_session(clear_page);
     launch_config.initial_grid_size = {4, 20};
-    ok &= check(companion->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
-        "insertion-change session starts");
-    companion->set_companion_presentation(true);
-    ok &= check(companion_backend->emit_output(QByteArrayLiteral("l0\r\nl1\r\nl2\r\n$ ")),
-        "insertion-change session writes four rows");
-    companion->resize(QSizeF(200.0, 40.0), {2, 20});
-    companion->resize(QSizeF(200.0, 80.0), {4, 20});
-    const auto displaced = companion->latest_render_snapshot_handle();
-    ok &= check(companion_backend->emit_output(QByteArrayLiteral("\x1b[2J")),
-        "whole-screen erasure revokes the resize-displaced rows");
-    const auto cleared = companion->latest_render_snapshot_handle();
+    ok &= check(clear_page->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "clear-page session starts");
+    ok &= check(clear_backend->emit_output(QByteArrayLiteral("l0\r\nl1\r\nl2\r\n$ ")),
+        "clear-page session writes four rows");
+    clear_page->resize(QSizeF(200.0, 40.0), {2, 20});
+    clear_page->resize(QSizeF(200.0, 80.0), {4, 20});
+    const auto displaced = clear_page->latest_render_snapshot_handle();
+    ok &= check(clear_backend->emit_output(QByteArrayLiteral("\x1b[2J")),
+        "whole-screen erasure establishes the current clear page");
+    const auto cleared = clear_page->latest_render_snapshot_handle();
     ok &= check(displaced && cleared &&
             displaced->viewport.scrollback_rows == cleared->viewport.scrollback_rows &&
-            displaced->viewport.presentation.insertion_row == 0 &&
-            cleared->viewport.presentation.insertion_row == 2 &&
+            displaced->viewport.presentation.clear_page_start_row == 0 &&
+            cleared->viewport.presentation.clear_page_start_row == 2 &&
             !term::snapshots_share_row_identity_space(*displaced, *cleared) &&
             full_repaint(*cleared),
-        "a Companion insertion change at constant S repaints every row");
+        "a clear-page boundary change at constant history repaints every row");
 
     term::Terminal_session_config evicting_config;
     evicting_config.scrollback_limit = 3;
@@ -23608,6 +23624,156 @@ bool test_mapping_change_without_native_geometry_change_repaints()
     return ok;
 }
 
+// Consumer capacity is independent of the native grid: a small canvas needs
+// offsets beyond raw history, and a large canvas can need rows after the native
+// source window. A held frame must not fill a newly requested interval with live
+// rows from a later state.
+bool test_search_highlights_row_coverage_with_native_source_geometry()
+{
+    bool ok = true;
+    for (const bool taller_consumer : {false, true}) {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch = valid_launch_config();
+        launch.initial_grid_size = {taller_consumer ? 2 : 6, 20};
+        ok &= check(session->start(launch).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(taller_consumer
+                    ? QByteArrayLiteral("header\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5\r\nrow6\r\nrow7\r\nrow8\r\nprompt>")
+                    : QByteArrayLiteral("header\r\nsecond\r\nmiddle\r\nprompt>")),
+            "coverage search fixture publishes a retained header");
+        const int display_rows = taller_consumer ? 12 : 6;
+        if (taller_consumer) {
+            session->set_canvas_presentation_rows(display_rows);
+        }
+        else {
+            ok &= check(session->resize(QSizeF(200.0, 40.0), {2, 20}).code ==
+                    term::Terminal_session_result_code::ACCEPTED &&
+                    session->resize(QSizeF(200.0, 120.0), {6, 20}).code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+                "coverage search fixture archives its header through shrink and growth");
+        }
+        const auto before_search = session->latest_render_snapshot_handle();
+        if (!check(before_search && term::render_snapshot_row_coverage_is_coherent(*before_search) &&
+                before_search->row_coverage_snapshot->grid_size.rows != before_search->grid_size.rows,
+                "search coverage has independent row capacity in the same native source publication"))
+        {
+            return false;
+        }
+        const auto header_identity = before_search->row_coverage_snapshot->visible_line_provenance.front();
+        session->set_search_query(QStringLiteral("header"));
+        ok &= check(session->wait_for_search_completion_for_testing(std::chrono::seconds(5)) &&
+                session->search_result_state().match_count == 1,
+            "coverage search finds the one retained header");
+        (void)session->scroll_published_viewport_to_offset_from_tail(0);
+        const auto source = session->latest_render_snapshot_handle();
+        const auto displayed = term::make_presented_snapshot(source, display_rows, 0);
+        const auto is_header_span = [](const auto& span, int row) {
+            return span.row == row && span.first_column == 0 && span.column_count == 6 && span.current;
+        };
+        ok &= check(source && term::render_snapshot_row_coverage_is_coherent(*source) &&
+                source->row_coverage_snapshot->visible_line_provenance.front().retained_line_id ==
+                    header_identity.retained_line_id &&
+                source->row_coverage_snapshot->visible_line_provenance.front().content_generation ==
+                    header_identity.content_generation &&
+                std::any_of(source->row_coverage_snapshot->search_match_spans.begin(),
+                    source->row_coverage_snapshot->search_match_spans.end(),
+                    [&](const auto& span) { return is_header_span(span, 0); }) &&
+                displayed && snapshot_row_text(*displayed, 0) == QStringLiteral("header") &&
+                std::any_of(displayed->search_match_spans.begin(), displayed->search_match_spans.end(),
+                    [&](const auto& span) { return is_header_span(span, 0); }),
+            taller_consumer
+                ? "coverage taller than the native grid paints its retained search match through the shared mapping"
+                : "coverage shorter than the native grid paints its retained search match through the shared mapping");
+    }
+    return ok;
+}
+
+bool test_canvas_capacity_uses_its_own_range_and_frozen_coverage()
+{
+    bool ok = true;
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {24, 20};
+
+    std::unique_ptr<term::Terminal_session> small;
+    Scripted_backend* small_backend = make_session(small);
+    ok &= check(small->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+            small_backend->emit_output(numbered_scroll_lines(31) + QByteArrayLiteral("$ ")),
+        "a native 24-row session fills eight history rows and its live screen");
+    small->set_canvas_presentation_rows(6);
+    (void)small->scroll_canvas_presentation_lines(1000, 6);
+    const auto small_source = small->latest_render_snapshot_handle();
+    const auto small_display = term::make_presented_snapshot(small_source, 6, 26);
+    ok &= check(small_source && small_source->grid_size.rows == 24 &&
+            small_source->viewport.scrollback_rows == 8 && small_source->viewport.offset_from_tail == 8 &&
+            small_source->presentation_rows == 6 && small_source->presentation_offset_from_tail == 26 &&
+            small_display && snapshot_row_text(*small_display, 0) == QStringLiteral("scroll-line-000") &&
+            snapshot_row_text(*small_display, 5) == QStringLiteral("scroll-line-005"),
+        "a six-row canvas reaches the first rows at offset 26 while native offset stays bounded by eight");
+
+    std::unique_ptr<term::Terminal_session> large;
+    Scripted_backend* large_backend = make_session(large);
+    ok &= check(large->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+            large_backend->emit_output(numbered_scroll_lines(1023) + QByteArrayLiteral("$ ")) &&
+            large_backend->emit_output(QByteArrayLiteral("\x1b[H\x1b[2J$ ")),
+        "a native 24-row session retains 1000 history rows and starts a one-row clear page");
+    large->set_canvas_presentation_rows(100);
+    (void)large->scroll_canvas_presentation_lines(120, 100);
+    const auto large_source = large->latest_render_snapshot_handle();
+    const auto large_display = term::make_presented_snapshot(large_source, 100, 120);
+    ok &= check(large_source && large_source->grid_size.rows == 24 &&
+            large_source->viewport.offset_from_tail == 120 &&
+            large_source->viewport.presentation.content_end_row_exclusive == 1001 &&
+            large_source->viewport.presentation.clear_page_start_row == 1000 &&
+            term::render_snapshot_row_coverage_is_coherent(*large_source) &&
+            large_display && snapshot_row_text(*large_display, 0) == QStringLiteral("scroll-line-880") &&
+            snapshot_row_text(*large_display, 99) == QStringLiteral("scroll-line-979"),
+        "a 100-row canvas receives the required 880..979 interval across the end of the native source window");
+
+    ok &= check(large_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[2;1Hhidden")) &&
+            large->synchronized_output_hold_active() &&
+            large->latest_render_snapshot_handle()->viewport.presentation.content_end_row_exclusive == 1001 &&
+            !snapshot_contains_text(*large->latest_render_snapshot_handle(), QStringLiteral("hidden")),
+        "live output inside a hold does not change the captured content end or row contents");
+    large->set_canvas_presentation_rows(200);
+    const auto released = large->latest_render_snapshot_handle();
+    const auto expanded = released
+        ? term::make_presented_snapshot(released, 200, released->presentation_offset_from_tail)
+        : nullptr;
+    ok &= check(!large->synchronized_output_hold_active() && released && !released->frozen_basis &&
+            released->viewport.presentation.content_end_row_exclusive == 1002 && expanded,
+        "requesting uncaptured rows ends the hold before acquiring a coherent larger consumer frame");
+    std::unique_ptr<term::Terminal_session> held_offset;
+    auto* held_backend = make_session(held_offset);
+    launch_config.initial_grid_size = {6, 20};
+    ok &= check(held_offset->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+            held_backend->emit_output(numbered_scroll_lines(15) + QByteArrayLiteral("$ ")),
+        "the held consumer offset fixture has H10, E16 and native capacity six");
+    held_offset->set_canvas_presentation_rows(2);
+    (void)held_offset->scroll_canvas_presentation_lines(3, 2);
+    const auto captured = held_offset->latest_render_snapshot_handle();
+    const auto captured_display = term::make_presented_snapshot(captured, 2, 3);
+    ok &= check(held_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\r\nhidden")),
+        "hidden output advances the live endpoint and detached anchor");
+    held_offset->set_canvas_presentation_rows(3);
+    const auto held_publication = held_offset->latest_render_snapshot_handle();
+    const auto held_display = term::make_presented_snapshot(held_publication,
+        held_publication->presentation_rows, held_publication->presentation_offset_from_tail);
+    ok &= check(held_offset->synchronized_output_hold_active() && held_publication->frozen_basis &&
+            held_publication->viewport.presentation == captured->viewport.presentation &&
+            held_publication->presentation_rows == 2 && held_publication->presentation_offset_from_tail == 3 &&
+            captured_display && held_display &&
+            held_display->visible_line_provenance == captured_display->visible_line_provenance,
+        "capacity-only publication retains frozen consumer coordinates despite hidden output");
+    ok &= check(held_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")), "the offset fixture releases its hold");
+    const auto resumed = held_offset->latest_render_snapshot_handle();
+    const auto resumed_display = term::make_presented_snapshot(resumed, 2, resumed->presentation_offset_from_tail);
+    ok &= check(resumed_display && captured_display &&
+            resumed_display->visible_line_provenance.front().retained_line_id ==
+                captured_display->visible_line_provenance.front().retained_line_id,
+        "release resolves the frozen consumer's detached row by retained identity");
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -23620,11 +23786,19 @@ int main(int argc, char** argv)
         ok &= test_saved_primary_anchor_survives_constant_s_eviction();
         ok &= test_detached_anchor_keeps_first_displayed_row();
         ok &= test_frozen_frame_availability();
-        ok &= test_short_history_held_growth_releases_early();
+        ok &= test_short_history_held_growth_keeps_output_at_the_top();
         ok &= test_incompatible_held_growth_releases_early();
         ok &= test_early_release_keeps_deferred_scroll_and_selection();
         ok &= test_held_alternate_growth_keeps_its_hold();
         ok &= test_parser_resize_inside_hold_reconciles_like_host_resize();
+        ok &= test_canvas_capacity_uses_its_own_range_and_frozen_coverage();
+        ok &= test_search_highlights_row_coverage_with_native_source_geometry();
+        ok &= test_hidden_cursor_endpoint_releases_incompatible_geometry();
+        ok &= test_public_projection_resize_and_memory_invalidation();
+        ok &= test_public_projection_geometry_release_preserves_prior_invalidation();
+        if (argc == 2 && std::string_view(argv[1]) == "--content-end-only") {
+            return ok ? 0 : 1;
+        }
         ok &= test_resize_after_output_ending_in_escape_prefix_is_applied();
         ok &= test_key_after_output_ending_in_escape_prefix_is_written();
         ok &= test_carried_callback_ending_in_two_byte_escape_claims_its_epoch();
@@ -23688,7 +23862,6 @@ int main(int argc, char** argv)
     ok &= test_selection_snapshot_and_visible_text();
     ok &= test_selection_snapshot_during_blocked_publication();
     ok &= test_blocked_detach_resize_snapshot_metadata_coherence();
-    ok &= test_hidden_safe_cursor_is_clamped_in_geometry_snapshot();
     ok &= test_selection_internal_state_and_lease();
     ok &= test_selection_replacement_empty_cancel_and_payload_detach();
     ok &= test_selection_model_semantic_flags();
@@ -23729,12 +23902,10 @@ int main(int argc, char** argv)
     ok &= test_public_projection_controller_diagnostic_precedence();
     ok &= test_public_projection_controller_mutates_copied_viewport_only();
     ok &= test_public_projection_session_invalidates_off_viewport_scroll();
-    ok &= test_public_projection_resize_and_memory_invalidation();
     ok &= test_public_projection_release_clears_hold_lifecycle();
     ok &= test_public_projection_selection_mutation_is_ignored_during_hold();
     ok &= test_public_projection_entry_and_release_boundaries();
     ok &= test_public_projection_release_reconciliation();
-    ok &= test_public_projection_geometry_invalidation_composes_with_prior_invalidation();
     ok &= test_public_projection_rebases_hidden_safe_cursor();
     ok &= test_public_projection_publishes_natural_full_row_scroll();
     ok &= test_public_projection_scroll_carries_row_images();

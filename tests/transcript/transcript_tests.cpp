@@ -4812,11 +4812,14 @@ bool test_replay_tool_accepts_natural_public_projection_scroll_snapshot(
     ok &= check(
         session.resize(QSizeF(640.0, 160.0), term::terminal_grid_size_t{4, 20}).code ==
             term::Terminal_session_result_code::ACCEPTED,
-        "natural public projection resize invalidates projection");
+        "natural public projection resize grows beyond frozen row coverage");
+    ok &= check(!session.synchronized_output_hold_active() &&
+            !session.public_release_intent_for_testing().has_value(),
+        "natural public projection growth releases the unpresentable frozen frame");
     ok &= check(
         record_offset_scroll(QStringLiteral("app.scrollbar.thumb"), 1).action ==
-            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED,
-        "natural public projection records invalidated deferred app scrollbar intent");
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records a live app scrollbar move after early release");
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
     recorder.reset();
 
@@ -4824,28 +4827,30 @@ bool test_replay_tool_accepts_natural_public_projection_scroll_snapshot(
         term::read_terminal_transcript(path, &error);
     ok &= check(events.has_value(), "natural public projection transcript parses");
     if (events.has_value()) {
-        bool has_deferred_scroll = false;
-        bool has_invalidated_release = false;
+        bool has_geometry_release = false;
+        bool has_live_scroll_after_release = false;
         for (const term::Terminal_transcript_event& event : *events) {
-            if (event.kind == QStringLiteral("surface.scroll") &&
+            if (has_geometry_release && event.kind == QStringLiteral("surface.scroll") &&
+                event.object.value(QStringLiteral("source")).toString() ==
+                    QStringLiteral("app.scrollbar.thumb") &&
                 event.object.value(QStringLiteral("action")).toString() ==
-                    QStringLiteral("deferred_intent_recorded"))
+                    QStringLiteral("viewport_moved"))
             {
-                has_deferred_scroll = true;
+                has_live_scroll_after_release = true;
             }
             if (event.kind == QStringLiteral("snapshot") &&
                 event.object.value(QStringLiteral("diagnostic_reason")).toString() ==
-                    QStringLiteral("public_projection_invalidated_deferred_intent") &&
+                    QStringLiteral("public_projection_geometry_invalidated") &&
                 event.object.value(QStringLiteral("release_reconciliation_result")).toString() ==
-                    QStringLiteral("deferred_offset"))
+                    QStringLiteral("sticky_tail"))
             {
-                has_invalidated_release = true;
+                has_geometry_release = true;
             }
         }
-        ok &= check(has_deferred_scroll,
-            "natural public projection transcript includes deferred scroll result");
-        ok &= check(has_invalidated_release,
-            "natural public projection transcript includes invalidated deferred release");
+        ok &= check(has_geometry_release,
+            "natural public projection transcript includes the early geometry release");
+        ok &= check(has_live_scroll_after_release,
+            "natural public projection transcript records the subsequent scroll against live content");
 
         QStringList expected_sources = {
             QStringLiteral("api.lines"),

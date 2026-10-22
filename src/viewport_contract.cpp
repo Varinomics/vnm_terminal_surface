@@ -23,6 +23,14 @@ void apply_scrollback_rows(Terminal_viewport_state& state, int rows)
 {
     const int old_rows = state.scrollback_rows;
     state.scrollback_rows = std::max(0, rows);
+    if (state.presentation.policy == Terminal_presentation_policy::CONTENT_TAIL) {
+        const int delta = state.scrollback_rows - old_rows;
+        state.presentation.content_end_row_exclusive += delta;
+        state.presentation.clear_page_start_row = std::clamp(
+            state.presentation.clear_page_start_row + std::min(0, delta),
+            0,
+            state.scrollback_rows);
+    }
 
     if (!state.follow_tail && state.scrollback_rows > old_rows) {
         state.offset_from_tail += state.scrollback_rows - old_rows;
@@ -35,6 +43,28 @@ void apply_scrollback_rows(Terminal_viewport_state& state, int rows)
     clamp_state_offset(state);
 }
 
+std::optional<Terminal_presentation_anchor> detached_anchor(const Terminal_viewport_state& state)
+{
+    if (state.follow_tail) {
+        return std::nullopt;
+    }
+    const int end_row = state.presentation.policy == Terminal_presentation_policy::CONTENT_TAIL
+        ? state.presentation.content_end_row_exclusive
+        : state.scrollback_rows + state.visible_rows;
+    return presentation_first_displayed_row(state, 0, end_row);
+}
+
+void apply_visible_rows(Terminal_viewport_state& state, int rows)
+{
+    const auto anchor = detached_anchor(state);
+    state.visible_rows = rows;
+    if (anchor.has_value()) {
+        state.offset_from_tail =
+            presentation_offset_for_logical_row(state, anchor->logical_row, anchor->display_row);
+    }
+    clamp_state_offset(state);
+}
+
 }
 
 Terminal_viewport_result Terminal_viewport_controller::set_visible_rows(int rows)
@@ -43,10 +73,8 @@ Terminal_viewport_result Terminal_viewport_controller::set_visible_rows(int rows
         return {Terminal_viewport_result_code::INVALID_VISIBLE_ROWS};
     }
 
-    m_state.visible_rows = rows;
-    m_primary_state.visible_rows = rows;
-    clamp_state_offset(m_state);
-    clamp_state_offset(m_primary_state);
+    apply_visible_rows(m_state, rows);
+    apply_visible_rows(m_primary_state, rows);
     return {};
 }
 
@@ -68,12 +96,7 @@ void Terminal_viewport_controller::set_presentation(Terminal_presentation_mappin
     Terminal_viewport_state& primary = m_state.active_buffer == Terminal_buffer_id::ALTERNATE
         ? m_primary_state
         : m_state;
-    const std::optional<Terminal_presentation_anchor> anchor = primary.follow_tail
-        ? std::nullopt
-        : presentation_first_displayed_row(
-            primary,
-            0,
-            primary.scrollback_rows + primary.visible_rows);
+    const auto anchor = detached_anchor(primary);
     primary.presentation = presentation;
     if (anchor.has_value()) {
         primary.offset_from_tail =
@@ -180,11 +203,7 @@ int Terminal_viewport_controller::max_offset_from_tail() const
 
 int Terminal_viewport_controller::first_visible_logical_row() const
 {
-    if (m_state.active_buffer == Terminal_buffer_id::ALTERNATE) {
-        return 0;
-    }
-
-    return m_state.scrollback_rows - m_state.offset_from_tail;
+    return presentation_requested_logical_row(m_state, 0);
 }
 
 Terminal_viewport_coordinate_result
@@ -194,9 +213,13 @@ Terminal_viewport_controller::viewport_row_to_logical_row(int viewport_row) cons
         return {Terminal_viewport_coordinate_result_code::INVALID_VIEWPORT_ROW, 0};
     }
 
+    const int logical_row = presentation_requested_logical_row(m_state, viewport_row);
+    if (logical_row < 0) {
+        return {Terminal_viewport_coordinate_result_code::INVALID_VIEWPORT_ROW, 0};
+    }
     return {
         Terminal_viewport_coordinate_result_code::OK,
-        first_visible_logical_row() + viewport_row,
+        logical_row,
     };
 }
 

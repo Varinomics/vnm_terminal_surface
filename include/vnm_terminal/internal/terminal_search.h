@@ -131,6 +131,12 @@ public:
         const Terminal_render_snapshot& snapshot,
         std::uint64_t                   active_buffer_epoch) const;
 
+    // Coverage has its own row capacity, but belongs to the source's native
+    // grid identity. Reject incoherent attachments before matching its rows.
+    std::vector<Terminal_render_search_match_span> spans_for_row_coverage(
+        const Terminal_render_snapshot& source,
+        std::uint64_t                   active_buffer_epoch) const;
+
 private:
     struct Shared_state;
 
