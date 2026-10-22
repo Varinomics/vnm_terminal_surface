@@ -23252,6 +23252,69 @@ QString displayed_first_row(const std::unique_ptr<term::Terminal_session>& sessi
     return presented ? snapshot_row_text(*presented, 0) : QStringLiteral("<unpresentable>");
 }
 
+// A short document stays on the top row when the grid grows inside a
+// synchronized hold, at the release and through a later held shrink: the
+// rows growth adds are blank below the output, never blank rows above it.
+// Ported from master's short-history growth fix, which kept a fresh CMD
+// banner at the top; the content-end presentation gives the same outcome.
+bool test_short_history_held_growth_keeps_output_at_the_top()
+{
+    bool ok = true;
+    for (const int history : {0, 2}) {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        auto launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {2, 20};
+        if (!check(session->start(launch_config).code == term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(numbered_scroll_lines(history + 1) + QByteArrayLiteral("$ ")),
+                "the short-history session starts with its first output at the top"))
+        {
+            return false;
+        }
+        const int prompt_row = history + 1;
+        const auto output_at_top = [&](const QString& prompt, const std::string& step) {
+            const auto displayed = term::make_presented_snapshot(session->latest_render_snapshot_handle());
+            bool rows_ok = displayed && displayed->cursor.position.row == prompt_row &&
+                snapshot_row_text(*displayed, 0) == QStringLiteral("scroll-line-000") &&
+                snapshot_row_text(*displayed, prompt_row) == prompt;
+            for (int row = prompt_row + 1; displayed && row < displayed->grid_size.rows; ++row) {
+                rows_ok = rows_ok && snapshot_row_text(*displayed, row).isEmpty();
+            }
+            if (!rows_ok) {
+                std::cerr << "history " << history << ", " << step << ":";
+                for (int row = 0; displayed && row < displayed->grid_size.rows; ++row) {
+                    std::cerr << " \"" << snapshot_row_text(*displayed, row).toStdString() << '"';
+                }
+                std::cerr << '\n';
+            }
+            return check(rows_ok, "the short document starts on the top row with blank rows below it");
+        };
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")) &&
+                session->synchronized_output_hold_active() &&
+                session->resize(QSizeF(200.0, 120.0), {6, 20}).code == term::Terminal_session_result_code::ACCEPTED,
+            "the short-history session grows from two to six rows inside a hold");
+        const auto grown = session->latest_render_snapshot_handle();
+        ok &= check(grown && grown->grid_size.rows == 6, "the grown publication has six rows");
+        // Whether the hold survives the growth, the prompt row shows either the
+        // held frame's prompt or the released output.
+        ok &= output_at_top(session->synchronized_output_hold_active()
+                ? QStringLiteral("$") : QStringLiteral("$ held"),
+            "growth inside the hold");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")) &&
+                !session->synchronized_output_hold_active(),
+            "the short-history session releases its hold");
+        ok &= output_at_top(QStringLiteral("$ held"), "after the release");
+
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")) &&
+                session->resize(QSizeF(200.0, 100.0), {5, 20}).code == term::Terminal_session_result_code::ACCEPTED,
+            "the short-history session starts another hold and shrinks one row");
+        ok &= output_at_top(QStringLiteral("$ held"), "a held shrink");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "the held shrink releases normally");
+    }
+    return ok;
+}
+
 // A held growth that leaves a detached view beyond the new maximum needs
 // rows the hold did not capture, so its frozen frame cannot be presented.
 // The growth then ends the application hold early, and the ordinary release
@@ -23723,6 +23786,7 @@ int main(int argc, char** argv)
         ok &= test_saved_primary_anchor_survives_constant_s_eviction();
         ok &= test_detached_anchor_keeps_first_displayed_row();
         ok &= test_frozen_frame_availability();
+        ok &= test_short_history_held_growth_keeps_output_at_the_top();
         ok &= test_incompatible_held_growth_releases_early();
         ok &= test_early_release_keeps_deferred_scroll_and_selection();
         ok &= test_held_alternate_growth_keeps_its_hold();
