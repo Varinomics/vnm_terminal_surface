@@ -1,6 +1,8 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/terminal_canvas_frame.h"
 #include "vnm_terminal/terminal_canvas_appearance.h"
+#include "vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h"
+#include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
 #include <QGuiApplication>
@@ -61,6 +63,90 @@ std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_text_frame(
         });
     }
     return frame;
+}
+
+bool test_projected_coverage_colors_and_optional_selector_admission()
+{
+    namespace terminal = vnm_terminal;
+    namespace internal = vnm_terminal::internal;
+    bool ok = true;
+    auto original = make_frame(201U);
+    original->content_extent->scrollback_rows = 2;
+    original->content_extent->content_bottom_row_exclusive = 2;
+    original->styles.push_back({0xffcdcd00U, original->default_background_rgba, 0U});
+    original->styles.push_back({0xff123456U, original->default_background_rgba, 0U});
+    original->color_references.emplace();
+    original->color_references->styles = {
+        {}, {3U, terminal::k_terminal_canvas_color_default},
+        {terminal::k_terminal_canvas_color_rgba, terminal::k_terminal_canvas_color_default},
+    };
+    original->cells.clear();
+    for (int row = 0; row < 2; ++row) {
+        original->cells.push_back({row, 0, 1, 1U, QStringLiteral("N")});
+        original->cells.push_back({row, 1, 1, 2U, QStringLiteral("R")});
+    }
+    original->row_coverage.emplace();
+    auto& coverage = *original->row_coverage;
+    coverage.rows = 4;
+    coverage.styles = original->styles;
+    coverage.color_references = original->color_references;
+    for (int row = 0; row < 4; ++row) {
+        coverage.cells.push_back({row, 0, 1, 1U, QStringLiteral("C")});
+        coverage.cells.push_back({row, 1, 1, 2U, QStringLiteral("R")});
+    }
+    original->presentation.emplace();
+    auto& presentation = *original->presentation;
+    presentation.policy = terminal::Terminal_canvas_presentation_policy::CONTENT_TAIL;
+    presentation.content_end_row_exclusive = 4;
+    presentation.covered_rows = 2;
+    presentation.visible_rows = 3;
+
+    auto themed = std::make_shared<terminal::Terminal_canvas_frame>(*original);
+    ok &= check(terminal::apply_terminal_canvas_color_scheme(*themed, QStringLiteral("Vintage")),
+        "a selected scheme applies to both native and coverage rows");
+    VNM_TerminalCanvas canvas;
+    canvas.set_presentation_rows(3);
+    if (!check(canvas.set_canvas_frame(themed), "the themed tail publication is accepted")) {
+        return false;
+    }
+    const auto displayed = internal::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas);
+    if (!check(displayed && displayed->grid_size.rows == 3 && displayed->cells.size() == 6U,
+            "actual projection combines one coverage row with two native rows"))
+    {
+        return false;
+    }
+    ok &= check(displayed->cells.front().text == QStringLiteral("C") &&
+            displayed->cells[2].text == QStringLiteral("N"),
+        "the assertion crosses the coverage/native source boundary");
+    const auto palette = terminal::terminal_color_scheme_preview(QStringLiteral("Vintage"))
+        .value(QStringLiteral("ansi")).toList();
+    const quint32 expected = palette[3].value<QColor>().rgba();
+    for (const auto& cell : displayed->cells) {
+        const auto& style = displayed->styles[cell.style_id];
+        const quint32 actual = internal::resolve_terminal_color_ref(style.foreground, displayed->color_state, true);
+        ok &= check(actual == (cell.position.column == 0 ? expected : 0xff123456U),
+            "every presented row uses the selected palette and preserves explicit RGB");
+    }
+    ok &= check(original->row_coverage->styles.front().foreground_rgba == 0xffffffffU &&
+            original->row_coverage->styles[1].foreground_rgba == 0xffcdcd00U,
+        "theme application leaves the shared source frame unchanged");
+    for (bool unknown : {false, true}) {
+        auto legacy = std::make_shared<terminal::Terminal_canvas_frame>(*original);
+        if (unknown) {
+            ++legacy->row_coverage->color_references->record_version;
+        }
+        else {
+            legacy->row_coverage->color_references.reset();
+        }
+        ok &= check(terminal::terminal_canvas_color_scheme_available(*legacy) &&
+                !terminal::apply_terminal_canvas_color_scheme(*legacy, QStringLiteral("Vintage")) &&
+                legacy->styles == original->styles && legacy->row_coverage->styles == original->row_coverage->styles,
+            "optional unavailable selectors skip recoloring atomically without invalidating native colors");
+        ok &= check(canvas.set_canvas_frame(legacy) && canvas.rows() == 3 &&
+                internal::VNM_TerminalCanvas_render_bridge::render_snapshot(canvas)->cells.size() == 6U,
+            "absent or unknown coverage selectors retain a valid displayed frame");
+    }
+    return ok;
 }
 
 bool test_frame_contract_and_text_bounds()
@@ -650,6 +736,7 @@ int main(int argc, char** argv)
     QGuiApplication application(argc, argv);
     bool            ok = true;
     ok &= test_frame_contract_and_text_bounds();
+    ok &= test_projected_coverage_colors_and_optional_selector_admission();
     ok &= test_wide_styles_require_coherent_admission_and_color_references();
     ok &= test_content_extent_properties_and_atomic_lifecycle();
     ok &= test_image_records_are_atomic_and_capability_local();

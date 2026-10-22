@@ -83,10 +83,10 @@ bool has_available_coverage(const Terminal_canvas_frame& frame)
 
 bool terminal_canvas_color_scheme_available(const Terminal_canvas_frame& frame)
 {
+    // Core frame admission also uses this native-table predicate. Optional
+    // coverage selectors must not make an otherwise renderable frame invalid.
     return frame.styles.size() <= terminal_canvas_style_limit(frame) &&
-        style_color_references_available(frame.styles, frame.color_references) &&
-        (!has_available_coverage(frame) || style_color_references_available(
-            frame.row_coverage->styles, frame.row_coverage->color_references));
+        style_color_references_available(frame.styles, frame.color_references);
 }
 
 bool apply_terminal_canvas_color_scheme(
@@ -94,7 +94,10 @@ bool apply_terminal_canvas_color_scheme(
     QStringView scheme_name)
 {
     const auto* scheme = internal::find_color_scheme(scheme_name);
-    if (!scheme || !terminal_canvas_color_scheme_available(frame)) {
+    if (!scheme || !terminal_canvas_color_scheme_available(frame) ||
+        (has_available_coverage(frame) && !style_color_references_available(
+            frame.row_coverage->styles, frame.row_coverage->color_references)))
+    {
         return false;
     }
     const auto colors = internal::make_terminal_color_state(*scheme);
