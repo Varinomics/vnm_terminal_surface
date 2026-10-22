@@ -5,6 +5,7 @@
 #include "../../src/native_backend_io_core.h"
 #include "../../src/native_backend_cleanup_owner.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
+#include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
@@ -6078,10 +6079,736 @@ bool test_native_cmd_resize()
     return ok;
 }
 
+// The files a cmd session uses to switch ConPTY's own buffers and to read them
+// back. `type` writes DECSET/DECRST 1049 through the console, so ConPTY acts on
+// them as it would for vim; the probe reports ConPTY's active buffer, row by
+// row, and its cursor, and stays alive until the test has compared it. Given a
+// size, it reports only once ConPTY's buffer has that size. It publishes the
+// report by renaming a finished file, so a report that exists is complete. The
+// scripts are run by relative path: cmd does not search the current directory
+// when NoDefaultCurrentDirectoryInExePath is set.
+bool write_native_cmd_screen_files(const QTemporaryDir& dir)
+{
+    const auto write_file = [&](
+            const QString&    name,
+            const QByteArray& bytes)
+        {
+            QFile file(dir.filePath(name));
+            return
+                file.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
+                file.write(bytes) == bytes.size();
+        };
+    return
+        write_file(QStringLiteral("lines.cmd"), QByteArrayLiteral(
+            "@for /l %%i in (1,1,6) do @echo line%%i\r\n")) &&
+        write_file(QStringLiteral("wrapped.cmd"), QByteArrayLiteral(
+            "@cls\r\n"
+            "@echo 01234567890123456789012345678901234567890123456789\r\n")) &&
+        // Five lines, then the cursor three rows up: cmd's next prompt
+        // overwrites the third line and two lines stay below the cursor.
+        write_file(QStringLiteral("below.txt"), QByteArrayLiteral(
+            "line1\r\nline2\r\nline3\r\nline4\r\nline5\x1b[3A")) &&
+        // The same, with spaces written to column 35 on the line the prompt
+        // overwrites: the prompt row keeps them after its text.
+        write_file(QStringLiteral("padded.txt"), QByteArrayLiteral(
+            "line1\r\nline2\r\nline3                              \r\nline4\r\nline5\x1b[3A")) &&
+        write_file(QStringLiteral("enter.txt"), QByteArrayLiteral("\x1b[?1049h")) &&
+        write_file(QStringLiteral("leave.txt"), QByteArrayLiteral("\x1b[?1049l")) &&
+        // A restore right after entering the alternate screen, and a restore
+        // after a replacement that saved the alternate screen's cursor.
+        write_file(QStringLiteral("enter_restore.txt"), QByteArrayLiteral(
+            "\x1b[?1049h\x1b" "8X")) &&
+        write_file(QStringLiteral("replace_restore.txt"), QByteArrayLiteral(
+            "\x1b[3;5H\x1b[?1049h\x1b[8;1H\x1b" "8Y")) &&
+        write_file(QStringLiteral("probe.cmd"), QByteArrayLiteral(
+            "@powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"%~dp0probe.ps1\" %*\r\n")) &&
+        write_file(QStringLiteral("probe.ps1"), QByteArrayLiteral(
+            "param([int]$Rows = 0, [int]$Columns = 0)\r\n"
+            "$ui = $Host.UI.RawUI\r\n"
+            "$deadline = (Get-Date).AddSeconds(20)\r\n"
+            "while ($Rows -gt 0 -and (Get-Date) -lt $deadline -and\r\n"
+            "       ($ui.BufferSize.Height -ne $Rows -or $ui.BufferSize.Width -ne $Columns)) {\r\n"
+            "    Start-Sleep -Milliseconds 10\r\n"
+            "}\r\n"
+            "$size = $ui.BufferSize\r\n"
+            "$area = New-Object Management.Automation.Host.Rectangle 0, 0, ($size.Width - 1), ($size.Height - 1)\r\n"
+            "$cells = $ui.GetBufferContents($area)\r\n"
+            "$lines = @('size ' + $size.Height + ' ' + $size.Width)\r\n"
+            "for ($row = 0; $row -lt $size.Height; $row++) {\r\n"
+            "    $text = ''\r\n"
+            "    for ($column = 0; $column -lt $size.Width; $column++) {\r\n"
+            "        $text += $cells[$row, $column].Character\r\n"
+            "    }\r\n"
+            "    $lines += $text.TrimEnd()\r\n"
+            "}\r\n"
+            "$cursor = $ui.CursorPosition\r\n"
+            "$lines += ('cursor ' + $cursor.Y + ' ' + $cursor.X)\r\n"
+            "$draft = Join-Path $PSScriptRoot 'buffer.tmp'\r\n"
+            "[IO.File]::WriteAllLines($draft, [string[]]$lines)\r\n"
+            "Move-Item -Force $draft (Join-Path $PSScriptRoot 'buffer.txt')\r\n"
+            "while (-not (Test-Path (Join-Path $PSScriptRoot 'release.txt'))) {\r\n"
+            "    Start-Sleep -Milliseconds 10\r\n"
+            "}\r\n"));
+}
+
+// What ConPTY's probe reported: the size of its active buffer, each row's text
+// without trailing blanks, and its cursor.
+struct Conpty_buffer_report
+{
+    term::terminal_grid_size_t     grid_size;
+    QStringList                    rows;
+    term::terminal_grid_position_t cursor;
+};
+
+std::optional<Conpty_buffer_report> read_conpty_buffer_report(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return std::nullopt;
+    }
+
+    QStringList lines = QString::fromUtf8(file.readAll()).split(QStringLiteral("\r\n"));
+    while (!lines.isEmpty() && lines.back().isEmpty()) {
+        lines.removeLast();
+    }
+    if (lines.size() < 2) {
+        return std::nullopt;
+    }
+
+    const QStringList size_fields   = lines.front().split(QChar(u' '));
+    const QStringList cursor_fields = lines.back().split(QChar(u' '));
+    if (size_fields.size()   != 3 || size_fields[0]   != QStringLiteral("size") ||
+        cursor_fields.size() != 3 || cursor_fields[0] != QStringLiteral("cursor"))
+    {
+        return std::nullopt;
+    }
+
+    Conpty_buffer_report report;
+    report.grid_size = {size_fields[1].toInt(), size_fields[2].toInt()};
+    report.rows      = lines.mid(1, lines.size() - 2);
+    report.cursor    = {cursor_fields[1].toInt(), cursor_fields[2].toInt()};
+    if (report.rows.size() != report.grid_size.rows) {
+        return std::nullopt;
+    }
+    return report;
+}
+
+// A real cmd under ConPTY, driven through the session that a surface owns.
+class Native_cmd_screen
+{
+public:
+    bool start(const QTemporaryDir& dir, term::terminal_grid_size_t grid_size, bool plain_cmd = false)
+    {
+        m_dir = dir.path();
+        m_prompt = plain_cmd ? QDir::toNativeSeparators(m_dir).toUtf8() + '>' : QByteArray("PROMPT>");
+        const QStringList arguments = plain_cmd
+            ? QStringList{QStringLiteral("/d")}
+            : QStringList{QStringLiteral("/d"), QStringLiteral("/q"), QStringLiteral("/k"),
+                  QStringLiteral("prompt PROMPT$G")};
+        auto launch = launch_config(qEnvironmentVariable("ComSpec"), arguments);
+        launch.working_directory = m_dir;
+        launch.initial_grid_size = grid_size;
+        return
+            m_session.start(launch).code == term::Terminal_session_result_code::ACCEPTED &&
+            wait_for([&] { return output().endsWith(m_prompt); });
+    }
+
+    void stop()
+    {
+        (void)m_session.terminate();
+        (void)wait_for([&] { return m_session.exit_status().has_value(); });
+    }
+
+    QByteArray output() const
+    {
+        QByteArray bytes;
+        for (const QByteArray& chunk : m_session.output_chunks()) {
+            bytes += chunk;
+        }
+        return bytes;
+    }
+
+    // Wakes on backend events, and every 10 ms for conditions such as the
+    // probe's report file that no backend event announces.
+    template <typename Predicate>
+    bool wait_for(Predicate predicate)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        for (;;) {
+            unsigned observed;
+            {
+                std::lock_guard lock(m_event_mutex);
+                observed = m_event_generation;
+            }
+            m_session.process_backend_callback_events();
+            if (predicate()) {
+                return true;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return false;
+            }
+            std::unique_lock lock(m_event_mutex);
+            (void)m_event_changed.wait_until(
+                lock,
+                std::min(deadline, now + std::chrono::milliseconds(10)),
+                [&] { return m_event_generation != observed; });
+        }
+    }
+
+    // Types a command line and waits for the prompt that follows it.
+    bool run(const QByteArray& command)
+    {
+        const std::size_t prompts = count_occurrences(output(), m_prompt);
+        return
+            m_session.write_user_bytes(command + "\r").code ==
+                term::Terminal_session_result_code::ACCEPTED &&
+            wait_for([&] { return count_occurrences(output(), m_prompt) > prompts; });
+    }
+
+    // Runs the probe and returns what it read while it waits, with the session
+    // drained to the same moment: the probe writes nothing, so everything ConPTY
+    // sent before it started has reached the model once the command's title
+    // update, which follows the command's echo, has.
+    std::optional<Conpty_buffer_report> probe()
+    {
+        return run_probe({}, std::nullopt);
+    }
+
+    // Resizes while the probe runs in place of cmd's prompt, and returns what
+    // the probe read once ConPTY's buffer had the new size. The prompt's
+    // cooked-read redraw cannot follow the resize, and the probe's command
+    // echo precedes it on both sides.
+    std::optional<Conpty_buffer_report> probe_resize(term::terminal_grid_size_t grid_size)
+    {
+        return run_probe(
+            QByteArray(" ") + QByteArray::number(grid_size.rows) + ' ' +
+                QByteArray::number(grid_size.columns),
+            grid_size);
+    }
+
+    // The snapshot taken while the last probe waited.
+    const std::optional<term::Terminal_render_snapshot>& probe_model() const
+    {
+        return m_probe_model;
+    }
+
+    // ConPTY applies a resize on its own thread, apart from input. Waiting until
+    // its active buffer has the new size keeps typed commands after the resize.
+    bool resize(term::terminal_grid_size_t grid_size)
+    {
+        if (!request_resize(grid_size)) {
+            return false;
+        }
+
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            const std::optional<Conpty_buffer_report> report = probe();
+            if (!report.has_value()) {
+                return false;
+            }
+            if (report->grid_size.rows    == grid_size.rows &&
+                report->grid_size.columns == grid_size.columns)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    term::Terminal_session& session()
+    {
+        return m_session;
+    }
+
+private:
+    bool request_resize(term::terminal_grid_size_t grid_size)
+    {
+        return
+            m_session.resize(
+                QSizeF(grid_size.columns * 10.0, grid_size.rows * 20.0),
+                grid_size).code == term::Terminal_session_result_code::ACCEPTED &&
+            wait_for([&] { return m_session.backend_geometry_in_sync(); });
+    }
+
+    std::optional<Conpty_buffer_report> run_probe(
+        const QByteArray&                         arguments,
+        std::optional<term::terminal_grid_size_t> resize_to)
+    {
+        const QString report_path  = QDir(m_dir).filePath(QStringLiteral("buffer.txt"));
+        const QString release_path = QDir(m_dir).filePath(QStringLiteral("release.txt"));
+        QFile::remove(report_path);
+        QFile::remove(release_path);
+        const qsizetype output_before = output().size();
+        if (m_session.write_user_bytes(".\\probe" + arguments + "\r").code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return std::nullopt;
+        }
+
+        const auto started = [&] { return output().indexOf(" - .\\probe", output_before) >= 0; };
+        if (resize_to.has_value() && (!wait_for(started) || !request_resize(*resize_to))) {
+            return std::nullopt;
+        }
+        const bool reported = wait_for([&] { return QFileInfo::exists(report_path) && started(); });
+        const std::optional<Conpty_buffer_report> report = reported
+            ? read_conpty_buffer_report(report_path)
+            : std::nullopt;
+        m_probe_model = m_session.latest_render_snapshot();
+        const std::size_t prompts = count_occurrences(output(), m_prompt);
+        (void)write_gate_file(release_path);
+        (void)wait_for([&] { return count_occurrences(output(), m_prompt) > prompts; });
+        return report;
+    }
+
+    std::mutex                                       m_event_mutex;
+    std::condition_variable                          m_event_changed;
+    unsigned                                         m_event_generation = 0U;
+    term::Terminal_session                           m_session{
+        term::make_windows_conpty_backend(),
+        [this]
+        {
+            term::Terminal_session_config config;
+            config.trace_output_chunk_limit = 4096U;
+            config.backend_event_notifier   = [this]
+            {
+                std::lock_guard lock(m_event_mutex);
+                ++m_event_generation;
+                m_event_changed.notify_all();
+            };
+            return config;
+        }()};
+    QString                                          m_dir;
+    QByteArray                                       m_prompt;
+    std::optional<term::Terminal_render_snapshot>    m_probe_model;
+};
+
+QStringList snapshot_row_texts(const term::Terminal_render_snapshot& snapshot)
+{
+    QStringList rows;
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        rows.push_back(QString(snapshot.grid_size.columns, QChar(u' ')));
+    }
+    for (const term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row >= 0 && cell.position.row < snapshot.grid_size.rows) {
+            rows[cell.position.row].replace(cell.position.column, 1, cell.text.to_qstring());
+        }
+    }
+    for (QString& row : rows) {
+        while (!row.isEmpty() && row.back() == QChar(u' ')) {
+            row.chop(1);
+        }
+    }
+    return rows;
+}
+
+bool screens_match(
+    const term::Terminal_render_snapshot& model,
+    const Conpty_buffer_report&           conpty,
+    const std::string&                    label)
+{
+    const QStringList model_rows = snapshot_row_texts(model);
+    const bool match =
+        model.grid_size.rows         == conpty.grid_size.rows    &&
+        model.grid_size.columns      == conpty.grid_size.columns &&
+        model_rows                   == conpty.rows              &&
+        model.cursor.position.row    == conpty.cursor.row        &&
+        model.cursor.position.column == conpty.cursor.column;
+    if (!match) {
+        std::cerr << label << ": model " << model.grid_size.rows << 'x' << model.grid_size.columns
+            << " cursor " << model.cursor.position.row << ',' << model.cursor.position.column
+            << " | ConPTY " << conpty.grid_size.rows << 'x' << conpty.grid_size.columns
+            << " cursor " << conpty.cursor.row << ',' << conpty.cursor.column << '\n';
+        for (int row = 0; row < std::max(model_rows.size(), conpty.rows.size()); ++row) {
+            std::cerr << "  " << row << " | "
+                << (row < model_rows.size() ? model_rows[row].toStdString() : std::string())
+                << " | "
+                << (row < conpty.rows.size() ? conpty.rows[row].toStdString() : std::string())
+                << '\n';
+        }
+    }
+    return check(match, label);
+}
+
+// A fresh CMD has no history to pull above its banner when its initial grid
+// grows. Compare ConPTY, the native model and the renderer's presentation so
+// an otherwise correct native resize cannot conceal a leading display gap.
+bool test_native_cmd_startup_growth()
+{
+    bool ok = true;
+    for (const int rows : {42, 43}) {
+        for (const bool hold_probe : {false, true}) {
+            const std::string label = "startup growth to " + std::to_string(rows) +
+                (hold_probe ? " with probe holding the console" : " with cmd reading input");
+            QTemporaryDir dir;
+            if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": fixture files")) {
+                return false;
+            }
+            Native_cmd_screen screen;
+            if (!check(screen.start(dir, {31, 118}, true), label + ": cmd starts")) {
+                screen.stop();
+                return false;
+            }
+            const auto initial = screen.session().latest_render_snapshot_handle();
+            const QString banner = snapshot_row_texts(*initial).front();
+            ok &= check(!banner.isEmpty() && initial->viewport.scrollback_rows == 0,
+                label + ": the banner begins at row zero without history");
+            std::optional<Conpty_buffer_report> report;
+            if (hold_probe) {
+                report = screen.probe_resize({rows, 118});
+            }
+            else {
+                ok &= check(screen.resize({rows, 118}), label + ": resize applied");
+                report = screen.probe();
+            }
+            ok &= check(report.has_value(), label + ": native buffer report available");
+            if (report.has_value()) {
+                ok &= screens_match(*screen.probe_model(), *report, label + ": model equals ConPTY");
+                const auto presented = term::make_presented_snapshot(
+                    std::make_shared<const term::Terminal_render_snapshot>(*screen.probe_model()));
+                ok &= check(presented != nullptr, label + ": renderer projection available");
+                if (presented) {
+                    ok &= check(snapshot_row_texts(*presented).front() == banner &&
+                            presented->cursor.position == screen.probe_model()->cursor.position,
+                        label + ": the displayed banner and cursor retain their native rows");
+                }
+            }
+            screen.stop();
+        }
+    }
+    return ok;
+}
+
+struct Native_cmd_alternate_case
+{
+    std::string                             name;
+    // The script that fills the primary screen before the child enters the
+    // alternate screen.
+    QByteArray                              setup;
+    std::vector<term::terminal_grid_size_t> sizes_before_replacement;
+    bool                                    replace_alternate = false;
+    std::vector<term::terminal_grid_size_t> sizes_after_replacement;
+};
+
+// ConPTY leaves its main buffer at its size while the alternate buffer is
+// active and resizes it once when it is used again: on return, and before an
+// active alternate buffer is replaced (screenInfo.cpp _handleDeferredResize).
+// No resize moves the cursor 1049 saved; the return restores it clamped
+// (adaptDispatch.cpp CursorRestoreState). After the child returns, the
+// session's primary screen has to be ConPTY's:
+// ConPTY places typed input with absolute cursor moves, so the echo lands
+// beside the prompt only then, and the probe compares every row.
+bool test_native_cmd_alternate_resize_case(const Native_cmd_alternate_case& test_case)
+{
+    const std::string label = "native cmd alternate resize, " + test_case.name;
+    QTemporaryDir dir;
+    if (!check(dir.isValid() && write_native_cmd_screen_files(dir),
+            label + ": files are written"))
+    {
+        return false;
+    }
+
+    Native_cmd_screen screen;
+    if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+        screen.stop();
+        return false;
+    }
+
+    bool ok = check(screen.run(test_case.setup), label + ": cmd fills the primary screen");
+    int smallest_rows = 12;
+    for (const auto* sizes : {&test_case.sizes_before_replacement, &test_case.sizes_after_replacement}) {
+        for (const term::terminal_grid_size_t grid_size : *sizes) {
+            smallest_rows = std::min(smallest_rows, grid_size.rows);
+        }
+    }
+    if (smallest_rows < 12) {
+        const std::optional<term::Terminal_render_snapshot> filled =
+            screen.session().latest_render_snapshot();
+        const QStringList filled_rows = snapshot_row_texts(*filled);
+        int last_written_row = filled->cursor.position.row;
+        for (int row = 0; row < filled_rows.size(); ++row) {
+            if (!filled_rows[row].isEmpty()) {
+                last_written_row = std::max(last_written_row, row);
+            }
+        }
+        ok &= check(last_written_row >= smallest_rows,
+            label + ": text or the prompt sits below the shrunk height, so shrinking moves rows");
+    }
+
+    // windows.h defines ALTERNATE, so the alternate buffer is named by exclusion.
+    ok &= check(screen.run("type enter.txt") &&
+            screen.session().latest_render_snapshot()->viewport.active_buffer !=
+                term::Terminal_buffer_id::PRIMARY,
+        label + ": the child enters the alternate screen");
+    for (const term::terminal_grid_size_t grid_size : test_case.sizes_before_replacement) {
+        ok &= check(screen.resize(grid_size), label + ": ConPTY applies the alternate-screen resize");
+    }
+    if (test_case.replace_alternate) {
+        const std::size_t entries = count_occurrences(screen.output(), "\x1b[?1049h");
+        ok &= check(screen.run("type enter.txt") &&
+                count_occurrences(screen.output(), "\x1b[?1049h") > entries,
+            label + ": the child replaces the active alternate screen");
+        for (const term::terminal_grid_size_t grid_size : test_case.sizes_after_replacement) {
+            ok &= check(screen.resize(grid_size), label + ": ConPTY applies the resize after replacement");
+        }
+    }
+
+    ok &= check(screen.run("type leave.txt") &&
+            screen.session().latest_render_snapshot()->viewport.active_buffer ==
+                term::Terminal_buffer_id::PRIMARY,
+        label + ": the child returns to the primary screen");
+
+    const auto cursor_row_text = [&] {
+        const std::optional<term::Terminal_render_snapshot> snapshot =
+            screen.session().latest_render_snapshot();
+        return snapshot_row_texts(*snapshot)[snapshot->cursor.position.row];
+    };
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>"),
+        label + ": the cursor is on the returned prompt");
+    ok &= check(screen.session().write_user_bytes("hello").code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            screen.wait_for([&] { return screen.output().contains("hello"); }),
+        label + ": cmd echoes typed input after return");
+    ok &= check(cursor_row_text() == QStringLiteral("PROMPT>hello"),
+        label + ": ConPTY's echo lands beside the session's prompt");
+    const qsizetype output_before_clear = screen.output().size();
+    ok &= check(screen.session().write_user_bytes("\x1b").code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            screen.wait_for([&] { return screen.output().size() > output_before_clear; }),
+        label + ": cmd clears the typed input");
+
+    const std::optional<Conpty_buffer_report> conpty = screen.probe();
+    ok &= check(conpty.has_value() && screen.probe_model().has_value(),
+        label + ": the probe reports ConPTY's primary buffer");
+    if (conpty.has_value() && screen.probe_model().has_value()) {
+        ok &= screens_match(*screen.probe_model(), *conpty,
+            label + ": every row and the cursor equal ConPTY's");
+    }
+
+    screen.stop();
+    return ok;
+}
+
+bool test_native_cmd_alternate_resize()
+{
+    const std::vector<Native_cmd_alternate_case> cases{
+        {
+            "exit at the original size",
+            QByteArrayLiteral(".\\lines"),
+            {{6, 40}, {12, 40}},
+            false,
+            {},
+        },
+        {
+            "exit at a different size",
+            QByteArrayLiteral(".\\lines"),
+            {{6, 40}, {14, 30}},
+            false,
+            {},
+        },
+        {
+            "replacement",
+            QByteArrayLiteral(".\\lines"),
+            {{6, 40}},
+            true,
+            {{12, 40}},
+        },
+        // Widening joins the wrapped line above the cursor 1049 saved. ConPTY
+        // restores the saved coordinates as they were, so the prompt follows
+        // them, not the rows.
+        {
+            "saved cursor through a joining reflow",
+            QByteArrayLiteral(".\\wrapped"),
+            {{12, 60}},
+            false,
+            {},
+        },
+        // Lines stay below the cursor 1049 saved, and the return shrinks and
+        // narrows the primary: ConPTY's reflow keeps the last rows with text,
+        // so rows above leave the screen instead of the lines below.
+        {
+            "text below the cursor, shorter and narrower",
+            QByteArrayLiteral("type below.txt"),
+            {{5, 30}},
+            false,
+            {},
+        },
+        // ConPTY trims written spaces from a line before it packs the line
+        // (textBuffer.cpp TextBuffer::Reflow), so a line padded past the new
+        // width stays one row.
+        {
+            "padded line above the cursor, shorter and narrower",
+            QByteArrayLiteral("type padded.txt"),
+            {{5, 30}},
+            false,
+            {},
+        },
+    };
+
+    bool ok = true;
+    for (const Native_cmd_alternate_case& test_case : cases) {
+        ok &= test_native_cmd_alternate_resize_case(test_case);
+    }
+    return ok;
+}
+
+// ConPTY creates an alternate buffer with the cursor of the buffer it is
+// entered from: the primary's, or the replaced alternate buffer's
+// (screenInfo.cpp _CreateAltBuffer). Output written before the application
+// positions the cursor, here cmd's prompt, has to land on ConPTY's rows.
+bool test_native_cmd_alternate_screen_entry()
+{
+    const std::string label = "native cmd alternate entry";
+    QTemporaryDir dir;
+    if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": files are written")) {
+        return false;
+    }
+
+    Native_cmd_screen screen;
+    if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+        screen.stop();
+        return false;
+    }
+
+    bool ok = check(screen.run(".\\lines"), label + ": cmd fills the primary screen");
+    ok &= check(screen.session().latest_render_snapshot()->cursor.position.row > 1,
+        label + ": the primary cursor is below the alternate screen's home row");
+    for (const char* step : {"entry", "replacement"}) {
+        const std::string step_label = label + ", " + step;
+        ok &= check(screen.run("type enter.txt") &&
+                screen.session().latest_render_snapshot()->viewport.active_buffer !=
+                    term::Terminal_buffer_id::PRIMARY,
+            step_label + ": the child is in the alternate screen");
+        const std::optional<Conpty_buffer_report> conpty = screen.probe();
+        ok &= check(conpty.has_value() && screen.probe_model().has_value(),
+            step_label + ": the probe reports ConPTY's alternate buffer");
+        if (conpty.has_value() && screen.probe_model().has_value()) {
+            ok &= screens_match(*screen.probe_model(), *conpty,
+                step_label + ": every row and the cursor equal ConPTY's");
+        }
+    }
+
+    ok &= check(screen.run("type leave.txt"), label + ": the child returns to the primary screen");
+    screen.stop();
+    return ok;
+}
+
+// ConPTY keeps one saved cursor for the main buffer and one for the alternate
+// buffer, apart from the buffers' rows, and an unused one restores to home
+// (adaptDispatch.hpp _savedCursorState). Every 1049h first saves the active
+// buffer's cursor, so a replacement saves the alternate one
+// (adaptDispatch.cpp _SetAlternateScreenBufferMode).
+bool test_native_cmd_alternate_saved_cursor()
+{
+    const std::string label = "native cmd alternate saved cursor";
+    QTemporaryDir dir;
+    if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": files are written")) {
+        return false;
+    }
+
+    Native_cmd_screen screen;
+    if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+        screen.stop();
+        return false;
+    }
+
+    struct Step
+    {
+        const char*             name;
+        std::vector<QByteArray> commands;
+    };
+    const std::vector<Step> steps{
+        {"restore right after entry",       {"type enter_restore.txt"}},
+        {"restore after a replacement",     {"type replace_restore.txt"}},
+        {"restore after leaving and entering again",
+            {"type leave.txt", "type enter_restore.txt"}},
+    };
+
+    bool ok = check(screen.run(".\\lines"), label + ": cmd fills the primary screen");
+    for (const Step& step : steps) {
+        const std::string step_label = label + ", " + step.name;
+        for (const QByteArray& command : step.commands) {
+            ok &= check(screen.run(command), step_label + ": cmd runs " + command.toStdString());
+        }
+        const std::optional<Conpty_buffer_report> conpty = screen.probe();
+        ok &= check(conpty.has_value() && screen.probe_model().has_value(),
+            step_label + ": the probe reports ConPTY's alternate buffer");
+        if (conpty.has_value() && screen.probe_model().has_value()) {
+            ok &= screens_match(*screen.probe_model(), *conpty,
+                step_label + ": every row and the cursor equal ConPTY's");
+        }
+    }
+
+    ok &= check(screen.run("type leave.txt"), label + ": the child returns to the primary screen");
+    screen.stop();
+    return ok;
+}
+
+// ConPTY reflows its main buffer on every resize and keeps the last rows that
+// hold text or the cursor, up to a screen from the cursor down (textBuffer.cpp
+// TextBuffer::Reflow). With lines below the cursor, a shrink drops rows from
+// the top. The reflow trims written spaces from a line before packing it, so
+// a padded line stays one row. The resize runs while the probe holds the
+// console, so cmd's prompt cannot redraw in between.
+bool test_native_cmd_primary_resize_with_text_below_the_cursor()
+{
+    bool ok = true;
+    for (const char* setup : {"type below.txt", "type padded.txt"}) {
+        const std::string label =
+            std::string("native cmd primary resize with text below the cursor, ") + setup;
+        QTemporaryDir dir;
+        if (!check(dir.isValid() && write_native_cmd_screen_files(dir), label + ": files are written")) {
+            ok = false;
+            continue;
+        }
+
+        Native_cmd_screen screen;
+        if (!check(screen.start(dir, {12, 40}), label + ": cmd starts at 12x40")) {
+            screen.stop();
+            ok = false;
+            continue;
+        }
+
+        ok &= check(screen.run(setup), label + ": cmd leaves lines below its prompt");
+        const std::optional<Conpty_buffer_report> conpty = screen.probe_resize({5, 30});
+        ok &= check(conpty.has_value() && screen.probe_model().has_value(),
+            label + ": the probe reports ConPTY's buffer after the resize");
+        if (conpty.has_value() && screen.probe_model().has_value()) {
+            ok &= check(conpty->grid_size.rows == 5 && conpty->grid_size.columns == 30,
+                label + ": ConPTY has the shorter and narrower size");
+            ok &= screens_match(*screen.probe_model(), *conpty,
+                label + ": every row and the cursor equal ConPTY's");
+        }
+
+        screen.stop();
+    }
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-startup-growth") {
+        bool ok = test_native_cmd_startup_growth();
+        ok &= wait_for_console_host_children_to_exit("native cmd startup growth");
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-alternate-resize") {
+        bool ok = test_native_cmd_alternate_resize();
+        ok &= wait_for_console_host_children_to_exit("native cmd alternate resize");
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-resize-text-below") {
+        bool ok = test_native_cmd_primary_resize_with_text_below_the_cursor();
+        ok &= wait_for_console_host_children_to_exit("native cmd resize with text below");
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-alternate-entry") {
+        bool ok = test_native_cmd_alternate_screen_entry();
+        ok &= test_native_cmd_alternate_saved_cursor();
+        ok &= wait_for_console_host_children_to_exit("native cmd alternate entry");
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-resize") {
         bool ok = test_native_cmd_resize();
         ok &= wait_for_console_host_children_to_exit("native cmd resize");

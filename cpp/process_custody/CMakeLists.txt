@@ -7,13 +7,17 @@ if(WIN32)
     list(APPEND _native_sources src/process_pipe_win.cpp src/process_channel_win.cpp
         src/process_spawn_win.cpp src/process_tree_win.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND _native_sources src/process_pipe_posix.cpp src/process_channel_posix.cpp
+    list(APPEND _native_sources src/process_channel_posix.cpp
         src/process_spawn_posix.cpp src/process_tree_posix.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    list(APPEND _native_sources src/process_pipe_posix.cpp src/process_channel_darwin.cpp
+    list(APPEND _native_sources src/process_channel_darwin.cpp
         src/process_spawn_darwin.cpp src/process_tree_darwin.cpp)
 else()
     message(FATAL_ERROR "vnm_process_custody supports Windows, Linux and Darwin")
+endif()
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    list(APPEND _native_sources src/process_pipe_posix.cpp src/process_stream_posix.cpp
+        src/process_spawn_common_posix.cpp)
 endif()
 
 add_library(vnm_process_custody STATIC ${_native_sources})
@@ -90,6 +94,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             set_tests_properties(vnm_process_custody_darwin_pty_tests PROPERTIES TIMEOUT 40)
         endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(vnm_process_custody_channel_resource_tests tests/channel_resource_tests.cpp)
+            target_link_libraries(vnm_process_custody_channel_resource_tests PRIVATE vnm_process_custody)
+            set_target_properties(vnm_process_custody_channel_resource_tests PROPERTIES
+                AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME vnm_process_custody_channel_resource_tests
+                COMMAND vnm_process_custody_channel_resource_tests)
+            set_tests_properties(vnm_process_custody_channel_resource_tests PROPERTIES TIMEOUT 10)
             add_test(NAME vnm_process_custody_started_descriptor_tests
                 COMMAND vnm_process_custody_tests --started-descriptor)
             set_tests_properties(vnm_process_custody_started_descriptor_tests PROPERTIES TIMEOUT 10)

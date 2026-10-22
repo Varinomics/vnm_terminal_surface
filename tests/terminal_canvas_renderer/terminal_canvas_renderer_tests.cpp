@@ -262,7 +262,7 @@ bool recorder_distinguishes_failed_candidate(
     return ok;
 }
 
-bool rendered_composition_handle_contract(
+bool rendered_presentation_handle_contract(
     QGuiApplication& application, QQuickWindow& window, VNM_TerminalCanvas& canvas)
 {
     namespace touch = vnm_terminal;
@@ -280,7 +280,20 @@ bool rendered_composition_handle_contract(
     selection.start = {2, 3, true};
     selection.end = {2, 10, true};
     selection.spans = {{2, 3, 7}};
-    selection.composition = touch::terminal_touch_selection_composition_t{1, 1};
+    frame->cursor.row = 5;
+    frame->cursor.visible = false;
+    // The legacy extent covers the occupied rows. The presentation endpoint
+    // below also includes the hidden logical cursor on the last native row.
+    frame->content_extent = touch::terminal_canvas_content_extent_t{
+        touch::k_terminal_canvas_content_extent_version, 2, 0, 0,
+        touch::Terminal_canvas_buffer::PRIMARY_BUFFER};
+    frame->presentation.emplace();
+    frame->presentation->policy = touch::Terminal_canvas_presentation_policy::CONTENT_TAIL;
+    frame->presentation->content_end_row_exclusive = 6;
+    frame->presentation->covered_rows = 6;
+    frame->presentation->visible_rows = 6;
+    frame->presentation->logical_cursor_visible = false;
+    canvas.set_presentation_rows(6);
     for (int row = 0; row < 6; ++row) {
         selection.visible_rows.push_back({100U + (std::uint64_t)row, 1U, 0});
     }
@@ -298,12 +311,16 @@ bool rendered_composition_handle_contract(
         &canvas, [&](const auto& request) { requests.push_back(request); });
     const auto cleanup = qScopeGuard([&] {
         canvas.set_touch_selection_enabled(false);
+        canvas.set_presentation_rows(0);
         QObject::disconnect(connection);
         renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
     });
     QImage rendered;
-    if (!check(canvas.set_canvas_frame(frame) && pump_until_rendered(application, window, canvas, rendered),
-            "the initial composition reaches a real committed canvas draw"))
+    if (!check(canvas.set_canvas_frame(frame), "the initial presentation frame is valid")) {
+        return false;
+    }
+    if (!check(pump_until_rendered(application, window, canvas, rendered),
+            "the initial presentation reaches a real committed canvas draw"))
     {
         return false;
     }
@@ -315,12 +332,12 @@ bool rendered_composition_handle_contract(
         canvas.complete_touch_selection_request({request.request_id, request.action,
             touch::Terminal_touch_selection_status::OK, 1U, {}, {}});
     };
-    const auto expect_scroll = [&](int padding, int native_rows, std::uint64_t row_id, const char* message) {
+    const auto expect_scroll = [&](int rows, int offset, std::uint64_t row_id, const char* message) {
         const auto& request = requests.back();
         return check(request.action == touch::Terminal_touch_selection_action::SCROLL_EXTEND &&
             request.target.row.retained_line_id == row_id && request.presentation &&
-            request.presentation->top_padding_rows == padding &&
-            request.presentation->visible_native_rows == native_rows, message);
+            request.presentation->visible_rows == rows &&
+            request.presentation->offset_from_tail == offset, message);
     };
     const auto next_scroll = [&] {
         const auto before = requests.size();
@@ -354,7 +371,7 @@ bool rendered_composition_handle_contract(
         }
         const auto report = recorder->snapshot();
         std::fprintf(stderr,
-            "held composition: candidate=%llu prepared=%llu committed=%d drew=%d retained_selection=%d "
+            "held presentation: candidate=%llu prepared=%llu committed=%d drew=%d retained_selection=%d "
             "retained_cell_height=%.3f previous_cell_height=%.3f\n",
             static_cast<unsigned long long>(candidate->sequence),
             static_cast<unsigned long long>(report.prepared_snapshot_sequence),
@@ -375,7 +392,7 @@ bool rendered_composition_handle_contract(
     increased->sequence = 802U;
     increased->cell_height = 25;
     increased->content_height = 150;
-    increased->selection->composition = touch::terminal_touch_selection_composition_t{4, 3};
+    canvas.set_presentation_rows(4);
     for (auto& row : increased->selection->visible_rows) { row.retained_line_id += 100U; }
     if (!check(install_held(increased), "an installed capacity increase remains behind the last committed draw")) {
         return false;
@@ -416,43 +433,43 @@ bool rendered_composition_handle_contract(
         }
         return false;
     }
-    bool ok = expect_scroll(1, 4, 100U,
-        "pending increase uses the last drawn row identity, metrics and prefix context");
+    bool ok = expect_scroll(6, 0, 100U,
+        "pending increase uses the last drawn row identity, metrics and consumer viewport");
     renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
     ++increased->sequence;
     if (!check(canvas.set_canvas_frame(increased) && pump_until_rendered(application, window, canvas, rendered),
-            "the increased composition reaches a real committed successor draw"))
+            "the increased presentation reaches a real committed successor draw"))
     {
         return false;
     }
     ok &= next_scroll();
-    ok &= expect_scroll(3, 1, 200U,
+    ok &= expect_scroll(4, 0, 202U,
         "committed increase adopts context and metrics together while retaining the partial first row");
     auto reduced = std::make_shared<touch::Terminal_canvas_frame>(*frame);
     reduced->sequence = 804U;
     for (auto& row : reduced->selection->visible_rows) { row.retained_line_id += 200U; }
-    if (!check(install_held(reduced), "an installed capacity decrease remains behind the last committed draw")) {
+    canvas.set_presentation_rows(6);
+    if (!check(install_held(reduced), "an installed capacity change remains behind the last committed draw")) {
         return false;
     }
     ok &= next_scroll();
-    ok &= expect_scroll(3, 1, 200U,
-        "pending decrease also uses the last drawn row identity, metrics and prefix context");
+    ok &= expect_scroll(4, 0, 202U,
+        "pending decrease also uses the last drawn row identity, metrics and consumer viewport");
     renderer::qsg_atlas_clear_resource_prepare_failure_for_testing();
     ++reduced->sequence;
     if (!check(canvas.set_canvas_frame(reduced) && pump_until_rendered(application, window, canvas, rendered),
-            "the reduced composition reaches a real committed successor draw"))
+            "the reduced presentation reaches a real committed successor draw"))
     {
         return false;
     }
     ok &= next_scroll();
-    ok &= expect_scroll(1, 4, 300U,
+    ok &= expect_scroll(6, 0, 300U,
         "committed decrease adopts the reduced context and row identity together");
-    auto metadata_only = std::make_shared<touch::Terminal_canvas_frame>(*reduced);
-    metadata_only->selection->composition->leading_capacity = 2;
-    ok &= check(canvas.set_canvas_frame(metadata_only) &&
-            pump_until_rendered(application, window, canvas, rendered) &&
-            recorder->snapshot().rendered_touch_selection->composition == metadata_only->selection->composition,
-        "a composition-only replacement reaches the renderer even with unchanged source sequence and cells");
+    canvas.set_presentation_rows(5);
+    ok &= check(pump_until_rendered(application, window, canvas, rendered) &&
+            recorder->snapshot().rendered_touch_selection->presentation &&
+            recorder->snapshot().rendered_touch_selection->presentation->visible_rows == 5,
+        "a capacity-only change reaches rendered input metadata with unchanged native sequence and cells");
     canvas.set_touch_selection_enabled(false);
     QTest::touchEvent(&window, device).release(0, QPoint(100, 8), &window);
     return ok;
@@ -654,7 +671,7 @@ int main(int argc, char** argv)
         ok &= recorder_distinguishes_failed_candidate(application, window, canvas);
         ok &= authoritative_grid_glyph_positions(application, window, canvas);
         ok &= row_images_follow_pixels_placement_and_lifecycle(application, window, canvas);
-        ok &= rendered_composition_handle_contract(application, window, canvas);
+        ok &= rendered_presentation_handle_contract(application, window, canvas);
     }
 
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");

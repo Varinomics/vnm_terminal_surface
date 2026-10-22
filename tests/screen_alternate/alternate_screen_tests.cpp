@@ -3,6 +3,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <variant>
@@ -377,6 +378,299 @@ bool test_resize_while_alternate_active()
     return ok;
 }
 
+// A model for a backend that owns its screen buffers, as ConPTY does: while the
+// alternate screen is active, a resize leaves the primary at its size until
+// the primary is used again (screenInfo.cpp _handleDeferredResize).
+term::Terminal_screen_model make_backend_owned_model(int rows, int columns)
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size                   = {rows, columns};
+    config.scrollback_limit            = 8;
+    config.tab_width                   = 4;
+    config.backend_owns_screen_buffers = true;
+    return term::Terminal_screen_model(config);
+}
+
+const QByteArray k_backend_owned_primary = QByteArrayLiteral("aaaaaa\r\nbbbbbb\r\ncccccc\r\ndd");
+// Where the cursor is when 1049 saves it after k_backend_owned_primary. A
+// backend-owned saved cursor keeps these coordinates through every resize.
+constexpr term::terminal_grid_position_t k_backend_owned_saved_cursor{3, 2};
+
+// The returned primary has the expected model's rows, and its cursor is the
+// one 1049 restored.
+bool primary_screens_equal(
+    const term::Terminal_screen_model& actual,
+    const term::Terminal_screen_model& expected,
+    term::terminal_grid_position_t     restored_cursor,
+    const std::string&                 label)
+{
+    bool equal =
+        actual.active_buffer_id()       == term::Terminal_buffer_id::PRIMARY    &&
+        actual.grid_size().rows         == expected.grid_size().rows            &&
+        actual.grid_size().columns      == expected.grid_size().columns         &&
+        actual.scrollback_size()        == expected.scrollback_size()           &&
+        actual.cursor_position().row    == restored_cursor.row                  &&
+        actual.cursor_position().column == restored_cursor.column;
+    for (int row = 0; equal && row < expected.grid_size().rows; ++row) {
+        equal = actual.row_text(row) == expected.row_text(row);
+    }
+    return check(equal, label);
+}
+
+bool test_backend_owned_primary_keeps_its_size_across_an_alternate_round_trip()
+{
+    term::Terminal_screen_model model    = make_backend_owned_model(4, 6);
+    term::Terminal_screen_model expected = make_backend_owned_model(4, 6);
+    model.ingest(k_backend_owned_primary);
+    expected.ingest(k_backend_owned_primary);
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h\x1b[HALT"));
+    model.resize({2, 6});
+    bool ok = check(model.scrollback_size() == 0,
+        "a shrink while the alternate screen is active leaves the primary's rows in place");
+    ok &= check(model.row_text(0) == QStringLiteral("ALT"),
+        "the alternate screen itself is resized");
+    model.resize({4, 6});
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= primary_screens_equal(model, expected, k_backend_owned_saved_cursor,
+        "returning at the original size finds the primary as it was");
+    return ok;
+}
+
+bool test_backend_owned_primary_resizes_once_on_return()
+{
+    term::Terminal_screen_model model    = make_backend_owned_model(4, 6);
+    term::Terminal_screen_model expected = make_backend_owned_model(4, 6);
+    model.ingest(k_backend_owned_primary);
+    expected.ingest(k_backend_owned_primary);
+    expected.resize({3, 4});
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    model.resize({2, 6});
+    model.resize({3, 4});
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    // The saved row 3 is clamped to the three-row grid.
+    return primary_screens_equal(model, expected, {2, 2},
+        "returning at a different size equals one resize of the primary to that size");
+}
+
+bool test_backend_owned_primary_resizes_before_the_alternate_screen_is_replaced()
+{
+    term::Terminal_screen_model model    = make_backend_owned_model(4, 6);
+    term::Terminal_screen_model expected = make_backend_owned_model(4, 6);
+    model.ingest(k_backend_owned_primary);
+    expected.ingest(k_backend_owned_primary);
+    expected.resize({2, 6});
+    const int replaced_scrollback = expected.scrollback_size();
+    expected.resize({4, 6});
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    model.resize({2, 6});
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    bool ok = check(model.scrollback_size() == replaced_scrollback,
+        "replacing the alternate screen first resizes the primary to the size then current");
+    model.resize({4, 6});
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= primary_screens_equal(model, expected, k_backend_owned_saved_cursor,
+        "the return then applies only the resize after the replacement");
+    return ok;
+}
+
+bool test_backend_owned_primary_rows_end_at_its_own_height()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(2, 6);
+    model.ingest(QByteArrayLiteral("aa\r\nbb"));
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    model.resize({5, 6});
+
+    const int first_active_row = model.scrollback_size();
+    term::Terminal_search_row_text text;
+    bool ok = check(model.search_source_row_text(
+            term::Terminal_buffer_id::PRIMARY, first_active_row + 1, text),
+        "the inactive primary's last row resolves");
+    ok &= check(!model.search_source_row_text(
+            term::Terminal_buffer_id::PRIMARY, first_active_row + 2, text) &&
+            model.image_slice_for_testing(
+                term::Terminal_buffer_id::PRIMARY, first_active_row + 4) == nullptr,
+        "rows of the taller grid below the inactive primary do not resolve");
+    return ok;
+}
+
+// ConPTY keeps a saved cursor at the coordinates the application saved, and
+// restores it with a clamping cursor move (adaptDispatch.cpp CursorSaveState
+// and CursorRestoreState).
+bool test_backend_owned_saved_cursor_keeps_its_coordinates_through_a_reflow()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(4, 6);
+    model.ingest(QByteArrayLiteral("abcdefgh\r\nxy\x1b" "7"));
+    model.resize({4, 10});
+    bool ok = check(model.row_text(1) == QStringLiteral("xy") &&
+            model.cursor_position().row == 1,
+        "widening joins the wrapped line, and the live cursor moves with its row");
+    model.ingest(QByteArrayLiteral("\x1b" "8"));
+    ok &= check(model.cursor_position().row == 2 && model.cursor_position().column == 2,
+        "restoring returns to the saved coordinates");
+    return ok;
+}
+
+bool test_backend_owned_saved_cursor_is_not_shifted_by_a_shrink()
+{
+    // Saved on row 1 with the cursor on row 3: shrinking to two rows archives
+    // two rows above the cursor, but the saved row stays row 1.
+    const QByteArray setup = QByteArrayLiteral("a\r\nb\r\nc\r\nd\x1b[2;1H\x1b" "7\x1b[4;2H");
+    term::Terminal_screen_model primary = make_backend_owned_model(4, 6);
+    primary.ingest(setup);
+    primary.resize({2, 6});
+    primary.ingest(QByteArrayLiteral("\x1b" "8"));
+    bool ok = check(primary.cursor_position().row == 1 && primary.cursor_position().column == 0,
+        "the primary's saved row is not shifted by the archived rows");
+
+    term::Terminal_screen_model alternate = make_backend_owned_model(4, 6);
+    alternate.ingest(QByteArrayLiteral("\x1b[?1049h") + setup);
+    alternate.resize({2, 6});
+    alternate.ingest(QByteArrayLiteral("\x1b" "8"));
+    ok &= check(alternate.cursor_position().row == 1 && alternate.cursor_position().column == 0,
+        "the alternate screen's saved row is not shifted either");
+
+    term::Terminal_screen_model clamped = make_backend_owned_model(4, 6);
+    clamped.ingest(QByteArrayLiteral("\x1b[4;6H\x1b" "7"));
+    clamped.resize({2, 4});
+    clamped.ingest(QByteArrayLiteral("\x1b" "8"));
+    ok &= check(clamped.cursor_position().row == 1 && clamped.cursor_position().column == 3,
+        "a saved position outside the grid is restored clamped to it");
+    return ok;
+}
+
+// ConPTY creates its alternate buffer with the cursor of the buffer it is
+// entered from (screenInfo.cpp _CreateAltBuffer).
+bool test_backend_owned_alternate_screen_starts_at_the_entry_cursor()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(4, 6);
+    model.ingest(QByteArrayLiteral("aa\r\nbb\x1b[?1049h"));
+    bool ok = check(model.cursor_position().row == 1 && model.cursor_position().column == 2,
+        "the alternate screen starts at the primary's cursor");
+    model.ingest(QByteArrayLiteral("x\x1b[1;5H\x1b[?1049h"));
+    ok &= check(model.row_text(1).isEmpty() &&
+            model.cursor_position().row == 0 && model.cursor_position().column == 4,
+        "a replacement clears the alternate screen and keeps its cursor");
+    return ok;
+}
+
+// ConPTY keeps one saved cursor per buffer apart from the buffers' rows, and
+// one never saved restores to home (adaptDispatch.hpp _savedCursorState).
+// Every 1049h saves the active buffer's cursor and every 1049l restores the
+// main buffer's (adaptDispatch.cpp _SetAlternateScreenBufferMode).
+bool test_backend_owned_saved_cursors_live_apart_from_the_screens()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(4, 6);
+    model.ingest(QByteArrayLiteral("aa\r\nbb\x1b[?1049h\x1b" "8X"));
+    bool ok = check(model.row_text(0) == QStringLiteral("X") &&
+            model.cursor_position().row == 0 && model.cursor_position().column == 1,
+        "restoring right after entry goes home");
+    model.ingest(QByteArrayLiteral("\x1b[2;4H\x1b[?1049h\x1b[4;1H\x1b" "8Y"));
+    ok &= check(model.row_text(1) == QStringLiteral("   Y") &&
+            model.cursor_position().row == 1 && model.cursor_position().column == 4,
+        "a replacement saves the alternate screen's cursor first");
+    model.ingest(QByteArrayLiteral("\x1b[?1049l\x1b[?1049h\x1b" "8"));
+    ok &= check(model.cursor_position().row == 1 && model.cursor_position().column == 3,
+        "the alternate screen's save outlives leaving it");
+    model.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(model.cursor_position().row == 1 && model.cursor_position().column == 2,
+        "returning restores the primary's save");
+
+    term::Terminal_screen_model unsaved = make_backend_owned_model(4, 6);
+    unsaved.ingest(QByteArrayLiteral("abc\x1b[?1049l"));
+    ok &= check(unsaved.cursor_position().row == 0 && unsaved.cursor_position().column == 0,
+        "a return without an entry restores the primary's unused save, home");
+    return ok;
+}
+
+// ConPTY's reflow keeps the last rows that hold text or the cursor, up to a
+// screen from the cursor down (textBuffer.cpp TextBuffer::Reflow): with text
+// below the cursor, a shrink drops rows from the top.
+bool test_backend_owned_primary_resize_keeps_text_below_the_cursor()
+{
+    const QByteArray rows = QByteArrayLiteral("a\r\nb\r\nc\r\nd\x1b[2;1H");
+    const auto rows_are = [](
+            const term::Terminal_screen_model& model,
+            std::initializer_list<const char*> expected)
+        {
+            int row = 0;
+            for (const char* text : expected) {
+                if (model.row_text(row++) != QString::fromLatin1(text)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+    term::Terminal_screen_model primary = make_backend_owned_model(4, 6);
+    primary.ingest(rows);
+    primary.resize({3, 6});
+    bool ok = check(rows_are(primary, {"b", "c", "d"}) && primary.scrollback_size() == 1 &&
+            primary.cursor_position().row == 0,
+        "a shrink of the active primary keeps the rows below the cursor");
+
+    term::Terminal_screen_model deferred = make_backend_owned_model(4, 6);
+    deferred.ingest(rows + QByteArrayLiteral("\x1b[?1049h"));
+    deferred.resize({3, 6});
+    deferred.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(rows_are(deferred, {"b", "c", "d"}) && deferred.scrollback_size() == 1 &&
+            deferred.cursor_position().row == 1,
+        "the deferred shrink keeps them too, and the return restores the saved row");
+
+    term::Terminal_screen_model far = make_backend_owned_model(4, 6);
+    far.ingest(QByteArrayLiteral("a\r\nb\r\nc\r\nd\x1b[1;1H"));
+    far.resize({2, 6});
+    ok &= check(rows_are(far, {"a", "b"}) && far.scrollback_size() == 0,
+        "rows more than a screen below the cursor are cut");
+
+    // The reflow trims written spaces from a line before packing it, so the
+    // padded line stays one row when the grid narrows below its spaces.
+    const QByteArray padded = QByteArrayLiteral("a\r\nb\r\nc    \r\nd\x1b[2;1H");
+    term::Terminal_screen_model narrowed = make_backend_owned_model(4, 6);
+    narrowed.ingest(padded);
+    narrowed.resize({3, 3});
+    ok &= check(rows_are(narrowed, {"b", "c", "d"}) && narrowed.cursor_position().row == 0,
+        "a padded line narrower than its spaces stays one row");
+
+    term::Terminal_screen_model narrowed_deferred = make_backend_owned_model(4, 6);
+    narrowed_deferred.ingest(padded + QByteArrayLiteral("\x1b[?1049h"));
+    narrowed_deferred.resize({3, 3});
+    narrowed_deferred.ingest(QByteArrayLiteral("\x1b[?1049l"));
+    ok &= check(rows_are(narrowed_deferred, {"b", "c", "d"}),
+        "the deferred resize keeps the padded line one row too");
+    return ok;
+}
+
+// ConPTY copies a line's attributes apart from its text: past the text they
+// continue in the row the text ends on (textBuffer.cpp TextBuffer::Reflow).
+bool test_backend_owned_reflow_keeps_trailing_attributes()
+{
+    term::Terminal_screen_model model = make_backend_owned_model(2, 6);
+    model.ingest(QByteArrayLiteral("abcdefgh\x1b[31m\x1b[K\x1b[0m\x1b[H"));
+    model.resize({2, 10});
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(50U);
+    const auto red_at = [&](
+            int row,
+            int column)
+        {
+            return std::any_of(snapshot.cells.begin(), snapshot.cells.end(),
+                [&](const term::Terminal_render_cell& cell) {
+                    return
+                        cell.position.row == row && cell.position.column == column &&
+                        foreground_rgba_for_cell(snapshot, cell) == k_red_rgba;
+                });
+        };
+    bool ok = check(model.row_text(0) == QStringLiteral("abcdefgh"),
+        "widening joins the wrapped line");
+    ok &= check(red_at(0, 8) && red_at(0, 9),
+        "the erased cells after the text keep their style after the joined text");
+    ok &= check(!red_at(1, 0) && !red_at(1, 1),
+        "they do not wrap into a row of their own");
+    return ok;
+}
+
 bool test_resize_normalizes_saved_origin_mode_and_noop()
 {
     bool ok = true;
@@ -469,6 +763,16 @@ int main()
     ok &= test_1048_saved_cursor_is_per_buffer();
     ok &= test_decrqm_alternate_modes();
     ok &= test_resize_while_alternate_active();
+    ok &= test_backend_owned_primary_keeps_its_size_across_an_alternate_round_trip();
+    ok &= test_backend_owned_primary_resizes_once_on_return();
+    ok &= test_backend_owned_primary_resizes_before_the_alternate_screen_is_replaced();
+    ok &= test_backend_owned_primary_rows_end_at_its_own_height();
+    ok &= test_backend_owned_saved_cursor_keeps_its_coordinates_through_a_reflow();
+    ok &= test_backend_owned_saved_cursor_is_not_shifted_by_a_shrink();
+    ok &= test_backend_owned_alternate_screen_starts_at_the_entry_cursor();
+    ok &= test_backend_owned_saved_cursors_live_apart_from_the_screens();
+    ok &= test_backend_owned_primary_resize_keeps_text_below_the_cursor();
+    ok &= test_backend_owned_reflow_keeps_trailing_attributes();
     ok &= test_resize_normalizes_saved_origin_mode_and_noop();
     ok &= test_resize_preserves_primary_wide_cells_crossing_right_edge();
     ok &= test_viewport_alternate_screen_policy_hooks();

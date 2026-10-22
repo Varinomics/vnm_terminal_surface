@@ -223,9 +223,12 @@ public:
     void clear_selection();
     Terminal_touch_selection_result apply_touch_selection(
         const Terminal_touch_selection_request& request);
-    // The Companion toggle: while enabled, the primary screen is presented
-    // through the COMPANION mapping instead of NATIVE or AUTOMATIC.
-    void set_companion_presentation(bool enabled);
+    // Capture enough immutable history for an exported consumer's row capacity.
+    // Zero uses the native screen height and never changes backend geometry.
+    void set_canvas_presentation_rows(int rows);
+    Terminal_viewport_scroll_result scroll_canvas_presentation_lines(
+        int line_delta, int rows,
+        std::optional<int> published_offset = std::nullopt);
     void set_scrollback_limit(int limit);
     void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
     void set_color_state(Terminal_color_state state);
@@ -434,8 +437,14 @@ private:
 
     struct Live_primary_viewport_anchor
     {
-        terminal_history_handle_t       history_handle;
-        int                             viewport_row = 0;
+        struct Row
+        {
+            terminal_history_handle_t   history_handle;
+            int                         viewport_row = 0;
+        };
+
+        std::optional<Row>               native;
+        std::optional<Row>               canvas;
     };
 
     struct Deferred_backend_content_snapshot
@@ -860,6 +869,7 @@ private:
         const Terminal_screen_model_result& model_result,
         const std::optional<Live_primary_viewport_anchor>& detached_viewport_anchor,
         QString message);
+    void sync_canvas_scroll_intent_from_native();
     void sync_viewport_from_model_result(
         const Terminal_screen_model_result&    result,
         std::optional<Live_primary_viewport_anchor>
@@ -883,7 +893,8 @@ private:
         std::uint64_t              sequence,
         QString                    message,
         bool                       allow_blocked_selection_only_snapshot = false);
-    void populate_touch_selection_projection(Terminal_render_snapshot& snapshot) const;
+    void populate_touch_selection_projection(
+        Terminal_render_snapshot& snapshot, int source_rows = 0) const;
 
     void advance_selection_content_basis_for_model_result(
         const Terminal_screen_model_result&    result,
@@ -1007,7 +1018,8 @@ private:
 
     void publish_synchronized_resize_snapshot(
         std::uint64_t              sequence,
-        QString                    message);
+        QString                    message,
+        std::optional<Terminal_viewport_state> canvas_viewport = std::nullopt);
     void release_hold_for_unpresentable_geometry(std::uint64_t sequence);
 
     bool selection_range_is_valid_for_active_model(
@@ -1248,6 +1260,7 @@ private:
     std::uint64_t                                          m_result_capture_sequence = 0U;
     std::optional<Terminal_session_result>                 m_captured_result;
     Terminal_viewport_controller                           m_viewport_controller;
+    Terminal_viewport_controller                           m_canvas_viewport_controller;
     Terminal_bell_state                                    m_bell_state;
     Selection_contract_controller                          m_selection;
     QString                                                m_touch_gesture_id;
@@ -1266,7 +1279,7 @@ private:
         Terminal_buffer_id::PRIMARY;
     bool                                                   m_deferred_viewport_changed = false;
     bool                                                   m_visual_bell_active        = false;
-    bool                                                   m_companion_presentation    = false;
+    int                                                    m_canvas_presentation_rows = 0;
     // The saved primary view's first displayed row while the alternate
     // screen is active.
     std::optional<Live_primary_viewport_anchor>            m_saved_primary_viewport_anchor;

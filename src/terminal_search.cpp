@@ -536,7 +536,8 @@ struct Terminal_search_controller::Shared_state
 
     std::vector<Terminal_render_search_match_span> spans_for_snapshot(
         const Terminal_render_snapshot& snapshot,
-        std::uint64_t                   active_buffer_epoch) const
+        std::uint64_t                   active_buffer_epoch,
+        terminal_grid_size_t            native_grid_size) const
     {
         std::lock_guard<std::mutex> lock(result_mutex);
         std::vector<Terminal_render_search_match_span> spans;
@@ -545,7 +546,7 @@ struct Terminal_search_controller::Shared_state
             result.source_identity.active_buffer_epoch != active_buffer_epoch       ||
             result.source_identity.row_origin_generation !=
                 snapshot.metadata.row_origin_generation                            ||
-            !grid_sizes_match(result.source_identity.grid_size, snapshot.grid_size))
+            !grid_sizes_match(result.source_identity.grid_size, native_grid_size))
         {
             return spans;
         }
@@ -1372,7 +1373,19 @@ Terminal_search_controller::spans_for_snapshot(
     std::uint64_t                   active_buffer_epoch) const
 {
     return !m_searching && m_source_available && !m_query.isEmpty()
-        ? m_shared->spans_for_snapshot(snapshot, active_buffer_epoch)
+        ? m_shared->spans_for_snapshot(snapshot, active_buffer_epoch, snapshot.grid_size)
+        : std::vector<Terminal_render_search_match_span>{};
+}
+
+std::vector<Terminal_render_search_match_span>
+Terminal_search_controller::spans_for_row_coverage(
+    const Terminal_render_snapshot& source,
+    std::uint64_t                   active_buffer_epoch) const
+{
+    return !m_searching && m_source_available && !m_query.isEmpty() &&
+            render_snapshot_row_coverage_is_coherent(source)
+        ? m_shared->spans_for_snapshot(*source.row_coverage_snapshot,
+            active_buffer_epoch, source.grid_size)
         : std::vector<Terminal_render_search_match_span>{};
 }
 

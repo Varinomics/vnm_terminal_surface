@@ -356,8 +356,8 @@ vnm_terminal_add_test(vnm_terminal_content_tail_projection
     terminal_content_tail_projection/terminal_content_tail_projection_tests.cpp
 )
 
-vnm_terminal_add_test(vnm_terminal_resize_vacancy
-    resize_vacancy/resize_vacancy_tests.cpp
+vnm_terminal_add_test(vnm_terminal_content_end
+    content_end/content_end_tests.cpp
 )
 
 target_link_libraries(vnm_terminal_sixel_placement PRIVATE
@@ -1314,6 +1314,10 @@ target_link_libraries(vnm_terminal_surface_host PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
     Qt6::GuiPrivate
 )
+if(APPLE)
+    target_link_libraries(vnm_terminal_surface_host PRIVATE
+        vnm_process_custody::vnm_process_custody)
+endif()
 
 target_compile_definitions(vnm_terminal_surface_host PRIVATE
     VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
@@ -1346,6 +1350,7 @@ add_test(
         ${vnm_terminal_qt_unscaled_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --core-only
 )
 
 set(vnm_terminal_surface_host_timeout 60)
@@ -1442,6 +1447,53 @@ set_tests_properties(vnm_terminal_surface_host_resize_presentation PROPERTIES
     TIMEOUT 60
 )
 
+add_test(
+    NAME vnm_terminal_surface_host_clear_presentation
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_readback_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_surface_host>"
+        --clear-presentation-only
+)
+set_tests_properties(vnm_terminal_surface_host_clear_presentation PROPERTIES
+    LABELS "conformance;surface;presentation;wheel"
+    TIMEOUT 120
+)
+
+# A real POSIX pty whose shell redraws its prompt on SIGWINCH, as zsh does.
+if(NOT WIN32)
+    add_test(
+        NAME vnm_terminal_surface_host_shell_redraw_zoom
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_readback_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --shell-redraw-zoom-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_shell_redraw_zoom PROPERTIES
+        LABELS "conformance;surface;resize;presentation;wheel"
+        TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_surface_host_shell_redraw_clear_zoom
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_readback_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --shell-redraw-clear-zoom-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_shell_redraw_clear_zoom PROPERTIES
+        LABELS "conformance;surface;resize;presentation;wheel"
+        TIMEOUT 180
+    )
+endif()
+
 # Input leasing against the painted frame needs a platform that draws.
 if(WIN32)
     add_test(
@@ -1491,6 +1543,21 @@ if(WIN32)
     set_tests_properties(vnm_terminal_surface_host_held_resize_gui PROPERTIES
         LABELS "conformance;windows;conpty;surface;resize"
         TIMEOUT 60
+    )
+
+    add_test(
+        NAME vnm_terminal_surface_host_conpty_rows
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --conpty-rows-only
+    )
+    set_tests_properties(vnm_terminal_surface_host_conpty_rows PROPERTIES
+        LABELS "conformance;windows;conpty;surface;resize;mouse"
+        TIMEOUT 180
     )
 endif()
 
@@ -2038,6 +2105,7 @@ add_test(
         "${CMAKE_COMMAND}" -E env
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_backend_session>"
+        --core-only
 )
 
 add_executable(vnm_terminal_backend_output_capture
@@ -2193,6 +2261,18 @@ if(WIN32)
             "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
     )
     add_test(
+        NAME vnm_terminal_windows_native_cmd_startup_growth
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-startup-growth
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_startup_growth PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 180
+    )
+    add_test(
         NAME vnm_terminal_windows_native_cmd_resize
         COMMAND
             "${CMAKE_COMMAND}" -E env
@@ -2203,6 +2283,42 @@ if(WIN32)
     set_tests_properties(vnm_terminal_windows_native_cmd_resize PROPERTIES
         LABELS "conformance;windows;conpty"
         TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_alternate_resize
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-alternate-resize
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_alternate_resize PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 180
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_alternate_entry
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-alternate-entry
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_alternate_entry PROPERTIES
+        LABELS "conformance;windows;conpty"
+        TIMEOUT 120
+    )
+    add_test(
+        NAME vnm_terminal_windows_native_cmd_resize_text_below
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --native-cmd-resize-text-below
+    )
+    set_tests_properties(vnm_terminal_windows_native_cmd_resize_text_below PROPERTIES
+        LABELS "conformance;windows;conpty;resize"
+        TIMEOUT 120
     )
 
     set_tests_properties(vnm_terminal_windows_native_cmd PROPERTIES

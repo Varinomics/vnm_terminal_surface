@@ -1,6 +1,5 @@
 #include <vnm_process_custody/process_channel.h>
 
-#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -70,16 +69,6 @@ int wait_for(int fd, short events, int timeout_ms)
         remaining_ms = static_cast<int>(
             std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count());
     }
-}
-
-bool set_nonblocking(int fd, std::string* out_error)
-{
-    const int flags = fcntl(fd, F_GETFL);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        *out_error = std::string("fcntl(O_NONBLOCK): ") + std::strerror(errno);
-        return false;
-    }
-    return true;
 }
 
 bool set_message_buffer(int fd, std::size_t message_bytes, std::string* out_error)
@@ -333,6 +322,8 @@ Receive_result Duplex_channel::receive(std::uint8_t* out_buffer, std::size_t in_
     message.msg_control    = control;
     message.msg_controllen = sizeof(control);
 
+    // Once recvmsg installs the rights, collecting them must not allocate.
+    result.descriptors.reserve(k_max_transferred_descriptors);
     ssize_t received = 0;
     do {
         received = recvmsg(m_impl->fd, &message, MSG_CMSG_CLOEXEC);
@@ -406,42 +397,6 @@ Receive_result Duplex_channel::receive(std::uint8_t* out_buffer, std::size_t in_
 // ---------------------------------------------------------------------------
 // Stream_channel
 
-struct Stream_channel::Impl
-{
-    int fd = -1;
-};
-
-Stream_channel::Stream_channel()
-:
-    m_impl(std::make_unique<Impl>())
-{}
-
-Stream_channel::Stream_channel(Native_handle in_end)
-:
-    m_impl(std::make_unique<Impl>())
-{
-    m_impl->fd = in_end;
-}
-
-Stream_channel::~Stream_channel() { close(); }
-
-Stream_channel::Stream_channel(Stream_channel&& other) noexcept
-:
-    m_impl(std::move(other.m_impl))
-{
-    other.m_impl = std::make_unique<Impl>();
-}
-
-Stream_channel& Stream_channel::operator=(Stream_channel&& other) noexcept
-{
-    if (this != &other) {
-        close();
-        m_impl       = std::move(other.m_impl);
-        other.m_impl = std::make_unique<Impl>();
-    }
-    return *this;
-}
-
 bool Stream_channel::create_pair(Stream_channel* out_first, Stream_channel* out_second, std::string* out_error)
 {
     int ends[2] = {-1, -1};
@@ -452,83 +407,6 @@ bool Stream_channel::create_pair(Stream_channel* out_first, Stream_channel* out_
     *out_first  = Stream_channel(ends[0]);
     *out_second = Stream_channel(ends[1]);
     return true;
-}
-
-bool          Stream_channel::valid()    const { return m_impl->fd >= 0; }
-Native_handle Stream_channel::native()   const { return m_impl->fd; }
-Native_handle Stream_channel::waitable() const { return m_impl->fd; }
-Native_handle Stream_channel::write_waitable() const { return m_impl->fd; }
-
-void Stream_channel::close()
-{
-    if (m_impl->fd >= 0) {
-        (void)::close(m_impl->fd);
-        m_impl->fd = -1;
-    }
-}
-
-bool Stream_channel::prepare_for_owner(std::string* out_error)
-{
-    return set_nonblocking(m_impl->fd, out_error);
-}
-
-Io_result Stream_channel::read(std::uint8_t* out_buffer, std::size_t in_capacity)
-{
-    Io_result result;
-    ssize_t count = 0;
-    do {
-        count = recv(m_impl->fd, out_buffer, in_capacity, MSG_DONTWAIT);
-    }
-    while (count < 0 && errno == EINTR);
-
-    if (count < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            result.status = Io_status::WOULD_BLOCK;
-        }
-        else
-        if (errno == ECONNRESET) {
-            result.status = Io_status::CLOSED;
-        }
-        else {
-            result.error = errno;
-        }
-        return result;
-    }
-    result.status = count == 0 ? Io_status::CLOSED : Io_status::TRANSFERRED;
-    result.bytes  = static_cast<std::size_t>(count);
-    return result;
-}
-
-Write_submission_result Stream_channel::begin_write(const std::uint8_t* in_data, std::size_t in_size)
-{
-    Write_submission_result result;
-    ssize_t count = 0;
-    do {
-        count = ::send(m_impl->fd, in_data, in_size, MSG_DONTWAIT | MSG_NOSIGNAL);
-    }
-    while (count < 0 && errno == EINTR);
-    if (count < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            result.status = Write_submission_status::BUSY;
-            return result;
-        }
-        if (errno == EPIPE || errno == ECONNRESET) {
-            result.status = Write_submission_status::CLOSED;
-            return result;
-        }
-        result.error = errno;
-        return result;
-    }
-    result.status = Write_submission_status::TRANSFERRED;
-    result.bytes  = static_cast<std::size_t>(count);
-    return result;
-}
-
-Io_result Stream_channel::complete_write(Write_ticket /*in_ticket*/)
-{
-    Io_result result;
-    result.error = EINVAL;
-    return result;
 }
 
 } // namespace vnm::process_custody

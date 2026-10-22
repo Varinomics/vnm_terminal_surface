@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <optional>
 #include <poll.h>
+#include <utility>
+#include <vector>
 
 namespace vnm::process_custody {
 namespace {
@@ -18,6 +20,30 @@ constexpr std::size_t k_max_request_bytes = 4 * 1024 * 1024;
 constexpr std::uint32_t k_fragment_kind = 5;
 constexpr std::uint32_t k_cleanup_scope_extension = 1;
 constexpr std::uint32_t k_darwin_birth_extension = 2;
+
+class Received_descriptors
+{
+public:
+    explicit Received_descriptors(std::vector<Native_handle>& descriptors)
+    :
+        m_descriptors(descriptors)
+    {}
+
+    Received_descriptors(const Received_descriptors&) = delete;
+    Received_descriptors& operator=(const Received_descriptors&) = delete;
+
+    ~Received_descriptors()
+    {
+        for (const auto descriptor : m_descriptors) {
+            close_native_handle(descriptor);
+        }
+    }
+
+    void release() noexcept { m_descriptors.clear(); }
+
+private:
+    std::vector<Native_handle>& m_descriptors;
+};
 
 struct Encoder
 {
@@ -288,8 +314,8 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
 {
     std::vector<std::uint8_t> bytes(k_owner_message_bytes);
     auto received = channel.receive(bytes.data(), bytes.size(), timeout_ms);
+    Received_descriptors descriptors(received.descriptors);
     if (received.status != Receive_status::MESSAGE) {
-        for (auto handle : received.descriptors) close_native_handle(handle);
         if (error && received.status == Receive_status::FAILED)
             *error = "owner control receive failed: " + std::to_string(received.error);
         return received.status;
@@ -309,7 +335,6 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
             (total != 0 && total != announced) || bytes.size() == fragment.position ||
             bytes.size() - fragment.position > announced - std::min<std::size_t>(offset, announced))
         {
-            for (auto handle : received.descriptors) close_native_handle(handle);
             if (error) *error = "malformed owner control fragment";
             return Receive_status::FAILED;
         }
@@ -323,7 +348,6 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
         const bool invalid = continuation.status != Receive_status::MESSAGE || !continuation.descriptors.empty();
         for (auto handle : continuation.descriptors) close_native_handle(handle);
         if (invalid) {
-            for (auto handle : received.descriptors) close_native_handle(handle);
             if (error) {
                 *error = "incomplete owner control request";
                 if (continuation.status == Receive_status::FAILED)
@@ -334,13 +358,14 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
         bytes.resize(continuation.size);
     }
     bytes = std::move(assembled);
+    Owner_message decoded;
     Decoder input{bytes};
     if (input.number() != k_wire_revision) input.valid = false;
-    message->kind = static_cast<Message_kind>(input.number());
+    decoded.kind = static_cast<Message_kind>(input.number());
     std::size_t expected_descriptors = 0;
-    switch (message->kind) {
+    switch (decoded.kind) {
         case Message_kind::START: {
-            auto& request = message->start;
+            auto& request = decoded.start;
             request.mode = static_cast<Owner_mode>(input.number());
             const auto use_standard_streams = input.number();
             if (use_standard_streams > 1) input.valid = false;
@@ -375,14 +400,14 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
         case Message_kind::STOP: {
             const auto grace = input.number();
             if (grace > 60000) input.valid = false;
-            message->grace_ms = static_cast<int>(grace);
+            decoded.grace_ms = static_cast<int>(grace);
             break;
         }
         case Message_kind::RESIZE:
-            message->dimensions = input.dimensions();
+            decoded.dimensions = input.dimensions();
             break;
         case Message_kind::EVENT: {
-            auto& event = message->event;
+            auto& event = decoded.event;
             bool local_observer_record = false;
             event.kind = static_cast<Owner_event_kind>(input.number());
             event.root_exit.process_id = input.number();
@@ -442,13 +467,11 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
         default: input.valid = false; break;
     }
     if (!input.valid || input.position != bytes.size() || expected_descriptors != received.descriptors.size()) {
-        for (auto handle : received.descriptors) close_native_handle(handle);
-        message->start.process.inherited.clear();
-        message->event.pty_master = k_invalid_handle;
-        message->event.root_reference = k_invalid_handle;
         if (error) *error = "malformed owner control message";
         return Receive_status::FAILED;
     }
+    *message = std::move(decoded);
+    descriptors.release();
     return Receive_status::MESSAGE;
 }
 

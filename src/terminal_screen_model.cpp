@@ -3519,6 +3519,25 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
     return state;
 }
 
+// A cleared alternate screen being entered. A backend that owns its screens
+// starts it at the cursor of the screen it is entered from, the primary's or
+// the replaced alternate screen's, as ConPTY creates its alternate buffer
+// (screenInfo.cpp _CreateAltBuffer), and keeps the alternate screen's saved
+// cursor, which ConPTY holds apart from the buffer (adaptDispatch.hpp
+// _savedCursorState).
+Terminal_screen_model::screen_buffer_state_t
+Terminal_screen_model::make_entered_alternate_state(
+    terminal_grid_position_t     entry_cursor,
+    const saved_cursor_state_t&  alternate_saved_cursor)
+{
+    screen_buffer_state_t state = make_empty_buffer_state();
+    if (m_config.backend_owns_screen_buffers) {
+        state.cursor       = entry_cursor;
+        state.saved_cursor = alternate_saved_cursor;
+    }
+    return state;
+}
+
 Terminal_screen_model::Retained_history_storage::Retained_history_storage() = default;
 
 Terminal_screen_model::Retained_history_storage::~Retained_history_storage() = default;
@@ -3658,14 +3677,14 @@ Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_reco
         retained_history.index[index].history_handle;
     const Terminal_history_ring_read_scope read =
         retained_history.ring->read_record_at_live_index(index, handle.byte_sequence);
-    const Terminal_history_row_record_decode_result decoded =
+    Terminal_history_row_record_decode_result decoded =
         decode_terminal_history_row_record(read, image_decode, handle);
     if (decoded.status != Terminal_history_row_record_codec_status::OK) {
         throw_retained_history_storage_failure();
     }
 
     return Terminal_screen_model::retained_row_record_from_history_row_record(
-        decoded.record);
+        std::move(decoded.record));
 }
 
 std::optional<terminal_history_handle_t>
@@ -3690,7 +3709,7 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
         "Terminal_screen_model::Primary_backing_buffer::append_retained_history_record");
 
     Terminal_history_row_record history_record =
-        Terminal_screen_model::history_row_record_from_retained_record(row);
+        Terminal_screen_model::history_row_record_from_retained_record(std::move(row));
 
     terminal_history_row_record_identity_t identity;
     identity.epoch        = k_terminal_history_retained_identity_epoch;
@@ -4125,20 +4144,28 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
         }
         std::vector<Cell> cells;
         std::vector<Terminal_retained_line_provenance> cell_origins;
-        // Resize vacancy of each logical slot. It follows the slot through
-        // flattening, joining and packing without changing either.
-        std::vector<char> cell_vacancy;
         std::optional<std::size_t> cursor_offset;
         std::optional<std::size_t> saved_offset;
         bool contains_latent_wide_cell = false;
+        int  last_source_text_columns  = 0;
         for (std::size_t index = first; index <= last; ++index) {
             const Terminal_screen_row& source = state.rows[index];
             int count = (int)source.cells.size();
-            while (count > 0 &&
-                !source.cells[(std::size_t)count - 1U].occupied &&
-                !source.cells[(std::size_t)count - 1U].protected_cell)
-            {
-                --count;
+            if (m_config.backend_owns_screen_buffers) {
+                // ConPTY's reflow packs a line's text without its trailing
+                // spaces, written or not, and copies the attributes past the
+                // text apart from it (textBuffer.cpp TextBuffer::Reflow).
+                while (count > 0 && is_space_cell(source.cells[(std::size_t)count - 1U])) {
+                    --count;
+                }
+            }
+            else {
+                while (count > 0 &&
+                    !source.cells[(std::size_t)count - 1U].occupied &&
+                    !source.cells[(std::size_t)count - 1U].protected_cell)
+                {
+                    --count;
+                }
             }
             // Preserve written cells beyond an earlier wide-glyph wrap gap.
             count = std::max(count, source.soft_wrap_columns);
@@ -4154,6 +4181,9 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 (int)index == old_saved.position.row)
             {
                 count = std::max(count, old_saved.position.column + 1);
+            }
+            if (index == last) {
+                last_source_text_columns = count;
             }
 
             std::size_t origin_span_index = 0U;
@@ -4210,8 +4240,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 const std::size_t logical_start = cells.size();
                 const Terminal_retained_line_provenance origin =
                     origin_at_column(source_column);
-                // Synthesized continuations inherit their base cell's vacancy.
-                const char vacant = source_column >= source.resize_vacant_from_column;
                 record_source_position(source_column, logical_start);
 
                 Cell base_cell = source_cell;
@@ -4220,7 +4248,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                 base_cell.wide_continuation = false;
                 cells.push_back(std::move(base_cell));
                 cell_origins.push_back(origin);
-                cell_vacancy.push_back(vacant);
 
                 for (int part = 1; part < natural_width; ++part) {
                     Cell continuation;
@@ -4244,7 +4271,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                     continuation.hyperlink_id = source_cell.hyperlink_id;
                     cells.push_back(std::move(continuation));
                     cell_origins.push_back(origin);
-                    cell_vacancy.push_back(vacant);
                 }
 
                 for (int part = 1; part < physical_width; ++part) {
@@ -4269,14 +4295,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             Terminal_screen_row row = std::move(state.rows[first]);
             row.cells.resize((std::size_t)columns);
             row.soft_wrap_columns = 0;
-            // The unused right margin inherits the last slot's vacancy; a row
-            // without slots keeps its empty-row origin.
-            const bool row_vacancy_kept = cell_vacancy.empty()
-                ? row.resize_vacant_from_column == 0
-                : cell_vacancy.back() != 0;
-            if (!row_vacancy_kept) {
-                row.resize_vacant_from_column = k_terminal_no_resize_vacancy_column;
-            }
             for (terminal_retained_line_content_origin_span_t& span :
                 row.content_origin_spans)
             {
@@ -4326,22 +4344,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             state.rows.begin() + static_cast<std::ptrdiff_t>(last) + 1,
             [](const Terminal_screen_row& source_row) { return source_row.image_slice != nullptr; }));
         row.image_slice = std::move(state.rows[first].image_slice);
-        // A destination row's vacancy is its trailing run of vacant slots: the
-        // unused right margin, a wide glyph's wrap margin included, inherits
-        // the last slot's vacancy, and a row without slots the empty-row origin.
-        const int empty_row_vacancy = state.rows[first].resize_vacant_from_column == 0
-            ? 0
-            : k_terminal_no_resize_vacancy_column;
-        int  vacant_run_start = -1;
-        bool row_has_slots    = false;
-        const auto finish_row_vacancy = [&](Terminal_screen_row& finished) {
-            finished.resize_vacant_from_column =
-                !row_has_slots         ? empty_row_vacancy :
-                vacant_run_start >= 0  ? vacant_run_start  :
-                                         k_terminal_no_resize_vacancy_column;
-            vacant_run_start = -1;
-            row_has_slots    = false;
-        };
         int column = 0;
         bool cursor_pending_end_mapped = false;
         bool saved_pending_end_mapped = false;
@@ -4365,7 +4367,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             if (column + width > columns) {
                 row.soft_wrap_columns = column;
                 finish_row_provenance(row);
-                finish_row_vacancy(row);
                 rows.push_back(std::move(row));
                 row = make_row(cell_origins[offset]);
                 column = 0;
@@ -4385,14 +4386,6 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
                     row.cells[static_cast<std::size_t>(column + part)] =
                         std::move(output_cell);
                     append_origin(row, column + part, cell_origins[offset + part]);
-                    if (cell_vacancy[offset + part] == 0) {
-                        vacant_run_start = -1;
-                    }
-                    else
-                    if (vacant_run_start < 0) {
-                        vacant_run_start = column + part;
-                    }
-                    row_has_slots = true;
                 }
             }
             const std::size_t end_offset = offset + static_cast<std::size_t>(source_width);
@@ -4417,8 +4410,19 @@ void Terminal_screen_model::reflow_primary_rows(screen_buffer_state_t& state, in
             offset = end_offset;
         }
         map_position(cells.size(), std::min(column, columns - 1), column == columns);
+        if (m_config.backend_owns_screen_buffers) {
+            // Past the text, the line's last source row keeps its attributes in
+            // the row the text ends on, as ConPTY's reflow copies them.
+            const std::vector<Cell>& tail = state.rows[last].cells;
+            for (int source_column = last_source_text_columns, target_column = column;
+                 source_column < static_cast<int>(tail.size()) && target_column < columns;
+                 ++source_column, ++target_column)
+            {
+                row.cells[static_cast<std::size_t>(target_column)] =
+                    tail[static_cast<std::size_t>(source_column)];
+            }
+        }
         finish_row_provenance(row);
-        finish_row_vacancy(row);
         rows.push_back(std::move(row));
         first = last + 1U;
     }
@@ -4430,6 +4434,16 @@ void Terminal_screen_model::resize_buffer_state(
     terminal_grid_size_t   grid_size,
     bool                   primary)
 {
+    // A backend that owns its screens never moves a saved cursor. ConPTY keeps
+    // DECSC and 1049 saves at the coordinates the application saved, and its
+    // restore clamps them to the grid (adaptDispatch.cpp CursorSaveState and
+    // CursorRestoreState), as restore_cursor does. Such a saved cursor takes no
+    // part in the resize, reflow included.
+    const saved_cursor_state_t kept_saved_cursor = state.saved_cursor;
+    if (m_config.backend_owns_screen_buffers) {
+        state.saved_cursor.valid = false;
+    }
+
     const bool width_changed = state.rows.front().cells.size() != (std::size_t)grid_size.columns;
     if (primary && width_changed) {
         reflow_primary_rows(state, grid_size.columns);
@@ -4442,13 +4456,29 @@ void Terminal_screen_model::resize_buffer_state(
 
     // Retained history is archival. Resize only the live screen and keep its
     // cursor visible; growing the screen does not pull archived rows back in.
-    const int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    int prefix_rows = std::max(0, state.cursor.row - grid_size.rows + 1);
+    if (primary && m_config.backend_owns_screen_buffers) {
+        // ConPTY's reflow keeps the last rows that hold text or the cursor, up
+        // to a screen from the cursor down (textBuffer.cpp TextBuffer::Reflow).
+        // A row holds text when it has a character other than a space or
+        // continues into the next row (Row.cpp ROW::MeasureRight).
+        int content_rows = state.cursor.row + 1;
+        for (int row = static_cast<int>(state.rows.size()) - 1; row >= content_rows; --row) {
+            const Terminal_screen_row& candidate = state.rows[static_cast<std::size_t>(row)];
+            const bool holds_text = candidate.soft_wrap_columns > 0 ||
+                !std::all_of(candidate.cells.begin(), candidate.cells.end(), is_space_cell);
+            if (holds_text) {
+                content_rows = row + 1;
+            }
+        }
+        prefix_rows = std::max(0,
+            std::min(content_rows, state.cursor.row + grid_size.rows) - grid_size.rows);
+    }
     for (int row = 0; row < prefix_rows; ++row) {
         if (primary) {
             append_scrollback_row(
                 state.rows[(std::size_t)row],
-                Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
-                nullptr, nullptr, true);
+                Terminal_retained_line_provenance_source::TERMINAL_STORAGE);
         }
     }
     if (prefix_rows > 0) {
@@ -4456,17 +4486,7 @@ void Terminal_screen_model::resize_buffer_state(
         state.cursor.row -= prefix_rows;
         state.saved_cursor.position.row -= prefix_rows;
     }
-    const std::size_t kept_rows = state.rows.size();
     resize_rows(state.rows, grid_size);
-    if (primary) {
-        for (std::size_t row = kept_rows; row < state.rows.size(); ++row) {
-            state.rows[row].resize_vacant_from_column = 0;
-        }
-        m_primary_resize_vacancy = std::any_of(state.rows.begin(), state.rows.end(),
-            [](const Terminal_screen_row& candidate) {
-                return candidate.resize_vacant_from_column != k_terminal_no_resize_vacancy_column;
-            });
-    }
     state.cursor.row    = std::clamp(state.cursor.row,    0, grid_size.rows - 1);
     state.cursor.column = std::clamp(state.cursor.column, 0, grid_size.columns - 1);
     if (state.saved_cursor.valid) {
@@ -4481,11 +4501,62 @@ void Terminal_screen_model::resize_buffer_state(
         }
         state.saved_cursor.origin_mode = false;
     }
+    if (m_config.backend_owns_screen_buffers) {
+        state.saved_cursor = kept_saved_cursor;
+    }
     state.scroll_top    = 0;
     state.scroll_bottom = grid_size.rows - 1;
     state.scroll_left   = 0;
     state.scroll_right  = grid_size.columns - 1;
     state.origin_mode   = false;
+}
+
+// ConPTY resizes its inactive main buffer once, to the size then current, when
+// the buffer is used again: on return from the alternate buffer and before an
+// active alternate buffer is replaced (screenInfo.cpp _handleDeferredResize).
+// A primary already at that size stays as it is, margins included, as
+// ConPTY's does.
+void Terminal_screen_model::resize_deferred_primary()
+{
+    if (grid_sizes_match(primary_grid_size(), m_config.grid_size)) {
+        return;
+    }
+
+    resize_primary_state(m_config.grid_size);
+    mark_grid_reflow_changed();
+}
+
+// A backend that owns its screens resizes the primary as ConPTY resizes its
+// main buffer: a narrowing or widening that also shrinks reflows the width at
+// the old height first, then the height (outputStream.cpp
+// ConhostInternalGetSet::ResizeWindow, screenInfo.cpp _handleDeferredResize).
+void Terminal_screen_model::resize_primary_state(terminal_grid_size_t grid_size)
+{
+    screen_buffer_state_t&     primary      = m_primary_backing.active_grid_state();
+    const terminal_grid_size_t primary_size = primary_grid_size();
+    if (m_config.backend_owns_screen_buffers   &&
+        grid_size.rows    <  primary_size.rows &&
+        grid_size.columns != primary_size.columns)
+    {
+        resize_buffer_state(primary, {primary_size.rows, grid_size.columns}, true);
+    }
+    resize_buffer_state(primary, grid_size, true);
+}
+
+// A space, written or not, whatever its attributes: ConPTY's reflow measures a
+// line's text up to its last other character (Row.cpp ROW::MeasureRight).
+bool Terminal_screen_model::is_space_cell(const Cell& cell)
+{
+    return cell.text == QStringLiteral(" ");
+}
+
+terminal_grid_size_t Terminal_screen_model::primary_grid_size() const
+{
+    const screen_buffer_state_t& primary = m_primary_backing.active_grid_state();
+    return {
+        static_cast<int>(primary.rows.size()),
+        static_cast<int>(primary.rows.front().cells.size()),
+    };
 }
 
 void Terminal_screen_model::resize_rows(
@@ -4582,70 +4653,7 @@ void Terminal_screen_model::replace_row_with_erased_retained_line(Terminal_scree
     fill_row_with_erased_cells(row.cells);
     row.soft_wrap_columns = 0;
     row.image_slice.reset();
-    row.resize_vacant_from_column = k_terminal_no_resize_vacancy_column;
     replace_retained_line_id(row);
-}
-
-int Terminal_screen_model::resize_vacancy_rows() const
-{
-    const std::vector<Terminal_screen_row>& rows = primary_active_grid_rows();
-    int vacant_rows = 0;
-    for (auto row = rows.rbegin();
-        row != rows.rend() && row->resize_vacant_from_column == 0;
-        ++row)
-    {
-        ++vacant_rows;
-    }
-    return vacant_rows;
-}
-
-// Application placement in a row, or the cursor entering it, makes that row
-// and every row above it application space, a mixed row's latent vacant
-// fragment included. The rule is an operation, not a cell comparison: a
-// placement that leaves the cells equal still retires.
-void Terminal_screen_model::retire_resize_vacancy_through(int row)
-{
-    if (!m_primary_resize_vacancy || m_active_buffer_id != Terminal_buffer_id::PRIMARY) {
-        return;
-    }
-
-    std::vector<Terminal_screen_row>& rows = active_grid_rows();
-    const int last_row = std::min(row, static_cast<int>(rows.size()) - 1);
-    for (int index = 0; index <= last_row; ++index) {
-        rows[static_cast<std::size_t>(index)].resize_vacant_from_column =
-            k_terminal_no_resize_vacancy_column;
-    }
-    if (last_row + 1 >= static_cast<int>(rows.size())) {
-        m_primary_resize_vacancy = false;
-    }
-}
-
-void Terminal_screen_model::retire_all_resize_vacancy()
-{
-    retire_resize_vacancy_through(m_config.grid_size.rows - 1);
-}
-
-// Rows carry their provenance when they move. A row that now lies above
-// application material, a moved application row or a replacement row the
-// application created, is retired, so vacancy remains a suffix.
-void Terminal_screen_model::normalize_resize_vacancy()
-{
-    if (!m_primary_resize_vacancy || m_active_buffer_id != Terminal_buffer_id::PRIMARY) {
-        return;
-    }
-
-    const std::vector<Terminal_screen_row>& rows = active_grid_rows();
-    int last_application_row = static_cast<int>(rows.size()) - 1;
-    while (last_application_row >= 0 &&
-        rows[static_cast<std::size_t>(last_application_row)].resize_vacant_from_column == 0)
-    {
-        --last_application_row;
-    }
-    retire_resize_vacancy_through(last_application_row - 1);
-    m_primary_resize_vacancy = std::any_of(rows.begin(), rows.end(),
-        [](const Terminal_screen_row& candidate) {
-            return candidate.resize_vacant_from_column != k_terminal_no_resize_vacancy_column;
-        });
 }
 
 bool Terminal_screen_model::cells_have_same_selection_content(
@@ -4911,8 +4919,7 @@ std::vector<bool> Terminal_screen_model::default_tab_stops(int column_count) con
 
 void Terminal_screen_model::reset_grid()
 {
-    m_resize_displaced_scrollback_rows = 0;
-    m_primary_resize_vacancy = false;
+    m_clear_page_start_row = 0;
     cancel_primary_repaint_recovery_candidate();
     cancel_primary_repaint_recovery_resize_guard();
     m_primary_backing.active_grid_state()     = make_empty_buffer_state();
@@ -4945,8 +4952,14 @@ bool Terminal_screen_model::apply_grid_resize(
     save_active_buffer_state();
     // Reflowed prefix rows are sealed into history at their new source width.
     m_config.grid_size = grid_size;
-    resize_buffer_state(m_primary_backing.active_grid_state(), grid_size, true);
-    resize_buffer_state(m_alternate_grid.active_grid_state(),  grid_size, false);
+    // An inactive primary whose backend owns its screens waits for
+    // resize_deferred_primary.
+    if (!m_config.backend_owns_screen_buffers ||
+        m_active_buffer_id == Terminal_buffer_id::PRIMARY)
+    {
+        resize_primary_state(grid_size);
+    }
+    resize_buffer_state(m_alternate_grid.active_grid_state(), grid_size, false);
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
     if (guard_primary_repaint_recovery) {
@@ -5262,9 +5275,9 @@ void Terminal_screen_model::reset_tab_stops()
     m_tab_stops = default_tab_stops(k_terminal_screen_model_max_columns);
 }
 
-void Terminal_screen_model::put_scalar(QString text)
+void Terminal_screen_model::put_scalar(QString text, char32_t codepoint)
 {
-    const Terminal_utf8_width_result width = measure_utf8_width(text.toUtf8());
+    const Terminal_codepoint_width width = width_for_codepoint(codepoint);
     if (width.cells <= 0) {
         append_zero_width_scalar(std::move(text));
         return;
@@ -5306,12 +5319,16 @@ void Terminal_screen_model::put_text(QString text)
             i + 1 < text.size() &&
             text[i + 1].isLowSurrogate())
         {
-            put_scalar(QString(current) + text[i + 1]);
+            put_scalar(
+                QString(current) + text[i + 1],
+                QChar::surrogateToUcs4(current, text[i + 1]));
             i += 2;
             continue;
         }
 
-        put_scalar(QString(current));
+        // A lone surrogate encoded by QString has one replacement cell.
+        const char32_t codepoint = current.isSurrogate() ? 0xfffdU : current.unicode();
+        put_scalar(QString(current), codepoint);
         ++i;
     }
 }
@@ -6001,12 +6018,6 @@ void Terminal_screen_model::erase_row_range(int row, int first_column, int last_
 
 void Terminal_screen_model::clear_screen_before_cursor()
 {
-    if (m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
-        m_cursor.row == m_config.grid_size.rows - 1 && m_cursor.column == m_config.grid_size.columns - 1)
-    {
-        m_resize_displaced_scrollback_rows = 0;
-        retire_all_resize_vacancy();
-    }
     for (int row = 0; row < m_cursor.row; ++row) {
         erase_row_range(row, 0, m_config.grid_size.columns - 1);
     }
@@ -6015,10 +6026,6 @@ void Terminal_screen_model::clear_screen_before_cursor()
 
 void Terminal_screen_model::clear_screen_after_cursor()
 {
-    if (m_active_buffer_id == Terminal_buffer_id::PRIMARY && m_cursor.row == 0 && m_cursor.column == 0) {
-        m_resize_displaced_scrollback_rows = 0;
-        retire_all_resize_vacancy();
-    }
     erase_row_range(m_cursor.row, m_cursor.column, m_config.grid_size.columns - 1);
     for (int row = m_cursor.row + 1; row < m_config.grid_size.rows; ++row) {
         erase_row_range(row, 0, m_config.grid_size.columns - 1);
@@ -6028,8 +6035,7 @@ void Terminal_screen_model::clear_screen_after_cursor()
 void Terminal_screen_model::erase_visible_screen()
 {
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
-        m_resize_displaced_scrollback_rows = 0;
-        retire_all_resize_vacancy();
+        m_clear_page_start_row = scrollback_size();
     }
     mark_terminal_content_changed();
     const bool primary_repaint_rebuild =
@@ -6070,7 +6076,6 @@ void Terminal_screen_model::erase_in_display(int mode)
         case 2:  erase_visible_screen();       break;
         case 3:
         {
-            m_resize_displaced_scrollback_rows = 0;
             cancel_primary_repaint_recovery_candidate();
             if (m_primary_backing.retained_history_empty()) {
                 record_primary_history_delta(
@@ -6185,10 +6190,6 @@ void Terminal_screen_model::copy_rectangular_area(
         (margin_relative_columns ? m_scroll_right : m_config.grid_size.columns - 1) -
             target_left + 1);
 
-    if (copy_rows > 0) {
-        retire_resize_vacancy_through(target_top + copy_rows - 1);
-    }
-
     // Capture before writing so overlapping copies behave as a single move.
     std::vector<std::vector<Cell>> source_cells;
     source_cells.reserve(static_cast<std::size_t>(copy_rows));
@@ -6239,7 +6240,6 @@ void Terminal_screen_model::fill_rectangular_area(
     replacement.hyperlink_id  = m_current_hyperlink_id;
     replacement.protected_cell = m_character_protected;
 
-    retire_resize_vacancy_through(area.bottom);
     for (int row_number = area.top; row_number <= area.bottom; ++row_number) {
         Terminal_screen_row& row = active_grid_rows()[static_cast<std::size_t>(row_number)];
         const std::vector<Cell> before_cells = row.cells;
@@ -6548,7 +6548,6 @@ void Terminal_screen_model::insert_lines(int count)
     }
 
     break_soft_wrap_before(m_scroll_bottom + 1);
-    normalize_resize_vacancy();
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
@@ -6591,7 +6590,6 @@ void Terminal_screen_model::delete_lines(int count)
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(row)]);
     }
 
-    normalize_resize_vacancy();
     mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
@@ -6948,6 +6946,20 @@ void Terminal_screen_model::apply_dec_private_mode(
             }
             return;
         case 1049:
+            // A backend that owns its screens saves the active screen's cursor
+            // on every entry and restores the primary's on every return
+            // (adaptDispatch.cpp _SetAlternateScreenBufferMode).
+            if (m_config.backend_owns_screen_buffers) {
+                if (enabled) {
+                    save_cursor();
+                    enter_alternate_screen(true, mode);
+                }
+                else {
+                    (void)leave_alternate_screen(true);
+                    restore_cursor();
+                }
+                return;
+            }
             if (enabled) {
                 if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
                     save_cursor();
@@ -7040,11 +7052,14 @@ int Terminal_screen_model::dec_private_mode_status(int mode) const
 void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int active_mode)
 {
     cancel_primary_repaint_recovery_candidate();
+    const terminal_grid_position_t entry_cursor = m_cursor;
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
         const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
         save_active_buffer_state();
         if (clear_alternate) {
-            m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+            m_alternate_grid.active_grid_state() = make_entered_alternate_state(
+                entry_cursor,
+                m_alternate_grid.active_grid_state().saved_cursor);
         }
         m_active_buffer_id = Terminal_buffer_id::ALTERNATE;
         record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -7053,7 +7068,9 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
     }
     else
     if (clear_alternate) {
-        m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+        resize_deferred_primary();
+        m_alternate_grid.active_grid_state() =
+            make_entered_alternate_state(entry_cursor, m_saved_cursor);
         mark_terminal_content_changed();
         restore_buffer_state(m_alternate_grid.active_grid_state());
     }
@@ -7077,8 +7094,16 @@ bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
 
     save_active_buffer_state();
     if (clear_alternate) {
+        const saved_cursor_state_t alternate_saved_cursor =
+            m_alternate_grid.active_grid_state().saved_cursor;
         m_alternate_grid.active_grid_state() = make_empty_buffer_state();
+        // A backend that owns its screens keeps the alternate screen's saved
+        // cursor apart from its rows (adaptDispatch.hpp _savedCursorState).
+        if (m_config.backend_owns_screen_buffers) {
+            m_alternate_grid.active_grid_state().saved_cursor = alternate_saved_cursor;
+        }
     }
+    resize_deferred_primary();
     const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
     m_active_buffer_id = Terminal_buffer_id::PRIMARY;
     record_mode_transition_delta(active_buffer_before, m_active_buffer_id);
@@ -7104,7 +7129,9 @@ void Terminal_screen_model::save_cursor()
 
 void Terminal_screen_model::restore_cursor()
 {
-    if (!m_saved_cursor.valid) {
+    // A backend that owns its screens restores a cursor never saved as its
+    // default: home, with default attributes (adaptDispatch.hpp CursorState).
+    if (!m_saved_cursor.valid && !m_config.backend_owns_screen_buffers) {
         return;
     }
 
@@ -7143,11 +7170,8 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
     const Terminal_screen_row&               row,
     Terminal_retained_line_provenance_source source,
     const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
-    const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id,
-    bool                                    resize_displaced)
+    const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id)
 {
-    const int previous_resize_rows = resize_displaced_scrollback_rows();
-    m_resize_displaced_scrollback_rows = 0;
     std::optional<terminal_history_handle_t> appended_handle;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
@@ -7254,9 +7278,6 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
             1);
     }
     mark_viewport_changed();
-    if (resize_displaced && appended_handle.has_value()) {
-        m_resize_displaced_scrollback_rows = std::min(previous_resize_rows, scrollback_size() - 1) + 1;
-    }
     return appended_handle;
 }
 
@@ -7266,7 +7287,6 @@ void Terminal_screen_model::replace_row_segment(
 {
     const int left  = active_left_margin();
     const int right = active_right_margin() + 1;
-    retire_resize_vacancy_through(target_row);
     Terminal_screen_row& target = active_grid_rows()[static_cast<std::size_t>(target_row)];
     const std::vector<Cell> before_cells = target.cells;
 
@@ -7341,7 +7361,6 @@ void Terminal_screen_model::shift_columns(int first_column, int count, bool inse
     const int end_column = right + 1;
     mark_terminal_content_changed();
     m_pending_wrap = false;
-    retire_resize_vacancy_through(m_scroll_bottom);
     for (int row_index = m_scroll_top; row_index <= m_scroll_bottom; ++row_index) {
         Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row_index)];
         std::vector<Cell>& cells = screen_row.cells;
@@ -7468,7 +7487,6 @@ void Terminal_screen_model::scroll_up_region(
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(bottom)]);
     }
 
-    normalize_resize_vacancy();
     mark_dirty_rows(top, bottom);
 }
 
@@ -7505,7 +7523,6 @@ void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
     }
 
     break_soft_wrap_before(bottom + 1);
-    normalize_resize_vacancy();
     mark_dirty_rows(top, bottom);
 }
 
@@ -8477,8 +8494,6 @@ std::size_t Terminal_screen_model::place_image_band(
     int                        end_column,
     terminal_cell_pixel_size_t cell)
 {
-    retire_resize_vacancy_through(row);
-
     // Clip at the right margin, and copy the band out of the decoder's raster,
     // which may be a view keeping a larger capacity buffer alive.
     const int band_width = static_cast<int>(std::min<std::int64_t>(
@@ -8877,10 +8892,6 @@ void Terminal_screen_model::horizontal_tab()
 void Terminal_screen_model::mark_cursor_dirty()
 {
     mark_dirty(m_cursor.row);
-    // Every cursor movement marks the row it lands on here, so this is where
-    // the cursor enters a row: entry retires resize vacancy through that row,
-    // whether the cursor is visible or not.
-    retire_resize_vacancy_through(m_cursor.row);
 }
 
 void Terminal_screen_model::mark_dirty(int row)
@@ -9462,11 +9473,7 @@ void Terminal_screen_model::record_primary_history_delta(
     int                            evicted_scrollback_rows,
     int                            discarded_scrollback_rows)
 {
-    if (kind == Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED ||
-        kind == Terminal_backing_delta_kind::PRIMARY_HISTORY_REWRITTEN)
-    {
-        m_resize_displaced_scrollback_rows = 0;
-    }
+    m_clear_page_start_row = std::max(0, m_clear_page_start_row - evicted_scrollback_rows);
     terminal_backing_delta_t delta;
     delta.kind                       = kind;
     delta.buffer_id                  = Terminal_buffer_id::PRIMARY;
@@ -10073,20 +10080,20 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
 }
 
 Terminal_history_row_record Terminal_screen_model::history_row_record_from_retained_record(
-    const retained_row_record_t& retained_record)
+    retained_row_record_t&& retained_record)
 {
     Terminal_history_row_record history_record;
-    history_record.provenance = retained_record.row.retained_line_provenance;
-    history_record.content_origin_spans = retained_record.row.content_origin_spans;
-    history_record.style_table = retained_record.style_table;
-    history_record.hyperlink_identity_keys = retained_record.hyperlink_identity_keys;
-    history_record.metadata = retained_record.metadata;
-    history_record.image_slice = retained_record.row.image_slice;
+    history_record.provenance              = retained_record.row.retained_line_provenance;
+    history_record.content_origin_spans    = std::move(retained_record.row.content_origin_spans);
+    history_record.style_table             = std::move(retained_record.style_table);
+    history_record.hyperlink_identity_keys = std::move(retained_record.hyperlink_identity_keys);
+    history_record.metadata                = retained_record.metadata;
+    history_record.image_slice             = std::move(retained_record.row.image_slice);
     history_record.cells.reserve(retained_record.row.cells.size());
 
-    for (const Cell& cell : retained_record.row.cells) {
+    for (Cell& cell : retained_record.row.cells) {
         history_record.cells.push_back({
-            cell.text,
+            std::move(cell.text),
             cell.display_width,
             cell.wide_continuation,
             cell.occupied,
@@ -10101,23 +10108,23 @@ Terminal_history_row_record Terminal_screen_model::history_row_record_from_retai
 
 Terminal_screen_model::retained_row_record_t
 Terminal_screen_model::retained_row_record_from_history_row_record(
-    const Terminal_history_row_record& history_record)
+    Terminal_history_row_record history_record)
 {
     retained_row_record_t retained_record;
     retained_record.row.retained_line_provenance = history_record.provenance;
-    retained_record.row.content_origin_spans = history_record.content_origin_spans;
-    retained_record.style_table = history_record.style_table;
-    retained_record.hyperlink_identity_keys = history_record.hyperlink_identity_keys;
+    retained_record.row.content_origin_spans = std::move(history_record.content_origin_spans);
+    retained_record.style_table = std::move(history_record.style_table);
+    retained_record.hyperlink_identity_keys = std::move(history_record.hyperlink_identity_keys);
     retained_record.metadata = history_record.metadata;
-    retained_record.row.image_slice = history_record.image_slice;
+    retained_record.row.image_slice = std::move(history_record.image_slice);
     retained_record.row.cells.reserve(history_record.cells.size());
 
     for (std::size_t index = 0; index < history_record.cells.size(); ++index) {
-        const Terminal_history_row_cell& cell = history_record.cells[index];
+        Terminal_history_row_cell& cell = history_record.cells[index];
         Cell restored_cell;
-        restored_cell.text = cell.text;
+        restored_cell.text = std::move(cell.text);
         restored_cell.text_category = Terminal_render_cell_text::category_for_text(
-            QStringView(cell.text));
+            QStringView(restored_cell.text));
         restored_cell.display_width = cell.display_width;
         restored_cell.wide_continuation = cell.wide_continuation;
         restored_cell.occupied = cell.occupied;
@@ -10135,7 +10142,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
             // Editing can move a clipped-wide cell away from the right margin.
             // Its original width is recoverable from the retained Unicode;
             // display_width alone would erase it during materialization.
-            const QByteArray text_bytes = cell.text.toUtf8();
+            const QByteArray text_bytes = restored_cell.text.toUtf8();
             const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
             if (width.status == Terminal_unicode_width_status::OK &&
                 width.cells > restored_cell.display_width)
@@ -10257,9 +10264,16 @@ int Terminal_screen_model::active_grid_row_count() const
     return m_config.grid_size.rows;
 }
 
+// The primary's own height: while its resize is deferred, the inactive primary
+// keeps the height it had when the alternate screen became active.
+int Terminal_screen_model::primary_active_grid_row_count() const
+{
+    return static_cast<int>(primary_active_grid_rows().size());
+}
+
 int Terminal_screen_model::primary_backing_row_count() const
 {
-    return scrollback_size() + active_grid_row_count();
+    return scrollback_size() + primary_active_grid_row_count();
 }
 
 int Terminal_screen_model::primary_backing_active_grid_first_row() const
@@ -10314,7 +10328,7 @@ Terminal_screen_model::active_grid_row_from_primary_backing(primary_backing_row_
     active_grid_row_t converted{
         row.value - primary_backing_active_grid_first_row(),
     };
-    if (!active_grid_row_is_valid(converted)) {
+    if (converted.value < 0) {
         return std::nullopt;
     }
 
@@ -10326,7 +10340,9 @@ Terminal_screen_model::primary_backing_row_from_viewport(
     const Terminal_viewport_state& viewport,
     viewport_row_t                 row) const
 {
-    if (viewport.active_buffer != Terminal_buffer_id::PRIMARY || !viewport_row_is_valid(row)) {
+    if (viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
+        row.value < 0 || row.value >= viewport.visible_rows)
+    {
         return std::nullopt;
     }
 
@@ -10353,7 +10369,7 @@ Terminal_screen_model::viewport_row_from_primary_backing(
 
     viewport_row_t converted =
         viewport_row_from_primary_backing_unbounded(viewport, row);
-    if (!viewport_row_is_valid(converted)) {
+    if (converted.value < 0 || converted.value >= viewport.visible_rows) {
         return std::nullopt;
     }
 

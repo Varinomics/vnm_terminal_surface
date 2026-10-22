@@ -86,6 +86,13 @@ struct Encoded_cell_part
     bool                          default_printable_ascii = false;
 };
 
+QByteArrayView encoded_cell_text(const Encoded_cell_part& part)
+{
+    return part.printable_ascii != 0U
+        ? QByteArrayView(reinterpret_cast<const char*>(&part.printable_ascii), 1)
+        : QByteArrayView(part.text_bytes);
+}
+
 struct Encoded_record_parts
 {
     std::vector<Encoded_cell_part> cell_parts;
@@ -297,14 +304,14 @@ public:
         return write_unsigned(value, 8U);
     }
 
-    bool write_bytes(const QByteArray& bytes)
+    bool write_bytes(QByteArrayView bytes)
     {
         const std::size_t byte_count = static_cast<std::size_t>(bytes.size());
         if (!can_write(byte_count)) {
             return false;
         }
 
-        std::memcpy(m_bytes.data() + m_offset, bytes.constData(), byte_count);
+        std::memcpy(m_bytes.data() + m_offset, bytes.data(), byte_count);
         m_offset += byte_count;
         return true;
     }
@@ -408,6 +415,19 @@ public:
         }
 
         bytes = QByteArray(
+            reinterpret_cast<const char*>(m_bytes.data() + m_offset),
+            static_cast<qsizetype>(byte_count));
+        m_offset += byte_count;
+        return true;
+    }
+
+    bool read_view(std::uint32_t byte_count, QByteArrayView& bytes)
+    {
+        if (!size_fits_qsizetype(byte_count) || !can_read(byte_count)) {
+            return false;
+        }
+
+        bytes = QByteArrayView(
             reinterpret_cast<const char*>(m_bytes.data() + m_offset),
             static_cast<qsizetype>(byte_count));
         m_offset += byte_count;
@@ -1082,7 +1102,7 @@ Terminal_history_row_record_codec_status read_table_length(
 
 bool occupied_cell_has_printable_ascii_text(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     return
         cell.occupied            &&
@@ -1137,7 +1157,7 @@ bool cell_is_default_printable_ascii(
 
 bool cell_is_default_printable_ascii(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     return
         occupied_cell_has_printable_ascii_text(cell, text_bytes) &&
@@ -1147,7 +1167,7 @@ bool cell_is_default_printable_ascii(
 
 Terminal_history_row_record_codec_status validate_cell_text(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     if (!cell.occupied || cell.wide_continuation) {
         return Terminal_history_row_record_codec_status::OK;
@@ -1157,8 +1177,7 @@ Terminal_history_row_record_codec_status validate_cell_text(
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
 
-    const Terminal_utf8_width_result width =
-        measure_utf8_width(QByteArrayView(text_bytes.constData(), text_bytes.size()));
+    const Terminal_utf8_width_result width = measure_utf8_width(text_bytes);
     if (width.status != Terminal_unicode_width_status::OK) {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
@@ -1194,7 +1213,7 @@ Terminal_history_row_record_codec_status validate_cell_stream_shape(
     for (std::size_t index = 0U; index < record.cells.size(); ++index) {
         const Terminal_history_row_cell& cell = record.cells[index];
         const Encoded_cell_part& cell_part = parts.cell_parts[index];
-        const QByteArray& text_bytes = cell_part.text_bytes;
+        const QByteArrayView text_bytes = encoded_cell_text(cell_part);
         const int column = static_cast<int>(index);
 
         if (cell.style_id >= referenced_style_refs.size() ||
@@ -1446,7 +1465,7 @@ bool try_prepare_prefix_plain_ascii_stream(
 
 std::size_t extended_cell_encoded_bytes(
     const Terminal_history_row_cell& cell,
-    const QByteArray&                text_bytes)
+    QByteArrayView                   text_bytes)
 {
     std::size_t byte_count = 2U;
     const bool occupied = cell.occupied;
@@ -1576,16 +1595,19 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
                 }
             }
             else {
-                cell_part.text_bytes = cell.text.toUtf8();
+                if (!cell_has_single_printable_ascii_text(cell, cell_part.printable_ascii)) {
+                    cell_part.text_bytes = cell.text.toUtf8();
+                }
+                const QByteArrayView text_bytes = encoded_cell_text(cell_part);
                 const std::size_t text_byte_count =
-                    static_cast<std::size_t>(cell_part.text_bytes.size());
+                    static_cast<std::size_t>(text_bytes.size());
                 if (!size_fits_u32(text_byte_count)) {
                     return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
                 }
 
                 if (!checked_add(
                         payload_bytes,
-                        extended_cell_encoded_bytes(cell, cell_part.text_bytes)))
+                        extended_cell_encoded_bytes(cell, text_bytes)))
                 {
                     return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
                 }
@@ -1678,7 +1700,7 @@ std::uint8_t extended_extra_field_set(const Terminal_history_row_cell& cell)
 bool write_extended_cell(
     Byte_writer&                       writer,
     const Terminal_history_row_cell&   cell,
-    const QByteArray&                  text_bytes)
+    QByteArrayView                     text_bytes)
 {
     const std::uint8_t text_length_width =
         cell.occupied && text_bytes.size() != 1
@@ -1778,7 +1800,7 @@ Terminal_history_row_record_codec_status write_cell_stream(
     for (std::size_t i = 0U; i < record.cells.size(); ++i) {
         const Terminal_history_row_cell& cell = record.cells[i];
         const Encoded_cell_part& cell_part = parts.cell_parts[i];
-        const QByteArray& text_bytes = cell_part.text_bytes;
+        const QByteArrayView text_bytes = encoded_cell_text(cell_part);
 
         if (cell_is_default_blank(cell)) {
             if (!writer.write_u8(k_opcode_default_blank)) {
@@ -2226,8 +2248,7 @@ Terminal_history_row_record_codec_status read_extended_value(
 Terminal_history_row_record_codec_status read_extended_cell(
     Byte_reader&                  reader,
     const row_record_header_t&     header,
-    Terminal_history_row_cell&     cell,
-    QByteArray&                    encoded_text)
+    Terminal_history_row_cell&     cell)
 {
     std::uint8_t tag0 = 0U;
     if (!reader.read_u8(tag0)) {
@@ -2339,12 +2360,19 @@ Terminal_history_row_record_codec_status read_extended_cell(
             : Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
     }
 
-    if (!reader.read_bytes(text_byte_count, encoded_text)) {
+    QByteArrayView encoded_text;
+    if (!reader.read_view(text_byte_count, encoded_text)) {
         return Terminal_history_row_record_codec_status::TRUNCATED_RECORD;
     }
 
     if (cell_is_default_printable_ascii(cell, encoded_text)) {
         return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
+    }
+
+    if (occupied_cell_has_printable_ascii_text(cell, encoded_text)) {
+        cell.text = printable_ascii_cell_text(
+            QChar(static_cast<ushort>(static_cast<unsigned char>(encoded_text[0]))));
+        return Terminal_history_row_record_codec_status::OK;
     }
 
     const Terminal_history_row_record_codec_status text_status =
@@ -2380,7 +2408,6 @@ Terminal_history_row_record_codec_status read_cell_stream(
         }
 
         Terminal_history_row_cell cell;
-        QByteArray encoded_text;
         if (opcode == k_opcode_default_blank) {
             if (remaining_wide_continuations > 0) {
                 return Terminal_history_row_record_codec_status::INVALID_PAYLOAD;
@@ -2421,8 +2448,7 @@ Terminal_history_row_record_codec_status read_cell_stream(
                 read_extended_cell(
                     reader,
                     header,
-                    cell,
-                    encoded_text);
+                    cell);
             if (status != Terminal_history_row_record_codec_status::OK) {
                 return status;
             }

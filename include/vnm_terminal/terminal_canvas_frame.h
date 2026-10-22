@@ -3,8 +3,10 @@
 #include "vnm_terminal/terminal_touch_selection.h"
 
 #include <QByteArray>
+#include <QChar>
 #include <QImage>
 #include <QString>
+#include <QStringView>
 #include <QtGlobal>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +53,43 @@ inline constexpr bool terminal_canvas_grid_fits_cell_budget(
             k_terminal_canvas_max_cells / static_cast<std::size_t>(columns);
 }
 
+// Count without encoding so canvas budget checks do not allocate per cell.
+// Malformed UTF-16 or an unrepresentable byte count has no result; callers
+// retain their own invalid-text policy.
+inline std::optional<qsizetype> terminal_canvas_text_utf8_size(QStringView text)
+{
+    qsizetype bytes = 0;
+    for (qsizetype offset = 0; offset < text.size(); ++offset) {
+        const QChar code_unit = text.at(offset);
+        qsizetype scalar_bytes = 1;
+        if (code_unit.unicode() >= 0x80U) {
+            if (code_unit.unicode() < 0x800U) {
+                scalar_bytes = 2;
+            }
+            else
+            if (code_unit.isHighSurrogate()) {
+                if (offset + 1 == text.size() || !text.at(offset + 1).isLowSurrogate()) {
+                    return std::nullopt;
+                }
+                ++offset;
+                scalar_bytes = 4;
+            }
+            else
+            if (code_unit.isLowSurrogate()) {
+                return std::nullopt;
+            }
+            else {
+                scalar_bytes = 3;
+            }
+        }
+        if (scalar_bytes > std::numeric_limits<qsizetype>::max() - bytes) {
+            return std::nullopt;
+        }
+        bytes += scalar_bytes;
+    }
+    return bytes;
+}
+
 enum class Terminal_canvas_cursor_shape
 {
     BLOCK,
@@ -72,8 +111,9 @@ enum class Terminal_canvas_buffer : std::uint8_t
 // In version 2, content_bottom_row_exclusive is a frame-relative exclusive row,
 // never a global logical row. It is exactly the maximum of one row, the last
 // exported semantic cell row plus one, and a visible in-range cursor row plus one.
-// Visibility is the terminal cursor mode, never the blinking paint phase: hidden
-// cursors must not add blank rows, and blinking must not move the content anchor.
+// This legacy advisory extent uses native-window paint visibility, independently
+// of the blink phase. Primary presentation uses the independently versioned
+// semantic endpoint below, which includes the logical cursor even when hidden.
 // An out-of-range cursor contributes nothing. The bottom is in [1, frame.rows],
 // scrollback_rows is in
 // [0, INT_MAX - (frame.rows - 1)], and offset_from_tail is in
@@ -89,6 +129,8 @@ struct terminal_canvas_content_extent_t
     int                   offset_from_tail = 0;
     Terminal_canvas_buffer active_buffer =
         Terminal_canvas_buffer::PRIMARY_BUFFER;
+
+    bool operator==(const terminal_canvas_content_extent_t&) const = default;
 };
 
 enum class Terminal_canvas_style_attribute : std::uint16_t
@@ -168,6 +210,8 @@ struct Terminal_canvas_cursor
     Terminal_canvas_cursor_shape shape         = Terminal_canvas_cursor_shape::BLOCK;
     bool                         visible       = false;
     bool                         blink_enabled = false;
+
+    bool operator==(const Terminal_canvas_cursor&) const = default;
 };
 
 inline constexpr std::uint16_t k_terminal_canvas_images_version = 1U;
@@ -245,23 +289,23 @@ inline bool terminal_canvas_images_are_valid(
     return true;
 }
 
-inline constexpr std::uint16_t k_terminal_canvas_leading_rows_version = 1U;
+inline constexpr std::uint16_t k_terminal_canvas_row_coverage_version = 1U;
 
-enum class Terminal_canvas_leading_rows_status
+enum class Terminal_canvas_row_coverage_status
 {
     AVAILABLE,
     INVALID,
     OVER_LIMIT,
 };
 
-// These retained rows precede the unchanged frame. A receiving presentation
-// may fit their suffix into its unused top padding without moving the native
-// screen. Selection describes the full frame with all leading rows prepended;
-// its source geometry and retained row identities remain those of this frame.
-struct Terminal_canvas_leading_rows
+// This immutable interval supplies terminal rows outside the native frame.
+// Its position and height are independent of the backend grid. Selection carries
+// exactly these rows while its source geometry remains the native frame's.
+struct Terminal_canvas_row_coverage
 {
-    std::uint16_t record_version = k_terminal_canvas_leading_rows_version;
-    Terminal_canvas_leading_rows_status status = Terminal_canvas_leading_rows_status::AVAILABLE;
+    std::uint16_t record_version = k_terminal_canvas_row_coverage_version;
+    Terminal_canvas_row_coverage_status status = Terminal_canvas_row_coverage_status::AVAILABLE;
+    int first_logical_row = 0;
     int rows = 0;
     std::vector<Terminal_canvas_style> styles;
     std::optional<Terminal_canvas_color_references> color_references;
@@ -269,44 +313,49 @@ struct Terminal_canvas_leading_rows
     std::optional<Terminal_canvas_images> images;
     std::optional<Terminal_canvas_selection> selection;
     std::optional<Terminal_canvas_wide_styles> wide_styles;
-    bool operator==(const Terminal_canvas_leading_rows&) const = default;
+    bool operator==(const Terminal_canvas_row_coverage&) const = default;
 };
 
-inline bool terminal_canvas_leading_rows_are_valid(
-    const Terminal_canvas_leading_rows& leading,
-    int                                frame_rows,
-    int                                frame_columns)
+inline bool terminal_canvas_row_coverage_is_valid(
+    const Terminal_canvas_row_coverage& coverage,
+    int                                 frame_rows,
+    int                                 frame_columns,
+    int                                 scrollback_rows)
 {
-    if (leading.record_version != k_terminal_canvas_leading_rows_version) {
+    if (coverage.record_version != k_terminal_canvas_row_coverage_version) {
         return true;
     }
-    switch (leading.status) {
-        case Terminal_canvas_leading_rows_status::INVALID:
-        case Terminal_canvas_leading_rows_status::OVER_LIMIT:
-            return leading.rows == 0 && leading.styles.empty() && leading.cells.empty() &&
-                !leading.color_references && !leading.images && !leading.selection && !leading.wide_styles;
-        case Terminal_canvas_leading_rows_status::AVAILABLE:
+    switch (coverage.status) {
+        case Terminal_canvas_row_coverage_status::INVALID:
+        case Terminal_canvas_row_coverage_status::OVER_LIMIT:
+            return coverage.first_logical_row == 0 && coverage.rows == 0 &&
+                coverage.styles.empty() && coverage.cells.empty() &&
+                !coverage.color_references && !coverage.images && !coverage.selection && !coverage.wide_styles;
+        case Terminal_canvas_row_coverage_status::AVAILABLE:
             break;
         default:
             return false;
     }
-    if (leading.rows <= 0 || leading.rows >= frame_rows ||
-        !terminal_canvas_grid_fits_cell_budget(leading.rows, frame_columns) ||
-        leading.cells.size() > (std::size_t)leading.rows * (std::size_t)frame_columns ||
-        leading.styles.empty() || leading.styles.size() > k_terminal_canvas_max_wide_styles)
+    if (coverage.first_logical_row < 0 || coverage.rows <= 0 ||
+        coverage.first_logical_row > scrollback_rows ||
+        (std::int64_t)coverage.first_logical_row + coverage.rows >
+            (std::int64_t)scrollback_rows + frame_rows ||
+        !terminal_canvas_grid_fits_cell_budget(coverage.rows, frame_columns) ||
+        coverage.cells.size() > (std::size_t)coverage.rows * (std::size_t)frame_columns ||
+        coverage.styles.empty() || coverage.styles.size() > k_terminal_canvas_max_wide_styles)
     {
         return false;
     }
-    if (leading.wide_styles) {
-        if (leading.wide_styles->record_version == k_terminal_canvas_wide_styles_version &&
-            (!leading.color_references ||
-                leading.color_references->record_version != k_terminal_canvas_color_references_version))
+    if (coverage.wide_styles) {
+        if (coverage.wide_styles->record_version == k_terminal_canvas_wide_styles_version &&
+            (!coverage.color_references ||
+                coverage.color_references->record_version != k_terminal_canvas_color_references_version))
         {
             return false;
         }
     }
     else
-    if (leading.styles.size() > k_terminal_canvas_max_styles) {
+    if (coverage.styles.size() > k_terminal_canvas_max_styles) {
         return false;
     }
     constexpr std::uint16_t known_attributes =
@@ -318,26 +367,26 @@ inline bool terminal_canvas_leading_rows_are_valid(
         (std::uint16_t)Terminal_canvas_style_attribute::INVERSE |
         (std::uint16_t)Terminal_canvas_style_attribute::INVISIBLE |
         (std::uint16_t)Terminal_canvas_style_attribute::STRIKE;
-    if (leading.styles.front().attributes != 0U) {
+    if (coverage.styles.front().attributes != 0U) {
         return false;
     }
-    for (const auto& style : leading.styles) {
+    for (const auto& style : coverage.styles) {
         if ((style.attributes & ~known_attributes) != 0U) {
             return false;
         }
     }
-    if (leading.color_references &&
-        leading.color_references->record_version == k_terminal_canvas_color_references_version)
+    if (coverage.color_references &&
+        coverage.color_references->record_version == k_terminal_canvas_color_references_version)
     {
-        if (leading.color_references->styles.size() != leading.styles.size()) {
+        if (coverage.color_references->styles.size() != coverage.styles.size()) {
             return false;
         }
-        for (const auto& refs : leading.color_references->styles) {
+        for (const auto& refs : coverage.color_references->styles) {
             if (refs.foreground > k_terminal_canvas_color_rgba || refs.background > k_terminal_canvas_color_rgba) {
                 return false;
             }
         }
-        const auto& defaults = leading.color_references->styles.front();
+        const auto& defaults = coverage.color_references->styles.front();
         if (defaults.foreground != k_terminal_canvas_color_default ||
             defaults.background != k_terminal_canvas_color_default)
         {
@@ -347,12 +396,12 @@ inline bool terminal_canvas_leading_rows_are_valid(
     int previous_row = -1;
     int previous_end = 0;
     qsizetype text_bytes = 0;
-    for (const auto& cell : leading.cells) {
-        if (cell.row < 0 || cell.row >= leading.rows || cell.row < previous_row ||
+    for (const auto& cell : coverage.cells) {
+        if (cell.row < 0 || cell.row >= coverage.rows || cell.row < previous_row ||
             cell.column < 0 || cell.display_width < 1 ||
             cell.display_width > frame_columns || cell.column > frame_columns - cell.display_width ||
             (cell.row == previous_row && cell.column < previous_end) ||
-            cell.style_index >= leading.styles.size() ||
+            cell.style_index >= coverage.styles.size() ||
             cell.text.size() > k_terminal_canvas_max_cell_text_utf16_code_units)
         {
             return false;
@@ -364,17 +413,17 @@ inline bool terminal_canvas_leading_rows_are_valid(
         previous_row = cell.row;
         previous_end = cell.column + cell.display_width;
     }
-    return (!leading.images || terminal_canvas_images_are_valid(*leading.images, leading.rows)) &&
-        (!leading.selection || terminal_canvas_selection_is_valid(*leading.selection, frame_rows, frame_columns));
+    return (!coverage.images || terminal_canvas_images_are_valid(*coverage.images, coverage.rows)) &&
+        (!coverage.selection || terminal_canvas_selection_is_valid(
+            *coverage.selection, coverage.rows, frame_columns, frame_rows));
 }
 
-inline constexpr std::uint16_t k_terminal_canvas_presentation_version = 1U;
+inline constexpr std::uint16_t k_terminal_canvas_presentation_version = 2U;
 
 enum class Terminal_canvas_presentation_policy : std::uint8_t
 {
     NATIVE,
-    AUTOMATIC,
-    COMPANION,
+    CONTENT_TAIL,
 };
 
 // The frame's presentation mapping record: which native row each display row
@@ -384,23 +433,26 @@ enum class Terminal_canvas_presentation_policy : std::uint8_t
 // invalidate the complete enclosing frame.
 //
 // The frame's own rows are native logical rows from the content extent's
-// scrollback_rows - offset_from_tail on. Display row d shows stream row
-// scrollback_rows - offset_from_tail + d: NATIVE shows native rows as they
-// are, AUTOMATIC shifts them down by hidden_rows, and COMPANION inserts
-// hidden_rows padding rows before native row insertion_row. Coverage is the
-// first covered_rows of the frame's own rows and the leading_rows rows the
-// leading-rows record supplies directly above them. A frozen frame shows
-// requested rows above its coverage as unused slots; a frame that lacks any
-// other requested row is invalid.
+// scrollback_rows - offset_from_tail on. CONTENT_TAIL presents native rows
+// through the current semantic content end, including the logical cursor even
+// when hidden. For consumer capacity N it appends max(0, N - (end -
+// clear_page_start)) unused slots after the end, so a document from the clear
+// page that fits starts on the top row; the history before the clear page
+// stays in the scroll range. The alternate screen retains NATIVE geometry.
+// Coverage is the first covered_rows of the native frame plus its attached
+// native logical interval. Endpoint, clear page, coverage, and cells
+// belong to the same immutable publication, including while output is held.
 struct Terminal_canvas_presentation
 {
     std::uint16_t                       record_version = k_terminal_canvas_presentation_version;
     Terminal_canvas_presentation_policy policy         = Terminal_canvas_presentation_policy::NATIVE;
-    int                                 hidden_rows    = 0;
-    int                                 insertion_row  = 0;
+    int                                 content_end_row_exclusive = 0;
+    int                                 clear_page_start_row      = 0;
     int                                 covered_rows   = 0;
-    int                                 leading_rows   = 0;
+    int                                 visible_rows   = 1;
+    int                                 offset_from_tail = 0;
     bool                                frozen         = false;
+    bool                                logical_cursor_visible = true;
     bool operator==(const Terminal_canvas_presentation&) const = default;
 };
 
@@ -417,22 +469,29 @@ inline bool terminal_canvas_presentation_is_valid(
     }
     switch (presentation.policy) {
         case Terminal_canvas_presentation_policy::NATIVE:
-            if (presentation.hidden_rows != 0) {
+            if (presentation.content_end_row_exclusive != 0 || presentation.clear_page_start_row != 0) {
                 return false;
             }
             break;
-        case Terminal_canvas_presentation_policy::AUTOMATIC:
-        case Terminal_canvas_presentation_policy::COMPANION:
+        case Terminal_canvas_presentation_policy::CONTENT_TAIL:
+            if (presentation.content_end_row_exclusive <= scrollback_rows ||
+                (std::int64_t)presentation.content_end_row_exclusive >
+                    (std::int64_t)scrollback_rows + frame_rows ||
+                presentation.clear_page_start_row < 0 ||
+                presentation.clear_page_start_row > scrollback_rows)
+            {
+                return false;
+            }
             break;
         default:
             return false;
     }
     return
-        presentation.hidden_rows   >= 0 && presentation.hidden_rows   <= frame_rows      &&
-        presentation.insertion_row >= 0 && presentation.insertion_row <= scrollback_rows &&
-        presentation.covered_rows  >= 0 && presentation.covered_rows  <= frame_rows      &&
-        presentation.leading_rows  >= 0 && presentation.leading_rows  <  frame_rows      &&
-        presentation.leading_rows  <= scrollback_rows - offset_from_tail;
+        frame_rows > 0 && scrollback_rows >= 0 &&
+        offset_from_tail >= 0 && offset_from_tail <= scrollback_rows &&
+        presentation.covered_rows >= 0 && presentation.covered_rows <= frame_rows &&
+        presentation.visible_rows > 0 && presentation.visible_rows <= k_terminal_canvas_max_rows &&
+        presentation.offset_from_tail >= 0;
 }
 
 struct Terminal_canvas_frame
@@ -467,7 +526,7 @@ struct Terminal_canvas_frame
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;
     std::optional<Terminal_canvas_wide_styles> wide_styles;
-    std::optional<Terminal_canvas_leading_rows> leading_rows;
+    std::optional<Terminal_canvas_row_coverage> row_coverage;
     std::optional<Terminal_canvas_presentation> presentation;
 };
 
