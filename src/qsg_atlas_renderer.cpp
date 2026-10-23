@@ -8673,14 +8673,12 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font)
 {
     QFont layout_font = font;
     layout_font.setKerning(false);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
     layout_font.setFeature(QFont::Tag("calt"), 0U);
     layout_font.setFeature(QFont::Tag("clig"), 0U);
     layout_font.setFeature(QFont::Tag("dlig"), 0U);
     layout_font.setFeature(QFont::Tag("hlig"), 0U);
     layout_font.setFeature(QFont::Tag("liga"), 0U);
     layout_font.setFeature(QFont::Tag("rlig"), 0U);
-#endif
     layout_font.setStyleStrategy(static_cast<QFont::StyleStrategy>(
         static_cast<int>(layout_font.styleStrategy()) |
         static_cast<int>(QFont::PreferNoShaping)));
