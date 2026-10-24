@@ -31,6 +31,7 @@ public:
 
     Terminal_backend_result interrupt() override;
     Terminal_backend_result terminate() override;
+    std::optional<process_cpu_time_t> process_cpu_time() const override;
 
     Terminal_backend_result set_cell_pixel_size(
         terminal_cell_pixel_size_t      size) override;

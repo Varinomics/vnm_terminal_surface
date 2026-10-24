@@ -9,6 +9,7 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include "vnm_terminal/terminal_message_submission.h"
+#include "vnm_terminal/process_cpu_time.h"
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
@@ -247,6 +248,7 @@ public:
     Terminal_session_result force_release_synchronized_output_without_backend_drain();
 
     Terminal_process_state process_state() const;
+    std::optional<process_cpu_time_t> process_cpu_time() const;
     bool backend_ready() const;
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;

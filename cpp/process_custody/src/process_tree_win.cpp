@@ -5,6 +5,8 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <thread>
 
 namespace vnm::process_custody {
@@ -55,6 +57,19 @@ bool process_has_ended(HANDLE handle)
 }
 
 } // namespace
+
+std::optional<std::uint64_t> job_cpu_time_usec(Native_handle job)
+{
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+    if (!job || !QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+            &accounting, sizeof(accounting), nullptr))
+    {
+        return std::nullopt;
+    }
+    const auto user_ticks   = static_cast<std::uint64_t>(accounting.TotalUserTime.QuadPart);
+    const auto kernel_ticks = static_cast<std::uint64_t>(accounting.TotalKernelTime.QuadPart);
+    return (user_ticks + kernel_ticks) / 10;
+}
 
 #ifdef LOGONOMIC_ENABLE_PROCESS_TREE_TEST_HOOKS
 void set_process_exit_observation_for_test(Process_exit_observation_for_test observation)

@@ -69,6 +69,7 @@ struct Owner_event
 {
     Cleanup_scope cleanup_scope = Cleanup_scope::UNSPECIFIED;
     std::uint64_t root_birth_token = 0; // optional Darwin occurrence capability; zero means absent/unknown
+    bool cpu_accounting_admitted = false; // STARTED: optional Linux cgroup admission before workload execution
     Owner_event_kind kind = Owner_event_kind::START_REJECTED;
     Exit_status root_exit;
     Tree_settlement settlement = Tree_settlement::PENDING;

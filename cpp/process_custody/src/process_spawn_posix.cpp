@@ -10,11 +10,35 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 
 namespace vnm::process_custody {
 
 namespace {
+
+bool join_cpu_accounting_cgroup(int directory, pid_t pid)
+{
+    const int descriptor = openat(directory, "cgroup.procs", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        return false;
+    }
+    char text[32];
+    const auto parsed = std::to_chars(text, text + sizeof(text) - 1, pid);
+    if (parsed.ec != std::errc()) {
+        close(descriptor);
+        return false;
+    }
+    *parsed.ptr = '\n';
+    const auto size = static_cast<std::size_t>(parsed.ptr - text + 1);
+    ssize_t written;
+    do {
+        written = write(descriptor, text, size);
+    }
+    while (written < 0 && errno == EINTR);
+    close(descriptor);
+    return written == static_cast<ssize_t>(size);
+}
 
 // What the child reports through the error pipe when it cannot reach exec.
 // Everything the child runs before execve is async-signal-safe and touches
@@ -241,6 +265,11 @@ Spawn_result spawn(const Spawn_request& in_request)
     // has not returned to a wait loop yet, so the pid cannot be recycled.
     const int pidfd = posix_pidfd_open(pid);
     const int pidfd_error = errno;
+    // The child cannot execute or fork before admission. Optional accounting
+    // may use migration here without weakening atomic generation containment.
+    const bool cpu_accounting_admitted = pidfd >= 0 && in_request.generation_cgroup < 0 &&
+        in_request.cpu_accounting_cgroup >= 0 &&
+        join_cpu_accounting_cgroup(in_request.cpu_accounting_cgroup, pid);
     const bool admitted = pidfd >= 0 && (!in_request.admit_execution || in_request.admit_execution());
     ssize_t released = -1;
     if (admitted) {
@@ -310,6 +339,7 @@ Spawn_result spawn(const Spawn_request& in_request)
     result.ok             = true;
     result.process_id     = pid;
     result.process_handle = pidfd;
+    result.cpu_accounting_admitted = cpu_accounting_admitted;
     result.inherited_handles = std::move(prepared.child_handles);
     return result;
 }

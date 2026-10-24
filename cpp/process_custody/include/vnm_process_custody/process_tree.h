@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,43 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
+
+#if defined(_WIN32)
+/// Includes CPU time from active and exited members of the retained Job. The
+/// caller keeps the borrowed handle alive; this query does not change custody.
+std::optional<std::uint64_t> job_cpu_time_usec(Native_handle job);
+#endif
+
+#if defined(__linux__)
+/// Reads cumulative CPU time from an existing cgroup v2 directory. The caller
+/// retains the directory; this query neither creates nor retires a scope.
+std::optional<std::uint64_t> cgroup_cpu_time_usec(int directory);
+
+/// Optional CPU accounting for one workload and its descendants. The caller
+/// and helper retain the same delegated scope until existing family cleanup
+/// has retired it. cgroup.kill must be available for cleanup after helper loss;
+/// the scope owns no process waits. Only acknowledged spawn admission makes
+/// its counters attributable. An enabled CPU controller is not required.
+class Process_cpu_scope
+{
+public:
+    Process_cpu_scope();
+    ~Process_cpu_scope();
+    Process_cpu_scope(const Process_cpu_scope&) = delete;
+    Process_cpu_scope& operator=(const Process_cpu_scope&) = delete;
+
+    bool establish(const std::string& nonce, std::string* error);
+    bool adopt(int directory, const std::string& name, std::string* error);
+    void configure_spawn(Spawn_request& request) const;
+    std::optional<std::uint64_t> cpu_time_usec() const;
+    bool release(); // failed removal retains identity; shared retirement is idempotent
+    bool terminate_and_release(std::chrono::milliseconds budget, std::string* error);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+#endif
 
 /// The custodian's ownership of one generation's process tree. Linux: this
 /// process becomes the subreaper of everything below it, the root (the

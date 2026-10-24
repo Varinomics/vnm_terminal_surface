@@ -12,6 +12,7 @@
 
 #include "native_backend_io_core.h"
 #include "native_backend_cleanup_owner.h"
+#include <vnm_process_custody/process_tree.h>
 #include <windows.h>
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
@@ -30,6 +31,7 @@ DECLARE_HANDLE(HPCON);
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <latch>
@@ -760,6 +762,26 @@ public:
     ~Impl()
     {
         shutdown();
+    }
+
+    std::optional<process_cpu_time_t> process_cpu_time() const
+    {
+        const std::lock_guard lock(m_mutex);
+        if (!m_process_assigned_to_job) {
+            return std::nullopt;
+        }
+        // Root exit does not retire the Job's accumulated descendant time.
+        const auto cumulative = vnm::process_custody::job_cpu_time_usec(m_process_job.get());
+        const auto sampled_at = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto processor_count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        if (!cumulative || sampled_at <= 0 || processor_count == 0) {
+            return std::nullopt;
+        }
+        return process_cpu_time_t{
+            *cumulative,
+            static_cast<std::uint64_t>(sampled_at),
+            static_cast<std::uint32_t>(processor_count)};
     }
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing()
@@ -2402,7 +2424,7 @@ private:
         }
     }
 
-    std::mutex                         m_mutex;
+    mutable std::mutex                 m_mutex;
     std::condition_variable            m_output_cv;
     std::condition_variable            m_write_cv;
     std::condition_variable            m_reader_cv;
@@ -2537,6 +2559,13 @@ Terminal_backend_result Windows_conpty_backend::terminate()
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->terminate();
+}
+
+std::optional<process_cpu_time_t> Windows_conpty_backend::process_cpu_time() const
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
+    return impl->process_cpu_time();
 }
 
 std::optional<terminal_cell_pixel_size_t> Windows_conpty_backend::fixed_cell_pixel_size() const

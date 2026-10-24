@@ -225,6 +225,7 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/internal/vnm_terminal_canvas_render_bridge.h
     include/vnm_terminal/internal/viewport_contract.h
     include/vnm_terminal/font_metrics.h
+    include/vnm_terminal/process_cpu_time.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_touch_selection.h
     include/vnm_terminal/terminal_touch_selection_codec.h
@@ -564,6 +565,7 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL)
     install(FILES
         include/vnm_terminal/backend_output_capture.h
         include/vnm_terminal/font_metrics.h
+        include/vnm_terminal/process_cpu_time.h
         include/vnm_terminal/terminal_canvas_export.h
         include/vnm_terminal/terminal_message_submission.h
         include/vnm_terminal/terminal_native_receipt.h

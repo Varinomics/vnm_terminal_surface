@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/backend_output_capture.h"
 #include "vnm_terminal/font_metrics.h"
+#include "vnm_terminal/process_cpu_time.h"
 #include "vnm_terminal/terminal_message_submission.h"
 #include "vnm_terminal/terminal_native_receipt.h"
 #include "vnm_terminal/terminal_touch_selection.h"
@@ -806,6 +807,9 @@ public:
      */
     vnm_terminal::Terminal_process_start_result start_terminal(
         vnm_terminal::Terminal_process_start_request request);
+    // A read-only aggregate for the command's OS accounting scope. Absence
+    // means exact family accounting is unavailable; it is not zero usage.
+    std::optional<vnm_terminal::process_cpu_time_t> process_cpu_time() const;
     Q_INVOKABLE bool interrupt_process();
     Q_INVOKABLE bool terminate_process();
 

@@ -63,6 +63,11 @@ struct Spawn_request
 #endif
 #if defined(__linux__)
     int                               generation_cgroup = -1; // retained cgroup directory; birth must be atomic
+    // Optional accounting only. The still-gated child joins before exec; a
+    // refused move leaves accounting unavailable without rejecting launch.
+    // A required generation_cgroup takes precedence and is never left.
+    int                               cpu_accounting_cgroup = -1;
+    std::string                       cpu_accounting_name; // owner protocol: verified scope retirement identity
 #endif
 #if defined(__APPLE__)
     bool                              new_process_group = false; // same retained session, distinct shell group
@@ -96,6 +101,9 @@ struct Spawn_result
     // Owned by the caller even when ok is false: a failed Windows resume can
     // leave a created child whose native cleanup has not yet been confirmed.
     Native_handle process_handle = k_invalid_handle;   // Linux: pidfd; Darwin: local kqueue; Windows: process handle.
+#if defined(__linux__)
+    bool cpu_accounting_admitted = false;
+#endif
 #if defined(__APPLE__)
     std::uint64_t process_birth_token = 0; // original PROC_PIDTBSDINFO birth time, in microseconds
     bool execution_confirmed = false; // only a registered-before-release NOTE_EXEC proves this

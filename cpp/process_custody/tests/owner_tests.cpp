@@ -9,8 +9,11 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sstream>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace custody = vnm::process_custody;
@@ -188,7 +191,8 @@ struct Run
     }
 };
 
-bool receipt(Run& run, bool* started, bool* root_exited, int* exit_code, int* master = nullptr)
+bool receipt(Run& run, bool* started, bool* root_exited, int* exit_code,
+    int* master = nullptr, bool* cpu_admitted = nullptr)
 {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -206,7 +210,12 @@ bool receipt(Run& run, bool* started, bool* root_exited, int* exit_code, int* ma
             if (master) *master = event.pty_master;
             else close(event.pty_master);
         }
-        if (event.kind == custody::Owner_event_kind::STARTED) *started = true;
+        if (event.kind == custody::Owner_event_kind::STARTED) {
+            *started = true;
+            if (cpu_admitted) {
+                *cpu_admitted = event.cpu_accounting_admitted;
+            }
+        }
         if (event.kind == custody::Owner_event_kind::ROOT_EXITED) {
             *root_exited = true;
             *exit_code = event.root_exit.exit_code;
@@ -397,6 +406,303 @@ bool large_bounded_start(const std::string& helper)
     return ok;
 }
 
+bool unavailable_cpu_accounting(const std::string& helper)
+{
+    custody::Process_cpu_scope unavailable;
+    if (!check(!unavailable.cpu_time_usec(), "an unestablished CPU scope is unavailable")) {
+        return false;
+    }
+    Run run;
+    if (!check(run.launch(helper), "unavailable-accounting helper starts")) {
+        return false;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::PTY;
+    request.process.executable = "/bin/sh";
+    request.process.argv = {"/bin/sh", "-c", "exit 23"};
+    // A real transferred descriptor with no cgroup admission authority makes
+    // the helper exercise the optional failure path on any Linux host.
+    const int unavailable_directory = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (!check(unavailable_directory >= 0, "unavailable accounting fixture descriptor opens")) {
+        return false;
+    }
+    request.process.cpu_accounting_cgroup = unavailable_directory;
+    std::string error;
+    const bool sent = custody::send_owner_start(run.control, request, &error);
+    close(unavailable_directory);
+    if (!check(sent, "optional accounting descriptor reaches the helper")) {
+        return false;
+    }
+    bool started = false;
+    bool exited = false;
+    bool admitted = true;
+    int exit_code = -1;
+    bool ok = check(receipt(run, &started, &exited, &exit_code, nullptr, &admitted),
+        "unavailable accounting retains native settlement");
+    ok &= check(started && exited && exit_code == 23 && !admitted,
+        "unavailable accounting preserves ordinary PTY execution without claiming a counter");
+    ok &= check(run.wait(), "unavailable-accounting helper is collected");
+    return ok;
+}
+
+struct Cpu_fixture_pipes
+{
+    int report[2] = {-1, -1};
+    int root_release[2] = {-1, -1};
+    int worker_release[2] = {-1, -1};
+
+    ~Cpu_fixture_pipes()
+    {
+        for (const auto pipe : {report, root_release, worker_release}) {
+            for (int index = 0; index < 2; ++index) {
+                if (pipe[index] >= 0) {
+                    close(pipe[index]);
+                }
+            }
+        }
+    }
+
+    bool open()
+    {
+        return pipe2(report, O_CLOEXEC) == 0 &&
+            pipe2(root_release, O_CLOEXEC) == 0 &&
+            pipe2(worker_release, O_CLOEXEC) == 0;
+    }
+
+    void close_transferred()
+    {
+        close(report[1]);
+        report[1] = -1;
+        close(root_release[0]);
+        root_release[0] = -1;
+        close(worker_release[0]);
+        worker_release[0] = -1;
+    }
+};
+
+bool cpu_scope_membership(int directory, pid_t root, pid_t worker, pid_t helper)
+{
+    const int descriptor = openat(directory, "cgroup.procs", O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        return false;
+    }
+    char buffer[4096];
+    const auto count = read(descriptor, buffer, sizeof(buffer));
+    close(descriptor);
+    if (count <= 0 || count == static_cast<ssize_t>(sizeof(buffer))) {
+        return false;
+    }
+    std::istringstream processes(std::string(buffer, static_cast<std::size_t>(count)));
+    bool root_present = false;
+    bool worker_present = false;
+    pid_t process = 0;
+    while (processes >> process) {
+        if (process == helper) {
+            return false;
+        }
+        root_present |= process == root;
+        worker_present |= process == worker;
+    }
+    return root_present && worker_present;
+}
+
+enum class Cpu_cleanup_case { NORMAL, OWNER_LOSS, CLIENT_LOSS };
+
+bool cpu_loss_retirement(Cpu_cleanup_case cleanup_case, Run& run,
+    custody::Process_cpu_scope& scope, const custody::Spawn_request& request, int worker_reference)
+{
+    const int parent = openat(request.cpu_accounting_cgroup, "..",
+        O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!check(parent >= 0, "CPU retirement fixture retains the directory's parent")) {
+        return false;
+    }
+    bool ok = true;
+    if (cleanup_case == Cpu_cleanup_case::OWNER_LOSS) {
+        ok &= check(custody::posix_pidfd_send_signal(run.helper.process_handle, SIGKILL) == 0 && run.wait(),
+            "the exact CPU-accounting helper is killed and collected");
+        pollfd live{worker_reference, POLLIN, 0};
+        ok &= check(poll(&live, 1, 0) == 0, "detached CPU descendant survives helper loss");
+        ok &= check(!scope.release() && scope.cpu_time_usec().has_value(),
+            "failed populated-scope removal retains its identity and accounting authority");
+        std::string error;
+        ok &= check(scope.terminate_and_release(5s, &error),
+            "existing family cleanup retires the admitted group after helper loss");
+    }
+    else {
+        // This is the sole control endpoint. Its EOF is the same cleanup
+        // trigger as loss of the client process. Keep the parent scope wholly
+        // untouched until helper exit and the independent directory check.
+        run.control.close();
+        ok &= check(run.wait(), "client control EOF lets the helper complete native cleanup");
+    }
+    pollfd ended{worker_reference, POLLIN, 0};
+    ok &= check(poll(&ended, 1, 5000) == 1, "CPU retirement physically ends the detached descendant");
+    struct stat directory{};
+    ok &= check(fstatat(parent, request.cpu_accounting_name.c_str(), &directory, AT_SYMLINK_NOFOLLOW) < 0 &&
+            errno == ENOENT, "the surviving cleanup owner removes the CPU scope directory");
+    close(parent);
+    ok &= check(scope.release(), "the other owner's scope retirement is idempotent");
+    return ok;
+}
+
+int cpu_accounting(const std::string& helper, const std::string& self, Cpu_cleanup_case cleanup_case)
+{
+    custody::Process_cpu_scope scope;
+    std::string error;
+    if (!scope.establish("test-" + std::to_string(getpid()), &error)) {
+        std::printf("SKIP: native CPU accounting requires a delegated cgroup v2: %s\n", error.c_str());
+        return 77;
+    }
+    const auto baseline = scope.cpu_time_usec();
+    if (!check(baseline.has_value(), "fresh native CPU scope exposes its cumulative counter")) {
+        return 1;
+    }
+    Run run;
+    Cpu_fixture_pipes pipes;
+    if (!check(pipes.open() && run.launch(helper), "CPU fixture pipes and owner start")) {
+        return 1;
+    }
+    custody::Owner_start_request request;
+    request.mode = custody::Owner_mode::PTY;
+    request.process.executable = self;
+    request.process.argv = {self, "--cpu-fixture"};
+    request.process.inherited = {
+        {pipes.report[1], 4}, {pipes.root_release[0], 5}, {pipes.worker_release[0], 6}};
+    scope.configure_spawn(request.process);
+    if (!check(custody::send_owner_start(run.control, request, &error), "CPU fixture request transfers scope")) {
+        return 1;
+    }
+    pipes.close_transferred();
+    custody::Owner_event started;
+    if (!check(custody::receive_owner_event(run.control, &started, 5000, &error) ==
+            custody::Receive_status::MESSAGE && started.kind == custody::Owner_event_kind::STARTED,
+        "CPU fixture gets its native admission receipt"))
+    {
+        custody::close_native_handle(started.root_reference);
+        custody::close_native_handle(started.pty_master);
+        return 1;
+    }
+    custody::close_native_handle(started.root_reference);
+    custody::close_native_handle(started.pty_master);
+    pid_t worker = 0;
+    bool intermediate_collected = false;
+    pollfd report{pipes.report[0], POLLIN, 0};
+    for (int record = 0; record < 2; ++record) {
+        pid_t value = -1;
+        if (!check(poll(&report, 1, 5000) == 1 &&
+                read(pipes.report[0], &value, sizeof(value)) == sizeof(value),
+            "CPU fixture reports its worker and the intermediate parent's collection"))
+        {
+            return 1;
+        }
+        if (value == 0) {
+            intermediate_collected = true;
+        }
+        else {
+            worker = value;
+        }
+    }
+    if (!check(worker > 0 && intermediate_collected, "CPU worker is detached and reparented before release")) {
+        return 1;
+    }
+    const int worker_reference = custody::posix_pidfd_open(worker);
+    if (!check(worker_reference >= 0, "detached CPU worker is retained before release")) {
+        return 1;
+    }
+    bool ok = true;
+    if (started.cpu_accounting_admitted) {
+        ok &= check(cpu_scope_membership(request.process.cpu_accounting_cgroup,
+                static_cast<pid_t>(started.root_exit.process_id), worker,
+                static_cast<pid_t>(run.helper.process_id)),
+            "CPU scope contains root and detached descendant while excluding the custody helper");
+    }
+    if (started.cpu_accounting_admitted && cleanup_case != Cpu_cleanup_case::NORMAL) {
+        ok &= check(mkdirat(request.process.cpu_accounting_cgroup, "empty-child", 0700) == 0,
+            "retirement also owns an empty child cgroup left by its workload");
+        ok &= cpu_loss_retirement(cleanup_case, run, scope, request.process, worker_reference);
+        close(worker_reference);
+        return ok ? 0 : 1;
+    }
+    ok &= check(write(pipes.worker_release[1], "R", 1) == 1, "detached CPU worker is released");
+    pollfd ended{worker_reference, POLLIN, 0};
+    ok &= check(poll(&ended, 1, 5000) == 1, "detached CPU worker exits before accounting is sampled");
+    close(worker_reference);
+    const auto after = scope.cpu_time_usec();
+    if (started.cpu_accounting_admitted) {
+        ok &= check(after && *after >= *baseline && *after - *baseline >= 20000,
+            "cgroup cumulative CPU retains the exited detached worker's CPU time");
+    }
+    ok &= check(write(pipes.root_release[1], "R", 1) == 1, "CPU fixture root is released");
+    bool was_started = true;
+    bool exited = false;
+    int exit_code = -1;
+    ok &= check(receipt(run, &was_started, &exited, &exit_code), "CPU fixture native tree settles");
+    ok &= check(exited && exit_code == 23 && run.wait(), "CPU fixture and helper finish normally");
+    if (!ok) {
+        return 1;
+    }
+    if (!started.cpu_accounting_admitted) {
+        std::printf("SKIP: cgroup exists but workload migration is unavailable; PTY launch still succeeded\n");
+        return 77;
+    }
+    return 0;
+}
+
+int cpu_fixture()
+{
+    const pid_t intermediate = fork();
+    if (intermediate < 0) {
+        return 3;
+    }
+    if (intermediate == 0) {
+        close(5);
+        if (setsid() < 0) {
+            _exit(4);
+        }
+        const pid_t worker = fork();
+        if (worker < 0) {
+            _exit(5);
+        }
+        if (worker > 0) {
+            _exit(0);
+        }
+        const pid_t self = getpid();
+        char release = 0;
+        if (write(4, &self, sizeof(self)) != sizeof(self) || read(6, &release, 1) != 1) {
+            _exit(6);
+        }
+        close(4);
+        close(6);
+        timespec start{}, now{};
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start) != 0) {
+            _exit(7);
+        }
+        do {
+            if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now) != 0) {
+                _exit(7);
+            }
+        }
+        while ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec < 20000000LL);
+        _exit(0);
+    }
+    close(6);
+    int status = 0;
+    pid_t collected;
+    do {
+        collected = waitpid(intermediate, &status, 0);
+    }
+    while (collected < 0 && errno == EINTR);
+    const pid_t intermediate_collected = 0;
+    if (collected != intermediate || write(4, &intermediate_collected, sizeof(intermediate_collected)) !=
+            sizeof(intermediate_collected))
+    {
+        return 9;
+    }
+    close(4);
+    char release = 0;
+    return read(5, &release, 1) == 1 ? 23 : 8;
+}
+
 int fixture(const std::string& mode)
 {
     const pid_t child = fork();
@@ -426,6 +732,26 @@ int fixture(const std::string& mode)
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string(argv[1]) == "--cpu-fixture") {
+        return cpu_fixture();
+    }
+    if (argc == 3 && (std::string(argv[1]) == "--cpu-accounting" ||
+            std::string(argv[1]) == "--cpu-unavailable" ||
+            std::string(argv[1]) == "--cpu-owner-loss" ||
+            std::string(argv[1]) == "--cpu-client-loss"))
+    {
+        std::string error;
+        if (!custody::prepare_parent_process(&error)) {
+            return 2;
+        }
+        const std::string mode = argv[1];
+        if (mode == "--cpu-unavailable") {
+            return unavailable_cpu_accounting(argv[2]) ? 0 : 1;
+        }
+        const auto cleanup_case = mode == "--cpu-owner-loss" ? Cpu_cleanup_case::OWNER_LOSS :
+            mode == "--cpu-client-loss" ? Cpu_cleanup_case::CLIENT_LOSS : Cpu_cleanup_case::NORMAL;
+        return cpu_accounting(argv[2], argv[0], cleanup_case);
+    }
     if (argc == 2 && std::string(argv[1]) == "--started-descriptor") {
         return started_descriptor_contract() ? 0 : 1;
     }

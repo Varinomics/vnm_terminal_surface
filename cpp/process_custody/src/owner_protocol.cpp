@@ -20,6 +20,8 @@ constexpr std::size_t k_max_request_bytes = 4 * 1024 * 1024;
 constexpr std::uint32_t k_fragment_kind = 5;
 constexpr std::uint32_t k_cleanup_scope_extension = 1;
 constexpr std::uint32_t k_darwin_birth_extension = 2;
+constexpr std::uint32_t k_cpu_accounting_extension = 3;
+constexpr std::size_t k_max_descriptors = 64;
 
 class Received_descriptors
 {
@@ -116,7 +118,7 @@ bool send(Duplex_channel& channel, const Encoder& message,
     std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt)
 {
     int native_error = 0;
-    if (message.bytes.size() > k_max_request_bytes || descriptors.size() > 64) {
+    if (message.bytes.size() > k_max_request_bytes || descriptors.size() > k_max_descriptors) {
         if (error) *error = "owner request exceeds transport bounds";
         return false;
     }
@@ -238,6 +240,16 @@ static bool send_owner_start_impl(Duplex_channel& channel, const Owner_start_req
         message.number(static_cast<std::uint32_t>(entry.child_number));
         descriptors.push_back(entry.parent_handle);
     }
+#if defined(__linux__)
+    if (request.process.cpu_accounting_cgroup >= 0 && descriptors.size() < k_max_descriptors) {
+        message.number(k_cpu_accounting_extension);
+        message.number(1);
+        message.number(static_cast<std::uint32_t>(8 + request.process.cpu_accounting_name.size()));
+        message.number(static_cast<std::uint32_t>(descriptors.size()));
+        message.text(request.process.cpu_accounting_name);
+        descriptors.push_back(request.process.cpu_accounting_cgroup);
+    }
+#endif
     return send(channel, message, descriptors, error, deadline);
 }
 
@@ -279,6 +291,11 @@ void close_start_descriptors(Owner_start_request& request)
 {
     for (const auto& entry : request.process.inherited) close_native_handle(entry.parent_handle);
     request.process.inherited.clear();
+#if defined(__linux__)
+    close_native_handle(request.process.cpu_accounting_cgroup);
+    request.process.cpu_accounting_cgroup = k_invalid_handle;
+    request.process.cpu_accounting_name.clear();
+#endif
 }
 
 bool send_event(Duplex_channel& channel, const Owner_event& event, std::string* error)
@@ -302,6 +319,12 @@ bool send_event(Duplex_channel& channel, const Owner_event& event, std::string* 
         message.number(8);
         message.number(static_cast<std::uint32_t>(event.root_birth_token >> 32));
         message.number(static_cast<std::uint32_t>(event.root_birth_token));
+    }
+    if (event.cpu_accounting_admitted) {
+        message.number(k_cpu_accounting_extension);
+        message.number(1);
+        message.number(4);
+        message.number(1);
     }
     std::vector<Native_handle> descriptors;
     if (event.root_reference != k_invalid_handle) descriptors.push_back(event.root_reference);
@@ -388,13 +411,57 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
             const auto environment = input.count();
             for (std::size_t i = 0; i < environment && input.valid; ++i)
                 request.process.environment.push_back(input.text());
-            expected_descriptors = input.count();
-            if (expected_descriptors != received.descriptors.size()) input.valid = false;
-            for (std::size_t i = 0; i < expected_descriptors && input.valid; ++i) {
+            const auto inherited_descriptors = input.count();
+            if (inherited_descriptors > received.descriptors.size()) input.valid = false;
+            for (std::size_t i = 0; i < inherited_descriptors && input.valid; ++i) {
                 const auto target = input.number();
                 if (target > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) input.valid = false;
                 request.process.inherited.push_back({received.descriptors[i], static_cast<int>(target)});
             }
+            std::size_t cpu_descriptor = received.descriptors.size();
+            bool cpu_extension_seen = false;
+            while (input.valid && input.position < bytes.size()) {
+                const auto tag = input.number();
+                const auto version = input.number();
+                const auto length = input.number();
+                if (!input.valid || length > bytes.size() - input.position) {
+                    input.valid = false;
+                    break;
+                }
+                if (tag == k_cpu_accounting_extension && version == 1 && length >= 8) {
+                    const auto end = input.position + length;
+                    const auto index = input.number();
+                    auto name = input.text();
+                    if (!input.valid || input.position != end || cpu_extension_seen ||
+                        index < inherited_descriptors || index >= received.descriptors.size())
+                    {
+                        input.valid = false;
+                        break;
+                    }
+                    cpu_extension_seen = true;
+#if defined(__linux__)
+                    cpu_descriptor = index;
+                    request.process.cpu_accounting_cgroup = received.descriptors[index];
+                    request.process.cpu_accounting_name = std::move(name);
+#else
+                    (void)name;
+#endif
+                }
+                else {
+                    input.position += length;
+                }
+            }
+            // Optional capability descriptors never enter the workload map.
+            // Unknown capabilities are unavailable; their handles still retire.
+            if (input.valid) {
+                for (std::size_t i = inherited_descriptors; i < received.descriptors.size(); ++i) {
+                    if (i != cpu_descriptor) {
+                        close_native_handle(received.descriptors[i]);
+                        received.descriptors[i] = k_invalid_handle;
+                    }
+                }
+            }
+            expected_descriptors = received.descriptors.size();
             break;
         }
         case Message_kind::STOP: {
@@ -430,6 +497,9 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
                     local_observer_record = true;
                     event.root_birth_token = 0;
                 }
+                if (tag == k_cpu_accounting_extension) {
+                    event.cpu_accounting_admitted = false;
+                }
                 if (tag == k_cleanup_scope_extension && version == 1 && length == 4) {
                     const auto scope = input.number();
                     if (scope == static_cast<std::uint32_t>(Cleanup_scope::TRANSITIVE_TREE) ||
@@ -443,12 +513,23 @@ Receive_status receive_message(Duplex_channel& channel, Owner_message* message,
                     event.root_birth_token = static_cast<std::uint64_t>(input.number()) << 32;
                     event.root_birth_token |= input.number();
                 }
+                else
+                if (tag == k_cpu_accounting_extension && version == 1 && length == 4) {
+                    const auto admitted = input.number();
+                    if (admitted > 1) {
+                        input.valid = false;
+                    }
+                    event.cpu_accounting_admitted = admitted == 1;
+                }
                 else {
                     input.position += length;
                 }
             }
             if (event.kind > Owner_event_kind::EXECUTION_STARTED || event.settlement > Tree_settlement::UNCONFIRMED)
                 input.valid = false;
+            if (event.cpu_accounting_admitted && event.kind != Owner_event_kind::STARTED) {
+                input.valid = false;
+            }
             expected_descriptors = received.descriptors.size();
             if (local_observer_record) {
                 if (event.kind != Owner_event_kind::STARTED || expected_descriptors > 1) {

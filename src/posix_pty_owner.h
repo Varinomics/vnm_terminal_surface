@@ -141,6 +141,19 @@ public:
         }
 #endif
 
+#if defined(__linux__)
+        auto start_request = request;
+        {
+            const std::lock_guard lock(m_cpu_mutex);
+            const auto nonce = std::to_string(m_helper.process_id) + "-" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            if (m_cpu_scope.establish(nonce, nullptr)) {
+                m_cpu_scope.configure_spawn(start_request.process);
+            }
+        }
+#else
+        const auto& start_request = request;
+#endif
         // The provider resumes only an untransferred fragment under this
         // absolute deadline; the client never replays a partial START.
         const auto startup_deadline =
@@ -160,7 +173,7 @@ public:
         bool request_sent = false;
         try {
             request_sent = pty_custody::send_owner_start_until(
-                m_channel, request, startup_deadline, error);
+                m_channel, start_request, startup_deadline, error);
         }
         catch (...) {
             if (error) {
@@ -315,6 +328,28 @@ public:
             ::close(m_helper.process_handle);
             m_helper.process_handle = -1;
         }
+#if defined(__linux__)
+        {
+            const std::lock_guard lock(m_cpu_mutex);
+            m_cpu_accounting_admitted = false;
+        }
+        // Existing family cleanup retains its authority when the helper dies.
+        // A successful group retirement cannot manufacture the lost wait
+        // owner's native receipt. No further getter accesses the retiring fd.
+        while (!m_cpu_scope.terminate_and_release(std::chrono::seconds(1), nullptr)) {
+        }
+#endif
+    }
+
+    std::optional<std::uint64_t> cpu_time_usec() const
+    {
+#if defined(__linux__)
+        const std::lock_guard lock(m_cpu_mutex);
+        if (m_cpu_accounting_admitted) {
+            return m_cpu_scope.cpu_time_usec();
+        }
+#endif
+        return std::nullopt;
     }
 
     bool confirmed() const noexcept
@@ -374,6 +409,12 @@ private:
             status = pty_custody::Receive_status::FAILED;
         }
         if (status == pty_custody::Receive_status::MESSAGE) {
+#if defined(__linux__)
+            if (event->kind == pty_custody::Owner_event_kind::STARTED) {
+                const std::lock_guard lock(m_cpu_mutex);
+                m_cpu_accounting_admitted = event->cpu_accounting_admitted;
+            }
+#endif
             if (event->kind == pty_custody::Owner_event_kind::ROOT_EXITED) {
                 m_root_exit = event->root_exit;
             }
@@ -423,6 +464,11 @@ private:
     bool m_helper_reaped = false;
     pid_t m_root = -1;
     std::optional<pty_custody::Exit_status> m_root_exit;
+#if defined(__linux__)
+    mutable std::mutex m_cpu_mutex;
+    pty_custody::Process_cpu_scope m_cpu_scope;
+    bool m_cpu_accounting_admitted = false;
+#endif
 #if defined(__APPLE__)
     Terminal_native_receipt_hook m_receipt_hook;
     Terminal_native_receipt m_receipt;

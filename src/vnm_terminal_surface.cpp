@@ -5754,6 +5754,14 @@ Terminal_process_start_result VNM_TerminalSurface::start_native_terminal(
         std::move(launch_config));
 }
 
+std::optional<vnm_terminal::process_cpu_time_t>
+VNM_TerminalSurface::process_cpu_time() const
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    return m_private->session
+        ? m_private->session->process_cpu_time() : std::nullopt;
+}
+
 bool VNM_TerminalSurface::interrupt_process()
 {
     Q_ASSERT(thread() == QThread::currentThread());

@@ -88,6 +88,14 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
         custody::Owner_start_request& request;
         ~Request_handles() { detail::close_start_descriptors(request); }
     } request_handles{request};
+#if defined(__linux__)
+    custody::Process_cpu_scope cpu_scope;
+    // Both processes retain retirement authority before any workload can run.
+    // Client EOF then leaves the existing helper cleanup able to remove its
+    // scope; helper loss leaves the client the same family cleanup authority.
+    const bool cpu_scope_retained = request.process.cpu_accounting_cgroup >= 0 &&
+        cpu_scope.adopt(request.process.cpu_accounting_cgroup, request.process.cpu_accounting_name, nullptr);
+#endif
 #if defined(__APPLE__)
     if (darwin_pty_contract && request.mode != custody::Owner_mode::PTY) {
         return reject("Darwin PTY outcome contract requires PTY mode", false);
@@ -131,6 +139,11 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
         // The PTY guard owns the slave, not the transferred-request guard.
     }
     custody::Spawn_request spawn = request.process;
+#if defined(__linux__)
+    if (!cpu_scope_retained) {
+        spawn.cpu_accounting_cgroup = -1;
+    }
+#endif
     if (request.mode == custody::Owner_mode::PTY) {
         for (int descriptor = 0; descriptor < 3; ++descriptor) spawn.inherited.push_back({slave, descriptor});
     }
@@ -188,6 +201,7 @@ int run_owner(custody::Duplex_channel& channel, bool darwin_pty_contract)
     started.root_birth_token = root.process_birth_token;
 #else
     started.root_reference = root.process_handle;
+    started.cpu_accounting_admitted = root.cpu_accounting_admitted;
 #endif
     started.pty_master = failed_admitted_birth ? -1 : master;
     bool stopping = !emit(started) || failed_admitted_birth;

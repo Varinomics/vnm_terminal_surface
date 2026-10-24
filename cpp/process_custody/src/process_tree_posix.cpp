@@ -5,6 +5,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
+#include <linux/magic.h>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -19,6 +21,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cstring>
+#include <utility>
 
 namespace vnm::process_custody {
 
@@ -103,6 +106,47 @@ bool kill_cgroup(int directory)
     return count == 2;
 }
 
+bool has_cgroup_kill(int directory)
+{
+    const int descriptor = openat(directory, "cgroup.kill", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        return false;
+    }
+    close(descriptor);
+    return true;
+}
+
+void remove_empty_cgroup_children(int directory)
+{
+    const int retained = openat(directory, ".", O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (retained < 0) {
+        return;
+    }
+    DIR* children = fdopendir(retained);
+    if (!children) {
+        close(retained);
+        return;
+    }
+    while (const auto entry = readdir(children)) {
+        if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN) {
+            continue;
+        }
+        const int child = openat(directory, entry->d_name, O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (child < 0) {
+            continue;
+        }
+        remove_empty_cgroup_children(child);
+        close(child);
+        // The kernel refuses populated cgroups. Other-owner races are benign;
+        // only successful removal of the retained outer scope retires it.
+        (void)unlinkat(directory, entry->d_name, AT_REMOVEDIR);
+    }
+    closedir(children);
+}
+
 std::string delegated_cgroup_directory()
 {
     std::ifstream membership("/proc/self/cgroup");
@@ -177,15 +221,11 @@ bool Process_tree_containment::establish(const std::string& nonce, std::string* 
     }
     m_impl->directory = openat(m_impl->parent, m_impl->name.c_str(),
         O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    const int control = m_impl->directory < 0 ? -1 : openat(m_impl->directory,
-        "cgroup.kill", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (control < 0 || !cgroup_empty(m_impl->directory)) {
-        if (control >= 0) close(control);
+    if (m_impl->directory < 0 || !has_cgroup_kill(m_impl->directory) || !cgroup_empty(m_impl->directory)) {
         if (error) *error = "generation cgroup kill/emptiness authority unavailable";
         release();
         return false;
     }
-    close(control);
     return true;
 }
 
@@ -221,6 +261,202 @@ void Process_tree_containment::release()
         m_impl->parent = -1;
     }
     m_impl->name.clear();
+}
+
+struct Process_cpu_scope::Impl
+{
+    int parent = -1;
+    int directory = -1;
+    std::string name;
+};
+
+Process_cpu_scope::Process_cpu_scope()
+:
+    m_impl(std::make_unique<Impl>())
+{}
+
+Process_cpu_scope::~Process_cpu_scope()
+{
+    // This is the existing family-cleanup obligation, including after loss of
+    // the other scope owner. Never discard a populated directory's identity.
+    while (!terminate_and_release(std::chrono::seconds(1), nullptr)) {
+    }
+}
+
+bool Process_cpu_scope::establish(const std::string& nonce, std::string* error)
+{
+    if (m_impl->directory >= 0 || nonce.empty() || nonce.size() > 128 ||
+        nonce.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") !=
+            std::string::npos)
+    {
+        if (error) {
+            *error = "CPU accounting scope already established or nonce invalid";
+        }
+        return false;
+    }
+    const auto parent_path = delegated_cgroup_directory();
+    if (parent_path.empty()) {
+        if (error) {
+            *error = "no accessible cgroup v2 membership mount";
+        }
+        return false;
+    }
+    m_impl->parent = open(parent_path.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    m_impl->name = "vnm-terminal-cpu-" + nonce;
+    if (m_impl->parent < 0 || mkdirat(m_impl->parent, m_impl->name.c_str(), 0700) != 0) {
+        if (error) {
+            *error = std::string("CPU accounting cgroup delegation unavailable: ") + std::strerror(errno);
+        }
+        // A collision belongs to another scope, even if its owner has gone.
+        m_impl->name.clear();
+        release();
+        return false;
+    }
+    m_impl->directory = openat(m_impl->parent, m_impl->name.c_str(),
+        O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    const int admission = m_impl->directory < 0 ? -1 : openat(m_impl->directory,
+        "cgroup.procs", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (admission >= 0) {
+        close(admission);
+    }
+    if (admission < 0 || !has_cgroup_kill(m_impl->directory) || !cpu_time_usec()) {
+        if (error) {
+            *error = "CPU accounting admission, cleanup authority or cumulative counter unavailable";
+        }
+        release();
+        return false;
+    }
+    return true;
+}
+
+bool Process_cpu_scope::adopt(int directory, const std::string& name, std::string* error)
+{
+    constexpr char prefix[] = "vnm-terminal-cpu-";
+    if (m_impl->directory >= 0 || name.size() <= sizeof(prefix) - 1 || name.size() > 160 ||
+        name.compare(0, sizeof(prefix) - 1, prefix) != 0 ||
+        name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") !=
+            std::string::npos)
+    {
+        if (error) {
+            *error = "invalid CPU accounting retirement identity";
+        }
+        return false;
+    }
+    std::string retained_name = name;
+    const int retained = fcntl(directory, F_DUPFD_CLOEXEC, 3);
+    const int parent = retained < 0 ? -1 : openat(retained, "..",
+        O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat retained_status{};
+    struct stat named_status{};
+    struct statfs filesystem{};
+    const bool identified = retained >= 0 && parent >= 0 &&
+        fstatfs(retained, &filesystem) == 0 && filesystem.f_type == CGROUP2_SUPER_MAGIC &&
+        fstat(retained, &retained_status) == 0 &&
+        fstatat(parent, name.c_str(), &named_status, AT_SYMLINK_NOFOLLOW) == 0 &&
+        retained_status.st_dev == named_status.st_dev && retained_status.st_ino == named_status.st_ino &&
+        has_cgroup_kill(retained);
+    if (!identified) {
+        if (retained >= 0) {
+            close(retained);
+        }
+        if (parent >= 0) {
+            close(parent);
+        }
+        if (error) {
+            *error = "CPU accounting retirement authority unavailable";
+        }
+        return false;
+    }
+    m_impl->name = std::move(retained_name);
+    m_impl->directory = retained;
+    m_impl->parent = parent;
+    return true;
+}
+
+void Process_cpu_scope::configure_spawn(Spawn_request& request) const
+{
+    request.cpu_accounting_cgroup = m_impl->directory;
+    request.cpu_accounting_name = m_impl->name;
+}
+
+std::optional<std::uint64_t> Process_cpu_scope::cpu_time_usec() const
+{
+    return cgroup_cpu_time_usec(m_impl->directory);
+}
+
+std::optional<std::uint64_t> cgroup_cpu_time_usec(int directory)
+{
+    std::string text;
+    if (directory < 0 || !read_control_file(directory, "cpu.stat", &text)) {
+        return std::nullopt;
+    }
+    std::optional<std::uint64_t> usage;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string key, value, extra;
+        if (!(fields >> key) || key != "usage_usec") {
+            continue;
+        }
+        if (usage || !(fields >> value) || (fields >> extra)) {
+            return std::nullopt;
+        }
+        std::uint64_t parsed_value = 0;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), parsed_value);
+        if (parsed.ec != std::errc() || parsed.ptr != value.data() + value.size()) {
+            return std::nullopt;
+        }
+        usage = parsed_value;
+    }
+    return usage;
+}
+
+bool Process_cpu_scope::release()
+{
+    if (m_impl->directory >= 0) {
+        remove_empty_cgroup_children(m_impl->directory);
+    }
+    if (m_impl->parent >= 0 && !m_impl->name.empty() &&
+        unlinkat(m_impl->parent, m_impl->name.c_str(), AT_REMOVEDIR) != 0 && errno != ENOENT)
+    {
+        return false;
+    }
+    if (m_impl->directory >= 0) {
+        close(m_impl->directory);
+        m_impl->directory = -1;
+    }
+    if (m_impl->parent >= 0) {
+        close(m_impl->parent);
+        m_impl->parent = -1;
+    }
+    m_impl->name.clear();
+    return true;
+}
+
+bool Process_cpu_scope::terminate_and_release(std::chrono::milliseconds budget, std::string* error)
+{
+    const Deadline deadline = Deadline::after(budget);
+    do {
+        if (release()) {
+            return true;
+        }
+        if (!kill_cgroup(m_impl->directory) && error) {
+            *error = std::string("CPU accounting family cleanup: ") + std::strerror(errno);
+        }
+        if (deadline.expired()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    while (true);
+    if (release()) {
+        return true;
+    }
+    if (error && error->empty()) {
+        *error = "CPU accounting scope retirement remains pending";
+    }
+    return false;
 }
 
 struct Process_tree_owner::Impl

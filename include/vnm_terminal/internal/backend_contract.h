@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/metrics_contract.h"
+#include "vnm_terminal/process_cpu_time.h"
 #include "vnm_terminal/terminal_native_receipt.h"
 #include <QProcessEnvironment>
 #include <QString>
@@ -486,6 +487,13 @@ public:
 
     virtual Terminal_backend_result interrupt() = 0;
     virtual Terminal_backend_result terminate() = 0;
+
+    // Native cumulative accounting covers the workload family, including
+    // exited descendants. Missing capability or a failed read is unavailable.
+    virtual std::optional<process_cpu_time_t> process_cpu_time() const
+    {
+        return std::nullopt;
+    }
 
     // A backend whose pseudoconsole places images on a cell of its own, with
     // no regard for the display, declares that cell here. The session then

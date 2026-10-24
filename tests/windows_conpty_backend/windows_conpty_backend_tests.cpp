@@ -9,6 +9,7 @@
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
+#include "vnm_terminal/process_cpu_time.h"
 
 #include <QByteArray>
 #include <QDir>
@@ -32,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -64,6 +66,7 @@ constexpr std::chrono::milliseconds k_wait_timeout(20000);
 // even if several fixtures genuinely fail.
 constexpr std::chrono::milliseconds k_file_marker_wait_timeout(20000);
 constexpr std::chrono::milliseconds k_console_host_exit_timeout(1000);
+constexpr std::uint64_t k_cpu_accounting_work_usec = 100'000U;
 // The slowest recorded cold ASan completion of this entire test executable was
 // 57.73 seconds, and it reached 80 seconds under full CPU saturation. Bound the
 // first scenario's progressing-output phase at 60 seconds, comfortably inside
@@ -921,6 +924,193 @@ term::Terminal_launch_config launch_config(
     config.identity.term      = QStringLiteral("xterm-256color");
     config.identity.colorterm = QStringLiteral("truecolor");
     return config;
+}
+
+std::optional<std::uint64_t> process_cpu_time_usec(HANDLE process)
+{
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+        std::cerr << "GetProcessTimes failed: " << GetLastError() << '\n';
+        return std::nullopt;
+    }
+    const auto ticks = [](FILETIME time) {
+        return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    };
+    return (ticks(kernel) + ticks(user)) / 10;
+}
+
+int run_cpu_accounting_child(const QString& directory)
+{
+    const QDir gates(directory);
+    if (!wait_for_file(gates.filePath(QStringLiteral("start-burn")))) {
+        return 1;
+    }
+    const auto initial_cpu = process_cpu_time_usec(GetCurrentProcess());
+    if (!initial_cpu) {
+        return 1;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    std::atomic<std::uint64_t> work{0};
+    do {
+        for (std::uint64_t i = 0; i < 4096; ++i) {
+            work.fetch_add(i, std::memory_order_relaxed);
+        }
+        const auto cpu = process_cpu_time_usec(GetCurrentProcess());
+        if (!cpu) {
+            return 1;
+        }
+        // A CPU-time threshold makes the workload independent of host scheduling.
+        if (*cpu - *initial_cpu >= k_cpu_accounting_work_usec) {
+            if (!write_gate_file(gates.filePath(QStringLiteral("burn-finished")))) {
+                return 1;
+            }
+            return wait_for_file(gates.filePath(QStringLiteral("child-exit"))) ? 0 : 1;
+        }
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+    return 1;
+}
+
+int run_cpu_accounting_root(const QString& executable_path, const QString& directory)
+{
+    const std::wstring application = QDir::toNativeSeparators(executable_path).toStdWString();
+    std::wstring command = QStringLiteral("\"%1\" --cpu-accounting-child \"%2\"")
+        .arg(executable_path, directory).toStdWString();
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    // Console detachment must preserve the root's inherited Job membership.
+    if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, FALSE,
+            DETACHED_PROCESS, nullptr, nullptr, &startup, &process))
+    {
+        std::cerr << "CPU child CreateProcessW failed: " << GetLastError() << '\n';
+        return 1;
+    }
+    Win32_process_handle child(process.hProcess);
+    CloseHandle(process.hThread);
+    std::cout << "cpu-root-pid=" << GetCurrentProcessId() << '\n'
+        << "cpu-child-pid=" << process.dwProcessId << '\n' << std::flush;
+    if (!wait_for_process_exit(child.get()) || process_exit_code(child.get()) != 0U) {
+        return 1;
+    }
+    child.reset();
+    std::cout << "cpu-child-exited\n" << std::flush;
+    return wait_for_file(QDir(directory).filePath(QStringLiteral("root-exit"))) ? 0 : 1;
+}
+
+bool check_cpu_accounting_sample(
+    term::Windows_conpty_backend&      backend,
+    std::uint64_t                      minimum_cpu_usec,
+    std::string_view                   phase,
+    vnm_terminal::process_cpu_time_t*  out_sample)
+{
+    const auto before = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto sample = backend.process_cpu_time();
+    const auto after = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const std::string label(phase);
+    if (!check(sample.has_value(), label + ": retained Job supplies a CPU sample")) {
+        return false;
+    }
+    *out_sample = *sample;
+    bool ok = check(sample->cpu_time_usec >= minimum_cpu_usec,
+        label + ": Job CPU includes independent root and child process totals");
+    if (!ok) {
+        std::cerr << "Job CPU usec=" << sample->cpu_time_usec
+            << ", root and child CPU usec=" << minimum_cpu_usec << '\n';
+    }
+    ok &= check(sample->sampled_at_usec >= static_cast<std::uint64_t>(before) &&
+            sample->sampled_at_usec <= static_cast<std::uint64_t>(after),
+        label + ": sample timestamp uses the native query's monotonic capture interval");
+    ok &= check(sample->logical_processor_count > 0 &&
+            sample->logical_processor_count == GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+        label + ": normalization counts every active processor group");
+    return ok;
+}
+
+bool test_cpu_accounting_retains_exited_descendants(const QString& executable_path)
+{
+    QTemporaryDir directory;
+    if (!check(directory.isValid(), "CPU accounting gate directory is available")) {
+        return false;
+    }
+    const QDir gates(directory.path());
+    Backend_capture capture;
+    term::Windows_conpty_backend backend;
+    if (!check(!backend.process_cpu_time(), "CPU is unavailable before Job admission")) {
+        return false;
+    }
+    const auto result = backend.start(launch_config(executable_path,
+        {QStringLiteral("--cpu-accounting-root"), directory.path()}), capture.callbacks());
+    if (!check(result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "CPU accounting fixture starts in the native ConPTY Job"))
+    {
+        return false;
+    }
+    const auto root_pid  = capture.wait_for_pid_output(QByteArrayLiteral("cpu-root-pid="));
+    const auto child_pid = capture.wait_for_pid_output(QByteArrayLiteral("cpu-child-pid="));
+    if (!check(root_pid && child_pid, "CPU accounting root reports both live process identities")) {
+        return false;
+    }
+    auto root  = open_process_handle(*root_pid);
+    auto child = open_process_handle(*child_pid);
+    if (!check(root.is_valid() && child.is_valid(), "CPU accounting holds both exact process handles")) {
+        return false;
+    }
+    vnm_terminal::process_cpu_time_t initial{}, live{}, child_exited{}, root_exited{};
+    if (!check_cpu_accounting_sample(backend, 0, "before workload", &initial) ||
+        !check(write_gate_file(gates.filePath(QStringLiteral("start-burn"))), "CPU child is released") ||
+        !check(wait_for_file(gates.filePath(QStringLiteral("burn-finished"))), "CPU child finishes its work"))
+    {
+        return false;
+    }
+    const auto live_root_cpu  = process_cpu_time_usec(root.get());
+    const auto live_child_cpu = process_cpu_time_usec(child.get());
+    if (!check(live_root_cpu && live_child_cpu && *live_child_cpu >= k_cpu_accounting_work_usec,
+            "independent process accounting confirms substantial child CPU") ||
+        !check_cpu_accounting_sample(backend, *live_root_cpu + *live_child_cpu, "live child", &live))
+    {
+        return false;
+    }
+    bool ok = check(live.cpu_time_usec >= initial.cpu_time_usec + k_cpu_accounting_work_usec,
+        "the Job accumulates the detached child's work after the baseline sample");
+    if (!check(write_gate_file(gates.filePath(QStringLiteral("child-exit"))), "CPU child may exit") ||
+        !check(wait_for_process_exit(child.get()), "CPU child actually exits") ||
+        !check(capture.wait_for_output(QByteArrayLiteral("cpu-child-exited")), "root observes child exit"))
+    {
+        return false;
+    }
+    const auto final_child_cpu  = process_cpu_time_usec(child.get());
+    const auto waiting_root_cpu = process_cpu_time_usec(root.get());
+    child.reset();
+    if (!check(final_child_cpu && waiting_root_cpu, "exited child CPU remains independently readable") ||
+        !check_cpu_accounting_sample(backend, *final_child_cpu + *waiting_root_cpu,
+            "child handles closed", &child_exited))
+    {
+        return false;
+    }
+    ok &= check(child_exited.cpu_time_usec >= live.cpu_time_usec,
+        "closing every exited-child handle preserves cumulative Job CPU");
+    if (!check(write_gate_file(gates.filePath(QStringLiteral("root-exit"))), "CPU root may exit") ||
+        !check(capture.wait_for_exit(), "CPU root actually exits"))
+    {
+        return false;
+    }
+    const auto exit = capture.exit_snapshot();
+    ok &= check(exit && exit->reason == term::Terminal_exit_reason::EXITED && exit->exit_code == 0,
+        "CPU accounting fixture exits successfully");
+    const auto final_root_cpu = process_cpu_time_usec(root.get());
+    root.reset();
+    if (!check(final_root_cpu.has_value(), "root final CPU is available") ||
+        !check_cpu_accounting_sample(backend, *final_root_cpu + *final_child_cpu,
+            "root exited", &root_exited))
+    {
+        return false;
+    }
+    ok &= check(root_exited.cpu_time_usec >= child_exited.cpu_time_usec,
+        "root exit does not hide the retained Job's final CPU total");
+    return ok;
 }
 
 const std::vector<term::terminal_grid_size_t>& resize_storm_grid_sizes()
@@ -5951,6 +6141,8 @@ bool test_post_birth_failure_keeps_native_custody(const QString& fixture_path)
         ok &= check(state.process_assigned_to_job ==
                 (fault == term::Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE),
             "the empty-Job assignment-failure case remains distinct from an assigned root");
+        ok &= check(backend.process_cpu_time().has_value() == state.process_assigned_to_job,
+            "CPU counters require successful root admission to the retained Job");
         ok &= check(capture.exit_count_snapshot() == 0,
             "termination requests alone cannot publish a completed native exit");
         backend.set_cleanup_observation_blocked_for_testing(false);
@@ -6788,6 +6980,17 @@ bool test_native_cmd_primary_resize_with_text_below_the_cursor()
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--cpu-accounting-child") {
+        return run_cpu_accounting_child(QString::fromLocal8Bit(argv[2]));
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--cpu-accounting-root") {
+        return run_cpu_accounting_root(QString::fromLocal8Bit(argv[0]), QString::fromLocal8Bit(argv[2]));
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--cpu-accounting") {
+        bool ok = test_cpu_accounting_retains_exited_descendants(QString::fromLocal8Bit(argv[0]));
+        ok &= wait_for_console_host_children_to_exit("CPU accounting");
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-startup-growth") {
         bool ok = test_native_cmd_startup_growth();
         ok &= wait_for_console_host_children_to_exit("native cmd startup growth");
@@ -6932,6 +7135,8 @@ int main(int argc, char** argv)
     // aggregate suite so it is not run twice, including in the ASan target.
     run_test("terminal child starts with default error mode",
         test_terminal_child_starts_with_default_error_mode(reporter_path));
+    run_test("CPU accounting retains exited descendants",
+        test_cpu_accounting_retains_exited_descendants(QString::fromLocal8Bit(argv[0])));
     run_test("resize storm reports final shell size",
         test_resize_storm_reports_final_shell_size(fixture_path));
     run_test("resize interleaved with shell output",

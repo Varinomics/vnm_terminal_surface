@@ -94,6 +94,18 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             set_tests_properties(vnm_process_custody_darwin_pty_tests PROPERTIES TIMEOUT 40)
         endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME vnm_process_custody_cpu_accounting_tests
+                COMMAND vnm_process_custody_tests --cpu-accounting $<TARGET_FILE:vnm_process_custody_owner>)
+            set_tests_properties(vnm_process_custody_cpu_accounting_tests PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+            add_test(NAME vnm_process_custody_cpu_owner_loss_tests
+                COMMAND vnm_process_custody_tests --cpu-owner-loss $<TARGET_FILE:vnm_process_custody_owner>)
+            add_test(NAME vnm_process_custody_cpu_client_loss_tests
+                COMMAND vnm_process_custody_tests --cpu-client-loss $<TARGET_FILE:vnm_process_custody_owner>)
+            set_tests_properties(vnm_process_custody_cpu_owner_loss_tests
+                vnm_process_custody_cpu_client_loss_tests PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+            add_test(NAME vnm_process_custody_cpu_unavailable_tests
+                COMMAND vnm_process_custody_tests --cpu-unavailable $<TARGET_FILE:vnm_process_custody_owner>)
+            set_tests_properties(vnm_process_custody_cpu_unavailable_tests PROPERTIES TIMEOUT 20)
             add_executable(vnm_process_custody_channel_resource_tests tests/channel_resource_tests.cpp)
             target_link_libraries(vnm_process_custody_channel_resource_tests PRIVATE vnm_process_custody)
             set_target_properties(vnm_process_custody_channel_resource_tests PROPERTIES

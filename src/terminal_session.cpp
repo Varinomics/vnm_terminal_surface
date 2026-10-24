@@ -3722,6 +3722,12 @@ Terminal_process_state Terminal_session::process_state() const
     return m_process_state;
 }
 
+std::optional<process_cpu_time_t> Terminal_session::process_cpu_time() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_backend ? m_backend->process_cpu_time() : std::nullopt;
+}
+
 bool Terminal_session::backend_ready() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

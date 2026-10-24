@@ -963,6 +963,24 @@ public:
         return backend_accept();
     }
 
+    std::optional<process_cpu_time_t> process_cpu_time() const
+    {
+        const auto cpu_time = m_owner.cpu_time_usec();
+        if (!cpu_time) {
+            return std::nullopt;
+        }
+        const auto sampled_at = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const long processor_count = ::sysconf(_SC_NPROCESSORS_ONLN);
+        if (sampled_at < 0 || processor_count <= 0 ||
+            static_cast<unsigned long>(processor_count) > std::numeric_limits<std::uint32_t>::max())
+        {
+            return std::nullopt;
+        }
+        return process_cpu_time_t{*cpu_time, static_cast<std::uint64_t>(sampled_at),
+            static_cast<std::uint32_t>(processor_count)};
+    }
+
     void shutdown()
     {
         {
@@ -1841,6 +1859,13 @@ Terminal_backend_result Posix_pty_backend::terminate()
     auto guard = Native_backend_public_call_guard(
         impl->call_state());
     return impl->terminate();
+}
+
+std::optional<process_cpu_time_t> Posix_pty_backend::process_cpu_time() const
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
+    return impl->process_cpu_time();
 }
 
 Terminal_backend_result Posix_pty_backend::set_cell_pixel_size(
