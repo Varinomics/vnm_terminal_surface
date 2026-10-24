@@ -26,7 +26,6 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr int k_surface_default_scrollback_limit = 10000;
 // A deadline-driven backend-output command is released in 4 KiB slices by
 // Terminal_session while retaining one command sequence for its final slice.
 constexpr qsizetype k_replay_backend_callback_slice_bytes = 4096;
@@ -371,22 +370,6 @@ bool session_viewport_matches_object(
         viewport_matches_object(visible_viewport_state(session), object);
 }
 
-int max_recorded_scrollback_rows(const std::vector<term::Terminal_transcript_event>& events)
-{
-    int max_scrollback_rows = 0;
-    for (const term::Terminal_transcript_event& event : events) {
-        if (event.kind != QStringLiteral("snapshot")) {
-            continue;
-        }
-
-        const QJsonObject viewport = event.object.value(QStringLiteral("viewport")).toObject();
-        max_scrollback_rows = std::max(
-            max_scrollback_rows,
-            viewport.value(QStringLiteral("scrollback_rows")).toInt());
-    }
-    return max_scrollback_rows;
-}
-
 bool is_replay_transparent_diagnostic_event(const QString& kind)
 {
     return
@@ -395,65 +378,30 @@ bool is_replay_transparent_diagnostic_event(const QString& kind)
         kind == QStringLiteral("surface.wheel_trace");
 }
 
-bool transcript_uses_immediate_public_projection(
-    const std::vector<term::Terminal_transcript_event>& events)
-{
-    for (const term::Terminal_transcript_event& event : events) {
-        if (event.object.value(QStringLiteral("snapshot_basis")).toString() ==
-                QStringLiteral("PUBLIC_PROJECTION") ||
-            event.object.value(
-                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
-                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 term::Terminal_session_config replay_session_config(
     const std::vector<term::Terminal_transcript_event>& events)
 {
-    term::Terminal_session_config config;
     const auto start_it = std::find_if(
         events.begin(),
         events.end(),
         [](const term::Terminal_transcript_event& event) {
             return event.kind == QStringLiteral("session.start");
         });
-
-    if (start_it != events.end() && start_it->object.contains(QStringLiteral("session_config"))) {
-        const QJsonObject session_config =
-            start_it->object.value(QStringLiteral("session_config")).toObject();
-        config.scrollback_limit =
-            session_config.contains(QStringLiteral("effective_scrollback_limit"))
-                ? session_config.value(QStringLiteral("effective_scrollback_limit")).toInt()
-                : session_config.value(QStringLiteral("scrollback_limit")).toInt();
-        config.recover_scrollback_from_primary_repaints =
-            session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
-        config.selection_viewport_projection_enabled =
-            session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
-        const QJsonValue explicit_scroll_policy =
-            session_config.value(QStringLiteral("synchronized_output_scroll_policy"));
-        if (explicit_scroll_policy.toString() == QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
-        {
-            config.synchronized_output_scroll_policy =
-                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
-        }
-        else
-        if (!explicit_scroll_policy.isString() && transcript_uses_immediate_public_projection(events)) {
-            config.synchronized_output_scroll_policy =
-                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
-        }
-        return config;
-    }
-
-    const int recorded_scrollback_rows = max_recorded_scrollback_rows(events);
+    // Causal validation requires session.start before decoding its configuration.
+    const QJsonObject session_config =
+        start_it->object.value(QStringLiteral("session_config")).toObject();
+    term::Terminal_session_config config;
     config.scrollback_limit =
-        recorded_scrollback_rows > 0 ? recorded_scrollback_rows : k_surface_default_scrollback_limit;
-    config.recover_scrollback_from_primary_repaints = false;
-    if (transcript_uses_immediate_public_projection(events)) {
+        session_config.value(QStringLiteral("effective_scrollback_limit")).toInt();
+    config.retained_history_capacity_bytes = static_cast<std::uint64_t>(
+        session_config.value(QStringLiteral("retained_history_capacity_bytes")).toInteger());
+    config.recover_scrollback_from_primary_repaints =
+        session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
+    config.selection_viewport_projection_enabled =
+        session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
+    if (session_config.value(QStringLiteral("synchronized_output_scroll_policy")).toString() ==
+        QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
+    {
         config.synchronized_output_scroll_policy =
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
     }
@@ -743,8 +691,6 @@ struct Causal_group_signature
     };
     std::vector<const term::Terminal_transcript_event*> backend_output_events;
     std::vector<Causal_event_signature>                other_events;
-    std::optional<Semantic_digest>                     host_resize_semantic_digest;
-    const term::Terminal_transcript_event*             host_resize_result = nullptr;
 };
 
 struct Causal_driver_layout
@@ -819,13 +765,6 @@ QJsonObject comparable_causal_event_object(QJsonObject object)
     return object;
 }
 
-QJsonObject host_resize_semantic_object(QJsonObject object)
-{
-    object = comparable_causal_event_object(std::move(object));
-    object.insert(QStringLiteral("kind"), QStringLiteral("host.resize"));
-    return object;
-}
-
 bool resize_result_matches_request(
     const term::Terminal_transcript_event& result,
     const term::Terminal_transcript_event& request)
@@ -867,11 +806,6 @@ void append_causal_event_signature(
         semantic_digest(comparable),
         &event,
     });
-    if (event.kind == QStringLiteral("session.resize")) {
-        const QJsonObject host_resize = host_resize_semantic_object(event.object);
-        signature.host_resize_semantic_digest = semantic_digest(host_resize);
-        signature.host_resize_result = &event;
-    }
 }
 
 Causal_driver_layout validated_causal_driver_layout(
@@ -884,12 +818,6 @@ Causal_driver_layout validated_causal_driver_layout(
         return layout;
     }
 
-    const bool has_resize_request = std::any_of(
-        events.begin(),
-        events.end(),
-        [](const term::Terminal_transcript_event& event) {
-            return event.kind == QStringLiteral("session.resize_request");
-        });
     std::map<std::uint64_t, Sequence_owner> sequence_owners;
     std::map<std::uint64_t, const term::Terminal_transcript_event*> resize_requests;
     std::optional<std::size_t> current_group;
@@ -1058,7 +986,7 @@ Causal_driver_layout validated_causal_driver_layout(
             }
             const auto owner = sequence_owners.find(*sequence);
             const bool resize_result =
-                event.kind == QStringLiteral("session.resize") && has_resize_request;
+                event.kind == QStringLiteral("session.resize");
             const bool text_area_resize_request =
                 event.kind == QStringLiteral("session.text_area_resize_request");
             const bool terminal_reply =
@@ -1253,59 +1181,13 @@ bool backend_output_streams_equal(
     return left_index == left.size() && right_index == right.size();
 }
 
-bool is_legacy_direct_resize_signature(const Causal_group_signature& signature)
-{
-    return
-        signature.owner_kind == QStringLiteral("session.resize") &&
-        signature.backend_output_events.empty() &&
-        signature.other_events.size() == 1U &&
-        signature.other_events.front().kind == QStringLiteral("session.resize") &&
-        signature.host_resize_semantic_digest.has_value() &&
-        signature.host_resize_result != nullptr;
-}
-
-bool is_modern_resize_pair_signature(const Causal_group_signature& signature)
-{
-    return
-        signature.owner_kind == QStringLiteral("session.resize_request") &&
-        signature.backend_output_events.empty() &&
-        signature.other_events.size() == 2U &&
-        signature.other_events[0].kind == QStringLiteral("session.resize_request") &&
-        signature.other_events[1].kind == QStringLiteral("session.resize") &&
-        signature.host_resize_semantic_digest.has_value() &&
-        signature.host_resize_result != nullptr;
-}
-
-bool legacy_and_modern_resize_signatures_equal(
-    const Causal_group_signature& left,
-    const Causal_group_signature& right,
-    Replay_result&                replay)
-{
-    const bool compatible_shapes =
-        (is_legacy_direct_resize_signature(left) &&
-         is_modern_resize_pair_signature(right)) ||
-        (is_modern_resize_pair_signature(left) &&
-         is_legacy_direct_resize_signature(right));
-    if (!compatible_shapes ||
-        left.host_resize_semantic_digest != right.host_resize_semantic_digest)
-    {
-        return false;
-    }
-    ++replay.semantic_digest_object_checks;
-    return
-        host_resize_semantic_object(left.host_resize_result->object) ==
-        host_resize_semantic_object(right.host_resize_result->object);
-}
-
 bool causal_group_signatures_equal(
     const Causal_group_signature& recorded,
     const Causal_group_signature& replayed,
     Replay_result&                replay)
 {
-    if (recorded.owner_kind != replayed.owner_kind) {
-        return legacy_and_modern_resize_signatures_equal(recorded, replayed, replay);
-    }
-    if (recorded.backend_output_digest != replayed.backend_output_digest ||
+    if (recorded.owner_kind != replayed.owner_kind ||
+        recorded.backend_output_digest != replayed.backend_output_digest ||
         recorded.other_events.size() != replayed.other_events.size())
     {
         return false;
@@ -1823,13 +1705,6 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
     config.backend_event_notifier = []() {};
     auto session = std::make_unique<term::Terminal_session>(std::move(backend), config);
 
-    const bool has_resize_request = std::any_of(
-        events.begin(),
-        events.end(),
-        [](const term::Terminal_transcript_event& event) {
-            return event.kind == QStringLiteral("session.resize_request");
-        });
-
     bool started = false;
     std::optional<Pending_scroll_intent> pending_scroll_intent;
     std::vector<QByteArray> backend_bytes_by_group(
@@ -1927,8 +1802,7 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
             }
         }
         else
-        if (event.kind == QStringLiteral("session.resize_request") ||
-            (event.kind == QStringLiteral("session.resize") && !has_resize_request))
+        if (event.kind == QStringLiteral("session.resize_request"))
         {
             const term::Terminal_session_result result = session->resize(
                 source_geometry_from_event(event),
