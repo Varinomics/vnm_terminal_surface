@@ -266,8 +266,8 @@ function(vnm_terminal_configure_test_process target_name)
     if(VNM_TERMINAL_SANITIZE_ADDRESS)
         if(MSVC)
             target_compile_options(${target_name} PRIVATE /fsanitize=address)
-            # Match the library: no STL container annotations, since Qt and the
-            # FetchContent deps this test links are not instrumented.
+            # Match the library's string/vector annotation policy across the
+            # uninstrumented Qt and graphics dependency boundaries.
             target_compile_definitions(${target_name} PRIVATE
                 _DISABLE_VECTOR_ANNOTATION
                 _DISABLE_STRING_ANNOTATION

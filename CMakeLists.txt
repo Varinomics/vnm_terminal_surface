@@ -487,8 +487,8 @@ endif()
 if(VNM_TERMINAL_SURFACE_BUILD_FULL AND VNM_TERMINAL_SANITIZE_ADDRESS)
     if(MSVC)
         target_compile_options(vnm_terminal_surface PRIVATE /fsanitize=address)
-        # Only our code is instrumented (Qt and the FetchContent deps are not), so
-        # turn off STL container annotations to avoid cross-boundary false positives.
+        # Qt and the graphics dependencies are not instrumented, so retain the
+        # matching string/vector annotation policy across those boundaries.
         target_compile_definitions(vnm_terminal_surface PRIVATE
             _DISABLE_VECTOR_ANNOTATION
             _DISABLE_STRING_ANNOTATION

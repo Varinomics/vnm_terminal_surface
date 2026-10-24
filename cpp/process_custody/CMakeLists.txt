@@ -28,6 +28,14 @@ target_include_directories(vnm_process_custody PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 set_target_properties(vnm_process_custody PROPERTIES
     AUTOMOC OFF AUTOUIC OFF AUTORCC OFF POSITION_INDEPENDENT_CODE ON)
+if(MSVC AND VNM_TERMINAL_SANITIZE_ADDRESS)
+    # CPU samples cross this boundary as std::optional, so custody and its
+    # consumers need the host's matching sanitizer and annotation settings.
+    target_compile_options(vnm_process_custody PUBLIC /fsanitize=address)
+    target_compile_definitions(vnm_process_custody PUBLIC
+        _DISABLE_VECTOR_ANNOTATION
+        _DISABLE_STRING_ANNOTATION)
+endif()
 if(WIN32)
     target_compile_definitions(vnm_process_custody PRIVATE NOMINMAX)
     option(VNM_PROCESS_CUSTODY_ENABLE_TEST_HOOKS "Enable the maintained Windows native observation fixtures" OFF)
