@@ -279,6 +279,8 @@ QImage composite_image_band(
     const QImage&               band,
     const composite_layout_t&   layout)
 {
+    const int band_width  = band.width();
+    const int band_height = band.height();
     QImage earlier_pixels = earlier.pixels;
     if (earlier_pixels.width()  != layout.earlier_width ||
         earlier_pixels.height() != layout.earlier_height)
@@ -299,18 +301,37 @@ QImage composite_image_band(
     if (combined.isNull() || earlier_pixels.isNull()) {
         throw std::bad_alloc();
     }
+
+    // Equal extents need no cleared union or separate copy of earlier pixels:
+    // every output pixel comes from the band or its immutable predecessor.
+    if (earlier_x == 0 && band_x == 0 &&
+        layout.earlier_width  == band_width &&
+        layout.earlier_height == band_height)
+    {
+        for (int y = 0; y < band_height; ++y) {
+            auto*       target = reinterpret_cast<std::uint32_t*>(combined.scanLine(y));
+            const auto* source = reinterpret_cast<const std::uint32_t*>(band.constScanLine(y));
+            const auto* prior  = reinterpret_cast<const std::uint32_t*>(earlier_pixels.constScanLine(y));
+            for (int x = 0; x < band_width; ++x) {
+                const std::uint32_t pixel = source[x];
+                target[x] = pixel != 0U ? pixel : prior[x];
+            }
+        }
+        return combined;
+    }
+
     combined.fill(0U);
 
-    for (int y = 0; y < earlier_pixels.height(); ++y) {
+    for (int y = 0; y < layout.earlier_height; ++y) {
         std::memcpy(
             combined.scanLine(y) + static_cast<std::size_t>(earlier_x) * sizeof(std::uint32_t),
             earlier_pixels.constScanLine(y),
-            static_cast<std::size_t>(earlier_pixels.width()) * sizeof(std::uint32_t));
+            static_cast<std::size_t>(layout.earlier_width) * sizeof(std::uint32_t));
     }
-    for (int y = 0; y < band.height(); ++y) {
+    for (int y = 0; y < band_height; ++y) {
         auto*       target = reinterpret_cast<std::uint32_t*>(combined.scanLine(y)) + band_x;
         const auto* source = reinterpret_cast<const std::uint32_t*>(band.constScanLine(y));
-        for (int x = 0; x < band.width(); ++x) {
+        for (int x = 0; x < band_width; ++x) {
             if (source[x] != 0U) {
                 target[x] = source[x];
             }
@@ -8309,9 +8330,8 @@ std::uint64_t Terminal_screen_model::sixel_band_cost(
             static_cast<std::uint64_t>(std::max<std::int64_t>(0, band_height));
 }
 
-// Drawing a band over its row's earlier image composites the union of their
-// columns: the union is cleared, the earlier image copied, resampled first
-// when its cell differs, and the band drawn over it.
+// Charge for the general composite's clear, copy and possible resampling.
+// Equal extents use less work but keep the same placement yield boundaries.
 std::uint64_t Terminal_screen_model::sixel_composite_cost(
     const Sixel_placement& placement,
     int                    row) const
@@ -8494,8 +8514,8 @@ std::size_t Terminal_screen_model::place_image_band(
     int                        end_column,
     terminal_cell_pixel_size_t cell)
 {
-    // Clip at the right margin, and copy the band out of the decoder's raster,
-    // which may be a view keeping a larger capacity buffer alive.
+    // Borrow the clipped band only while preparing the row. Published pixels
+    // must own their storage instead of retaining the decoder's larger raster.
     const int band_width = static_cast<int>(std::min<std::int64_t>(
         raster.width(),
         static_cast<std::int64_t>(end_column - first_column) * cell.width));
@@ -8503,8 +8523,13 @@ std::size_t Terminal_screen_model::place_image_band(
 
     // The band is laid out as the slice it may become, so its columns come
     // from the one slice rule; make_image_slice gives it a revision.
-    Terminal_image_slice band{
-        QImage(band_width, band_height, QImage::Format_RGBA8888_Premultiplied),
+    const Terminal_image_slice band{
+        QImage(
+            raster.constScanLine(band_top),
+            band_width,
+            band_height,
+            raster.bytesPerLine(),
+            raster.format()),
         first_column,
         cell,
         0U,
@@ -8522,10 +8547,6 @@ std::size_t Terminal_screen_model::place_image_band(
     for (int y = 0; y < band_height; ++y) {
         const auto* source =
             reinterpret_cast<const std::uint32_t*>(raster.constScanLine(band_top + y));
-        std::memcpy(
-            band.pixels.scanLine(y),
-            source,
-            static_cast<std::size_t>(band_width) * sizeof(std::uint32_t));
         for (int column = 0; column < band_columns; ++column) {
             if (covered_columns[static_cast<std::size_t>(column)] != 0U) {
                 continue;
@@ -8556,6 +8577,7 @@ std::size_t Terminal_screen_model::place_image_band(
     // replaces the earlier image, and the refused size is reported.
     std::size_t refused_composite_bytes = 0U;
     int         slice_first_column      = first_column;
+    QImage pixels;
     if (screen_row.image_slice != nullptr) {
         const composite_layout_t layout = composite_image_layout(
             *screen_row.image_slice,
@@ -8566,12 +8588,18 @@ std::size_t Terminal_screen_model::place_image_band(
             refused_composite_bytes = static_cast<std::size_t>(layout.bytes);
         }
         else {
-            band.pixels        = composite_image_band(*screen_row.image_slice, band.pixels, layout);
+            pixels             = composite_image_band(*screen_row.image_slice, band.pixels, layout);
             slice_first_column = layout.first_column;
         }
     }
+    if (pixels.isNull()) {
+        pixels = band.pixels.copy();
+        if (pixels.isNull()) {
+            throw std::bad_alloc();
+        }
+    }
     std::shared_ptr<const Terminal_image_slice> image =
-        make_image_slice(std::move(band.pixels), slice_first_column, cell);
+        make_image_slice(std::move(pixels), slice_first_column, cell);
 
     // Text under an image would draw over it, so a covered cell loses its
     // text and hyperlink and keeps its style, the way an erase leaves a cell;

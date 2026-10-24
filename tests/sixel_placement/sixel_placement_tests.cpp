@@ -600,6 +600,66 @@ bool test_images_on_one_row_composite()
     return ok;
 }
 
+bool test_equal_extent_overlays_preserve_snapshot_pixels()
+{
+    // S4 overlays drawn pixels while A1 keeps published slices immutable.
+    // Both 37 x 42 rasters clip to 30 pixels and span bands of 20, 20 and 2
+    // rows, so each composite reads a clipped source with its original stride.
+    const QByteArray first_data = QByteArray("#1;2;100;0;0#1") +
+        QByteArray("!10~!5?!22~-").repeated(6) + "!10~!5?!22~";
+    QByteArray overlay_data("#2;2;0;100;0#2");
+    for (int row = 0; row < 7; ++row) {
+        overlay_data += "!7~!5?!25";
+        overlay_data += static_cast<char>('?' + (1 << (row % 6)));
+        if (row + 1 < 7) {
+            overlay_data += '-';
+        }
+    }
+
+    term::Terminal_screen_model model = make_model(5, 4);
+    model.ingest(cursor_to(0, 1) + sixel("9;1", first_data));
+    const term::Terminal_render_snapshot before = model.render_snapshot(1U);
+    model.ingest(cursor_to(0, 1) + sixel("9;1", overlay_data));
+    const term::Terminal_render_snapshot after = model.render_snapshot(2U);
+
+    bool ok = true;
+    for (int band = 0; band < 3; ++band) {
+        const auto prior   = term::render_snapshot_row_image(before, band);
+        const auto current = term::render_snapshot_row_image(after, band);
+        const int height = band == 2 ? 2 : 20;
+        if (!check(prior && current &&
+                prior->pixels.size()   == QSize(30, height) &&
+                current->pixels.size() == QSize(30, height),
+                "equal-extent overlays preserve clipped full and partial band dimensions"))
+        {
+            return false;
+        }
+        ok &= check(current != prior && current->revision > prior->revision &&
+                current->first_column == 1 && current->cell_pixel_size == k_cell &&
+                current->pixels.format() == QImage::Format_RGBA8888_Premultiplied,
+            "an equal-extent overlay publishes a distinct slice with unchanged placement");
+
+        bool prior_unchanged  = true;
+        bool overlay_matches = true;
+        for (int y = 0; y < height; ++y) {
+            const int raster_y = band * k_cell.height + y;
+            for (int x = 0; x < 30; ++x) {
+                const QColor prior_color = x < 10 || x >= 15
+                    ? QColor(Qt::red)
+                    : QColor(Qt::transparent);
+                const bool green_pixel = x < 7 || (x >= 12 && raster_y % 6 == (raster_y / 6) % 6);
+                const QColor current_color = green_pixel ? QColor(Qt::green) : prior_color;
+                prior_unchanged  = prior_unchanged && prior->pixels.pixelColor(x, y) == prior_color;
+                overlay_matches = overlay_matches && current->pixels.pixelColor(x, y) == current_color;
+            }
+        }
+        ok &= check(prior_unchanged, "an overlay leaves all pixels in the earlier snapshot unchanged");
+        ok &= check(overlay_matches,
+            "drawn overlay pixels replace earlier pixels and zero pixels preserve them exactly");
+    }
+    return ok;
+}
+
 bool test_images_without_geometry_or_pixels()
 {
     bool ok = true;
@@ -2289,6 +2349,7 @@ int main()
     ok &= test_aspect_ratios_clamp_to_one_region();
     ok &= test_images_erase_the_text_they_cover();
     ok &= test_images_on_one_row_composite();
+    ok &= test_equal_extent_overlays_preserve_snapshot_pixels();
     ok &= test_images_without_geometry_or_pixels();
     ok &= test_image_rows_move_and_die_with_their_rows();
     ok &= test_placement_marks_rows_dirty();
