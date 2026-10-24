@@ -8887,7 +8887,6 @@ bool test_cell_stable_ascii_layout_font()
         (static_cast<int>(layout_font.styleStrategy()) &
             static_cast<int>(QFont::PreferNoShaping)) != 0,
         "cell-stable ASCII layout font requests no shaping");
-#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
     for (QFont::Tag tag : {
         QFont::Tag("calt"),
         QFont::Tag("clig"),
@@ -8899,7 +8898,6 @@ bool test_cell_stable_ascii_layout_font()
         ok &= check(layout_font.featureValue(tag) == 0U,
             "cell-stable ASCII layout font disables ASCII ligature features");
     }
-#endif
     const QFontInfo resolved_font(layout_font);
     ok &= check(resolved_font.fixedPitch(),
         "cell-stable ASCII layout font resolves to a fixed-pitch face");
