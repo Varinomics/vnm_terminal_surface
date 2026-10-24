@@ -30,7 +30,7 @@ enum class Terminal_touch_selection_action
 };
 
 enum class Terminal_selection_handle { START, END };
-enum class Terminal_touch_menu { COPY = 0, PASTE = 1, LEGACY_COPY = 3 };
+enum class Terminal_touch_menu { COPY = 0, PASTE = 1 };
 
 enum class Terminal_touch_selection_status
 {

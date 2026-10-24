@@ -482,6 +482,7 @@ bool touch_intent_contract()
     presentation.cell_metrics = {10.0, 20.0, 14.0, 6.0};
     presentation.selection.source = {1U, touch::Terminal_selection_buffer::PRIMARY_SCREEN, 1U, 5, 20};
     presentation.selection.selection_generation = 1U;
+    presentation.selection.word_query_version = touch::k_terminal_word_query_version;
     for (int row = 0; row < 5; ++row) {
         presentation.selection.visible_rows.push_back({(std::uint64_t)row + 1U, 1U, 0});
     }
@@ -512,19 +513,24 @@ bool touch_intent_contract()
         return false;
     }
     QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
-    ok &= check(requests.size() == 1U && requests.front().action == touch::Terminal_touch_selection_action::SELECT_WORD &&
+    ok &= check(requests.size() == 1U && requests.front().action == touch::Terminal_touch_selection_action::INSPECT_WORD &&
         requests.front().target.column == 5 && taps == 1 && copy_menus == 0,
-        "a hold selects the displayed word and waits for its owner before the menu");
+        "a hold inspects the displayed word and waits for its owner before selecting");
     if (!requests.empty()) {
+        item.controller->complete({requests.front().request_id, requests.front().action,
+            touch::Terminal_touch_selection_status::OK, 1U, {}, {}, true});
+        ok &= check(requests.size() == 2U && requests.back().action == touch::Terminal_touch_selection_action::SELECT_WORD,
+            "owner-confirmed text is selected before the menu");
+        const auto selected = requests.back();
         presentation.selection.has_selection = true;
         presentation.selection.touch_handles_visible = true;
         presentation.selection.selection_generation = 2U;
         presentation.selection.start = {1, 4, true};
         presentation.selection.end = {1, 8, true};
         presentation.selection.spans = {{1, 4, 4}};
-        item.controller->complete({requests.front().request_id, requests.front().action,
+        item.controller->complete({selected.request_id, selected.action,
             touch::Terminal_touch_selection_status::OK, 2U, {}, {}});
-        ok &= check(requests.size() == 2U && requests.back().action == touch::Terminal_touch_selection_action::END_GESTURE,
+        ok &= check(requests.size() == 3U && requests.back().action == touch::Terminal_touch_selection_action::END_GESTURE,
             "release completes one owner gesture without a short tap");
         item.controller->complete({requests.back().request_id, requests.back().action,
             touch::Terminal_touch_selection_status::OK, 2U, {}, {}});
@@ -559,6 +565,9 @@ bool touch_intent_contract()
             return false;
         }
         QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
+        const auto inspected = requests.back();
+        item.controller->complete({inspected.request_id, inspected.action,
+            touch::Terminal_touch_selection_status::OK, 3U, {}, {}, true});
         const auto pending_selection = requests.back();
         QTest::touchEvent(&window, device).press(0, QPoint(170, 10), &window);
         QTest::touchEvent(&window, device).release(0, QPoint(170, 10), &window);
@@ -772,6 +781,45 @@ bool direct_word_hold_contract()
     ok &= check(menus.size() == menus_before_shared_selection + 1 &&
         menus.back() == touch::Terminal_touch_menu::COPY && requests.size() == requests_before_selected_hold,
         "holding an existing shared selection presents its current generation after changes during the hold");
+    item.controller->cancel();
+    shown.selection.has_selection = false;
+    shown.selection.touch_handles_visible = false;
+    shown.selection.spans.clear();
+    shown.selection.word_query_version.reset();
+    item.controller->presentation_changed();
+    const auto requests_without_word_query = requests.size();
+    if (!hold()) {
+        return false;
+    }
+    ok &= check(requests.size() == requests_without_word_query &&
+        menus.back() == touch::Terminal_touch_menu::PASTE && taps == 0,
+        "an unavailable word query keeps Paste usable without selecting uninspected text");
+    const auto dismissals_before_selection = dismissals;
+    shown.selection.has_selection = true;
+    shown.selection.selection_generation = 7U;
+    shown.selection.start = {0, 4, true};
+    shown.selection.end = {0, 8, true};
+    shown.selection.spans = {{0, 4, 4}};
+    item.controller->presentation_changed();
+    ok &= check(dismissals == dismissals_before_selection + 1,
+        "a shared selection dismisses Paste while word inspection is unavailable");
+    if (!hold()) {
+        return false;
+    }
+    ok &= check(requests.size() == requests_without_word_query && menus.back() == touch::Terminal_touch_menu::COPY,
+        "an existing shared selection can be copied while word inspection is unavailable");
+    item.controller->cancel();
+    shown.selection.has_selection = false;
+    shown.selection.spans.clear();
+    shown.selection.word_query_version = touch::k_terminal_word_query_version;
+    item.controller->presentation_changed();
+    if (!hold()) {
+        return false;
+    }
+    ok &= check(requests.size() == requests_without_word_query + 1 &&
+        requests.back().action == touch::Terminal_touch_selection_action::INSPECT_WORD,
+        "word inspection resumes when its current capability returns");
+    item.controller->cancel();
     return ok;
 }
 
@@ -1079,6 +1127,7 @@ bool moving_viewport_contract()
     shown.cell_metrics = {10, 20, 14, 6};
     shown.selection.source = {1U, touch::Terminal_selection_buffer::PRIMARY_SCREEN, 1U, 5, 20};
     shown.selection.selection_generation = 1U;
+    shown.selection.word_query_version = touch::k_terminal_word_query_version;
     for (int row = 0; row < 5; ++row) {
         shown.selection.visible_rows.push_back({(std::uint64_t)row + 1U, 1U, 0});
     }
@@ -1110,7 +1159,7 @@ bool moving_viewport_contract()
     item.controller->set_viewport(QRectF(0, 10, 200, 90));
     stationary_touch.stationary(0).commit();
     if (!check(QTest::qWaitFor([&] { return !requests.empty(); }, 1000) &&
-            requests.back().action == touch::Terminal_touch_selection_action::SELECT_WORD &&
+            requests.back().action == touch::Terminal_touch_selection_action::INSPECT_WORD &&
             requests.back().target.row.retained_line_id == 4U && taps == 0,
             "incoming output moves content beneath a held screen point without cancelling or inventing finger travel")) {
         return false;

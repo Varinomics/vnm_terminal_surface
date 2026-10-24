@@ -336,22 +336,19 @@ void Terminal_touch_controller::prolonged_press()
         m_gesture = Gesture::PASTE;
         return;
     }
-    if (presentation->selection.word_query_version == k_terminal_word_query_version) {
-        m_generation = presentation->selection.selection_generation;
-        if (presentation->selection.has_selection) {
-            m_gesture = Gesture::CONTEXT;
-        }
-        else if (m_callbacks.paste_available() && press_near_block_cursor(*presentation)) {
-            m_gesture = Gesture::PASTE;
-        }
-        else {
-            m_gesture = Gesture::INSPECTING;
-            send(Terminal_touch_selection_action::INSPECT_WORD);
-        }
-        return;
+    m_generation = presentation->selection.selection_generation;
+    if (presentation->selection.has_selection) {
+        m_gesture = Gesture::CONTEXT;
     }
-    m_gesture = Gesture::SELECTING;
-    send(Terminal_touch_selection_action::SELECT_WORD);
+    else if (presentation->selection.word_query_version != k_terminal_word_query_version ||
+        (m_callbacks.paste_available() && press_near_block_cursor(*presentation)))
+    {
+        m_gesture = Gesture::PASTE;
+    }
+    else {
+        m_gesture = Gesture::INSPECTING;
+        send(Terminal_touch_selection_action::INSPECT_WORD);
+    }
 }
 
 terminal_selection_point_t Terminal_touch_controller::point_for_position(
@@ -592,10 +589,7 @@ void Terminal_touch_controller::show_menu_if_presented()
     m_menu_pending = false;
     m_menu_visible = true;
     m_paste_menu = false;
-    m_callbacks.menu_requested(
-        presentation->selection.word_query_version == k_terminal_word_query_version
-            ? Terminal_touch_menu::COPY : Terminal_touch_menu::LEGACY_COPY,
-        anchor, m_generation);
+    m_callbacks.menu_requested(Terminal_touch_menu::COPY, anchor, m_generation);
 }
 
 void Terminal_touch_controller::report_notice(QString reason)
@@ -688,9 +682,7 @@ void Terminal_touch_controller::presentation_changed()
     {
         dismiss_menu();
     }
-    if (presentation && m_menu_visible && m_paste_menu &&
-        presentation->selection.has_selection &&
-        presentation->selection.word_query_version == k_terminal_word_query_version)
+    if (presentation && m_menu_visible && m_paste_menu && presentation->selection.has_selection)
     {
         dismiss_menu();
     }
