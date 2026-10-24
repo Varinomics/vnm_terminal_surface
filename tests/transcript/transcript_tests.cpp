@@ -29,7 +29,6 @@ namespace {
 
 using vnm_terminal::test_helpers::check;
 
-constexpr int k_surface_default_scrollback_limit = 10000;
 
 term::Terminal_launch_config valid_launch_config()
 {
@@ -111,6 +110,20 @@ QJsonObject valid_header_object(std::uint64_t event_index = 0U)
     return object;
 }
 
+QJsonObject valid_session_config_object()
+{
+    return {
+        {QStringLiteral("recover_scrollback_from_primary_repaints"), false},
+        {QStringLiteral("selection_viewport_projection_enabled"), false},
+        {QStringLiteral("scrollback_limit"), 8},
+        {QStringLiteral("effective_scrollback_limit"), 8},
+        {QStringLiteral("retained_history_capacity_bytes"),
+            static_cast<qint64>(term::k_terminal_default_retained_history_capacity_bytes)},
+        {QStringLiteral("synchronized_output_scroll_policy"),
+            QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION")},
+    };
+}
+
 QJsonObject valid_session_start_object(std::uint64_t event_index)
 {
     QJsonObject grid_size;
@@ -124,6 +137,7 @@ QJsonObject valid_session_start_object(std::uint64_t event_index)
     object.insert(QStringLiteral("argv"), QJsonArray{QStringLiteral("fixture")});
     object.insert(QStringLiteral("working_directory"), QStringLiteral("C:/workspace"));
     object.insert(QStringLiteral("initial_grid_size"), grid_size);
+    object.insert(QStringLiteral("session_config"), valid_session_config_object());
     return object;
 }
 
@@ -159,6 +173,26 @@ QJsonObject valid_compact_snapshot_object(std::uint64_t event_index)
     object.insert(QStringLiteral("grid_size"), grid_size);
     object.insert(QStringLiteral("viewport"), viewport);
     object.insert(QStringLiteral("cursor"), cursor);
+    object.insert(QStringLiteral("snapshot_basis"), QStringLiteral("LIVE_CONTENT"));
+    object.insert(QStringLiteral("snapshot_purpose"), QStringLiteral("CONTENT"));
+    object.insert(
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"));
+    object.insert(
+        QStringLiteral("synchronized_output_scroll_policy_change_event"),
+        QStringLiteral("none"));
+    object.insert(QStringLiteral("diagnostic_reason"), QStringLiteral("none"));
+    insert_u64(object, QStringLiteral("public_projection_generation"), 0U);
+    object.insert(QStringLiteral("public_viewport_before"), viewport);
+    object.insert(QStringLiteral("public_viewport_after"), viewport);
+    object.insert(QStringLiteral("live_viewport_before_on_release"), viewport);
+    object.insert(QStringLiteral("live_viewport_after_on_release"), viewport);
+    object.insert(QStringLiteral("visible_scroll_applied"), false);
+    object.insert(QStringLiteral("live_content_publication_blocked"), false);
+    object.insert(QStringLiteral("release_reconciliation_result"), QStringLiteral("none"));
+    object.insert(QStringLiteral("hidden_row_eligibility"), QStringLiteral("not_evaluated"));
+    object.insert(QStringLiteral("hidden_row_clamp_reason"), QStringLiteral("none"));
+    object.insert(QStringLiteral("public_projection_disable_reason"), QStringLiteral("none"));
     insert_u64(object, QStringLiteral("snapshot_sequence"), 1U);
     insert_u64(object, QStringLiteral("row_origin_generation"), 1U);
     object.insert(QStringLiteral("cell_count"), 0);
@@ -339,40 +373,6 @@ bool write_transcript_lines(
     }
 
     return true;
-}
-
-QJsonObject valid_wheel_trace_object(std::uint64_t event_index)
-{
-    QJsonObject object;
-    object.insert(QStringLiteral("kind"), QStringLiteral("surface.wheel_trace"));
-    insert_u64(object, QStringLiteral("event_index"), event_index);
-    object.insert(QStringLiteral("source"), QStringLiteral("surface.text_area.wheel"));
-    object.insert(QStringLiteral("route"), QStringLiteral("local_scroll"));
-    object.insert(QStringLiteral("outcome"), QStringLiteral("local_scroll_publication_deferred"));
-    object.insert(QStringLiteral("accepted"), true);
-    object.insert(QStringLiteral("angle_delta_x"), 0);
-    object.insert(QStringLiteral("angle_delta_y"), 120);
-    object.insert(QStringLiteral("pixel_delta_x"), 0);
-    object.insert(QStringLiteral("pixel_delta_y"), 0);
-    object.insert(QStringLiteral("modifiers"), 0);
-    object.insert(QStringLiteral("wheel_steps"), 1);
-    object.insert(QStringLiteral("effective_line_delta"), 3);
-    object.insert(QStringLiteral("angle_remainder"), 0.0);
-    object.insert(QStringLiteral("pixel_remainder"), 0.0);
-    object.insert(QStringLiteral("session_present"), true);
-    object.insert(QStringLiteral("render_publication_blocked"), true);
-    object.insert(QStringLiteral("published_synchronized_output"), false);
-    object.insert(QStringLiteral("alternate_screen"), false);
-    object.insert(QStringLiteral("local_scroll_attempted"), true);
-    object.insert(QStringLiteral("local_scroll_intent_recorded"), true);
-    object.insert(QStringLiteral("local_scroll_applied"), true);
-    object.insert(QStringLiteral("visible_scroll_applied"), false);
-    object.insert(QStringLiteral("live_sgr_mouse_reporting"), false);
-    object.insert(QStringLiteral("published_sgr_mouse_reporting"), false);
-    object.insert(QStringLiteral("published_mouse_tracking"), false);
-    object.insert(QStringLiteral("backend_drain_calls"), 1);
-    object.insert(QStringLiteral("backend_drain_elapsed_ns"), 0);
-    return object;
 }
 
 struct Replay_tool_process_result
@@ -609,101 +609,6 @@ bool rewrite_first_recovered_row_provenance_source(
     return rewritten && write_transcript_lines(path, lines);
 }
 
-bool remove_snapshot_row_provenance_sources(const QString& path)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return false;
-    }
-
-    bool rewritten = false;
-    std::vector<QByteArray> lines;
-    while (!file.atEnd()) {
-        const QByteArray line = file.readLine();
-        QJsonParseError parse_error;
-        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
-        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
-            return false;
-        }
-
-        QJsonObject object = document.object();
-        if (object.value(QStringLiteral("kind")).toString() == QStringLiteral("snapshot")) {
-            QJsonArray row_provenance =
-                object.value(QStringLiteral("row_provenance")).toArray();
-            bool row_provenance_changed = false;
-            for (int row = 0; row < row_provenance.size(); ++row) {
-                QJsonObject provenance = row_provenance.at(row).toObject();
-                if (!provenance.contains(QStringLiteral("source"))) {
-                    continue;
-                }
-
-                provenance.remove(QStringLiteral("source"));
-                row_provenance.replace(row, provenance);
-                row_provenance_changed = true;
-            }
-
-            if (row_provenance_changed) {
-                object.insert(QStringLiteral("row_provenance"), row_provenance);
-                rewritten = true;
-            }
-        }
-        lines.push_back(json_line(object));
-    }
-    file.close();
-
-    return rewritten && write_transcript_lines(path, lines);
-}
-
-bool remove_snapshot_public_scroll_schema_fields(const QString& path)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return false;
-    }
-
-    const QStringList schema_fields = {
-        QStringLiteral("snapshot_basis"),
-        QStringLiteral("snapshot_purpose"),
-        QStringLiteral("effective_synchronized_output_scroll_policy"),
-        QStringLiteral("synchronized_output_scroll_policy_change_event"),
-        QStringLiteral("diagnostic_reason"),
-        QStringLiteral("public_projection_generation"),
-        QStringLiteral("public_viewport_before"),
-        QStringLiteral("public_viewport_after"),
-        QStringLiteral("live_viewport_before_on_release"),
-        QStringLiteral("live_viewport_after_on_release"),
-        QStringLiteral("visible_scroll_applied"),
-        QStringLiteral("live_content_publication_blocked"),
-        QStringLiteral("release_reconciliation_result"),
-        QStringLiteral("hidden_row_eligibility"),
-        QStringLiteral("hidden_row_clamp_reason"),
-        QStringLiteral("public_projection_disable_reason"),
-    };
-
-    bool rewritten = false;
-    std::vector<QByteArray> lines;
-    while (!file.atEnd()) {
-        const QByteArray line = file.readLine();
-        QJsonParseError parse_error;
-        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
-        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
-            return false;
-        }
-
-        QJsonObject object = document.object();
-        if (object.value(QStringLiteral("kind")).toString() == QStringLiteral("snapshot")) {
-            for (const QString& field : schema_fields) {
-                object.remove(field);
-            }
-            rewritten = true;
-        }
-        lines.push_back(json_line(object));
-    }
-    file.close();
-
-    return rewritten && write_transcript_lines(path, lines);
-}
-
 bool corrupt_first_public_projection_scroll_snapshot_to_self_consistent_wrong_content(
     const QString& path)
 {
@@ -892,25 +797,6 @@ bool write_transcript_objects(
         lines.push_back(json_line(std::move(objects[index])));
     }
     return write_transcript_lines(path, lines);
-}
-
-bool remove_first_event_kind(const QString& path, const QString& kind)
-{
-    std::optional<std::vector<QJsonObject>> objects = read_transcript_objects(path);
-    if (!objects.has_value()) {
-        return false;
-    }
-    const auto event = std::find_if(
-        objects->begin(),
-        objects->end(),
-        [&kind](const QJsonObject& object) {
-            return object.value(QStringLiteral("kind")).toString() == kind;
-        });
-    if (event == objects->end()) {
-        return false;
-    }
-    objects->erase(event);
-    return write_transcript_objects(path, std::move(*objects));
 }
 
 QJsonObject comparable_test_snapshot(QJsonObject object)
@@ -1845,85 +1731,29 @@ struct Replay_harness
     term::Terminal_selection_result selected_text;
 };
 
-int max_recorded_scrollback_rows(const std::vector<term::Terminal_transcript_event>& events)
-{
-    int max_scrollback_rows = 0;
-    for (const term::Terminal_transcript_event& event : events) {
-        if (event.kind != QStringLiteral("snapshot")) {
-            continue;
-        }
-
-        const QJsonObject viewport = event.object.value(QStringLiteral("viewport")).toObject();
-        max_scrollback_rows = std::max(
-            max_scrollback_rows,
-            viewport.value(QStringLiteral("scrollback_rows")).toInt());
-    }
-    return max_scrollback_rows;
-}
-
-bool transcript_uses_immediate_public_projection(
-    const std::vector<term::Terminal_transcript_event>& events)
-{
-    for (const term::Terminal_transcript_event& event : events) {
-        if (event.object.value(QStringLiteral("snapshot_basis")).toString() ==
-                QStringLiteral("PUBLIC_PROJECTION") ||
-            event.object.value(
-                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
-                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 term::Terminal_session_config replay_session_config(
     const std::vector<term::Terminal_transcript_event>& events)
 {
-    term::Terminal_session_config config;
     const auto start_it = std::find_if(
         events.begin(),
         events.end(),
         [](const term::Terminal_transcript_event& event) {
             return event.kind == QStringLiteral("session.start");
         });
-
-    if (start_it != events.end() && start_it->object.contains(QStringLiteral("session_config"))) {
-        const QJsonObject session_config =
-            start_it->object.value(QStringLiteral("session_config")).toObject();
-        config.scrollback_limit =
-            session_config.contains(QStringLiteral("effective_scrollback_limit"))
-                ? session_config.value(QStringLiteral("effective_scrollback_limit")).toInt()
-                : session_config.value(QStringLiteral("scrollback_limit")).toInt();
-        if (session_config.contains(QStringLiteral("retained_history_capacity_bytes"))) {
-            config.retained_history_capacity_bytes = static_cast<std::size_t>(
-                session_config.value(QStringLiteral("retained_history_capacity_bytes")).toInteger());
-        }
-        config.recover_scrollback_from_primary_repaints =
-            session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
-        config.selection_viewport_projection_enabled =
-            session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
-        const QJsonValue explicit_scroll_policy =
-            session_config.value(QStringLiteral("synchronized_output_scroll_policy"));
-        if (explicit_scroll_policy.toString() == QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
-        {
-            config.synchronized_output_scroll_policy =
-                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
-        }
-        else
-        if (!explicit_scroll_policy.isString() && transcript_uses_immediate_public_projection(events)) {
-            config.synchronized_output_scroll_policy =
-                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
-        }
-        return config;
-    }
-
-    const int recorded_scrollback_rows = max_recorded_scrollback_rows(events);
+    const QJsonObject session_config =
+        start_it->object.value(QStringLiteral("session_config")).toObject();
+    term::Terminal_session_config config;
     config.scrollback_limit =
-        recorded_scrollback_rows > 0 ? recorded_scrollback_rows : k_surface_default_scrollback_limit;
-    config.recover_scrollback_from_primary_repaints = false;
-    if (transcript_uses_immediate_public_projection(events)) {
+        session_config.value(QStringLiteral("effective_scrollback_limit")).toInt();
+    config.retained_history_capacity_bytes = static_cast<std::uint64_t>(
+        session_config.value(QStringLiteral("retained_history_capacity_bytes")).toInteger());
+    config.recover_scrollback_from_primary_repaints =
+        session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
+    config.selection_viewport_projection_enabled =
+        session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
+    if (session_config.value(QStringLiteral("synchronized_output_scroll_policy")).toString() ==
+        QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
+    {
         config.synchronized_output_scroll_policy =
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
     }
@@ -2084,13 +1914,6 @@ Replay_harness replay_events(const std::vector<term::Terminal_transcript_event>&
     Scripted_backend* backend_ptr = backend.get();
     term::Terminal_session session(std::move(backend), replay_session_config(events));
 
-    const bool has_resize_request = std::any_of(
-        events.begin(),
-        events.end(),
-        [](const term::Terminal_transcript_event& event) {
-            return event.kind == QStringLiteral("session.resize_request");
-        });
-
     bool started = false;
     std::optional<Pending_scroll_intent> pending_scroll_intent;
     for (const term::Terminal_transcript_event& event : events) {
@@ -2146,8 +1969,7 @@ Replay_harness replay_events(const std::vector<term::Terminal_transcript_event>&
             }
         }
         else
-        if (event.kind == QStringLiteral("session.resize_request") ||
-            (event.kind == QStringLiteral("session.resize") && !has_resize_request))
+        if (event.kind == QStringLiteral("session.resize_request"))
         {
             const term::Terminal_session_result result = session.resize(
                 source_geometry_from_event(event),
@@ -3024,47 +2846,6 @@ bool test_reader_rejects_invalid_leading_event_fields()
     return ok;
 }
 
-bool test_reader_accepts_session_config_without_recovery_flag()
-{
-    QTemporaryDir temp_dir;
-    if (!check(temp_dir.isValid(), "temporary legacy session-config directory is valid")) {
-        return false;
-    }
-
-    QJsonObject session_config;
-    session_config.insert(QStringLiteral("scrollback_limit"), 8);
-    session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
-    session_config.insert(
-        QStringLiteral("synchronized_output_scroll_policy"),
-        QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"));
-
-    QJsonObject start = valid_session_start_object(1U);
-    start.insert(QStringLiteral("session_config"), session_config);
-
-    const QString path = temp_dir.filePath(QStringLiteral("legacy-session-config.ndjson"));
-    bool ok = true;
-    ok &= check(
-        write_transcript_lines(path, {json_line(valid_header_object()), json_line(start)}),
-        "legacy session-config transcript writes");
-
-    QString error;
-    const std::optional<std::vector<term::Terminal_transcript_event>> events =
-        term::read_terminal_transcript(path, &error);
-    ok &= check(events.has_value(),
-        "reader accepts session_config without restored recovery flag");
-    if (!events.has_value()) {
-        std::cerr << error.toStdString() << '\n';
-    }
-    else {
-        const term::Terminal_session_config replay_config = replay_session_config(*events);
-        ok &= check(
-            replay_config.retained_history_capacity_bytes ==
-                term::k_terminal_default_retained_history_capacity_bytes,
-            "replay defaults a missing retained-history capacity");
-    }
-    return ok;
-}
-
 bool test_reader_rejects_invalid_retained_history_capacity()
 {
     QTemporaryDir temp_dir;
@@ -3072,7 +2853,7 @@ bool test_reader_rejects_invalid_retained_history_capacity()
         return false;
     }
 
-    QJsonObject session_config;
+    QJsonObject session_config = valid_session_config_object();
     session_config.insert(QStringLiteral("scrollback_limit"), 8);
     session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
     session_config.insert(QStringLiteral("retained_history_capacity_bytes"), 0);
@@ -3095,49 +2876,6 @@ bool test_reader_rejects_invalid_retained_history_capacity()
         QStringLiteral("excessive-retained-history-capacity.ndjson"),
         {json_line(valid_header_object()), json_line(start)},
         QStringLiteral("retained_history_capacity_bytes is outside"));
-    return ok;
-}
-
-bool test_reader_defaults_missing_row_provenance_source()
-{
-    QTemporaryDir temp_dir;
-    if (!check(temp_dir.isValid(), "temporary row-provenance source directory is valid")) {
-        return false;
-    }
-
-    QJsonObject snapshot = valid_compact_snapshot_object(1U);
-    QJsonArray row_provenance = snapshot.value(QStringLiteral("row_provenance")).toArray();
-    QJsonObject provenance = row_provenance.at(0).toObject();
-    provenance.remove(QStringLiteral("source"));
-    row_provenance.replace(0, provenance);
-    snapshot.insert(QStringLiteral("row_provenance"), row_provenance);
-
-    const QString path =
-        temp_dir.filePath(QStringLiteral("missing-row-provenance-source.ndjson"));
-    bool ok = true;
-    ok &= check(
-        write_transcript_lines(path, {json_line(valid_header_object()), json_line(snapshot)}),
-        "missing row-provenance source transcript writes");
-
-    QString error;
-    const std::optional<std::vector<term::Terminal_transcript_event>> events =
-        term::read_terminal_transcript(path, &error);
-    ok &= check(events.has_value(), "reader accepts missing row_provenance source");
-    if (!events.has_value()) {
-        std::cerr << error.toStdString() << '\n';
-        return false;
-    }
-
-    const std::optional<term::Terminal_transcript_event> snapshot_event =
-        first_event(*events, QStringLiteral("snapshot"));
-    const QJsonArray defaulted_provenance = snapshot_event.has_value()
-        ? snapshot_event->object.value(QStringLiteral("row_provenance")).toArray()
-        : QJsonArray{};
-    ok &= check(snapshot_event.has_value() &&
-            !defaulted_provenance.isEmpty() &&
-            defaulted_provenance.at(0).toObject().value(QStringLiteral("source")).toString() ==
-                QStringLiteral("terminal_storage"),
-        "reader defaults missing row_provenance source to terminal_storage");
     return ok;
 }
 
@@ -3321,86 +3059,6 @@ bool test_reader_accepts_selection_projection_diagnostic_reason()
             event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
                 QStringLiteral("selection_public_projection_unsupported"),
         "selection projection diagnostic reason is accepted");
-    return ok;
-}
-
-bool test_reader_defaults_detached_selection_legacy_reason_to_selection_purpose()
-{
-    QTemporaryDir temp_dir;
-    if (!check(temp_dir.isValid(), "temporary detached selection legacy directory is valid")) {
-        return false;
-    }
-
-    QJsonObject snapshot = valid_compact_snapshot_object(1U);
-    snapshot.insert(QStringLiteral("reason"), QStringLiteral("selection visual detached"));
-
-    const QString path = temp_dir.filePath(QStringLiteral("detached-selection-legacy.ndjson"));
-    bool ok = true;
-    ok &= check(
-        write_transcript_lines(path, {json_line(valid_header_object()), json_line(snapshot)}),
-        "detached selection legacy fixture writes");
-
-    QString error;
-    const std::optional<std::vector<term::Terminal_transcript_event>> events =
-        term::read_terminal_transcript(path, &error);
-    ok &= check(events.has_value(), "detached selection legacy transcript parses");
-    if (!events.has_value()) {
-        std::cerr << error.toStdString() << '\n';
-        return false;
-    }
-
-    const std::optional<term::Terminal_transcript_event> event =
-        first_event(*events, QStringLiteral("snapshot"));
-    ok &= check(
-        event.has_value() &&
-            event->object.value(QStringLiteral("snapshot_basis")).toString() ==
-                QStringLiteral("LIVE_CONTENT") &&
-            event->object.value(QStringLiteral("snapshot_purpose")).toString() ==
-                QStringLiteral("SELECTION_DERIVED"),
-        "detached selection legacy reason defaults missing purpose to selection-derived");
-    return ok;
-}
-
-bool test_reader_defaults_old_wheel_trace_policy_fields()
-{
-    QTemporaryDir temp_dir;
-    if (!check(temp_dir.isValid(), "temporary old wheel-trace directory is valid")) {
-        return false;
-    }
-
-    QJsonObject wheel_trace = valid_wheel_trace_object(1U);
-    wheel_trace.remove(QStringLiteral("effective_synchronized_output_scroll_policy"));
-    wheel_trace.remove(QStringLiteral("synchronized_output_scroll_policy_change_event"));
-    wheel_trace.remove(QStringLiteral("diagnostic_reason"));
-
-    const QString path = temp_dir.filePath(QStringLiteral("old-wheel-trace.ndjson"));
-    bool ok = true;
-    ok &= check(
-        write_transcript_lines(path, {json_line(valid_header_object()), json_line(wheel_trace)}),
-        "old wheel-trace fixture writes");
-
-    QString error;
-    const std::optional<std::vector<term::Terminal_transcript_event>> events =
-        term::read_terminal_transcript(path, &error);
-    ok &= check(events.has_value(), "old wheel-trace transcript parses with policy defaults");
-    if (!events.has_value()) {
-        std::cerr << error.toStdString() << '\n';
-        return false;
-    }
-
-    const std::optional<term::Terminal_transcript_event> event =
-        first_event(*events, QStringLiteral("surface.wheel_trace"));
-    ok &= check(
-        event.has_value() &&
-            event->object.value(
-                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
-                QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION") &&
-            event->object.value(
-                QStringLiteral("synchronized_output_scroll_policy_change_event")).toString() ==
-                QStringLiteral("none") &&
-            event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
-                QStringLiteral("none"),
-        "old wheel-trace policy fields default to deferred/no-change diagnostics");
     return ok;
 }
 
@@ -3861,7 +3519,7 @@ bool test_replay_drives_terminal_state()
 
 bool test_replay_config_keeps_explicit_deferred_public_scroll_policy()
 {
-    QJsonObject session_config;
+    QJsonObject session_config = valid_session_config_object();
     session_config.insert(QStringLiteral("scrollback_limit"), 8);
     session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
     session_config.insert(
@@ -3890,37 +3548,10 @@ bool test_replay_config_keeps_explicit_deferred_public_scroll_policy()
         "replay config keeps explicit deferred public scroll policy despite public projection events");
 }
 
-bool test_replay_config_defaults_missing_selection_viewport_projection_to_disabled()
-{
-    QJsonObject session_config;
-    session_config.insert(QStringLiteral("scrollback_limit"), 8);
-    session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
-    session_config.insert(
-        QStringLiteral("synchronized_output_scroll_policy"),
-        QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"));
-
-    QJsonObject start = valid_session_start_object(1U);
-    start.insert(QStringLiteral("session_config"), session_config);
-
-    const term::Terminal_session_config config = replay_session_config({
-        {0U, QStringLiteral("header"), valid_header_object()},
-        {1U, QStringLiteral("session.start"), start},
-    });
-
-    bool ok = true;
-    ok &= check(
-        !config.selection_viewport_projection_enabled,
-        "replay config defaults missing selection viewport projection to disabled");
-    ok &= check(
-        !config.recover_scrollback_from_primary_repaints,
-        "replay config defaults missing recorded recovery flag to disabled");
-    return ok;
-}
-
 bool test_replay_config_preserves_recorded_recovery_flag()
 {
     auto replay_recovery_flag = [](bool recorded_recovery_flag) {
-        QJsonObject session_config;
+        QJsonObject session_config = valid_session_config_object();
         session_config.insert(QStringLiteral("scrollback_limit"), 8);
         session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
         session_config.insert(
@@ -3944,18 +3575,6 @@ bool test_replay_config_preserves_recorded_recovery_flag()
         !replay_recovery_flag(false),
         "replay config preserves recorded disabled recovery flag");
     return ok;
-}
-
-bool test_replay_config_defaults_inferred_recovery_to_disabled()
-{
-    const term::Terminal_session_config config = replay_session_config({
-        {0U, QStringLiteral("header"), valid_header_object()},
-        {1U, QStringLiteral("snapshot"), valid_compact_snapshot_object(1U)},
-    });
-
-    return check(
-        !config.recover_scrollback_from_primary_repaints,
-        "replay config defaults inferred recovery to disabled");
 }
 
 bool test_replay_tool_preserves_recorded_disabled_recovery_flag(
@@ -4588,80 +4207,6 @@ bool test_replay_tool_compares_recovered_row_provenance_source(
         "recovered-source mismatched replay compares provenance source");
     ok &= check(replay.stdout_text.contains("fields=row_provenance"),
         "recovered-source mismatched replay reports row_provenance field");
-    if (!ok) {
-        print_replay_tool_output(replay);
-    }
-    return ok;
-}
-
-bool test_replay_tool_defaults_missing_row_provenance_source(
-    const QString& replay_tool_path)
-{
-    bool ok = true;
-    ok &= check(!replay_tool_path.isEmpty(), "missing-source replay tool path is passed");
-    if (replay_tool_path.isEmpty()) {
-        return false;
-    }
-
-    QTemporaryDir temp_dir;
-    if (!check(temp_dir.isValid(), "missing-source replay directory is valid")) {
-        return false;
-    }
-
-    const QString path = temp_dir.filePath(QStringLiteral("missing-source-replay.ndjson"));
-    QString error;
-    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
-        term::Terminal_transcript_recorder::create(path, true, &error);
-    ok &= check(recorder != nullptr, "missing-source replay recorder opens");
-    if (recorder == nullptr) {
-        std::cerr << error.toStdString() << '\n';
-        return false;
-    }
-
-    auto backend = std::make_unique<Scripted_backend>();
-    Scripted_backend* backend_ptr = backend.get();
-
-    term::Terminal_session_config config;
-    config.transcript_recorder = recorder;
-    term::Terminal_session session(std::move(backend), config);
-
-    term::Terminal_launch_config launch_config = valid_launch_config();
-    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
-    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
-        "missing-source replay captured session starts");
-    backend_ptr->emit_output(QByteArrayLiteral("alpha\r\nbravo\r\ncharlie"));
-    recorder.reset();
-
-    ok &= check(remove_snapshot_row_provenance_sources(path),
-        "missing-source replay fixture removes row_provenance source fields");
-
-    const std::optional<std::vector<term::Terminal_transcript_event>> events =
-        term::read_terminal_transcript(path, &error);
-    ok &= check(events.has_value(), "missing-source replay transcript parses");
-    if (!events.has_value()) {
-        std::cerr << error.toStdString() << '\n';
-        return false;
-    }
-
-    const std::optional<term::Terminal_transcript_event> snapshot_event =
-        first_event(*events, QStringLiteral("snapshot"));
-    const QJsonArray row_provenance = snapshot_event.has_value()
-        ? snapshot_event->object.value(QStringLiteral("row_provenance")).toArray()
-        : QJsonArray{};
-    ok &= check(snapshot_event.has_value() &&
-            !row_provenance.isEmpty() &&
-            row_provenance.at(0).toObject().value(QStringLiteral("source")).toString() ==
-                QStringLiteral("terminal_storage"),
-        "missing-source replay reader defaults row provenance before replay");
-
-    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
-    ok &= check(replay.finished, "missing-source replay tool finishes");
-    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
-        "missing-source replay tool exits successfully");
-    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
-        "missing-source replay has no model divergence");
-    ok &= check(replay.stdout_text.contains("source=terminal_storage"),
-        "missing-source replay prints defaulted terminal-storage source");
     if (!ok) {
         print_replay_tool_output(replay);
     }
@@ -5384,25 +4929,6 @@ bool test_replay_tool_rejects_session_sequence_corruption(
         valid_resize.exit_status == QProcess::NormalExit && valid_resize.exit_code == 0,
         "valid resize request/result ownership replays successfully");
 
-    const QString legacy_resize_path =
-        temp_dir.filePath(QStringLiteral("legacy-direct-resize.ndjson"));
-    ok &= check(capture_resize_owner_transcript(legacy_resize_path),
-        "legacy resize fixture captures a modern request/result pair");
-    ok &= check(remove_first_event_kind(
-            legacy_resize_path,
-            QStringLiteral("session.resize_request")),
-        "legacy resize fixture removes only the modern request marker");
-    const Replay_tool_process_result legacy_resize =
-        run_replay_tool(replay_tool_path, legacy_resize_path);
-    ok &= check(legacy_resize.finished, "legacy direct resize replay tool finishes");
-    ok &= check(
-        legacy_resize.exit_status == QProcess::NormalExit && legacy_resize.exit_code == 0,
-        "legacy direct resize normalizes to the replayed modern request/result pair");
-    ok &= check(
-        legacy_resize.stdout_text.contains("causal_driver_divergences=0") &&
-            legacy_resize.stdout_text.contains("causal_protocol_divergences=0"),
-        "legacy direct resize retains a clean normalized causal comparison");
-
     ok &= check(rewrite_first_event_sequence(
             resize_path,
             QStringLiteral("session.resize"),
@@ -5473,7 +4999,6 @@ bool test_replay_tool_rejects_session_sequence_corruption(
         print_replay_tool_output(coherent);
         print_replay_tool_output(split);
         print_replay_tool_output(valid_resize);
-        print_replay_tool_output(legacy_resize);
         print_replay_tool_output(resize);
         print_replay_tool_output(valid_text_area);
         print_replay_tool_output(text_area);
@@ -6001,16 +5526,12 @@ int main(int argc, char** argv)
     ok &= test_snapshot_timing_diagnostics_include_snapshot_metadata();
     ok &= test_reader_rejects_malformed_transcripts();
     ok &= test_reader_rejects_invalid_leading_event_fields();
-    ok &= test_reader_accepts_session_config_without_recovery_flag();
     ok &= test_reader_rejects_invalid_retained_history_capacity();
-    ok &= test_reader_defaults_missing_row_provenance_source();
     ok &= test_reader_rejects_invalid_row_provenance_source();
     ok &= test_reader_rejects_compact_snapshots_missing_required_diagnostics();
     ok &= test_reader_rejects_invalid_snapshot_public_scroll_enum_values();
     ok &= test_reader_rejects_snapshot_basis_purpose_mismatches();
     ok &= test_reader_accepts_selection_projection_diagnostic_reason();
-    ok &= test_reader_defaults_detached_selection_legacy_reason_to_selection_purpose();
-    ok &= test_reader_defaults_old_wheel_trace_policy_fields();
     ok &= test_transcript_orders_host_and_resize_requests_before_synchronous_output();
     ok &= test_text_area_resize_requests_record_from_session();
     ok &= test_terminal_reply_replay_does_not_duplicate_host_write();
@@ -6018,9 +5539,7 @@ int main(int argc, char** argv)
     ok &= test_replay_noop_scroll_intent_does_not_consume_next_scroll();
     ok &= test_replay_drives_terminal_state();
     ok &= test_replay_config_keeps_explicit_deferred_public_scroll_policy();
-    ok &= test_replay_config_defaults_missing_selection_viewport_projection_to_disabled();
     ok &= test_replay_config_preserves_recorded_recovery_flag();
-    ok &= test_replay_config_defaults_inferred_recovery_to_disabled();
     const QString replay_tool_path =
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
     ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
@@ -6029,7 +5548,6 @@ int main(int argc, char** argv)
     ok &= test_budgeted_drain_records_the_unbudgeted_causal_order();
     ok &= test_released_tail_is_recorded_once_and_in_order();
     ok &= test_replay_tool_compares_recovered_row_provenance_source(replay_tool_path);
-    ok &= test_replay_tool_defaults_missing_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
     ok &= test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
         replay_tool_path);
