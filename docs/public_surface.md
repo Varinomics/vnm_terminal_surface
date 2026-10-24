@@ -376,14 +376,9 @@ payload signatures to agree. Deadline-driven `backend.output` fragments retain
 one logical group only when each continuation follows a full 4096-byte slice;
 the final slice may be shorter. Replay queues and drains that logical byte stream
 under one replay owner, so callback slicing cannot manufacture or conceal a
-causal group boundary. A `session.resize` result in request/result-schema
-transcripts must retain the sequence owned by its immediately applicable
-`session.resize_request`; legacy direct `session.resize` events remain accepted.
-Legacy direct results and replay-produced modern pairs compare through the same
-exact host-resize outcome signature. Modern pairs additionally require their
-request fields to agree with the result and retain exact request/result driver
-comparison, so the compatibility normalization does not admit corrupt modern
-metadata.
+causal group boundary. A `session.resize` result must retain the sequence owned
+by its immediately applicable `session.resize_request`. The request fields must
+agree with the result, and request/result drivers are compared exactly.
 Parser-produced `session.text_area_resize_request` events must retain their
 current `backend.output` transition owner.
 
