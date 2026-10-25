@@ -214,6 +214,9 @@ std::optional<std::uint64_t> Process_cpu_tracker::cpu_time_usec()
                 candidates.push_back(current);
             }
         }
+        if (candidates.empty()) {
+            continue;
+        }
         // The parent can exit or its PID can be reused during enumeration.
         // Admit new children only while both sides of that relationship are
         // observed against the same parent occurrence.
