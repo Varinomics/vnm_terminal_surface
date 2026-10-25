@@ -1,5 +1,7 @@
 #pragma once
 
+#include "native_backend_factory.h"
+
 #include "helpers/test_check.h"
 #include "../../src/native_backend_cleanup_owner.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
@@ -223,6 +225,7 @@ private:
 #endif
 
 inline bool check_foreground_cleanup(const QString& executable,
+    const Native_backend_factory& make_backend,
     Foreground_cleanup_case scenario = Foreground_cleanup_case::NORMAL)
 {
 #if defined(__linux__)
@@ -298,7 +301,7 @@ inline bool check_foreground_cleanup(const QString& executable,
     std::unique_ptr<internal::Terminal_backend> backend;
     bool started = true;
     if (!host_eof || host == 0) {
-        backend = internal::make_posix_pty_backend();
+        backend = make_backend();
         started = backend->start(config, std::move(callbacks)).code ==
             internal::Terminal_backend_result_code::ACCEPTED;
     }
@@ -436,6 +439,8 @@ inline bool check_foreground_cleanup(const QString& executable,
     return ok;
 #else
     (void)executable;
+    (void)make_backend;
+    (void)scenario;
     return check(false, "foreground cleanup containment gate requires Linux");
 #endif
 }

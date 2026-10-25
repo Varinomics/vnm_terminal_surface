@@ -29,6 +29,7 @@ against an app build that consumes this surface.
 | --- | --- | --- |
 | Backend lifecycle and signals (start, write, resize, pause, interrupt, terminate, exit) | `vnm_terminal_backend_session`, `vnm_terminal_backend_session_resize_frontier`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_behavior_smoke` | surface |
 | Native backend shared I/O helpers or output delivery limit coupling | `vnm_terminal_backend_session`, `vnm_terminal_backend_session_resize_frontier`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend` | surface |
+| Optional process-owner contract or ordinary native launch | `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend`, `vnm_terminal_surface_host`, `vnm_terminal_surface_package_consumer_builds` | surface |
 | Render snapshot and frame building | `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_qsg_atlas`, `vnm_terminal_render_cell_text` | surface |
 | Surface / host API (scroll, selection, paste, focus, clipboard) | `vnm_terminal_surface_host`, `vnm_terminal_surface_host_resize_frontier`, `vnm_terminal_surface_host_async_resize_metadata` | surface |
 | Search, scrollback match identity, and search overlays | `vnm_terminal_search_index`, `vnm_terminal_backend_session`, `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, `vnm_terminal_custom_titlebar_integration` | surface + application |

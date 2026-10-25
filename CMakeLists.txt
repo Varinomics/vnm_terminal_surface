@@ -163,10 +163,13 @@ set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR "${Qt6_VERSION_MAJOR}")
 set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 set(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE
     "${VNM_TERMINAL_SURFACE_BUILD_FULL}")
-set(vnm_terminal_surface_process_custody_required OFF)
-if(VNM_TERMINAL_SURFACE_BUILD_FULL AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-    set(vnm_terminal_surface_process_custody_required ON)
-endif()
+add_library(vnm_terminal_process_owner_contract INTERFACE)
+add_library(vnm_terminal_surface::process_owner_contract ALIAS vnm_terminal_process_owner_contract)
+set_target_properties(vnm_terminal_process_owner_contract PROPERTIES EXPORT_NAME process_owner_contract)
+target_compile_features(vnm_terminal_process_owner_contract INTERFACE cxx_std_20)
+target_include_directories(vnm_terminal_process_owner_contract INTERFACE
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 
 set(VNM_MSDF_TEXT_BUILD_QT_LCD ON CACHE BOOL "" FORCE)
 option(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT
@@ -319,7 +322,7 @@ add_library(
 
 if(VNM_TERMINAL_SURFACE_BUILD_FULL)
 
-include(cmake/vnm_terminal_process_custody_dependency.cmake)
+find_package(Threads REQUIRED)
 
 add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/backend_output_capture.h
@@ -370,7 +373,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_canvas_export.h
     include/vnm_terminal/terminal_message_submission.h
-    include/vnm_terminal/terminal_native_receipt.h
+    include/vnm_terminal/terminal_process_owner.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/native_backend_cleanup_owner.h
     src/backend_output_capture.cpp
@@ -417,6 +420,9 @@ if(WIN32)
         src/windows_conpty_backend.cpp
     )
     include(cmake/vnm_terminal_conpty_dependency.cmake)
+    target_compile_definitions(vnm_terminal_surface PRIVATE
+        _WIN32_WINNT=0x0A00
+        WINVER=0x0A00)
     # Windows system APIs used by font discovery, clipboard, and audible bell support.
     target_link_libraries(vnm_terminal_surface PRIVATE
         dwrite
@@ -428,7 +434,12 @@ endif()
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_sources(vnm_terminal_surface PRIVATE
         src/posix_pty_backend.cpp
+        src/posix_terminal_process_owner.cpp
+        src/posix_terminal_process_owner.h
     )
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(vnm_terminal_surface PRIVATE src/linux_terminal_foreground_custody.h)
 endif()
 
 target_include_directories(vnm_terminal_surface PUBLIC
@@ -442,14 +453,12 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 )
 
 target_link_libraries(vnm_terminal_surface PRIVATE
+    Threads::Threads
     Qt6::GuiPrivate
     Qt6::QuickPrivate
     ${vnm_terminal_qt_lcd_link}
     vnm_qt_dispatch::vnm_qt_dispatch
 )
-if(vnm_terminal_surface_process_custody_required)
-    target_link_libraries(vnm_terminal_surface PRIVATE vnm_process_custody::vnm_process_custody)
-endif()
 
 target_compile_definitions(vnm_terminal_surface PUBLIC
     VNM_TERMINAL_PROFILING_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_PROFILING}>
@@ -526,6 +535,7 @@ endif()
 
 set(vnm_terminal_surface_install_targets
     vnm_terminal_surface_renderer
+    vnm_terminal_process_owner_contract
 )
 if(VNM_TERMINAL_SURFACE_BUILD_FULL)
     list(APPEND vnm_terminal_surface_install_targets
@@ -552,6 +562,8 @@ if(NOT vnm_terminal_msdf_text_package_dependency)
 endif()
 
 install(FILES
+    include/vnm_terminal/terminal_process_owner.h
+    include/vnm_terminal/process_cpu_time.h
     include/vnm_terminal/terminal_canvas_appearance.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_touch_selection.h
@@ -565,10 +577,8 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL)
     install(FILES
         include/vnm_terminal/backend_output_capture.h
         include/vnm_terminal/font_metrics.h
-        include/vnm_terminal/process_cpu_time.h
         include/vnm_terminal/terminal_canvas_export.h
         include/vnm_terminal/terminal_message_submission.h
-        include/vnm_terminal/terminal_native_receipt.h
         include/vnm_terminal/vnm_terminal_surface.h
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
     )
@@ -596,6 +606,7 @@ configure_package_config_file(
     cmake/vnm_terminal_surfaceConfig.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surfaceConfig.cmake"
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vnm_terminal_surface"
+    PATH_VARS CMAKE_INSTALL_DATADIR
 )
 
 write_basic_package_version_file(
@@ -607,7 +618,6 @@ write_basic_package_version_file(
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surfaceConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surfaceConfigVersion.cmake"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_terminal_process_custody_contract.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vnm_terminal_surface"
 )
 

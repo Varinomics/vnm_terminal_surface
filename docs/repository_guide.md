@@ -7,6 +7,8 @@ It is the quick operational reference after `docs/developer_orientation.md`,
 ## Top-Level Layout
 
 - `include/vnm_terminal/vnm_terminal_surface.h` is the public Qt Quick item.
+- `include/vnm_terminal/terminal_process_owner.h` is the optional, Qt-free
+  POSIX process lifecycle extension. Native terminal launch works without it.
 - `include/vnm_terminal/internal` contains source-tree internal contracts shared
   by the session, backend, model, input, renderer, fixture, and generated table
   code. It is not installed API.
@@ -500,6 +502,7 @@ Every installed package exports
 `vnm_terminal/vnm_terminal_canvas.h`. A full package also exports
 `vnm_terminal_surface::vnm_terminal_surface` with
 `vnm_terminal/backend_output_capture.h`, `vnm_terminal/font_metrics.h`,
+`vnm_terminal/terminal_process_owner.h`, `vnm_terminal/process_cpu_time.h`,
 `vnm_terminal/terminal_canvas_export.h`,
 `vnm_terminal/terminal_message_submission.h`,
 `vnm_terminal/vnm_terminal_surface.h`, and the public diagnostics headers.

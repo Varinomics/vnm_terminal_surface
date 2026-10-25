@@ -119,9 +119,6 @@ endif()
 if(DEFINED vnm_msdf_text_dir AND NOT "${vnm_msdf_text_dir}" STREQUAL "")
     list(APPEND configure_args "-Dvnm_msdf_text_DIR=${vnm_msdf_text_dir}")
 endif()
-if(DEFINED vnm_process_custody_dir AND NOT "${vnm_process_custody_dir}" STREQUAL "")
-    list(APPEND configure_args "-Dvnm_process_custody_DIR=${vnm_process_custody_dir}")
-endif()
 list(APPEND configure_args
     "-Dvnm_qt_dispatch_DIR:PATH=${provider_package_dir}"
     "-DCMAKE_FIND_USE_PACKAGE_ROOT_PATH=FALSE"
@@ -241,26 +238,16 @@ if(NOT consumer_build_result EQUAL 0)
         "${consumer_build_stdout}${consumer_build_stderr}")
 endif()
 
-if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
-    include("${consumer_binary_dir}/process_owner_${install_config}.cmake")
-    file(REAL_PATH "${source}" owner_source)
-    if(DEFINED imported_process_owner AND NOT "${imported_process_owner}" STREQUAL "")
-        file(REAL_PATH "${imported_process_owner}" expected_owner)
-        if(NOT owner_source STREQUAL expected_owner)
-            message(FATAL_ERROR "Package consumer selected a different installed process owner")
-        endif()
-    else()
-        file(REAL_PATH "${install_dir}" installed_prefix)
-        cmake_path(IS_PREFIX installed_prefix "${owner_source}" NORMALIZE owner_is_installed)
-        if(NOT owner_is_installed)
-            message(FATAL_ERROR "Process owner resolved outside the installed prefix: ${owner_source}")
-        endif()
-    endif()
-    file(SHA256 "${owner_source}" source_hash)
-    file(SHA256 "${deployed}" deployed_hash)
-    if(NOT source_hash STREQUAL deployed_hash)
-        message(FATAL_ERROR "Package consumer did not stage the installed process owner")
-    endif()
+execute_process(
+    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${consumer_binary_dir}"
+        --build-config "${install_config}" --output-on-failure
+    RESULT_VARIABLE consumer_run_result
+    OUTPUT_VARIABLE consumer_run_stdout
+    ERROR_VARIABLE consumer_run_stderr)
+if(NOT consumer_run_result EQUAL 0)
+    message(FATAL_ERROR
+        "Installed default native terminal checks failed.\n"
+        "${consumer_run_stdout}${consumer_run_stderr}")
 endif()
 
-message(STATUS "Package smoke consumer built against the installed public headers.")
+message(STATUS "Package consumer built and exercised the installed default native terminal.")

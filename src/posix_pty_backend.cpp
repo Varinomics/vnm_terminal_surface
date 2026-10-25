@@ -5,7 +5,7 @@
 #include "native_backend_io_core.h"
 #include "native_backend_cleanup_owner.h"
 #include "posix_process_group_custody.h"
-#include "posix_pty_owner.h"
+#include "posix_terminal_process_owner.h"
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
 #include "posix_pty_io_test_hook.h"
 #endif
@@ -428,8 +428,10 @@ void set_posix_pty_io_hook_for_testing(Posix_pty_io_hook_for_testing hook)
 class Posix_pty_backend::Impl
 {
 public:
-    Impl()
-        : m_cleanup(this,
+    explicit Impl(std::unique_ptr<Terminal_process_owner> owner)
+    :
+        m_owner(owner ? std::move(owner) : make_posix_terminal_process_owner()),
+        m_cleanup(this,
             [](void* context) noexcept {
                 auto* impl = static_cast<Impl*>(context);
                 wait_for_native_backend_public_calls(impl->call_state());
@@ -437,7 +439,7 @@ public:
             },
             [](void* context) noexcept { delete static_cast<Impl*>(context); },
             [](void* context) noexcept {
-                return static_cast<Impl*>(context)->m_owner.confirmed();
+                return static_cast<Impl*>(context)->m_owner->confirmed();
             })
     {}
 
@@ -553,18 +555,17 @@ public:
             winsize_from_grid_size(effective_config.initial_grid_size, cell_pixel_size);
         int master_fd = -1;
         pid_t child_pid = -1;
-        pty_custody::Owner_start_request owner_request;
-        owner_request.mode = pty_custody::Owner_mode::PTY;
-        owner_request.process.executable = native_launch->executable.toStdString();
-        owner_request.process.working_directory = native_launch->working_directory.toStdString();
+        terminal_process_launch_t owner_request;
+        owner_request.executable = native_launch->executable.toStdString();
+        owner_request.working_directory = native_launch->working_directory.toStdString();
         for (const auto& argument : native_launch->argv_bytes) {
-            owner_request.process.argv.emplace_back(argument.toStdString());
+            owner_request.argv.emplace_back(argument.toStdString());
         }
         for (const auto& variable : native_launch->env_bytes) {
-            owner_request.process.environment.emplace_back(variable.toStdString());
+            owner_request.environment.emplace_back(variable.toStdString());
         }
-        // Preserve the previous exec inheritance contract, but transfer exact
-        // descriptors rather than making remote numeric descriptors authority.
+        // Preserve the exec inheritance contract through an owner that may
+        // start the workload outside this process.
 #if defined(__linux__)
         for (const auto& name : QDir(QStringLiteral("/proc/self/fd")).entryList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
             bool valid = false;
@@ -572,7 +573,7 @@ public:
             if (valid && fd > 2) {
                 const int flags = ::fcntl(fd, F_GETFD);
                 if (flags >= 0 && (flags & FD_CLOEXEC) == 0) {
-                    owner_request.process.inherited.push_back({fd, fd});
+                    owner_request.inherited.push_back({fd, fd});
                 }
             }
         }
@@ -581,34 +582,36 @@ public:
         for (int fd = 3; fd < descriptor_limit; ++fd) {
             const int flags = ::fcntl(fd, F_GETFD);
             if (flags >= 0 && (flags & FD_CLOEXEC) == 0) {
-                owner_request.process.inherited.push_back({fd, fd});
+                owner_request.inherited.push_back({fd, fd});
             }
         }
 #endif
-        owner_request.dimensions.rows = initial_winsize.ws_row;
-        owner_request.dimensions.columns = initial_winsize.ws_col;
-        owner_request.dimensions.pixel_width = initial_winsize.ws_xpixel;
-        owner_request.dimensions.pixel_height = initial_winsize.ws_ypixel;
-        std::string owner_error;
-        bool owner_started = false;
+        owner_request.rows = initial_winsize.ws_row;
+        owner_request.columns = initial_winsize.ws_col;
+        owner_request.pixel_width = initial_winsize.ws_xpixel;
+        owner_request.pixel_height = initial_winsize.ws_ypixel;
+        terminal_process_launch_result_t owner_result;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_start_attempted = true;
         }
         try {
-            owner_started = m_owner.launch(owner_request, &master_fd, &child_pid, &owner_error,
-                std::move(effective_config.native_receipt_hook));
+            owner_result = m_owner->launch(owner_request);
         }
         catch (const std::exception& error) {
-            owner_error = error.what();
+            owner_result.error = error.what();
+            owner_result.native_dispatch_occurred = true;
+            owner_result.start_outcome_determinate = false;
         }
-        if (!owner_started) {
+        if (!owner_result.accepted) {
             auto result = reject_start(Terminal_backend_error_code::START_FAILED,
-                QString::fromStdString(owner_error), true);
-            result.start_outcome_determinate = false;
+                QString::fromStdString(owner_result.error), owner_result.native_dispatch_occurred);
+            result.start_outcome_determinate = owner_result.start_outcome_determinate;
             request_deferred_cleanup();
             return result;
         }
+        master_fd = owner_result.master_descriptor;
+        child_pid = static_cast<pid_t>(owner_result.root_process_id);
         Unique_fd master(master_fd);
         const int nonblocking_result = set_fd_nonblocking(master.get());
         if (nonblocking_result != 0) {
@@ -957,7 +960,7 @@ public:
         m_write_cv.notify_all();
         wake_io_threads();
         std::string error;
-        if (!m_owner.stop(static_cast<int>(policy.graceful_interval.count()), &error)) {
+        if (!m_owner->stop(policy.graceful_interval, policy.kill_interval, &error)) {
             return backend_stop_error(QString::fromStdString(error));
         }
         return backend_accept();
@@ -965,25 +968,7 @@ public:
 
     std::optional<process_cpu_time_t> process_cpu_time() const
     {
-        const auto cpu_time = m_owner.cpu_time_usec();
-        if (!cpu_time) {
-            return std::nullopt;
-        }
-        const auto sampled_at = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        const long processor_count = ::sysconf(_SC_NPROCESSORS_ONLN);
-        if (sampled_at < 0 || processor_count <= 0 ||
-            static_cast<unsigned long>(processor_count) > std::numeric_limits<std::uint32_t>::max())
-        {
-            return std::nullopt;
-        }
-#if defined(__APPLE__)
-        constexpr auto scope = Process_cpu_scope::OBSERVED_FAMILY;
-#else
-        constexpr auto scope = Process_cpu_scope::WORKLOAD_FAMILY;
-#endif
-        return process_cpu_time_t{*cpu_time, static_cast<std::uint64_t>(sampled_at),
-            static_cast<std::uint32_t>(processor_count), scope};
+        return m_owner->process_cpu_time();
     }
 
     void shutdown()
@@ -1006,7 +991,7 @@ public:
         wake_io_threads();
 
         std::string owner_error;
-        (void)m_owner.stop(0, &owner_error);
+        (void)m_owner->stop(std::chrono::milliseconds(0), std::chrono::milliseconds(0), &owner_error);
 
         // Workers can still hold raw descriptor snapshots taken before the
         // stop flags. Keep the owning master open until every worker has
@@ -1022,7 +1007,7 @@ public:
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
         observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_BEGIN, m_master.get());
 #endif
-        m_owner.finish();
+        m_owner->finish();
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
         observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_END, m_master.get());
 #endif
@@ -1641,7 +1626,7 @@ private:
             return;
         }
 
-        const auto root_exit = m_owner.wait_root();
+        const auto root_exit = m_owner->wait_root();
         const int wait_error = root_exit ? 0 : ECHILD;
         const auto reap_time = std::chrono::steady_clock::now();
         if (wait_error != 0) {
@@ -1717,11 +1702,11 @@ private:
             m_reader_finished);
         // Honor the exit-drain window even if PTY EOF ends the reader early.
         // Shutdown can interrupt this output drain; native cleanup belongs to
-        // the helper independently of callback delivery.
+        // the owner independently of callback delivery.
         wait_out_exit_drain_window(reap_time);
         drain_paused_output_before_exit_report();
-        // Root exit is not tree emptiness. Only the dedicated owner consumes
-        // workload waits; its explicit receipt controls native settlement.
+        // Root observation does not discharge cleanup. The selected owner
+        // retains the sole consuming wait and its remaining native obligations.
         const int status = root_exit->signal != 0
             ? root_exit->signal : (root_exit->exit_code << 8);
 
@@ -1733,11 +1718,11 @@ private:
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
         observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_BEGIN, m_master.get());
 #endif
-        m_owner.finish();
+        m_owner->finish();
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
         observe_pty_io_for_testing(Posix_pty_io_point_for_testing::FINISH_END, m_master.get());
 #endif
-        if (!m_owner.confirmed()) {
+        if (!m_owner->confirmed()) {
             report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 QStringLiteral("PTY cleanup remains unconfirmed"));
@@ -1745,7 +1730,7 @@ private:
     }
 
     // Allocated before native birth; all queued signals retain this identity.
-    Posix_pty_owner m_owner;
+    std::unique_ptr<Terminal_process_owner> m_owner;
 #if !defined(TIOCSIG)
     std::shared_ptr<Posix_process_group_custody> m_child_group_custody =
         std::make_shared<Posix_process_group_custody>(-1);
@@ -1802,9 +1787,9 @@ private:
     bool                                m_writer_failed = false;
 };
 
-Posix_pty_backend::Posix_pty_backend()
+Posix_pty_backend::Posix_pty_backend(std::unique_ptr<Terminal_process_owner> owner)
 :
-    m_impl(std::make_unique<Impl>())
+    m_impl(std::make_unique<Impl>(std::move(owner)))
 {}
 
 Posix_pty_backend::~Posix_pty_backend()
@@ -1882,9 +1867,10 @@ Terminal_backend_result Posix_pty_backend::set_cell_pixel_size(
     return impl->set_cell_pixel_size(size);
 }
 
-std::unique_ptr<Terminal_backend> make_posix_pty_backend()
+std::unique_ptr<Terminal_backend> make_posix_pty_backend(
+    std::unique_ptr<Terminal_process_owner> owner)
 {
-    return std::make_unique<Posix_pty_backend>();
+    return std::make_unique<Posix_pty_backend>(std::move(owner));
 }
 
 }

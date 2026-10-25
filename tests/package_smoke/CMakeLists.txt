@@ -5,12 +5,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(vnm_terminal_surface CONFIG REQUIRED)
+find_package(Qt6Gui CONFIG REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 
 get_property(package_imports DIRECTORY PROPERTY IMPORTED_TARGETS)
 foreach(package_target IN LISTS package_imports)
     get_target_property(package_links ${package_target} INTERFACE_LINK_LIBRARIES)
     if(package_target MATCHES "^vnm_framework::" OR package_links MATCHES "vnm_framework::")
         message(FATAL_ERROR "The installed surface package introduced a framework dependency")
+    endif()
+    if(package_target MATCHES "^vnm_process_custody::" OR package_links MATCHES "vnm_process_custody")
+        message(FATAL_ERROR "The installed surface package introduced a private custody dependency")
     endif()
 endforeach()
 
@@ -108,13 +112,17 @@ if(WIN32)
     vnm_terminal_deploy_conpty(vnm_terminal_surface_package_smoke)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    vnm_process_custody_deploy_owner(vnm_terminal_surface_package_smoke)
-    get_target_property(process_owner_imported vnm_process_custody::vnm_process_custody_owner IMPORTED)
-    if(NOT process_owner_imported)
-        message(FATAL_ERROR "Package smoke must consume the installed process owner")
-    endif()
-    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/process_owner_$<CONFIG>.cmake"
-        CONTENT
-            "set(source [==[$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>]==])\nset(deployed [==[$<TARGET_FILE_DIR:vnm_terminal_surface_package_smoke>/vnm_process_custody_owner]==])\n")
+if(WIN32)
+    set(qt_runtime_path "PATH=$<TARGET_FILE_DIR:Qt6::Core>$<SEMICOLON>$ENV{PATH}")
+elseif(APPLE)
+    set(qt_runtime_path "DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:Qt6::Core>:$ENV{DYLD_LIBRARY_PATH}")
+else()
+    set(qt_runtime_path "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:Qt6::Core>:$ENV{LD_LIBRARY_PATH}")
 endif()
+enable_testing()
+add_test(NAME default_native_terminal
+    COMMAND "${CMAKE_COMMAND}" -E env "${qt_runtime_path}"
+        "QT_QPA_PLATFORM=offscreen"
+        "QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>"
+        "$<TARGET_FILE:vnm_terminal_surface_package_smoke>")
+set_tests_properties(default_native_terminal PROPERTIES TIMEOUT 90)

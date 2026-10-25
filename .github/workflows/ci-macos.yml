@@ -27,7 +27,7 @@ jobs:
       # A lost native-test runner must not cancel the independent test groups.
       fail-fast: false
       matrix:
-        test_group: ${{ fromJSON(inputs.focused_units && '["focused"]' || '["custody", "custody-rights", "native", "remaining"]') }}
+        test_group: ${{ fromJSON(inputs.focused_units && '["focused"]' || '["native", "remaining"]') }}
     env:
       TEST_GROUP: ${{ matrix.test_group }}
       CCACHE_MAXSIZE: 2GiB
@@ -133,12 +133,9 @@ jobs:
           from pathlib import Path
           import subprocess
 
-          custody = '^vnm_process_custody_(tests|truncated_rights_tests)$'
-          native = '^(vnm_process_custody_|vnm_terminal_posix_|vnm_terminal_native_backend_cleanup_owner_tests$)'
+          native = '^(vnm_terminal_posix_|vnm_terminal_native_backend_cleanup_owner_tests$)'
           filters = {
-              'custody': ['-R', '^vnm_process_custody_tests$'],
-              'custody-rights': ['-R', '^vnm_process_custody_truncated_rights_tests$'],
-              'native': ['-R', native, '-E', custody],
+              'native': ['-R', native],
               'remaining': ['-E', native],
               'focused': ['-R', '^vnm_terminal_(screen_basic|screen_operations|unicode_width|backend_session(_resize_frontier)?|surface_host(_resize_frontier|_async_resize_metadata|_pending_mouse_wheel_trace)?)$'],
           }
@@ -153,7 +150,7 @@ jobs:
 
           all_tests = inventory('all', [])
           selected_group = os.environ['TEST_GROUP']
-          groups = ['focused'] if selected_group == 'focused' else ['custody', 'custody-rights', 'native', 'remaining']
+          groups = ['focused'] if selected_group == 'focused' else ['native', 'remaining']
           selected_tests = []
           for group in groups:
               names = inventory(group, filters[group])

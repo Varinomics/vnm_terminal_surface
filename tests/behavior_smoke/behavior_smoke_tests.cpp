@@ -3,7 +3,6 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
-#include "posix_pty_backend/native_receipt_capture.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -146,11 +145,6 @@ private:
 
 struct Surface_fixture
 {
-#if defined(__APPLE__)
-    // Native observations must outlive surface/backend teardown.
-    std::shared_ptr<vnm_terminal::test_helpers::Native_receipt_capture> native_receipts =
-        std::make_shared<vnm_terminal::test_helpers::Native_receipt_capture>();
-#endif
     QQuickWindow           window;
     VNM_TerminalSurface    surface;
 
@@ -1329,11 +1323,6 @@ bool run_native_surface_behavior_smokes(QGuiApplication& app, const QString& fix
             {},
             std::nullopt,
         };
-#if defined(__APPLE__)
-        request.native_receipt_hook = [capture = fixture.native_receipts](const auto& receipt) {
-            return capture->retain(receipt);
-        };
-#endif
         const auto start_result = fixture.surface.start_terminal(std::move(request));
         const bool started = start_result.accepted;
         ok &= check(started,

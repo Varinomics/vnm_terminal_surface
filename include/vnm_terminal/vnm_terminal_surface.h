@@ -4,7 +4,7 @@
 #include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/process_cpu_time.h"
 #include "vnm_terminal/terminal_message_submission.h"
-#include "vnm_terminal/terminal_native_receipt.h"
+#include "vnm_terminal/terminal_process_owner.h"
 #include "vnm_terminal/terminal_touch_selection.h"
 
 #include <QQuickItem>
@@ -42,7 +42,6 @@ struct Terminal_process_start_request
     // The tail is passed verbatim, without argv escaping. Embedded NUL and use
     // on other platforms are rejected; absence preserves ordinary argv handling.
     std::optional<QString> windows_native_arguments = std::nullopt;
-    Terminal_native_receipt_hook native_receipt_hook;
 };
 
 enum class Terminal_process_start_determinacy
@@ -796,6 +795,8 @@ public:
         QString                source);
     /**
      * Starts one terminal child from explicit semantic inputs.
+     * An omitted owner uses the built-in native lifetime policy. A supplied
+     * POSIX owner is selected before birth; its failure never selects a fallback.
      *
      * `base_environment` is a caller-captured, policy-sanitized snapshot. The
      * optional capability contribution remains separate until this call and
@@ -806,7 +807,8 @@ public:
      * retried.
      */
     vnm_terminal::Terminal_process_start_result start_terminal(
-        vnm_terminal::Terminal_process_start_request request);
+        vnm_terminal::Terminal_process_start_request request,
+        std::unique_ptr<vnm_terminal::Terminal_process_owner> owner = {});
     // An aggregate whose scope states native or observed family coverage.
     // Absence means accounting is unavailable; it is not zero usage.
     std::optional<vnm_terminal::process_cpu_time_t> process_cpu_time() const;
@@ -997,8 +999,8 @@ private:
         std::uint64_t          window_binding_generation);
 
     vnm_terminal::Terminal_process_start_result start_native_terminal(
-        vnm_terminal::internal::Terminal_launch_config
-                               launch_config);
+        vnm_terminal::internal::Terminal_launch_config launch_config,
+        std::unique_ptr<vnm_terminal::Terminal_process_owner> owner);
 
     vnm_terminal::Terminal_process_start_result start_backend_terminal(
         std::unique_ptr<vnm_terminal::internal::Terminal_backend>

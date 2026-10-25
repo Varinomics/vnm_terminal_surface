@@ -188,12 +188,23 @@ resize synchronization changes emit `geometry_sync_changed()`.
 
 ## Process Launch
 
-`start_terminal(Terminal_process_start_request)` is the sole public launch
-boundary and starts one native terminal backend:
+`start_terminal(Terminal_process_start_request request,
+std::unique_ptr<vnm_terminal::Terminal_process_owner> owner = {})` is the sole
+public launch boundary and starts one built-in native terminal backend:
 
 - Windows uses ConPTY.
 - Linux and macOS use POSIX PTY APIs.
 - Platforms without a native backend fail with `backend_error()`.
+
+The owner argument is optional. Request-only calls use the built-in native
+process lifecycle. POSIX hosts with additional ownership requirements can
+supply an implementation of the installed, Qt-free
+`vnm_terminal/terminal_process_owner.h` contract. Ownership transfers into the
+call and the owner is selected before process birth; failure of a supplied owner
+does not retry through the default implementation. Windows rejects a supplied
+owner before birth. The backend retains terminal I/O, resize, and session
+integration in either case. See
+[Backend lifecycle and signals](backend_lifecycle_and_signals.md).
 
 The request carries ordered argv, a caller-chosen absolute working directory,
 a policy-sanitized explicit base environment, and a separate optional
@@ -201,9 +212,8 @@ capability contribution. `argv[0]` names the executable; the surface never
 parses a shell command string. The one exception is the optional
 `windows_native_arguments`: on Windows, with exactly one `argv` entry, its text
 is appended to the command line verbatim, without argv escaping; it is rejected
-on other platforms and when it contains NUL. The request also carries
-`native_receipt_hook`, which the macOS backend requires: a launch without a
-retained handler is rejected before dispatch. The surface reads no ambient environment. It
+on other platforms and when it contains NUL. The surface reads no ambient
+environment. It
 validates platform name identity and collisions, composes the final child
 environment, resolves a bare executable from that environment, revalidates the
 working directory immediately at the native boundary, and makes at most one

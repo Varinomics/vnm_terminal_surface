@@ -27,9 +27,6 @@ provenance and rebuilds.
 1. Finalize the shared version in `CMakeLists.txt` and prepare release notes for
    the selected source. Describe caller-visible changes and required migration,
    including public C++ layout changes that require consumers to rebuild.
-   macOS hosts must supply the retained native receipt hook and deploy the
-   custody helper described in the
-   [backend lifecycle contract](backend_lifecycle_and_signals.md).
 2. Obtain independent review, then stage, commit, and push the surface changes
    to `master`. Follow the terminal release guide to refresh its dependency
    lock and commit and push its corresponding release changes. Keep the surface

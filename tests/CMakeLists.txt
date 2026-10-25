@@ -17,7 +17,7 @@ set_tests_properties(vnm_terminal_surface_source_package_argument_transport PROP
 set(vnm_package_dependency_context "${CMAKE_CURRENT_BINARY_DIR}/package-dependencies.cmake")
 file(WRITE "${vnm_package_dependency_context}"
     "set(CMAKE_PREFIX_PATH [==[${CMAKE_PREFIX_PATH}]==] CACHE STRING \"\" FORCE)\n")
-foreach(package IN ITEMS vnm_msdf_text Freetype msdfgen Qt6 vnm_process_custody)
+foreach(package IN ITEMS vnm_msdf_text Freetype msdfgen Qt6)
     if(${package}_DIR AND NOT "${${package}_DIR}" MATCHES "-NOTFOUND$")
         file(APPEND "${vnm_package_dependency_context}"
             "set(${package}_DIR [==[${${package}_DIR}]==] CACHE PATH \"\" FORCE)\n")
@@ -276,9 +276,6 @@ function(vnm_terminal_configure_test_process target_name)
             target_compile_options(${target_name} PRIVATE -fsanitize=address)
             target_link_options(${target_name} PRIVATE -fsanitize=address)
         endif()
-    endif()
-    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
-        vnm_process_custody_deploy_owner(${target_name})
     endif()
 endfunction()
 
@@ -1338,10 +1335,6 @@ target_link_libraries(vnm_terminal_surface_host PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
     Qt6::GuiPrivate
 )
-if(APPLE)
-    target_link_libraries(vnm_terminal_surface_host PRIVATE
-        vnm_process_custody::vnm_process_custody)
-endif()
 
 target_compile_definitions(vnm_terminal_surface_host PRIVATE
     VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
@@ -1366,17 +1359,6 @@ set_tests_properties(vnm_terminal_surface_host_resize_frontier PROPERTIES
     TIMEOUT 30
 )
 
-add_test(
-    NAME vnm_terminal_surface_host
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        ${vnm_terminal_qt_offscreen_environment}
-        ${vnm_terminal_qt_unscaled_environment}
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_surface_host>"
-        --core-only
-)
-
 set(vnm_terminal_surface_host_timeout 60)
 if(WIN32)
     set(vnm_terminal_surface_host_timeout 120)
@@ -1384,10 +1366,24 @@ elseif(APPLE)
     set(vnm_terminal_surface_host_timeout 180)
 endif()
 
-set_tests_properties(vnm_terminal_surface_host PROPERTIES
-    LABELS "conformance;input;mouse;paste;focus"
-    TIMEOUT "${vnm_terminal_surface_host_timeout}"
-)
+set(vnm_terminal_surface_host_group_names
+    vnm_terminal_surface_host
+    vnm_terminal_surface_host_input
+    vnm_terminal_surface_host_lifecycle)
+set(vnm_terminal_surface_host_groups output input lifecycle)
+foreach(test_name group IN ZIP_LISTS
+        vnm_terminal_surface_host_group_names vnm_terminal_surface_host_groups)
+    add_test(NAME ${test_name}
+        COMMAND "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            "--core-${group}")
+    set_tests_properties(${test_name} PROPERTIES
+        LABELS "conformance;input;mouse;paste;focus;${group}"
+        TIMEOUT "${vnm_terminal_surface_host_timeout}")
+endforeach()
 
 # Fractional display scaling makes neighbouring font sizes round up to the same
 # device-pixel advance even where whole-pixel hinting keeps them apart at 100%.
@@ -1651,10 +1647,6 @@ target_link_libraries(vnm_terminal_behavior_smoke PRIVATE
     Qt6::Gui
     Qt6::Quick
 )
-if(APPLE)
-    target_link_libraries(vnm_terminal_behavior_smoke PRIVATE
-        vnm_process_custody::vnm_process_custody)
-endif()
 
 set_target_properties(vnm_terminal_behavior_smoke PROPERTIES
     AUTOMOC OFF
@@ -1718,10 +1710,6 @@ if(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_link_libraries(vnm_terminal_compat_smoke PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
     )
-    if(APPLE)
-        target_link_libraries(vnm_terminal_compat_smoke PRIVATE
-            vnm_process_custody::vnm_process_custody)
-    endif()
 
     set_target_properties(vnm_terminal_compat_smoke PROPERTIES
         AUTOMOC OFF
@@ -1743,6 +1731,14 @@ if(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         TIMEOUT 120
     )
 endif()
+
+add_test(NAME vnm_terminal_launch_environment_validation
+    COMMAND "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_compat_smoke>" --launch-environment-only)
+set_tests_properties(vnm_terminal_launch_environment_validation PROPERTIES TIMEOUT 30)
 
 add_executable(vnm_terminal_parser_randomized
     parser_randomized/parser_randomized_tests.cpp
@@ -2365,14 +2361,11 @@ endif()
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     add_executable(vnm_terminal_posix_pty_foreground_interrupt
         posix_pty_backend/foreground_interrupt_tests.cpp
+        posix_pty_backend/foreground_interrupt_fixture.cpp
     )
     target_link_libraries(vnm_terminal_posix_pty_foreground_interrupt PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
     )
-    if(APPLE)
-        target_link_libraries(vnm_terminal_posix_pty_foreground_interrupt PRIVATE
-            vnm_process_custody::vnm_process_custody)
-    endif()
     set_target_properties(vnm_terminal_posix_pty_foreground_interrupt PROPERTIES
         AUTOMOC OFF
     )
@@ -2388,35 +2381,6 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         TIMEOUT 20
     )
 
-    if(APPLE)
-        add_executable(vnm_terminal_posix_pty_native_receipts
-            posix_pty_backend/native_receipt_tests.cpp)
-        target_link_libraries(vnm_terminal_posix_pty_native_receipts PRIVATE
-            vnm_terminal_surface::vnm_terminal_surface
-            vnm_process_custody::vnm_process_custody)
-        set_target_properties(vnm_terminal_posix_pty_native_receipts PROPERTIES AUTOMOC OFF)
-        add_test(NAME vnm_terminal_posix_pty_native_receipts
-            COMMAND "$<TARGET_FILE:vnm_terminal_posix_pty_native_receipts>")
-        set_tests_properties(vnm_terminal_posix_pty_native_receipts PROPERTIES
-            LABELS "conformance;macos;pty;custody" TIMEOUT 30)
-
-        add_executable(vnm_terminal_posix_pty_shell_jobs_close
-            posix_pty_backend/shell_jobs_close_tests.cpp
-        )
-        target_link_libraries(vnm_terminal_posix_pty_shell_jobs_close PRIVATE
-            vnm_terminal_surface::vnm_terminal_surface
-            vnm_process_custody::vnm_process_custody
-        )
-        set_target_properties(vnm_terminal_posix_pty_shell_jobs_close PROPERTIES AUTOMOC OFF)
-        add_test(NAME vnm_terminal_posix_pty_shell_jobs_close
-            COMMAND "$<TARGET_FILE:vnm_terminal_posix_pty_shell_jobs_close>"
-        )
-        set_tests_properties(vnm_terminal_posix_pty_shell_jobs_close PROPERTIES
-            LABELS "conformance;macos;pty"
-            TIMEOUT 30
-        )
-    endif()
-
     add_executable(vnm_terminal_posix_pty_backend
         posix_pty_backend/posix_pty_backend_tests.cpp
     )
@@ -2425,10 +2389,6 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
         posix_pty_backend/executable_lookup_tests.cpp)
     target_link_libraries(vnm_terminal_posix_executable_lookup PRIVATE
         vnm_terminal_surface::vnm_terminal_surface)
-    if(APPLE)
-        target_link_libraries(vnm_terminal_posix_executable_lookup PRIVATE
-            vnm_process_custody::vnm_process_custody)
-    endif()
     set_target_properties(vnm_terminal_posix_executable_lookup PROPERTIES AUTOMOC OFF)
     add_test(NAME vnm_terminal_posix_executable_lookup
         COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
@@ -2436,14 +2396,30 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     set_tests_properties(vnm_terminal_posix_executable_lookup PROPERTIES
         LABELS "conformance;posix;pty" TIMEOUT 90)
 
+    add_executable(vnm_terminal_posix_pty_descriptor_inheritance
+        posix_pty_backend/descriptor_inheritance_tests.cpp)
+    target_link_libraries(vnm_terminal_posix_pty_descriptor_inheritance PRIVATE
+        vnm_terminal_surface::vnm_terminal_surface)
+    target_include_directories(vnm_terminal_posix_pty_descriptor_inheritance PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    set_target_properties(vnm_terminal_posix_pty_descriptor_inheritance PROPERTIES AUTOMOC OFF)
+    add_test(NAME vnm_terminal_posix_pty_descriptor_inheritance
+        COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_posix_pty_descriptor_inheritance>")
+    set_tests_properties(vnm_terminal_posix_pty_descriptor_inheritance PROPERTIES
+        LABELS "conformance;posix;pty;descriptors" TIMEOUT 30)
+
     add_executable(vnm_terminal_posix_pty_exit_output
-        posix_pty_backend/exit_output_tests.cpp)
+        posix_pty_backend/exit_output_tests.cpp
+        posix_pty_backend/exit_output_fixture.cpp)
     target_link_libraries(vnm_terminal_posix_pty_exit_output PRIVATE
-        vnm_terminal_surface::vnm_terminal_surface
-        vnm_process_custody::vnm_process_custody)
+        vnm_terminal_surface::vnm_terminal_surface)
     target_include_directories(vnm_terminal_posix_pty_exit_output PRIVATE "${PROJECT_SOURCE_DIR}/src")
     set_target_properties(vnm_terminal_posix_pty_exit_output PROPERTIES AUTOMOC OFF)
-    set(vnm_terminal_exit_output_cases finite small flow external detached detached_tail silent reset cleanup_tail)
+    if(APPLE)
+        set(vnm_terminal_exit_output_cases finite small flow silent hangup bounded_reset graceful_cleanup_tail)
+    else()
+        set(vnm_terminal_exit_output_cases finite small flow external silent reset cleanup_tail)
+    endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         list(APPEND vnm_terminal_exit_output_cases peer_failure)
     endif()
@@ -2462,10 +2438,6 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_link_libraries(vnm_terminal_posix_pty_backend PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
     )
-    if(APPLE)
-        target_link_libraries(vnm_terminal_posix_pty_backend PRIVATE
-            vnm_process_custody::vnm_process_custody)
-    endif()
 
     set_target_properties(vnm_terminal_posix_pty_backend PROPERTIES
         AUTOMOC OFF
@@ -2486,6 +2458,23 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     )
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(vnm_terminal_posix_pty_foreground_pipeline
+            posix_pty_backend/foreground_pipeline_tests.cpp)
+        target_link_libraries(vnm_terminal_posix_pty_foreground_pipeline PRIVATE
+            vnm_terminal_surface::vnm_terminal_surface)
+        set_target_properties(vnm_terminal_posix_pty_foreground_pipeline PROPERTIES AUTOMOC OFF)
+        add_test(NAME vnm_terminal_posix_pty_foreground_pipeline
+            COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_posix_pty_foreground_pipeline>")
+        set_tests_properties(vnm_terminal_posix_pty_foreground_pipeline PROPERTIES
+            LABELS "conformance;posix;pty;shutdown" TIMEOUT 30)
+
+        add_test(NAME vnm_terminal_posix_pty_foreground_cleanup
+            COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_posix_pty_backend>" --foreground-cleanup)
+        set_tests_properties(vnm_terminal_posix_pty_foreground_cleanup PROPERTIES
+            LABELS "conformance;posix;pty;shutdown" TIMEOUT 30)
+
         add_test(
             NAME vnm_terminal_posix_pty_backend_failed_start_retries
             COMMAND
@@ -2546,15 +2535,9 @@ if(TARGET vnm_terminal_posix_pty_backend)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_posix_pty_backend
         vnm_terminal_posix_executable_lookup
+        vnm_terminal_posix_pty_descriptor_inheritance
         vnm_terminal_posix_pty_exit_output
         vnm_terminal_posix_pty_foreground_interrupt
-    )
-endif()
-
-if(TARGET vnm_terminal_posix_pty_shell_jobs_close)
-    list(APPEND vnm_terminal_test_process_targets
-        vnm_terminal_posix_pty_shell_jobs_close
-        vnm_terminal_posix_pty_native_receipts
     )
 endif()
 
@@ -2563,6 +2546,20 @@ if(TARGET vnm_terminal_compat_smoke)
         vnm_terminal_compat_smoke
     )
 endif()
+
+if(TARGET vnm_terminal_posix_pty_foreground_pipeline)
+    list(APPEND vnm_terminal_test_process_targets
+        vnm_terminal_posix_pty_foreground_pipeline
+    )
+endif()
+
+add_test(NAME vnm_terminal_surface_package_prefix
+    COMMAND "${CMAKE_COMMAND}"
+        -S "${CMAKE_CURRENT_SOURCE_DIR}/package_prefix"
+        -B "${CMAKE_CURRENT_BINARY_DIR}/package_prefix"
+        "-DSURFACE_SOURCE_DIR=${PROJECT_SOURCE_DIR}")
+set_tests_properties(vnm_terminal_surface_package_prefix PROPERTIES
+    LABELS "package;windows;conpty" TIMEOUT 30)
 
 if(TARGET vnm_terminal_unicode_data_conformance)
     list(APPEND vnm_terminal_test_process_targets
@@ -2632,41 +2629,6 @@ math(EXPR vnm_terminal_surface_next_patch "${PROJECT_VERSION_PATCH} + 1")
 set(vnm_terminal_surface_next_version
     "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${vnm_terminal_surface_next_patch}")
 
-find_program(vnm_process_custody_test_ninja NAMES ninja)
-if(vnm_process_custody_test_ninja)
-    add_test(NAME vnm_terminal_process_custody_runtime_tests
-        COMMAND "${CMAKE_COMMAND}"
-            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/process_custody_runtime"
-            "-DRUNTIME_MODULE=${PROJECT_SOURCE_DIR}/cpp/process_custody/cmake/vnm_process_custody_runtime.cmake"
-            "-DNINJA_EXECUTABLE=${vnm_process_custody_test_ninja}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/process_custody_runtime/check_runtime.cmake")
-    set_tests_properties(vnm_terminal_process_custody_runtime_tests PROPERTIES TIMEOUT 120)
-endif()
-
-add_test(
-    NAME vnm_terminal_process_custody_dependency_tests
-    COMMAND "${CMAKE_COMMAND}"
-        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/process_custody_dependency"
-        "-DDEPENDENCY_MODULE=${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_process_custody_dependency.cmake"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/process_custody_dependency/check_resolution.cmake")
-set_tests_properties(vnm_terminal_process_custody_dependency_tests PROPERTIES
-    LABELS "package;native" TIMEOUT 30)
-
-set(vnm_terminal_custody_package_dir "")
-set(vnm_terminal_custody_imported_owner "")
-set(vnm_terminal_custody_imported OFF)
-if(vnm_terminal_surface_process_custody_required)
-    get_target_property(vnm_terminal_custody_imported
-        vnm_process_custody::vnm_process_custody IMPORTED)
-endif()
-if(vnm_terminal_custody_imported)
-    set(vnm_terminal_custody_package_dir "${vnm_process_custody_DIR}")
-    if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
-        set(vnm_terminal_custody_imported_owner
-            "$<TARGET_FILE:vnm_process_custody::vnm_process_custody_owner>")
-    endif()
-endif()
-
 add_test(
     NAME vnm_terminal_surface_package_consumer_builds
     COMMAND
@@ -2683,8 +2645,6 @@ add_test(
         "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke"
         "-Dconsumer_binary_dir=${CMAKE_BINARY_DIR}/package_smoke/consumer"
         "-Dqt6_dir=${Qt6_DIR}"
-        "-Dvnm_process_custody_dir=${vnm_terminal_custody_package_dir}"
-        "-Dimported_process_owner=${vnm_terminal_custody_imported_owner}"
         -P "${PROJECT_SOURCE_DIR}/tests/package_smoke/expect_consumer_builds.cmake"
 )
 

@@ -23,17 +23,6 @@ For a complete terminal application and screenshots, see
 
 The host owns the surrounding application UI and its interaction policies.
 
-## macOS cleanup scope
-
-macOS PTY cleanup uses a persistent native helper that retains the controlling
-session and the shell's sole wait. Its retained tty authorizes cleanup of
-ordinary foreground and background jobs even after the shell exits. Workload
-START requires a host receipt hook that retains and persists the exact helper
-observation first. Root exit and scoped cleanup are independent receipts;
-failed observations leave cleanup unconfirmed. Deliberately detached descendants
-may survive, so this is owned-process-group cleanup rather than transitive
-containment. Windows and Linux cleanup contracts are unchanged.
-
 ## Requirements
 
 - Qt 6.12 or newer, including its Gui and Quick private development modules
@@ -66,7 +55,9 @@ its first window. Create a `VNM_TerminalSurface` under the window's content item
 or expose it to QML, size it, and call `start_terminal()` with the executable,
 arguments, absolute working directory, and explicit child environment. The
 [public surface reference](docs/public_surface.md) describes the launch request
-and host operations.
+and host operations. POSIX hosts can optionally supply a process owner for
+application-specific lifecycle requirements; ordinary terminal launch needs no
+owner implementation from the host.
 
 On Windows, call the deployment helper for each executable that hosts a
 terminal. For installed packages, custom runtime destinations, and distribution

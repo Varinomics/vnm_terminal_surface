@@ -4,7 +4,7 @@
 #include "descriptor_lifetime_checks.h"
 #include "foreground_cleanup_checks.h"
 #include "native_session_checks.h"
-#include "native_receipt_capture.h"
+#include "native_backend_factory.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/session_contract.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
@@ -347,9 +347,6 @@ term::Terminal_launch_config launch_config(
     config.initial_grid_size  = term::terminal_grid_size_t{24, 80};
     config.identity.term      = QStringLiteral("xterm-256color");
     config.identity.colorterm = QStringLiteral("truecolor");
-#if defined(__APPLE__)
-    vnm_terminal::test_helpers::retain_native_receipts(config);
-#endif
     return config;
 }
 
@@ -409,12 +406,89 @@ bool wait_for_process_absent(pid_t pid)
     return false;
 }
 
+struct owner_rejection_probe_t
+{
+    unsigned launches = 0;
+    vnm_terminal::terminal_process_launch_t request;
+    std::atomic_bool finished = false;
+};
+
+class Rejecting_process_owner final : public vnm_terminal::Terminal_process_owner
+{
+public:
+    Rejecting_process_owner(std::shared_ptr<owner_rejection_probe_t> probe, bool dispatched)
+        : m_probe(std::move(probe)), m_dispatched(dispatched)
+    {
+    }
+
+    vnm_terminal::terminal_process_launch_result_t launch(
+        const vnm_terminal::terminal_process_launch_t& request) override
+    {
+        ++m_probe->launches;
+        m_probe->request = request;
+        vnm_terminal::terminal_process_launch_result_t result;
+        result.native_dispatch_occurred = m_dispatched;
+        result.start_outcome_determinate = !m_dispatched;
+        result.error = "selected owner rejected launch";
+        return result;
+    }
+
+    bool stop(std::chrono::milliseconds, std::chrono::milliseconds, std::string*) noexcept override
+    {
+        return true;
+    }
+
+    std::optional<vnm_terminal::terminal_process_exit_t> wait_root() override
+    {
+        return std::nullopt;
+    }
+
+    void finish() override { m_probe->finished = true; }
+    bool confirmed() const noexcept override { return true; }
+
+private:
+    std::shared_ptr<owner_rejection_probe_t> m_probe;
+    bool m_dispatched;
+};
+
+bool test_supplied_owner_rejection_preserves_dispatch(const QString& fixture_path)
+{
+    bool ok = true;
+    for (const bool dispatched : {false, true}) {
+        const auto probe = std::make_shared<owner_rejection_probe_t>();
+        Backend_capture capture;
+        auto backend = term::make_posix_pty_backend(
+            std::make_unique<Rejecting_process_owner>(probe, dispatched));
+        const auto config = launch_config(fixture_path, {QStringLiteral("--hold-open")});
+        const auto result = backend->start(config, capture.callbacks());
+        ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
+            result.native_dispatch_occurred == dispatched &&
+            result.start_outcome_determinate == !dispatched,
+            "supplied owner rejection preserves dispatch certainty without default-owner retry");
+        ok &= check(probe->launches == 1 && probe->request.argv.size() == 2 &&
+            probe->request.argv.front() == fixture_path.toStdString() &&
+            probe->request.argv.back() == "--hold-open" &&
+            probe->request.rows == config.initial_grid_size->rows &&
+            probe->request.columns == config.initial_grid_size->columns,
+            "selected owner receives the native launch arguments and initial dimensions once");
+        const auto errors = capture.errors_snapshot();
+        ok &= check(errors.size() == 1 && errors.front().message.contains(
+            QStringLiteral("selected owner rejected launch")),
+            "supplied owner failure remains visible to the caller");
+        backend.reset();
+        ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout) && probe->finished,
+            "rejected selected owner is retained until its cleanup finishes");
+    }
+    return ok;
+}
+
 bool test_launch_output(const QString& fixture_path)
 {
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result =
         backend->start(launch_config(fixture_path, {QStringLiteral("--list")}),
             capture.callbacks());
@@ -454,7 +528,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
         checkpoint_dir.filePath(QStringLiteral("enable-input-modes.checkpoint"));
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_launch_config config = launch_config(
         fixture_path,
         {
@@ -569,7 +643,7 @@ bool test_winsize_carries_text_area_pixels(const QString& fixture_path)
     };
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     ok &= check(backend->set_cell_pixel_size({9, 18}).code ==
         term::Terminal_backend_result_code::ACCEPTED,
         "POSIX PTY backend accepts a cell pixel size before start");
@@ -629,7 +703,7 @@ bool test_missing_working_directory(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_launch_config config =
         launch_config(fixture_path, {QStringLiteral("--hold-open")});
     config.working_directory = QFileInfo(fixture_path).absolutePath() +
@@ -667,7 +741,7 @@ bool test_failed_executable(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_launch_config config = launch_config(
         QFileInfo(fixture_path).absolutePath() + QStringLiteral("/missing-fixture"),
         {});
@@ -752,7 +826,7 @@ bool test_callback_reentrant_failed_start_retry()
     const term::Terminal_launch_config config = launch_config(executable_path, {});
     Backend_capture initial_capture;
     Backend_capture retry_capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_backend_callbacks callbacks = initial_capture.callbacks();
     const auto record_initial_error = callbacks.error_reported;
     bool retry_invoked = false;
@@ -771,7 +845,7 @@ bool test_callback_reentrant_failed_start_retry()
         start_result.error.has_value() &&
         start_result.error->code == term::Terminal_backend_error_code::START_FAILED &&
         start_result.native_dispatch_occurred &&
-        !start_result.start_outcome_determinate,
+        start_result.start_outcome_determinate,
         "invalid shebang interpreter fails after native dispatch");
     ok &= check(initial_capture.errors_snapshot().size() == 1U,
         "callback-reentrant scenario reports the original native failure once");
@@ -786,6 +860,11 @@ bool test_callback_reentrant_failed_start_retry()
         retry_errors.front().code == term::Terminal_backend_error_code::START_FAILED &&
         retry_errors.front().message.contains(QStringLiteral("can only be started once")),
         "callback-reentrant retry reports the single-start rejection");
+
+    backend.reset();
+    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+        std::chrono::steady_clock::now() + k_wait_timeout),
+        "default failed-exec cleanup completes without reusing the original native owner");
 
     return ok;
 }
@@ -807,14 +886,14 @@ bool test_post_return_failed_start_retry()
     const term::Terminal_launch_config config = launch_config(executable_path, {});
     Backend_capture initial_capture;
     Backend_capture retry_capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result =
         backend->start(config, initial_capture.callbacks());
     bool ok = check(start_result.code == term::Terminal_backend_result_code::REJECTED &&
         start_result.error.has_value() &&
         start_result.error->code == term::Terminal_backend_error_code::START_FAILED &&
         start_result.native_dispatch_occurred &&
-        !start_result.start_outcome_determinate,
+        start_result.start_outcome_determinate,
         "post-return scenario reaches native exec failure");
 
     const term::Terminal_backend_result retry_result =
@@ -828,6 +907,11 @@ bool test_post_return_failed_start_retry()
         retry_errors.front().message.contains(QStringLiteral("can only be started once")),
         "post-return retry reports the single-start rejection");
 
+    backend.reset();
+    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+        std::chrono::steady_clock::now() + k_wait_timeout),
+        "default failed-exec cleanup completes without reusing the original native owner");
+
     return ok;
 }
 #endif
@@ -838,7 +922,7 @@ bool test_rejection_paths(const QString& fixture_path)
 
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
         const term::Terminal_backend_result callback_result =
             backend->start(launch_config(fixture_path, {QStringLiteral("--hold-open")}), {});
         ok &= check(callback_result.code == term::Terminal_backend_result_code::REJECTED &&
@@ -849,7 +933,7 @@ bool test_rejection_paths(const QString& fixture_path)
     }
 
     {
-        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
         ok &= check(backend->write(QByteArrayLiteral("x")).code ==
             term::Terminal_backend_result_code::REJECTED,
             "POSIX PTY write before start rejects");
@@ -864,7 +948,7 @@ bool test_rejection_paths(const QString& fixture_path)
 
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
         term::Terminal_launch_config config =
             launch_config(fixture_path, {QStringLiteral("--hold-open")});
         config.initial_grid_size = term::terminal_grid_size_t{70000, 80};
@@ -879,7 +963,7 @@ bool test_rejection_paths(const QString& fixture_path)
 
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
         const term::Terminal_backend_result start_result =
             backend->start(
                 launch_config(fixture_path, {QStringLiteral("--hold-open")}),
@@ -925,7 +1009,7 @@ bool test_interrupt(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result =
         backend->start(
             launch_config(fixture_path, {QStringLiteral("--hold-open")}),
@@ -936,13 +1020,7 @@ bool test_interrupt(const QString& fixture_path)
         "interrupt fixture ready marker reaches output");
 
     const auto cpu = backend->process_cpu_time();
-#if defined(__APPLE__)
-    ok &= check(cpu && cpu->scope == vnm_terminal::Process_cpu_scope::OBSERVED_FAMILY,
-        "live Darwin PTY supplies observed-family CPU accounting");
-#else
-    ok &= check(!cpu || cpu->scope == vnm_terminal::Process_cpu_scope::WORKLOAD_FAMILY,
-        "available Linux cgroup CPU declares native family accounting");
-#endif
+    ok &= check(!cpu, "default POSIX owner does not claim family CPU accounting");
 
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
@@ -968,7 +1046,7 @@ bool test_interrupt_without_stdin_reader(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result =
         backend->start(
             launch_config(fixture_path, {QStringLiteral("--hold-open-no-read")}),
@@ -999,7 +1077,7 @@ bool test_interrupt_ignored_child_exits_normally()
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
             QStringLiteral(
@@ -1045,7 +1123,7 @@ bool test_process_exit_reports_with_descendant_slave_open()
     std::optional<pid_t> descendant_pid;
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
         const term::Terminal_backend_result start_result = backend->start(
             shell_launch_config(
                 QStringLiteral(
@@ -1099,7 +1177,7 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
     std::atomic_bool repause_accepted  = false;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend     = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend     = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_backend*                 backend_ptr = backend.get();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
@@ -1174,7 +1252,7 @@ bool test_paused_release_preserves_marker_order_and_caps_callback_bursts()
     const QByteArray fresh_marker = QByteArrayLiteral("paused-fresh-marker");
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
             QStringLiteral(
@@ -1262,7 +1340,7 @@ bool test_paused_release_with_tight_delivery_limits_does_not_trap_output()
     const QByteArray tail   = QByteArrayLiteral("Z");
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_launch_config config =
         shell_launch_config(QStringLiteral(
             "touch %1; "
@@ -1339,7 +1417,7 @@ bool test_destructor_from_output_callback_returns()
 
     const QByteArray marker = QByteArrayLiteral("destroy-from-output-callback");
     auto state = std::make_shared<Destroy_from_output_state>();
-    state->backend = term::make_posix_pty_backend().release();
+    state->backend = vnm_terminal::test_helpers::make_default_test_backend().release();
 
     term::Terminal_backend_callbacks callbacks;
     callbacks.output_received = [state, marker](QByteArray bytes) {
@@ -1426,7 +1504,7 @@ bool test_destructor_from_process_exited_callback_returns()
     const QByteArray ready_marker = QByteArrayLiteral("process-exited-destroy-ready");
 
     auto state = std::make_shared<Destroy_from_exit_state>();
-    state->backend = term::make_posix_pty_backend().release();
+    state->backend = vnm_terminal::test_helpers::make_default_test_backend().release();
 
     term::Terminal_backend_callbacks callbacks;
     callbacks.output_received = [state](QByteArray bytes) {
@@ -1543,7 +1621,7 @@ bool test_terminate_kills_descendant_in_target_group()
     std::optional<pid_t> descendant_pid;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
             QStringLiteral(
@@ -1589,7 +1667,7 @@ bool test_terminate(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_launch_config config =
         launch_config(fixture_path, {QStringLiteral("--hold-open")});
     const term::Terminal_backend_result start_result =
@@ -1622,7 +1700,7 @@ bool test_terminate_accepts_zero_grace_policy(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
     term::Terminal_launch_config config =
         launch_config(fixture_path, {QStringLiteral("--hold-open-no-read")});
     config.termination_policy.graceful_interval = std::chrono::milliseconds(0);
@@ -1656,7 +1734,7 @@ bool test_destructor_returns_with_running_process(const QString& fixture_path)
 
     Backend_capture capture;
     {
-        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = vnm_terminal::test_helpers::make_default_test_backend();
         const term::Terminal_backend_result start_result =
             backend->start(
                 launch_config(fixture_path, {QStringLiteral("--hold-open")}),
@@ -1676,7 +1754,7 @@ int main(int argc, char** argv)
 {
     if (argc == 3 && std::string_view(argv[1]) == "--native-session") {
         return vnm_terminal::test_helpers::check_native_session_lifecycle(
-            term::make_posix_pty_backend, launch_config(QString::fromLocal8Bit(argv[2]), {})) ? 0 : 1;
+            vnm_terminal::test_helpers::make_default_test_backend, launch_config(QString::fromLocal8Bit(argv[2]), {})) ? 0 : 1;
     }
     if (argc == 4 && std::string_view(argv[1]) == "--foreground-cleanup-shell") {
         bool control_valid = false;
@@ -1690,7 +1768,8 @@ int main(int argc, char** argv)
     }
     if (argc == 2 && std::string_view(argv[1]) == "--foreground-cleanup") {
         return vnm_terminal::test_helpers::check_foreground_cleanup(
-            QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath()) ? 0 : 1;
+            QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath(),
+            vnm_terminal::test_helpers::make_default_test_backend) ? 0 : 1;
     }
 #if defined(__linux__)
     if (argc == 2 && std::string_view(argv[1]) == "--failed-start-reentrant-retry") {
@@ -1707,22 +1786,12 @@ int main(int argc, char** argv)
         return ok ? 0 : 1;
     }
 #endif
-    if (argc == 2 && (std::string_view(argv[1]) == "--foreground-adopted" ||
-                     std::string_view(argv[1]) == "--foreground-host-eof" ||
-                     std::string_view(argv[1]) == "--foreground-owner-loss")) {
-        using Case = vnm_terminal::test_helpers::Foreground_cleanup_case;
-        const auto scenario = std::string_view(argv[1]) == "--foreground-adopted"
-            ? Case::ADOPTED : std::string_view(argv[1]) == "--foreground-host-eof"
-            ? Case::HOST_EOF : Case::OWNER_LOSS;
-        return vnm_terminal::test_helpers::check_foreground_cleanup(
-            QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath(), scenario) ? 0 : 1;
-    }
     if (argc == 3 && std::string_view(argv[1]) == "--callback-lifetime") {
         bool ok = vnm_terminal::test_helpers::check_callback_lifetime(
-            term::make_posix_pty_backend(),
+            vnm_terminal::test_helpers::make_default_test_backend(),
             launch_config(QString::fromLocal8Bit(argv[2]), {QStringLiteral("--hold-open")}), true);
         ok &= vnm_terminal::test_helpers::check_callback_lifetime(
-            term::make_posix_pty_backend(),
+            vnm_terminal::test_helpers::make_default_test_backend(),
             launch_config(QString::fromLocal8Bit(argv[2]), {QStringLiteral("--hold-open")}), false);
         ok &= test_destructor_from_output_callback_returns();
         ok &= test_destructor_from_process_exited_callback_returns();
@@ -1735,9 +1804,10 @@ int main(int argc, char** argv)
 
     const QString fixture_path = QString::fromLocal8Bit(argv[1]);
     bool ok = true;
+    ok &= test_supplied_owner_rejection_preserves_dispatch(fixture_path);
     ok &= test_launch_output(fixture_path);
     ok &= vnm_terminal::test_helpers::check_native_session_lifecycle(
-        term::make_posix_pty_backend, launch_config(fixture_path, {}));
+        vnm_terminal::test_helpers::make_default_test_backend, launch_config(fixture_path, {}));
     ok &= test_interactive_canvas_fixture(fixture_path);
     ok &= test_winsize_carries_text_area_pixels(fixture_path);
     ok &= test_missing_working_directory(fixture_path);
@@ -1761,8 +1831,8 @@ int main(int argc, char** argv)
     ok &= test_terminate_accepts_zero_grace_policy(fixture_path);
     ok &= test_destructor_returns_with_running_process(fixture_path);
     for (const auto point : {
-             term::Posix_pty_io_point_for_testing::READ,
-             term::Posix_pty_io_point_for_testing::WRITE})
+             vnm_terminal::internal::Posix_pty_io_point_for_testing::READ,
+             vnm_terminal::internal::Posix_pty_io_point_for_testing::WRITE})
     {
         ok &= vnm_terminal::test_helpers::check_pty_descriptor_lifetime(
             launch_config(fixture_path, {QStringLiteral("--hold-open-no-read")}), point);

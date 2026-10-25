@@ -110,4 +110,30 @@ file(READ "${stage}/LICENSE" vendor_license)
 if(EXISTS "${stage}/conpty-source-build.json" OR NOT vendor_license MATCHES "Microsoft Corporation")
     message(FATAL_ERROR "Vendor intake retained source admission or lost vendor notices")
 endif()
+
+# The installed staging helper needs its own fallback notices when consuming a
+# vendor archive that has no root LICENSE file.
+get_filename_component(helper_directory "${helper}" DIRECTORY)
+set(install_build "${test_root}/install-build")
+set(install_prefix "${test_root}/install")
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    -S "${CMAKE_CURRENT_LIST_DIR}/install" -B "${install_build}"
+    "-DHELPER_DIRECTORY=${helper_directory}"
+    "-DVNM_TERMINAL_CONPTY_PACKAGE_DIR=${source}"
+    RESULT_VARIABLE configure_result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT configure_result EQUAL 0)
+    message(FATAL_ERROR "ConPTY module installation configure failed: ${output}${error}")
+endif()
+execute_process(COMMAND "${CMAKE_COMMAND}" --install "${install_build}" --prefix "${install_prefix}"
+    RESULT_VARIABLE install_result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT install_result EQUAL 0)
+    message(FATAL_ERROR "ConPTY module installation failed: ${output}${error}")
+endif()
+set(helper "${install_prefix}/lib/cmake/vnm_terminal_surface/vnm_terminal_conpty_source.cmake")
+set(stage "${test_root}/installed-helper-stage")
+check_stage(pass "")
+file(READ "${stage}/LICENSE" installed_vendor_license)
+if(NOT installed_vendor_license STREQUAL vendor_license)
+    message(FATAL_ERROR "Installed ConPTY staging did not preserve the exact vendor notices")
+endif()
 message(STATUS "ConPTY source receipt, required shared shaders, byte integrity and vendor transition passed")

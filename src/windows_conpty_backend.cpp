@@ -12,7 +12,6 @@
 
 #include "native_backend_io_core.h"
 #include "native_backend_cleanup_owner.h"
-#include <vnm_process_custody/process_tree.h>
 #include <windows.h>
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
@@ -767,15 +766,23 @@ public:
             return std::nullopt;
         }
         // Root exit does not retire the Job's accumulated descendant time.
-        const auto cumulative = vnm::process_custody::job_cpu_time_usec(m_process_job.get());
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+        if (!QueryInformationJobObject(m_process_job.get(), JobObjectBasicAccountingInformation,
+                &accounting, sizeof(accounting), nullptr))
+        {
+            return std::nullopt;
+        }
+        const auto user_ticks   = static_cast<std::uint64_t>(accounting.TotalUserTime.QuadPart);
+        const auto kernel_ticks = static_cast<std::uint64_t>(accounting.TotalKernelTime.QuadPart);
+        const auto cumulative  = (user_ticks + kernel_ticks) / 10;
         const auto sampled_at = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         const auto processor_count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-        if (!cumulative || sampled_at <= 0 || processor_count == 0) {
+        if (sampled_at <= 0 || processor_count == 0) {
             return std::nullopt;
         }
         return process_cpu_time_t{
-            *cumulative,
+            cumulative,
             static_cast<std::uint64_t>(sampled_at),
             static_cast<std::uint32_t>(processor_count),
             Process_cpu_scope::WORKLOAD_FAMILY};

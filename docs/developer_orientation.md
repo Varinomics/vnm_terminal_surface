@@ -33,6 +33,8 @@ part of the product shape.
 - `src/native_backend_io_core.*` holds platform-neutral native-backend helpers
   such as start preparation, write-queue accounting, callback forwarding,
   paused-output buffering, and worker-thread join behavior.
+- `include/vnm_terminal/terminal_process_owner.h` is the optional POSIX lifecycle
+  extension; request-only terminal launch uses the built-in process owner.
 - `src/terminal_screen_model.cpp` owns terminal cell state, scrollback,
   alternate screen, modes, and escape-sequence effects.
 - `src/terminal_input_encoder.cpp` maps Qt input events to terminal byte

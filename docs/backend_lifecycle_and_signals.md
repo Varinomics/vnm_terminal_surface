@@ -37,23 +37,40 @@ outcome is safe to retry; they do not refine or replace the error code.
 
 ### POSIX session and process group
 
-The POSIX backend launches `vnm_process_custody_owner` beside its hosting
-executable. The helper owns the workload's sole wait and native cleanup; the
-backend owns its helper's sole wait and the presentation's master descriptor.
-Linux gives the shell a new session and uses the helper's subreaper for tree
-cleanup. On macOS, the persistent helper retains the controlling PTY session
-and places the shell in its own foreground process group within that session.
-Both `Terminal_process_group_policy` values use this isolated terminal session.
-Linux also retains a nonblocking, close-on-exec slave obtained through
-`TIOCGPTPEER` without acquiring a controlling terminal. Failure to obtain that
-peer rejects startup through the existing deferred native-cleanup path.
+The built-in POSIX process owner supplies the PTY and child lifecycle for
+ordinary request-only terminal launch. The public library does not require a
+host-provided helper or a separate process-management repository.
 
-Darwin workload START requires `Terminal_native_receipt_hook` to acknowledge
-retention and persistence of the original helper's identity and status observer.
-The hook separately receives exact root birth, root exit, or no-birth evidence;
-revoking presentation callbacks does not revoke these native obligations.
-The [custody contract](../cpp/process_custody/README.md) defines the helper's
-scoped status and the distinction between root and helper observation.
+The child starts in its own session and process group. The owner
+retains the original group identity until its sole reap and keeps terminal
+access for foreground signaling. Stop runs asynchronously, allowing the grace
+interval before forced termination. Its scope is the exact root, original group,
+and retained terminal foreground; it does not promise cleanup or recovery of
+every descendant or an escaped process group.
+
+On Linux kernels without retained process-group signaling, foreground cleanup
+retains each observed member's native identity and signals that identity. This
+is observed-member cleanup, not atomic containment of the whole process family.
+The 256-member batch bounds simultaneous retention, not the terminal's group
+size: subsequent scans reuse retired slots. Observed members that do not fit in
+the current batch prevent an empty or settled result until they are handled.
+
+Hosts can supply `Terminal_process_owner` from the installed, Qt-free
+`vnm_terminal/terminal_process_owner.h` contract as the optional second argument
+to `start_terminal(request, owner)`. That owner controls process birth, wait,
+termination, and cleanup while the same POSIX backend owns terminal I/O and
+resize. The backend selects the owner before birth and never retries a failed
+supplied owner through its built-in implementation. Windows rejects a nonnull
+owner before birth.
+
+The owner contract transfers the PTY master descriptor only on successful
+`launch()`. Every process born during a rejected launch or exception remains
+that owner's cleanup obligation, so it must prepare cleanup resources before
+birth. One backend worker calls `wait_root()` for exact root-exit observation.
+`stop()` may run concurrently and must not block for its grace interval; a
+failed stop stays committed. `finish()` must be idempotent and retire the
+owner's waits after the sole waiter has finished or observed exit. `confirmed()`
+describes the selected owner's actual cleanup obligations, not a guessed exit.
 
 ### Windows session and process group
 
@@ -65,13 +82,11 @@ Windows mapping of the new-session request.
 
 ### Early-child setup-failure cleanup
 
-The POSIX helper withholds execution until it retains the child's native
-identity and confirms that START remains admitted. A rejected gate permits
-no-workload evidence only when no child was born or the still-gated child was
-positively reaped. An admitted or uncertain birth retains its exact identity
-and root-exit evidence separately from the startup rejection. Startup failure
-never fabricates group settlement. Native cleanup continues independently of
-the bounded startup return.
+The selected process owner reports whether a child was born and whether the
+start outcome is determinate. A rejected start does not establish that native
+dispatch never occurred or that every descendant has stopped. The caller must
+use the result's dispatch and determinacy fields before deciding whether a new
+request is safe; a dispatched indeterminate start must not be retried.
 
 ## Output Read, Pause, And Backpressure
 
@@ -116,6 +131,10 @@ re-pause requests are ignored so the `process_exited` callback cannot be
 suppressed indefinitely.
 
 ### POSIX: drain while paused up to a high-water mark
+
+On Linux, the backend retains a nonblocking, close-on-exec slave obtained through
+`TIOCGPTPEER` without acquiring a controlling terminal. Failure to obtain that
+drain peer rejects startup through the existing deferred cleanup path.
 
 The POSIX reader deliberately keeps draining the master while output is paused,
 buffering the bytes application-side in the paused buffer rather than leaving
@@ -174,8 +193,8 @@ The POSIX backend writes both into the PTY `winsize`: `ws_row` and `ws_col`
 carry the grid, and `ws_xpixel` and `ws_ypixel` carry the text area in pixels,
 columns times the cell width and rows times the cell height. A pixel field is
 zero while no cell size is known or when the product does not fit the field.
-The spawn `winsize` already has pixels; on Linux the process-custody owner
-creates the PTY with them. A resize sets the new grid with the current pixels.
+The initial PTY `winsize` includes these pixels. A resize sets the new grid
+with the current pixels.
 A pixel-only change, such as a font change that keeps the grid or a move to a
 screen with another device pixel ratio, reads the grid back with `TIOCGWINSZ`
 and rewrites the pixel fields with `TIOCSWINSZ`, without a resize transaction.
@@ -245,24 +264,19 @@ native exit code are unchanged.
 `terminate()` sets a `TERMINATED` exit-reason override under the mutex, clears
 the paused state, and wakes the workers.
 
-- POSIX sends STOP with the requested grace interval to its persistent helper.
-  The helper attempts graceful termination, then forced cleanup. On macOS it
-  signals ordinary foreground and background groups through the retained tty
-  and keeps the original root's sole wait. After that wait is collected, a tty
-  membership snapshot naming only the retained helper confirms scoped cleanup.
-  Bounded exhaustion while inert members remain produces terminal
-  `UNCONFIRMED`; failure or timeout never proves emptiness. A live root remains
-  pending. A failed STOP send closes the sending direction so control EOF
-  requests the same native cleanup.
+- POSIX asks the selected process owner to terminate using the configured grace
+  and kill intervals. The owner controls signal targets and collects the root's
+  wait; the backend continues to manage terminal output and callback delivery.
 - ConPTY escalation waits up to the graceful interval for the process to exit,
   then calls `TerminateJobObject` on the child process job, then waits up to the
   kill interval for the root process to exit. A process still active after
   forced termination, or a `TerminateJobObject` failure followed by a failed
   root-process `TerminateProcess` fallback, is reported as `TERMINATE_FAILED`.
 
-The POSIX helper starts cleanup on root exit independently of the presentation's
-output drain and exit callback. Root exit does not establish job emptiness, and
-callback delivery does not authorize releasing a native cleanup obligation.
+Root exit and descendant cleanup are different outcomes. A process-exit
+callback reports the root's state; it does not establish transitive termination
+of every process that the terminal workload may have created. A supplied owner
+documents any stronger cleanup scope it provides.
 
 ## Exit-Reason Resolution
 
@@ -338,17 +352,20 @@ drains until native read/poll reports no input, including pending flip-buffer
 bytes. Darwin resumes flow-stopped output and snapshots the queued FIFO prefix;
 later producer writes cannot extend that prefix. Synchronous callback duration
 still contributes to delivery time. Shutdown can interrupt delivery without
-interrupting the helper's native cleanup.
+changing the selected owner's native cleanup obligation.
 
-After macOS cleanup settlement the helper retains its controlling terminal until
-the client retires output through control-channel EOF. `finish()` half-closes the
-client's sending direction before closing and collecting the helper, so a
-duplicate client endpoint cannot delay normal retirement. Client abandonment
-also retires the terminal when its last endpoint closes; an endpoint leaked to
-another live process can postpone that EOF. The helper then revokes its retained
-terminal so later producer output cannot block the session leader's native exit.
-Unexpected drain-control failures
-use the existing `READ_FAILED` path and do not establish complete delivery.
+On Darwin, the default child's session-leader exit revokes its controlling
+terminal. Normal PTY hangup/reset and tail output during an explicit graceful
+stop are supported. Continuing an external writer after root exit, resetting
+then writing after that exit, and preserving cleanup output after natural root
+exit require an owner that retains the controlling session; the default owner
+does not guarantee those post-exit behaviors.
+
+The default Darwin owner checks for queued output every 250 ms while waiting
+for exit or stop. It queries process state with `sysctl` only when output is
+queued, and resumes flow-stopped output only when `P_WEXIT` confirms committed
+exit. Active cleanup observes at 10 ms intervals. These are lifecycle and PTY
+flow-control checks, separate from CPU sampling.
 
 ## Teardown
 
@@ -358,13 +375,27 @@ A cleanup reservation created before native birth retains the implementation
 until active public calls and worker threads have drained, including destruction
 from inside a callback. No cleanup thread allocation is required after birth.
 
-On POSIX, shutdown sends forced STOP to the helper and joins the reader/writer/wait
-workers while retaining the presentation's master descriptor. It drains the
-helper's remaining receipts and collects that helper's sole wait before closing
-the master and any Linux drain peer. Retaining the descriptors until workers
-finish prevents their pending I/O from reaching an unrelated file that reuses
-its number. The helper retains
-its own PTY descriptors throughout native cleanup. Bounded I/O polling allows
-presentation threads to re-check their stop flags even when the slave remains
-open. Helper death without an admitted terminal outcome leaves native cleanup
-unconfirmed; presentation teardown and root exit never replace that outcome.
+On POSIX, shutdown requests termination through the selected owner and joins
+the reader, writer, and wait workers while retaining their descriptors. Keeping
+those descriptors until workers finish prevents pending I/O from reaching an
+unrelated file that reuses its number. The owner then completes its lifecycle
+retirement. Native process cleanup guarantees belong to that owner; presentation
+teardown and a root-exit callback do not extend its scope.
+
+## CPU Accounting
+
+`VNM_TerminalSurface::process_cpu_time()` returns an optional cumulative sample.
+The default POSIX owner reports CPU accounting unavailable. A supplied owner
+can provide a sample with an explicit coverage scope. The Windows native backend
+reports workload-family CPU through its process Job accounting, including CPU
+credited to exited descendants.
+
+`OBSERVED_FAMILY` identifies best-effort root and descendant observations and
+can miss short-lived or detached children and work outside the observation
+window. `WORKLOAD_FAMILY` identifies native workload accounting. Query failure
+remains unavailable rather than becoming an idle sample. Counters from different
+launches are not comparable, and the online logical processor count describes
+the machine rather than an affinity or quota limit.
+
+The surface API owns no sampling timer. Hosts choose whether and how often to
+query; an optional owner's documentation defines its query cost and scope limits.

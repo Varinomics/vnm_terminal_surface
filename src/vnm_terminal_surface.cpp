@@ -239,7 +239,6 @@ term::Terminal_launch_config terminal_launch_config(
     launch_config.argv                = std::move(request.argv);
     launch_config.working_directory   = std::move(request.working_directory);
     launch_config.windows_native_arguments = std::move(request.windows_native_arguments);
-    launch_config.native_receipt_hook = std::move(request.native_receipt_hook);
     launch_config.inherit_environment = false;
     launch_config.environment_edits.reserve(
         request.base_environment.size() +
@@ -600,12 +599,14 @@ const term::Terminal_color_scheme& resolve_surface_color_scheme(
     return scheme != nullptr ? *scheme : term::default_color_scheme();
 }
 
-std::unique_ptr<term::Terminal_backend> make_native_backend()
+std::unique_ptr<term::Terminal_backend> make_native_backend(
+    std::unique_ptr<vnm_terminal::Terminal_process_owner> owner)
 {
 #if defined(_WIN32)
+    (void)owner;
     return term::make_windows_conpty_backend();
 #elif defined(__linux__) || defined(__APPLE__)
-    return term::make_posix_pty_backend();
+    return term::make_posix_pty_backend(std::move(owner));
 #else
     return nullptr;
 #endif
@@ -5695,7 +5696,8 @@ bool VNM_TerminalSurface::scroll_to_offset_from_tail_from_source(
 }
 
 Terminal_process_start_result VNM_TerminalSurface::start_terminal(
-    Terminal_process_start_request request)
+    Terminal_process_start_request request,
+    std::unique_ptr<vnm_terminal::Terminal_process_owner> owner)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     Input_frontier_scope input_frontier(*this);
@@ -5722,11 +5724,12 @@ Terminal_process_start_result VNM_TerminalSurface::start_terminal(
         set_process_state(Process_state::FAILED);
         return rejected_terminal_start();
     }
-    return start_native_terminal(terminal_launch_config(std::move(request)));
+    return start_native_terminal(terminal_launch_config(std::move(request)), std::move(owner));
 }
 
 Terminal_process_start_result VNM_TerminalSurface::start_native_terminal(
-    term::Terminal_launch_config launch_config)
+    term::Terminal_launch_config launch_config,
+    std::unique_ptr<vnm_terminal::Terminal_process_owner> owner)
 {
     if (launch_config.argv.isEmpty() ||
         launch_config.argv.front().trimmed().isEmpty())
@@ -5739,7 +5742,17 @@ Terminal_process_start_result VNM_TerminalSurface::start_native_terminal(
         return rejected_terminal_start();
     }
 
-    std::unique_ptr<term::Terminal_backend> backend = make_native_backend();
+#if !defined(__linux__) && !defined(__APPLE__)
+    if (owner) {
+        report_backend_error({
+            term::Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+            QStringLiteral("a POSIX terminal process owner is unavailable on this platform"),
+        });
+        set_process_state(Process_state::FAILED);
+        return rejected_terminal_start();
+    }
+#endif
+    std::unique_ptr<term::Terminal_backend> backend = make_native_backend(std::move(owner));
     if (backend == nullptr) {
         report_backend_error({
             term::Terminal_backend_error_code::START_FAILED,

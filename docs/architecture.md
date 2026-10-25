@@ -111,6 +111,14 @@ Native backend selection happens in `make_native_backend()` in
 - Linux and macOS use POSIX PTY APIs in `src/posix_pty_backend.cpp`.
 - Shared native-backend mechanics live in `src/native_backend_io_core.*`.
 
+On POSIX, `start_terminal(request)` uses the built-in process lifecycle.
+An optional `Terminal_process_owner` supplied as the second argument changes
+process ownership while the same backend continues to own PTY I/O, resize, and
+callback delivery. The Qt-free extension contract is installed as
+`vnm_terminal/terminal_process_owner.h`. Selection happens before birth; a
+supplied owner's failure never falls back to a second launch. Windows rejects
+the optional owner argument before dispatch.
+
 The supported native product targets are Windows x64, Linux x86_64, and macOS
 Darwin builds. A build on a platform without a native backend may still compile
 library code, but process launch reports an unavailable-backend error instead

@@ -3,7 +3,6 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
-#include "posix_pty_backend/native_receipt_capture.h"
 
 #include <QByteArray>
 #include <QEventLoop>
@@ -293,11 +292,6 @@ bool is_live_surface_process_state(VNM_TerminalSurface::Process_state state)
 
 struct Surface_fixture
 {
-#if defined(__APPLE__)
-    // Native observations must outlive surface/backend teardown.
-    std::shared_ptr<vnm_terminal::test_helpers::Native_receipt_capture> native_receipts =
-        std::make_shared<vnm_terminal::test_helpers::Native_receipt_capture>();
-#endif
     QQuickWindow           window;
     VNM_TerminalSurface    surface;
 
@@ -431,11 +425,6 @@ vnm_terminal::Terminal_process_start_result start_terminal_fixture(
         std::move(base_environment),
         std::move(capability_environment),
     };
-#if defined(__APPLE__)
-    request.native_receipt_hook = [capture = fixture.native_receipts](const auto& receipt) {
-        return capture->retain(receipt);
-    };
-#endif
     return fixture.surface.start_terminal(std::move(request));
 }
 
@@ -1873,6 +1862,9 @@ int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
 
+    if (argc == 2 && argument_equals(argv[1], "--launch-environment-only")) {
+        return test_launch_environment_validation_contract() ? 0 : 1;
+    }
     if (argc != 2 || argument_equals(argv[1], "--help")) {
         std::cerr << "usage: compat_smoke_tests <fixture-executable>\n";
         return 2;

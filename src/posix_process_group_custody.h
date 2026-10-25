@@ -66,6 +66,20 @@ public:
         open_group_reference();
     }
 
+    // An empty, preallocated holder can capture a foreground group without
+    // allocating cleanup state after the terminal has admitted its child.
+    bool adopt_foreground_group(pid_t process_group, pid_t retained_session) noexcept
+    {
+        const std::lock_guard lock(m_mutex);
+        if (m_pid > 0 || process_group <= 1) {
+            return false;
+        }
+        m_pid = process_group;
+        m_wait_owned = false;
+        open_group_reference();
+        return m_group_signals_supported && belongs_to_session(retained_session);
+    }
+
     static std::shared_ptr<Posix_process_group_custody> capture_foreground(
         pid_t process_group, pid_t retained_session)
     {
@@ -124,7 +138,7 @@ public:
         return ::kill(m_pid, signal_number) == 0 ? 0 : errno;
     }
 
-    int observe_exit() noexcept
+    int observe_exit(siginfo_t* exit_info = nullptr) noexcept
     {
         siginfo_t info{};
         int result = 0;
@@ -132,6 +146,9 @@ public:
             result = ::waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOWAIT);
         } while (result < 0 && errno == EINTR);
         if (result == 0 && info.si_pid == m_pid) {
+            if (exit_info) {
+                *exit_info = info;
+            }
             return 0;
         }
         const int error = result < 0 ? errno : EIO;

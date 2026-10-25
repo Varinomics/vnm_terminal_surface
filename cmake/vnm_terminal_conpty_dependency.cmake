@@ -32,4 +32,5 @@ install(DIRECTORY "${conpty_package_dir}/"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/vnm_terminal_surface/conpty")
 install(FILES "${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_conpty.cmake"
     "${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_conpty_source.cmake"
+    "${CMAKE_CURRENT_LIST_DIR}/conpty-LICENSE"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vnm_terminal_surface")

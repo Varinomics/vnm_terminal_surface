@@ -2,7 +2,7 @@
 
 if(WIN32 AND @VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE@)
     set_property(GLOBAL PROPERTY vnm_terminal_conpty_package_dir
-        "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/vnm_terminal_surface/conpty")
+        "@PACKAGE_CMAKE_INSTALL_DATADIR@/vnm_terminal_surface/conpty")
 endif()
 
 include(CMakeFindDependencyMacro)
@@ -21,14 +21,8 @@ find_dependency(Qt6
     "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}.${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"
     COMPONENTS Core Gui Quick QuickPrivate GuiPrivate)
 if(VNM_TERMINAL_SURFACE_FULL_TARGET_AVAILABLE)
+    find_dependency(Threads REQUIRED)
     find_dependency(vnm_qt_dispatch 2 CONFIG REQUIRED)
-    if(@vnm_terminal_surface_process_custody_required@)
-        if(NOT TARGET vnm_process_custody::vnm_process_custody)
-            find_dependency(vnm_process_custody CONFIG REQUIRED)
-        endif()
-        include("${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_process_custody_contract.cmake")
-        vnm_terminal_require_process_custody()
-    endif()
 endif()
 
 set(_vnm_terminal_msdf_components qt_lcd)

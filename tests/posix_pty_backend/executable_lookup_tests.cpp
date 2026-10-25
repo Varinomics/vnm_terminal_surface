@@ -1,5 +1,4 @@
 #include "helpers/test_check.h"
-#include "native_receipt_capture.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 
 #include <QByteArray>
@@ -89,9 +88,6 @@ bool check_launch(
     config.initial_grid_size  = term::terminal_grid_size_t{24, 80};
     config.environment_edits.push_back({
         term::Terminal_environment_operation::SET, QStringLiteral("PATH"), path});
-#if defined(__APPLE__)
-    vnm_terminal::test_helpers::retain_native_receipts(config);
-#endif
     auto backend = term::make_posix_pty_backend();
     const auto started = backend->start(config, std::move(callbacks));
     const std::string label(name);

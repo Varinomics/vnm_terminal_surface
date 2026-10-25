@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/backend_contract.h"
+#include "vnm_terminal/terminal_process_owner.h"
 #include <memory>
 
 namespace vnm_terminal::internal {
@@ -10,7 +11,7 @@ namespace vnm_terminal::internal {
 class Posix_pty_backend final : public Terminal_backend
 {
 public:
-    Posix_pty_backend();
+    explicit Posix_pty_backend(std::unique_ptr<Terminal_process_owner> owner = {});
     ~Posix_pty_backend() override;
 
     Posix_pty_backend(const Posix_pty_backend&)            = delete;
@@ -42,7 +43,8 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-std::unique_ptr<Terminal_backend> make_posix_pty_backend();
+std::unique_ptr<Terminal_backend> make_posix_pty_backend(
+    std::unique_ptr<Terminal_process_owner> owner = {});
 
 #endif
 

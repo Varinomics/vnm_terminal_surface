@@ -104,7 +104,7 @@ function(vnm_terminal_stage_conpty_package source destination)
         endif()
         set(license "${source}/LICENSE")
     else()
-        set(license "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../THIRD_PARTY/conpty/LICENSE")
+        set(license "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/conpty-LICENSE")
     endif()
 
     file(MAKE_DIRECTORY "${destination}")

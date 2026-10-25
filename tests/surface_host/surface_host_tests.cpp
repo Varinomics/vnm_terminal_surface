@@ -11,7 +11,6 @@
 #include "vnm_terminal/terminal_canvas_export.h"
 #include "vnm_terminal/vnm_terminal_canvas.h"
 #include "helpers/test_check.h"
-#include "posix_pty_backend/native_receipt_capture.h"
 #if defined(Q_OS_WIN)
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 #endif
@@ -7777,10 +7776,6 @@ bool test_shell_redraw_zoom_keeps_prompt_in_place(
     const bool    cleared         = redraw_start == Shell_redraw_start::AFTER_CLEAR;
     const QString first_written_row = QStringLiteral("1");
 
-#if defined(__APPLE__)
-    // Native observations must outlive surface and backend teardown.
-    const auto native_receipts = std::make_shared<vnm_terminal::test_helpers::Native_receipt_capture>();
-#endif
     Surface_fixture fixture;
     fixture.window.resize(900, 760);
     fixture.surface.setSize(QSizeF(878.0, 723.0));
@@ -7799,11 +7794,6 @@ bool test_shell_redraw_zoom_keeps_prompt_in_place(
         {{QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin")}},
         std::nullopt,
     };
-#if defined(__APPLE__)
-    request.native_receipt_hook = [native_receipts](const auto& receipt) {
-        return native_receipts->retain(receipt);
-    };
-#endif
     const vnm_terminal::Terminal_process_start_result start =
         fixture.surface.start_terminal(std::move(request));
     if (!start.accepted) {
@@ -23309,181 +23299,192 @@ int main(int argc, char** argv)
     }
 #endif
 
-    const bool core_only = app.arguments().contains(QStringLiteral("--core-only"));
+    const bool output_group    = app.arguments().contains(QStringLiteral("--core-output"));
+    const bool input_group     = app.arguments().contains(QStringLiteral("--core-input"));
+    const bool lifecycle_group = app.arguments().contains(QStringLiteral("--core-lifecycle"));
+    const bool all_groups      = !output_group && !input_group && !lifecycle_group;
+    const bool core_only       = app.arguments().contains(QStringLiteral("--core-only")) ||
+        output_group || input_group || lifecycle_group;
     bool ok = true;
-    ok &= test_start_maps_output_to_snapshot(app);
-    ok &= test_honored_text_area_resize_can_be_returned_to_item_geometry(app);
-    ok &= test_disabled_text_area_resize_policy_ignores_the_request(app);
-    ok &= test_surface_polish_refreshes_metrics_after_window_dpr_change(app);
-    ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
-    ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
-    ok &= test_surface_pending_frame_fallback_advances_snapshot_without_frame(app);
-    ok &= test_surface_frame_fallback_requires_runner_progress(app);
-    ok &= test_surface_after_frame_owner_release_rechecks_pending_callbacks(app);
-    ok &= test_surface_output_backpressure_uses_posted_callback_owner(app);
-    ok &= test_surface_pressure_bypasses_active_after_frame_owner(app);
-    ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
-    ok &= test_surface_cursor_settle_presentation(app);
-    ok &= test_surface_cursor_settle_input_grace(app);
-    ok &= test_surface_unrendered_publication_input_keeps_cursor_visible(app);
-    ok &= test_surface_undrawn_publication_keeps_atlas_completion_pending(app);
-    ok &= test_surface_undrawn_publication_restores_cursor_after_render(app);
-    ok &= test_surface_frame_boundary_output_publishes_followup_dirty_rows(app);
-    ok &= test_surface_backend_drain_metrics_split_stages(app);
-    ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
-    ok &= test_surface_frame_catchup_budget_env_config();
-    ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
-    ok &= test_surface_synchronized_release_counts_explicit_boundary(app);
-    ok &= test_surface_bulk_output_keeps_snapshot_cursor_visible(app);
-    ok &= test_surface_synchronized_hold_stop_preserves_drain_stats(app);
-    ok &= test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(app);
-    ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
-    ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
-    ok &= test_surface_reported_atlas_completion_advances_rendered_publication(app);
-    ok &= test_surface_stale_atlas_completion_does_not_advance_rendered_publication(app);
-    ok &= test_surface_reset_session_clears_pending_atlas_completion(app);
-    ok &= test_surface_qsg_capture_without_draw_preserves_dirty_rows(app);
-    ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
-    ok &= test_explicit_hyperlink_lookup_feedback_and_activation(app);
-    ok &= test_explicit_hyperlink_stale_and_mouse_reporting_boundaries(app);
-    ok &= test_osc52_clipboard_write_signal_and_deny(app);
-    ok &= test_osc52_clipboard_wrong_duplicate_and_replacement(app);
-    ok &= test_osc52_clipboard_late_exit_restart_and_targets(app);
-    ok &= test_osc52_clipboard_allow_writes_clipboard(app);
-    ok &= test_keyboard_printable_controls_and_prompt_path(app);
-    ok &= test_copy_shortcut_policy(app);
-    ok &= test_synchronized_output_scroll_policy_property(app);
-    ok &= test_text_area_resize_policy_property(app);
-    ok &= test_text_area_resize_policy_disables_on_a_live_session(app);
-    ok &= test_text_area_resize_arbitration_enabled_property(app);
-    ok &= test_text_area_resize_arbitration_timeout_ms_property(app);
-    ok &= test_accepted_text_area_resize_arbitration_resizes_the_backend_once(app);
-    ok &= test_text_area_resize_arbitration_accepts_after_the_host_resizes_its_item(app);
-    ok &= test_text_area_resize_arbitration_answered_inline_does_not_nest(app);
-    ok &= test_text_area_resize_arbitration_answered_inline_keeps_notification_order(app);
-    ok &= test_text_area_resize_arbitration_prefix_title_precedes_same_command_request(app);
-    ok &= test_text_area_resize_arbitration_same_command_ties_keep_stream_order(app);
-    ok &= test_rejected_text_area_resize_arbitration_leaves_the_item_grid(app);
-    ok &= test_text_area_resize_arbitration_times_out(app);
-    ok &= test_text_area_resize_arbitration_does_not_spin_the_backend_drain(app);
-    ok &= test_visible_frames_replay_a_settled_heavy_tail(app);
-    ok &= test_respond_text_area_resize_reports_a_missing_request(app);
-    ok &= test_text_area_resize_arbitration_clears_when_the_process_is_torn_down(app);
-    ok &= test_text_area_resize_arbitration_exit_before_delivery_suppresses_stale_request(app);
-    ok &= test_text_area_resize_arbitration_can_be_enabled_on_a_live_session(app);
-    ok &= test_interaction_diagnostics_has_single_surface_owner(app);
-    ok &= test_scroll_diagnostic_enum_name_table(app);
-    ok &= test_no_payload_copy_fallback_states(app);
-    ok &= test_control_wheel_font_zoom(app);
-    ok &= test_control_wheel_zoom_changes_the_rendering_every_notch(app);
-    ok &= test_plain_wheel_scrolls_primary_scrollback(app);
-    ok &= test_public_viewport_scroll_api(app);
-    ok &= test_immediate_public_projection_public_scroll_api(app);
-    ok &= test_public_viewport_scroll_source_labels(app);
-    ok &= test_immediate_public_projection_page_keys(app);
-    ok &= test_public_scroll_api_records_deferred_after_projection_invalidation(app);
-    ok &= test_surface_destruction_emits_no_state_change_signals(app);
-    ok &= test_late_lifecycle_recorder_does_not_inherit_released_render_node();
-    ok &= test_app_route_boundaries_record_deferred_after_projection_invalidation(app);
-    ok &= test_plain_wheel_scrolls_scroll_region_primary_scrollback(app);
-    ok &= test_plain_wheel_scrolls_csi_scroll_up_primary_scrollback(app);
-    ok &= test_page_keys_scroll_primary_scrollback(app);
-    ok &= test_page_keys_fall_through_on_alternate_screen(app);
-    ok &= test_plain_wheel_boundaries_and_alternate_input(app);
-    ok &= test_local_first_wheel_scroll_applies_frontier_before_later_callbacks(app);
-    ok &= test_wheel_input_stops_after_post_barrier_callbacks_become_pending(app);
-    ok &= test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(app);
-    ok &= test_mouse_press_ignores_hidden_pending_mouse_enable(app);
-    ok &= test_mouse_release_pending_report_uses_published_modes(app);
-    ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
-    ok &= test_pending_mouse_report_preserves_following_key_input(app);
-    ok &= test_single_pending_mouse_press_survives_frontier_backlog(app);
-    if (!core_only) {
-        ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+    if (all_groups || output_group) {
+        ok &= test_start_maps_output_to_snapshot(app);
+        ok &= test_honored_text_area_resize_can_be_returned_to_item_geometry(app);
+        ok &= test_disabled_text_area_resize_policy_ignores_the_request(app);
+        ok &= test_surface_polish_refreshes_metrics_after_window_dpr_change(app);
+        ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
+        ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
+        ok &= test_surface_pending_frame_fallback_advances_snapshot_without_frame(app);
+        ok &= test_surface_frame_fallback_requires_runner_progress(app);
+        ok &= test_surface_after_frame_owner_release_rechecks_pending_callbacks(app);
+        ok &= test_surface_output_backpressure_uses_posted_callback_owner(app);
+        ok &= test_surface_pressure_bypasses_active_after_frame_owner(app);
+        ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
+        ok &= test_surface_cursor_settle_presentation(app);
+        ok &= test_surface_cursor_settle_input_grace(app);
+        ok &= test_surface_unrendered_publication_input_keeps_cursor_visible(app);
+        ok &= test_surface_undrawn_publication_keeps_atlas_completion_pending(app);
+        ok &= test_surface_undrawn_publication_restores_cursor_after_render(app);
+        ok &= test_surface_frame_boundary_output_publishes_followup_dirty_rows(app);
+        ok &= test_surface_backend_drain_metrics_split_stages(app);
+        ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
+        ok &= test_surface_frame_catchup_budget_env_config();
+        ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
+        ok &= test_surface_synchronized_release_counts_explicit_boundary(app);
+        ok &= test_surface_bulk_output_keeps_snapshot_cursor_visible(app);
+        ok &= test_surface_synchronized_hold_stop_preserves_drain_stats(app);
+        ok &= test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(app);
+        ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
+        ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
+        ok &= test_surface_reported_atlas_completion_advances_rendered_publication(app);
+        ok &= test_surface_stale_atlas_completion_does_not_advance_rendered_publication(app);
+        ok &= test_surface_reset_session_clears_pending_atlas_completion(app);
+        ok &= test_surface_qsg_capture_without_draw_preserves_dirty_rows(app);
+        ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
+        ok &= test_explicit_hyperlink_lookup_feedback_and_activation(app);
+        ok &= test_explicit_hyperlink_stale_and_mouse_reporting_boundaries(app);
+        ok &= test_osc52_clipboard_write_signal_and_deny(app);
+        ok &= test_osc52_clipboard_wrong_duplicate_and_replacement(app);
+        ok &= test_osc52_clipboard_late_exit_restart_and_targets(app);
+        ok &= test_osc52_clipboard_allow_writes_clipboard(app);
+        ok &= test_synchronized_output_scroll_policy_property(app);
+        ok &= test_text_area_resize_policy_property(app);
+        ok &= test_text_area_resize_policy_disables_on_a_live_session(app);
+        ok &= test_text_area_resize_arbitration_enabled_property(app);
+        ok &= test_text_area_resize_arbitration_timeout_ms_property(app);
+        ok &= test_accepted_text_area_resize_arbitration_resizes_the_backend_once(app);
+        ok &= test_text_area_resize_arbitration_accepts_after_the_host_resizes_its_item(app);
+        ok &= test_text_area_resize_arbitration_answered_inline_does_not_nest(app);
+        ok &= test_text_area_resize_arbitration_answered_inline_keeps_notification_order(app);
+        ok &= test_text_area_resize_arbitration_prefix_title_precedes_same_command_request(app);
+        ok &= test_text_area_resize_arbitration_same_command_ties_keep_stream_order(app);
+        ok &= test_rejected_text_area_resize_arbitration_leaves_the_item_grid(app);
+        ok &= test_text_area_resize_arbitration_times_out(app);
+        ok &= test_text_area_resize_arbitration_does_not_spin_the_backend_drain(app);
+        ok &= test_visible_frames_replay_a_settled_heavy_tail(app);
+        ok &= test_respond_text_area_resize_reports_a_missing_request(app);
+        ok &= test_text_area_resize_arbitration_clears_when_the_process_is_torn_down(app);
+        ok &= test_text_area_resize_arbitration_exit_before_delivery_suppresses_stale_request(app);
+        ok &= test_text_area_resize_arbitration_can_be_enabled_on_a_live_session(app);
+        ok &= test_interaction_diagnostics_has_single_surface_owner(app);
+        ok &= test_scroll_diagnostic_enum_name_table(app);
     }
-    ok &= test_page_key_scrolls_before_post_frontier_alternate_screen(app);
-    ok &= test_surface_text_input_routes_keep_one_frontier(app);
-    ok &= test_mouse_input_stops_at_callback_frontier(app);
-    if (!core_only) {
-        ok &= test_control_wheel_resize_keeps_event_frontier(app);
+    if (all_groups || input_group) {
+        ok &= test_copy_shortcut_policy(app);
+        ok &= test_no_payload_copy_fallback_states(app);
+        ok &= test_control_wheel_font_zoom(app);
+        ok &= test_control_wheel_zoom_changes_the_rendering_every_notch(app);
+        ok &= test_plain_wheel_scrolls_primary_scrollback(app);
+        ok &= test_public_viewport_scroll_api(app);
+        ok &= test_immediate_public_projection_public_scroll_api(app);
+        ok &= test_public_viewport_scroll_source_labels(app);
+        ok &= test_immediate_public_projection_page_keys(app);
+        ok &= test_public_scroll_api_records_deferred_after_projection_invalidation(app);
+        ok &= test_app_route_boundaries_record_deferred_after_projection_invalidation(app);
+        ok &= test_plain_wheel_scrolls_scroll_region_primary_scrollback(app);
+        ok &= test_plain_wheel_scrolls_csi_scroll_up_primary_scrollback(app);
+        ok &= test_page_keys_scroll_primary_scrollback(app);
+        ok &= test_page_keys_fall_through_on_alternate_screen(app);
+        ok &= test_plain_wheel_boundaries_and_alternate_input(app);
+        ok &= test_local_first_wheel_scroll_applies_frontier_before_later_callbacks(app);
+        ok &= test_wheel_input_stops_after_post_barrier_callbacks_become_pending(app);
+        ok &= test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(app);
+        ok &= test_mouse_press_ignores_hidden_pending_mouse_enable(app);
+        ok &= test_mouse_release_pending_report_uses_published_modes(app);
+        ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
+        ok &= test_pending_mouse_report_preserves_following_key_input(app);
+        ok &= test_single_pending_mouse_press_survives_frontier_backlog(app);
+        if (!core_only) {
+            ok &= test_surface_key_routes_stop_at_callback_frontier(app);
+        }
+        ok &= test_page_key_scrolls_before_post_frontier_alternate_screen(app);
+        ok &= test_surface_text_input_routes_keep_one_frontier(app);
+        ok &= test_mouse_input_stops_at_callback_frontier(app);
+        if (!core_only) {
+            ok &= test_control_wheel_resize_keeps_event_frontier(app);
+        }
+        ok &= test_reentrant_paste_captures_new_public_frontier(app);
+        ok &= test_resize_policy_setters_keep_callback_frontier(app);
+        ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
+        ok &= test_all_motion_hover_reports_only_cell_changes(app);
+        ok &= test_drag_after_new_press_reports_repeated_cell(app);
+        ok &= test_repeated_drag_after_local_scroll_returns_to_tail(app);
+        ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
+        if (!core_only) {
+            ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
+        }
+        ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
+        ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
+        ok &= test_transcript_timing_diagnostics_records_hot_paths();
+        ok &= test_mouse_reporting_surface_events(app);
+        ok &= test_pointer_cancel_ends_held_surface_gestures(app);
+        ok &= test_row_timestamp_tooltip_signal_contract(app);
+        ok &= test_selection_drag_and_selected_text(app);
+        ok &= test_selection_visual_detach_after_row_mutation(app);
+        ok &= test_selection_copy_intent_after_output(app);
+        ok &= test_async_clipboard_intent(app);
+        ok &= test_async_clipboard_report_chronology(app);
+        ok &= test_selection_drag_remaps_live_scrollback_viewport_spans(app);
+        ok &= test_selection_drag_survives_unrelated_row_backend_output(app);
+        ok &= test_selection_drag_survives_worker_unrelated_row_backend_output(app);
+        ok &= test_selection_drag_survives_at_tail_streaming_output(app);
+        ok &= test_selection_drag_preserves_exact_press_handle_during_streaming(app);
+        ok &= test_selection_drag_composes_synchronized_press_successors(app);
+        ok &= test_selection_drag_survives_stable_row_content_drift(app);
+        ok &= test_selection_drag_exact_capacity_boundaries(app);
+        ok &= test_selection_drag_preserves_payload_after_mid_drag_drift(app);
+        ok &= test_selection_drag_rejects_snapshot_change(app);
+        ok &= test_stale_synchronized_output_recovery(app);
+        ok &= test_synchronized_output_styled_blank_rows_preserve_background(app);
+        ok &= test_stale_synchronized_output_recovery_force_releases_after_budgeted_catchup(app);
+        ok &= test_paste_text_public_method_and_policy(app);
+        ok &= test_right_click_paste_and_mouse_reporting_precedence(app);
+        ok &= test_focus_reporting_writes_mode_bytes_and_preserves_ime_cancel(app);
+        ok &= test_ime_preedit_updates_overlay_without_snapshot_churn(app);
+        ok &= test_ime_commit_writes_utf8_and_clears_preedit(app);
+        ok &= test_ime_no_session_overlay_and_later_start_clear(app);
+        ok &= test_ime_startup_commit_clears_preedit_without_backend_error(app);
+        ok &= test_ime_multi_codepoint_commit_writes_utf8(app);
+        ok &= test_ime_combined_commit_and_preedit(app);
+        ok &= test_ime_replacement_range_is_stream_commit(app);
+        ok &= test_ime_commit_failure_preserves_preedit(app);
+        ok &= test_ime_synchronized_output_overlay(app);
+        ok &= test_ime_focus_loss_cancels_preedit(app);
+        ok &= test_ime_cursor_rectangle_query_tracks_snapshot_cursor(app);
     }
-    ok &= test_reentrant_paste_captures_new_public_frontier(app);
-    ok &= test_resize_policy_setters_keep_callback_frontier(app);
-    ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
-    ok &= test_all_motion_hover_reports_only_cell_changes(app);
-    ok &= test_drag_after_new_press_reports_repeated_cell(app);
-    ok &= test_repeated_drag_after_local_scroll_returns_to_tail(app);
-    ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
-    if (!core_only) {
-        ok &= test_wheel_fallback_trace_distinguishes_pending_mouse_report(app);
+    if (all_groups || lifecycle_group) {
+        ok &= test_keyboard_printable_controls_and_prompt_path(app);
+        ok &= test_surface_destruction_emits_no_state_change_signals(app);
+        ok &= test_late_lifecycle_recorder_does_not_inherit_released_render_node();
+        ok &= test_keyboard_cursor_modes(app);
+        ok &= test_keyboard_navigation_keys(app);
+        ok &= test_keyboard_function_keys(app);
+        ok &= test_keyboard_keypad_modes(app);
+        ok &= test_keyboard_focus_routed_delivery(app);
+        ok &= test_keyboard_no_session_and_post_exit_semantics(app);
+        ok &= test_ordinary_exit_retains_output_interaction(app);
+        ok &= test_keyboard_unhandled_key_skips_backend_drain(app);
+        ok &= test_worker_callback_drains_on_gui_thread(app);
+        ok &= test_hover_move_does_not_drain_queued_backend_output(app);
+        ok &= test_heap_surface_destroy_closes_queued_worker_callback(app);
+        ok &= test_after_frame_callback_update_latch_falls_back_on_window_destroy(app);
+        ok &= test_window_destroy_keeps_surface_session_until_surface_destroy(app);
+        if (!core_only) {
+            ok &= test_geometry_change_resizes_session(app);
+            ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
+            ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
+        }
+        ok &= test_backend_exit_updates_surface(app);
+        ok &= test_public_lifecycle_methods(app);
+        ok &= test_terminal_icon_name_notifications(app);
+        ok &= test_audible_bell_policy_requests_platform_bell(app);
+        ok &= test_notification_burst_uses_durable_channel(app);
+        ok &= test_surface_overflow_reports_error_and_exit(app);
+        ok &= test_public_search_api_persists_query_and_navigates(app);
+        ok &= test_public_search_spinner_keeps_results_visible(app);
+        ok &= test_search_completion_during_surface_destruction(app);
+        ok &= test_search_completion_after_session_restart(app);
+        ok &= test_invalid_argv_reports_backend_error(app);
+        ok &= test_indeterminate_dispatched_start_is_reported_once(app);
     }
-    ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
-    ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
-    ok &= test_transcript_timing_diagnostics_records_hot_paths();
-    ok &= test_mouse_reporting_surface_events(app);
-    ok &= test_pointer_cancel_ends_held_surface_gestures(app);
-    ok &= test_row_timestamp_tooltip_signal_contract(app);
-    ok &= test_selection_drag_and_selected_text(app);
-    ok &= test_selection_visual_detach_after_row_mutation(app);
-    ok &= test_selection_copy_intent_after_output(app);
-    ok &= test_async_clipboard_intent(app);
-    ok &= test_async_clipboard_report_chronology(app);
-    ok &= test_selection_drag_remaps_live_scrollback_viewport_spans(app);
-    ok &= test_selection_drag_survives_unrelated_row_backend_output(app);
-    ok &= test_selection_drag_survives_worker_unrelated_row_backend_output(app);
-    ok &= test_selection_drag_survives_at_tail_streaming_output(app);
-    ok &= test_selection_drag_preserves_exact_press_handle_during_streaming(app);
-    ok &= test_selection_drag_composes_synchronized_press_successors(app);
-    ok &= test_selection_drag_survives_stable_row_content_drift(app);
-    ok &= test_selection_drag_exact_capacity_boundaries(app);
-    ok &= test_selection_drag_preserves_payload_after_mid_drag_drift(app);
-    ok &= test_selection_drag_rejects_snapshot_change(app);
-    ok &= test_stale_synchronized_output_recovery(app);
-    ok &= test_synchronized_output_styled_blank_rows_preserve_background(app);
-    ok &= test_stale_synchronized_output_recovery_force_releases_after_budgeted_catchup(app);
-    ok &= test_paste_text_public_method_and_policy(app);
-    ok &= test_right_click_paste_and_mouse_reporting_precedence(app);
-    ok &= test_focus_reporting_writes_mode_bytes_and_preserves_ime_cancel(app);
-    ok &= test_ime_preedit_updates_overlay_without_snapshot_churn(app);
-    ok &= test_ime_commit_writes_utf8_and_clears_preedit(app);
-    ok &= test_ime_no_session_overlay_and_later_start_clear(app);
-    ok &= test_ime_startup_commit_clears_preedit_without_backend_error(app);
-    ok &= test_ime_multi_codepoint_commit_writes_utf8(app);
-    ok &= test_ime_combined_commit_and_preedit(app);
-    ok &= test_ime_replacement_range_is_stream_commit(app);
-    ok &= test_ime_commit_failure_preserves_preedit(app);
-    ok &= test_ime_synchronized_output_overlay(app);
-    ok &= test_ime_focus_loss_cancels_preedit(app);
-    ok &= test_ime_cursor_rectangle_query_tracks_snapshot_cursor(app);
-    ok &= test_keyboard_cursor_modes(app);
-    ok &= test_keyboard_navigation_keys(app);
-    ok &= test_keyboard_function_keys(app);
-    ok &= test_keyboard_keypad_modes(app);
-    ok &= test_keyboard_focus_routed_delivery(app);
-    ok &= test_keyboard_no_session_and_post_exit_semantics(app);
-    ok &= test_ordinary_exit_retains_output_interaction(app);
-    ok &= test_keyboard_unhandled_key_skips_backend_drain(app);
-    ok &= test_worker_callback_drains_on_gui_thread(app);
-    ok &= test_hover_move_does_not_drain_queued_backend_output(app);
-    ok &= test_heap_surface_destroy_closes_queued_worker_callback(app);
-    ok &= test_after_frame_callback_update_latch_falls_back_on_window_destroy(app);
-    ok &= test_window_destroy_keeps_surface_session_until_surface_destroy(app);
-    if (!core_only) {
-        ok &= test_geometry_change_resizes_session(app);
-        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
-        ok &= test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, true);
-    }
-    ok &= test_backend_exit_updates_surface(app);
-    ok &= test_public_lifecycle_methods(app);
-    ok &= test_terminal_icon_name_notifications(app);
-    ok &= test_audible_bell_policy_requests_platform_bell(app);
-    ok &= test_notification_burst_uses_durable_channel(app);
-    ok &= test_surface_overflow_reports_error_and_exit(app);
-    ok &= test_public_search_api_persists_query_and_navigates(app);
-    ok &= test_public_search_spinner_keeps_results_visible(app);
-    ok &= test_search_completion_during_surface_destruction(app);
-    ok &= test_search_completion_after_session_restart(app);
-    ok &= test_invalid_argv_reports_backend_error(app);
-    ok &= test_indeterminate_dispatched_start_is_reported_once(app);
     return ok ? 0 : 1;
 }
