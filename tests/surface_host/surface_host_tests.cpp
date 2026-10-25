@@ -6881,7 +6881,9 @@ bool test_pointer_uses_physical_modifiers(QGuiApplication& app, bool qt_swaps_co
         pump_events(app);
         auto backend = std::make_unique<Scripted_backend>();
         backend->outputs_during_start = {
-            QByteArrayLiteral("\x1b[?1003;1006hphysical-modifier-reporting"),
+            // Content-tail presentation must include every native row hit below.
+            QByteArrayLiteral("\x1b[?1003;1006hphysical-modifier-reporting"
+                "\r\npress-and-drag\r\nhover-and-motion"),
         };
         bool started = false;
         Scripted_backend* backend_ptr = start_surface_with_backend(
