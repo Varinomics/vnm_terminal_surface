@@ -207,12 +207,15 @@ struct Write_all_result
     QString     error_message;
 };
 
+// Packaged ConPTY uses opaque pointer handles independently of the SDK's NTDDI gates.
+using Conpty_handle = void*;
+
 struct Conpty_api
 {
-    using CreatePseudoConsole_fn = HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
-    using ResizePseudoConsole_fn = HRESULT(WINAPI*)(HPCON, COORD);
-    using ClosePseudoConsole_fn  = void(WINAPI*)(HPCON);
-    using ReparentPseudoConsole_fn = HRESULT(WINAPI*)(HPCON, HWND);
+    using CreatePseudoConsole_fn   = HRESULT(WINAPI*)(COORD, HANDLE, HANDLE, DWORD, Conpty_handle*);
+    using ResizePseudoConsole_fn   = HRESULT(WINAPI*)(Conpty_handle, COORD);
+    using ClosePseudoConsole_fn    = void(WINAPI*)(Conpty_handle);
+    using ReparentPseudoConsole_fn = HRESULT(WINAPI*)(Conpty_handle, HWND);
 
     CreatePseudoConsole_fn create = nullptr;
     ResizePseudoConsole_fn resize = nullptr;
@@ -456,7 +459,7 @@ public:
     static void submit(
         std::unique_ptr<Conpty_close_owner>     reservation,
         Conpty_api::ClosePseudoConsole_fn       close,
-        HPCON                                  conpty,
+        Conpty_handle                          conpty,
         std::shared_ptr<Conpty_window_observer> observer,
         std::shared_ptr<Close_control>          control) noexcept
     {
@@ -496,7 +499,7 @@ private:
     }
 
     Conpty_api::ClosePseudoConsole_fn       m_close = nullptr;
-    HPCON                                  m_conpty = nullptr;
+    Conpty_handle                          m_conpty = nullptr;
     std::shared_ptr<Conpty_window_observer> m_observer;
     std::shared_ptr<Close_control>          m_control;
     Native_backend_cleanup_reservation    m_cleanup;
@@ -693,7 +696,7 @@ std::wstring environment_block_from_process_environment(
 }
 
 std::vector<std::byte> initialized_attribute_list_storage(
-    HPCON                          conpty,
+    Conpty_handle                  conpty,
     LPPROC_THREAD_ATTRIBUTE_LIST&  attribute_list,
     Terminal_backend_result&       failure)
 {
@@ -954,7 +957,7 @@ public:
         pty_output_write.reset(output_write_handle);
 
         auto window_observer = std::make_shared<Conpty_window_observer>();
-        HPCON local_conpty = nullptr;
+        Conpty_handle local_conpty = nullptr;
         const auto close_on_failed_start = qScopeGuard(
             [&] {
                 if (local_conpty != nullptr) {
@@ -1271,7 +1274,7 @@ public:
                     QStringLiteral("ConPTY resize requires a positive SHORT-sized grid"));
         }
 
-        HPCON conpty = nullptr;
+        Conpty_handle conpty = nullptr;
         Conpty_api::ResizePseudoConsole_fn resize_conpty = nullptr;
         std::shared_ptr<Windows_conpty_resize_control_for_testing> resize_control;
         {
@@ -1777,7 +1780,7 @@ private:
 
     void request_conpty_close()
     {
-        HPCON conpty = nullptr;
+        Conpty_handle conpty = nullptr;
         Conpty_api::ClosePseudoConsole_fn close_conpty_api = nullptr;
         std::shared_ptr<Conpty_window_observer> window_observer;
         std::unique_ptr<Conpty_close_owner> close_owner;
@@ -2439,7 +2442,7 @@ private:
     std::shared_ptr<Native_backend_callback_gate> m_callback_gate =
         std::make_shared<Native_backend_callback_gate>();
     Conpty_api                         m_api;
-    HPCON                              m_conpty = nullptr;
+    Conpty_handle                      m_conpty = nullptr;
     std::shared_ptr<Conpty_window_observer> m_window_observer;
     Unique_handle                      m_input_write;
     Unique_handle                      m_output_read;
