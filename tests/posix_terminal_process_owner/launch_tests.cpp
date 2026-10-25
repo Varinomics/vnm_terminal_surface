@@ -180,7 +180,8 @@ void descriptor_test(const std::string& executable, Probe kind)
     probe              = kind;
     bool foreign_ok    = false;
     std::string foreign_error;
-    std::jthread foreign([
+    auto owner = terminal::internal::make_posix_terminal_process_owner();
+    std::thread foreign([
             &barrier, &foreign_control, &foreign_events, &foreign_ok, &foreign_error, &executable
         ]
         {
@@ -226,8 +227,14 @@ void descriptor_test(const std::string& executable, Probe kind)
             }
         });
 
-    auto owner = terminal::internal::make_posix_terminal_process_owner();
-    const auto launched = owner->launch(launch_request(executable, control));
+    terminal::terminal_process_launch_result_t launched;
+    try {
+        launched = owner->launch(launch_request(executable, control));
+    }
+    catch (...) {
+        foreign.join();
+        throw;
+    }
     foreign.join();
     probe = Probe::NONE;
     descriptor_barrier = nullptr;
@@ -269,7 +276,8 @@ void signal_test(const std::string& executable)
     require(::pthread_sigmask(SIG_SETMASK, nullptr, &before) == 0, "read launching thread mask");
     probe = Probe::SIGNAL;
     bool delivered = false;
-    std::jthread signaler([&ready, &release, &delivered] {
+    auto owner = terminal::internal::make_posix_terminal_process_owner();
+    std::thread signaler([&ready, &release, &delivered] {
         pid_t child = -1;
         if (transfer(ready.reader(), &child, sizeof(child), false)) {
             siginfo_t held{};
@@ -280,8 +288,14 @@ void signal_test(const std::string& executable)
         char command = 'R';
         (void)transfer(release.writer(), &command, 1, true);
     });
-    auto owner = terminal::internal::make_posix_terminal_process_owner();
-    const auto launched = owner->launch(launch_request(executable, control));
+    terminal::terminal_process_launch_result_t launched;
+    try {
+        launched = owner->launch(launch_request(executable, control));
+    }
+    catch (...) {
+        signaler.join();
+        throw;
+    }
     signaler.join();
     probe = Probe::NONE;
     sigset_t after;
