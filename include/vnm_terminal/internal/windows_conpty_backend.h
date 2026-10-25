@@ -16,6 +16,7 @@ enum class Windows_conpty_start_fault_for_testing
     NONE,
     JOB_ASSIGNMENT,
     THREAD_RESUME_FAILURE,
+    RESIZE_WORKER_START,
 };
 
 struct Windows_conpty_backend_write_state_for_testing

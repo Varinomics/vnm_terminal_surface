@@ -1357,6 +1357,9 @@ public:
         std::shared_ptr<std::latch> startup_gate;
         try {
             startup_gate = std::make_shared<std::latch>(1);
+            if (m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::RESIZE_WORKER_START) {
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+            }
             m_resize_thread = spawn_native_backend_gated_worker(
                 call_state(),
                 startup_gate,
@@ -1610,6 +1613,7 @@ public:
         m_output_read.reset();
         m_process.reset();
         m_process_job.reset();
+        m_process_assigned_to_job = false;
         m_reader_thread_handle.reset();
         m_writer_thread_handle.reset();
         clear_queued_writes_locked();

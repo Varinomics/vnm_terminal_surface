@@ -17,6 +17,7 @@
 #include <QFileInfo>
 #include <QIODevice>
 #include <QKeyEvent>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QString>
 #include <QStringList>
@@ -6199,6 +6200,103 @@ bool test_post_birth_failure_keeps_native_custody(const QString& fixture_path)
     return ok;
 }
 
+bool test_failed_start_retires_cpu_job(const QString& fixture_path)
+{
+    // This runs in its own process so Job admission cannot affect other fixtures.
+    Win32_process_handle host_job(CreateJobObjectW(nullptr, nullptr));
+    if (!check(host_job.is_valid() && AssignProcessToJobObject(host_job.get(), GetCurrentProcess()),
+            "failed-start CPU fixture enters its own host Job"))
+    {
+        return false;
+    }
+    const auto burn_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    auto host_cpu = process_cpu_time_usec(GetCurrentProcess());
+    std::atomic_uint work{0};
+    while (host_cpu && *host_cpu == 0 && std::chrono::steady_clock::now() < burn_deadline) {
+        for (unsigned int index = 0; index < 4096; ++index) {
+            work.fetch_add(index, std::memory_order_relaxed);
+        }
+        host_cpu = process_cpu_time_usec(GetCurrentProcess());
+    }
+    if (!check(host_cpu && *host_cpu > 0, "the fixture host has independently measured CPU work")) {
+        return false;
+    }
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION host_accounting{};
+    if (!check(QueryInformationJobObject(nullptr, JobObjectBasicAccountingInformation,
+            &host_accounting, sizeof(host_accounting), nullptr),
+            "a null Job handle resolves to the fixture host Job"))
+    {
+        return false;
+    }
+
+    Backend_capture capture;
+    term::Windows_conpty_backend backend;
+    struct Observation_release
+    {
+        term::Windows_conpty_backend& backend;
+        ~Observation_release() { backend.set_cleanup_observation_blocked_for_testing(false); }
+    } release{backend};
+    if (!check(backend.set_start_fault_for_testing(
+            term::Windows_conpty_start_fault_for_testing::RESIZE_WORKER_START),
+            "worker startup failure is armed before native dispatch"))
+    {
+        return false;
+    }
+    backend.set_cleanup_observation_blocked_for_testing(true);
+    const auto result = backend.start(
+        launch_config(fixture_path, {QStringLiteral("--hold-open")}), capture.callbacks());
+    bool ok = check(result.code == term::Terminal_backend_result_code::REJECTED &&
+            result.native_dispatch_occurred && !result.start_outcome_determinate,
+        "worker startup failure rejects start while deferred cleanup retains the native child");
+    const auto admitted = backend.write_state_for_testing();
+    ok &= check(admitted.process_handle_retained && admitted.process_assigned_to_job &&
+            !admitted.native_cleanup_settled && backend.process_cpu_time().has_value(),
+        "failed start keeps CPU accounting tied to its admitted child until native settlement");
+
+    backend.set_cleanup_observation_blocked_for_testing(false);
+    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    auto cleaned = backend.write_state_for_testing();
+    while (cleaned.process_handle_retained && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        cleaned = backend.write_state_for_testing();
+    }
+    ok &= check(cleaned.native_cleanup_settled && !cleaned.process_handle_retained,
+        "deferred cleanup releases the exact native handles while the facade remains alive");
+    ok &= check(!cleaned.process_assigned_to_job,
+        "released Job ownership clears process admission");
+    const auto sample = backend.process_cpu_time();
+    if (sample) {
+        QueryInformationJobObject(host_job.get(), JobObjectBasicAccountingInformation,
+            &host_accounting, sizeof(host_accounting), nullptr);
+        std::cerr << "CPU after failed-start cleanup: returned_usec=" << sample->cpu_time_usec
+            << " host_job_usec="
+            << (host_accounting.TotalKernelTime.QuadPart + host_accounting.TotalUserTime.QuadPart) / 10
+            << " host_process_usec=" << *host_cpu << '\n';
+    }
+    ok &= check(!sample,
+        "the live failed-start facade never reports its host Job as terminal CPU");
+    return ok;
+}
+
+bool test_failed_start_cpu_in_isolated_process(const QString& executable_path, const QString& fixture_path)
+{
+    QProcess child;
+    child.start(executable_path, {QStringLiteral("--failed-start-cpu-child"), fixture_path});
+    if (!check(child.waitForStarted(k_wait_timeout.count()),
+            "failed-start CPU subprocess starts"))
+    {
+        return false;
+    }
+    const bool finished = child.waitForFinished(2 * k_wait_timeout.count());
+    if (!finished) {
+        child.kill();
+        child.waitForFinished();
+    }
+    std::cerr << child.readAllStandardError().constData();
+    return check(finished && child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0,
+        "failed-start CPU subprocess preserves Job ownership through deferred cleanup");
+}
+
 
 bool test_native_cmd_resize()
 {
@@ -7022,6 +7120,17 @@ bool test_native_cmd_primary_resize_with_text_below_the_cursor()
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
+        bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));
+        ok &= term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout);
+        ok &= wait_for_console_host_children_to_exit("failed-start CPU");
+        return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu") {
+        return test_failed_start_cpu_in_isolated_process(
+            QString::fromLocal8Bit(argv[0]), QString::fromLocal8Bit(argv[2])) ? 0 : 1;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--cpu-accounting-child") {
         return run_cpu_accounting_child(QString::fromLocal8Bit(argv[2]));
     }
@@ -7163,6 +7272,8 @@ int main(int argc, char** argv)
             term::make_windows_conpty_backend, launch_config(fixture_path, {})));
     run_test("post-birth failure retains native custody",
         test_post_birth_failure_keeps_native_custody(fixture_path));
+    run_test("failed-start cleanup retires CPU Job ownership",
+        test_failed_start_cpu_in_isolated_process(QString::fromLocal8Bit(argv[0]), fixture_path));
     run_test("pid parser", test_pid_parser_requires_line_delimiter());
     run_test("progressing output exit wait has absolute bound",
         test_progressing_output_exit_wait_has_absolute_bound());
