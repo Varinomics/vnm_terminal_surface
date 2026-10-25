@@ -65,6 +65,17 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
     constexpr int k_min_anchored_meaningful_matches        = 3;
 
     const int row_count = static_cast<int>(input.candidate_rows.size());
+    int rewritten_tail_end = row_count;
+    // Unchanged blank viewport rows below the content are not a rewritten tail.
+    // Keep nonblank footers within the bound; they need the separate anchored
+    // continuation proof below.
+    while (rewritten_tail_end > 0 &&
+        input.candidate_rows[static_cast<std::size_t>(rewritten_tail_end - 1)].isEmpty() &&
+        input.current_rows[static_cast<std::size_t>(rewritten_tail_end - 1)].isEmpty())
+    {
+        --rewritten_tail_end;
+    }
+
     int best_shift              = 0;
     int best_meaningful_matches = 0;
     int best_matched_prefix     = 0;
@@ -119,16 +130,17 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
         }
 
         // Matching surviving rows prove the upward shift, not the displaced
-        // payload. Bound every partial match's tail so broad graphic/layout
-        // repaints cannot manufacture history from a short shifted prefix.
+        // payload. Bound every partial match's rewritten tail so a short shifted
+        // prefix cannot manufacture history from a broad graphic/layout repaint.
         // A blank displaced row additionally needs preferred-strength evidence;
         // a full surviving suffix remains sufficient for either payload.
         const bool full_surviving_suffix_matched =
             matched_prefix == row_count - shift;
-        const int unmatched_tail_rows = row_count - shift - matched_prefix;
+        const int rewritten_tail_rows = std::max(
+            0, std::min(row_count - shift, rewritten_tail_end) - matched_prefix);
         const int max_partial_rewritten_tail_rows =
             std::max(k_min_partial_rewritten_tail_rows, row_count / 4);
-        if (unmatched_tail_rows > max_partial_rewritten_tail_rows) {
+        if (rewritten_tail_rows > max_partial_rewritten_tail_rows) {
             continue;
         }
         const bool strong_partial_blank_shift =

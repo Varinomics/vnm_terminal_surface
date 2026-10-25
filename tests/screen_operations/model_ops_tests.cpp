@@ -1359,6 +1359,75 @@ bool test_selection_attachment_follows_multiple_successors_in_one_ingest()
     return ok;
 }
 
+bool test_primary_repaint_recovery_preserves_successors_above_unchanged_blank_tail()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(16, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+
+    const term::terminal_selection_source_identity_t source =
+        selection_source_for_model(model);
+    const term::Terminal_selection_range range{{2, 0}, {2, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t lease =
+        selection_lease_for_range(model, range, source);
+    const term::terminal_history_handle_t original_handle =
+        lease.selected_lines.front().history_handle;
+
+    QByteArray two_repaints = QByteArrayLiteral("\x1b[?2026h");
+    two_repaints += visible_row_write_stream({
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, true);
+    two_repaints += visible_row_write_stream({
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+        QByteArrayLiteral("ff"),
+    }, true);
+    two_repaints += QByteArrayLiteral("\x1b[?2026l");
+    const term::Terminal_screen_model_result result = model.ingest(two_repaints);
+
+    const term::terminal_selection_line_successor_t* first =
+        successor_for_old_handle(result, original_handle);
+    const term::terminal_selection_line_successor_t* second = first == nullptr
+        ? nullptr
+        : successor_for_old_handle(result, first->final_handle);
+    ok &= check(first != nullptr && second != nullptr,
+        "synchronized repaints above unchanged blank rows preserve both cc successors");
+    const term::Terminal_selection_attachment_resolution resolution =
+        model.resolve_selection_attachment(lease, source, result);
+    ok &= check(resolution.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            resolution.translated_lease.has_value() &&
+            resolution.translated_lease->selected_lines.size() == 1U &&
+            second != nullptr &&
+            resolution.translated_lease->selected_lines.front().history_handle ==
+                second->final_handle &&
+            resolution.translated_lease->selected_range == range &&
+            resolution.old_logical_rows == std::vector<int>({2}) &&
+            resolution.final_logical_rows == std::vector<int>({2}),
+        "selection above an unchanged blank tail follows original cc through both repaints");
+    ok &= check(model.scrollback_size() == 2 &&
+            result.recovery_proposals.size() == 2U &&
+            model.row_text(0) == QStringLiteral("cc") &&
+            model.row_text(2) == QStringLiteral("ee") &&
+            model.row_text(4).isEmpty() &&
+            model.row_text(15).isEmpty(),
+        "recovery above unchanged blank rows retains aa and bb without changing the active frame");
+
+    return ok;
+}
+
 bool test_primary_repaint_recovery_preserves_row_content_stamps()
 {
     bool ok = true;
@@ -2612,6 +2681,51 @@ bool test_flat_ring_retained_hyperlink_metadata_authority()
                 after_eviction_snapshot,
                 retained_uris[static_cast<std::size_t>(first_surviving_uri)]),
         "flat-ring clear needs no retained hyperlink pre-reclaim cleanup for correctness");
+
+    return ok;
+}
+
+bool test_repaint_recovery_shift_helper_ignores_only_unchanged_blank_tail()
+{
+    bool ok = true;
+
+    for (const int rows : {7, 52}) {
+        term::terminal_repaint_recovery_shift_input_t input;
+        input.candidate_active          = true;
+        input.primary_buffer_active     = true;
+        input.scrollback_rows_unchanged = true;
+        input.candidate_rows = {
+            QStringLiteral("aa"),
+            QStringLiteral("bb"),
+            QStringLiteral("cc"),
+            QStringLiteral("dd"),
+        };
+        input.current_rows = {
+            QStringLiteral("bb"),
+            QStringLiteral("cc"),
+            QStringLiteral("dd"),
+            QStringLiteral("ee"),
+        };
+        input.candidate_rows.resize(static_cast<std::size_t>(rows));
+        input.current_rows.resize(static_cast<std::size_t>(rows));
+        const term::terminal_repaint_recovery_shift_result_t shift =
+            term::primary_repaint_recovery_shift_result(input);
+        ok &= check(shift.shifted_rows == 1 &&
+                shift.matched_prefix_rows == 3 &&
+                shift.unmatched_tail_rows == rows - 4 &&
+                shift.match_kind == term::Terminal_repaint_recovery_match_kind::PARTIAL,
+            "recovery helper accepts a short rewrite above unchanged blank rows with raw match counts");
+
+        input.candidate_rows.back() = QStringLiteral("footer");
+        ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+            "recovery helper counts a cleared nonblank tail toward the rewrite bound");
+        input.current_rows.back() = QStringLiteral("footer");
+        ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+            "recovery helper counts an unchanged nonblank footer toward the rewrite bound");
+        input.candidate_rows.back().clear();
+        ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+            "recovery helper counts a newly written nonblank tail toward the rewrite bound");
+    }
 
     return ok;
 }
@@ -6852,9 +6966,11 @@ int main()
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();
+    ok &= test_repaint_recovery_shift_helper_ignores_only_unchanged_blank_tail();
     ok &= test_primary_repaint_recovery_accepts_distinct_shift();
     ok &= test_primary_repaint_recovery_accepts_anchored_footer_continuation();
     ok &= test_selection_attachment_follows_multiple_successors_in_one_ingest();
+    ok &= test_primary_repaint_recovery_preserves_successors_above_unchanged_blank_tail();
     ok &= test_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_primary_repaint_recovery_recovers_blank_separator_row();
     ok &= test_primary_repaint_recovery_preserves_styled_blank_separator_row();
