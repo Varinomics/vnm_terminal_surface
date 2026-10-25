@@ -61,7 +61,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
 
     constexpr int k_min_meaningful_matches                 = 2;
     constexpr int k_preferred_meaningful_matches           = 3;
-    constexpr int k_min_partial_blank_rewritten_tail_rows  = 2;
+    constexpr int k_min_partial_rewritten_tail_rows        = 2;
     constexpr int k_min_anchored_meaningful_matches        = 3;
 
     const int row_count = static_cast<int>(input.candidate_rows.size());
@@ -118,25 +118,23 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
             continue;
         }
 
-        // The rows that prove an upward shift are the surviving rows that
-        // matched after the shift, not the displaced payload itself, so a blank
-        // displaced row is still recoverable - dropping it is what makes blank
-        // separator lines vanish from reconstructed scrollback. A blank payload
-        // is weaker evidence than a text-bearing one, so accept either a full
-        // surviving-suffix match or a preferred-strength partial match. The
-        // latter is still limited to a bounded rewritten tail so broad layout
-        // repaints, such as a startup banner moving upward, do not manufacture
-        // scrollback from a top spacer.
+        // Matching surviving rows prove the upward shift, not the displaced
+        // payload. Bound every partial match's tail so broad graphic/layout
+        // repaints cannot manufacture history from a short shifted prefix.
+        // A blank displaced row additionally needs preferred-strength evidence;
+        // a full surviving suffix remains sufficient for either payload.
         const bool full_surviving_suffix_matched =
             matched_prefix == row_count - shift;
         const int unmatched_tail_rows = row_count - shift - matched_prefix;
-        const int max_partial_blank_rewritten_tail_rows =
-            std::max(k_min_partial_blank_rewritten_tail_rows, row_count / 4);
+        const int max_partial_rewritten_tail_rows =
+            std::max(k_min_partial_rewritten_tail_rows, row_count / 4);
+        if (unmatched_tail_rows > max_partial_rewritten_tail_rows) {
+            continue;
+        }
         const bool strong_partial_blank_shift =
             meaningful_matches >= k_preferred_meaningful_matches &&
             static_cast<int>(distinct_matched_texts.size()) >=
-                k_preferred_meaningful_matches &&
-            unmatched_tail_rows <= max_partial_blank_rewritten_tail_rows;
+                k_preferred_meaningful_matches;
         if (!displaced_has_text &&
             !full_surviving_suffix_matched &&
             !strong_partial_blank_shift)

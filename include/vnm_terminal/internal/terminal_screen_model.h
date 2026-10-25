@@ -1477,6 +1477,7 @@ private:
     void clear_all_tab_stops();
     std::optional<terminal_history_handle_t> append_scrollback_row(
         const Terminal_screen_row&     row,
+        const char*                    append_path,
         Terminal_retained_line_provenance_source source =
             Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
         const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys =
@@ -1818,6 +1819,9 @@ private:
         Terminal_buffer_id             buffer_id,
         std::vector<int>&              logical_rows) const;
 
+    struct History_growth_observation;
+    std::shared_ptr<History_growth_observation>
+                                    m_history_growth_observation;
     Terminal_screen_model_config    m_config;
     Terminal_byte_stream_parser     m_parser;
     Terminal_color_state            m_color_state;

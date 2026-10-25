@@ -12,8 +12,15 @@
 
 #include <QByteArray>
 #include <QChar>
+#include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
+#include <QDir>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSaveFile>
 #include <QScopedValueRollback>
 #include <QSize>
 #include <QStringList>
@@ -279,6 +286,8 @@ QImage composite_image_band(
     const QImage&               band,
     const composite_layout_t&   layout)
 {
+    const int band_width  = band.width();
+    const int band_height = band.height();
     QImage earlier_pixels = earlier.pixels;
     if (earlier_pixels.width()  != layout.earlier_width ||
         earlier_pixels.height() != layout.earlier_height)
@@ -299,18 +308,37 @@ QImage composite_image_band(
     if (combined.isNull() || earlier_pixels.isNull()) {
         throw std::bad_alloc();
     }
+
+    // Equal extents need no cleared union or separate copy of earlier pixels:
+    // every output pixel comes from the band or its immutable predecessor.
+    if (earlier_x == 0 && band_x == 0 &&
+        layout.earlier_width  == band_width &&
+        layout.earlier_height == band_height)
+    {
+        for (int y = 0; y < band_height; ++y) {
+            auto*       target = reinterpret_cast<std::uint32_t*>(combined.scanLine(y));
+            const auto* source = reinterpret_cast<const std::uint32_t*>(band.constScanLine(y));
+            const auto* prior  = reinterpret_cast<const std::uint32_t*>(earlier_pixels.constScanLine(y));
+            for (int x = 0; x < band_width; ++x) {
+                const std::uint32_t pixel = source[x];
+                target[x] = pixel != 0U ? pixel : prior[x];
+            }
+        }
+        return combined;
+    }
+
     combined.fill(0U);
 
-    for (int y = 0; y < earlier_pixels.height(); ++y) {
+    for (int y = 0; y < layout.earlier_height; ++y) {
         std::memcpy(
             combined.scanLine(y) + static_cast<std::size_t>(earlier_x) * sizeof(std::uint32_t),
             earlier_pixels.constScanLine(y),
-            static_cast<std::size_t>(earlier_pixels.width()) * sizeof(std::uint32_t));
+            static_cast<std::size_t>(layout.earlier_width) * sizeof(std::uint32_t));
     }
-    for (int y = 0; y < band.height(); ++y) {
+    for (int y = 0; y < band_height; ++y) {
         auto*       target = reinterpret_cast<std::uint32_t*>(combined.scanLine(y)) + band_x;
         const auto* source = reinterpret_cast<const std::uint32_t*>(band.constScanLine(y));
-        for (int x = 0; x < band.width(); ++x) {
+        for (int x = 0; x < band_width; ++x) {
             if (source[x] != 0U) {
                 target[x] = source[x];
             }
@@ -535,6 +563,257 @@ Terminal_screen_model_config_status validate_terminal_screen_model_config(
     return Terminal_screen_model_config_status::OK;
 }
 
+// This opt-in observer records one actual append, not the incoming byte stream.
+// Parser offsets delimit a batch: Parser_action has no per-action byte offset.
+struct Terminal_screen_model::History_growth_observation
+{
+    struct Input_context
+    {
+        std::uint64_t ingest          = 0U;
+        std::uint64_t sequence        = 0U;
+        std::uint64_t consumed_before = 0U;
+        qsizetype     chunk_size      = 0;
+        qsizetype     batch_begin     = 0;
+        qsizetype     batch_end       = 0;
+        std::size_t   action_ordinal  = 0U;
+        bool          in_ingest       = false;
+    };
+
+    explicit History_growth_observation(const QString& directory)
+    {
+        static std::atomic<std::uint64_t> next_model{0U};
+        path = QDir(directory).filePath(
+            QStringLiteral("terminal-history-growth-%1-%2.json")
+                .arg(QCoreApplication::applicationPid())
+                .arg(++next_model));
+        document = {
+            {QStringLiteral("schema_version"), 1},
+            {QStringLiteral("status"), QStringLiteral("armed")},
+            {QStringLiteral("event_limit"), 1},
+            {QStringLiteral("pid"), QString::number(QCoreApplication::applicationPid())},
+            {QStringLiteral("directory"), directory},
+        };
+        save();
+    }
+
+    ~History_growth_observation()
+    {
+        if (!finished) {
+            document.insert(QStringLiteral("status"), QStringLiteral("completed-without-growth"));
+            document.insert(QStringLiteral("last_input"), input_json(input));
+            save();
+        }
+    }
+
+    static QJsonObject input_json(const Input_context& context)
+    {
+        return {
+            {QStringLiteral("model_ingest_ordinal"), QString::number(context.ingest)},
+            {QStringLiteral("session_sequence"), QString::number(context.sequence)},
+            {QStringLiteral("model_consumed_bytes_before_ingest"),
+                QString::number(context.consumed_before)},
+            {QStringLiteral("chunk_size"), static_cast<qint64>(context.chunk_size)},
+            {QStringLiteral("parser_batch_begin"), static_cast<qint64>(context.batch_begin)},
+            {QStringLiteral("parser_batch_end"), static_cast<qint64>(context.batch_end)},
+            {QStringLiteral("action_ordinal_in_batch"),
+                QString::number(context.action_ordinal)},
+            {QStringLiteral("in_model_ingest"), context.in_ingest},
+        };
+    }
+
+    static QJsonObject state(const Terminal_screen_model& model)
+    {
+        return {
+            {QStringLiteral("rows"), model.m_config.grid_size.rows},
+            {QStringLiteral("columns"), model.m_config.grid_size.columns},
+            {QStringLiteral("cursor_row"), model.m_cursor.row},
+            {QStringLiteral("cursor_column"), model.m_cursor.column},
+            {QStringLiteral("scroll_top"), model.m_scroll_top},
+            {QStringLiteral("scroll_bottom"), model.m_scroll_bottom},
+            {QStringLiteral("scroll_left"), model.m_scroll_left},
+            {QStringLiteral("scroll_right"), model.m_scroll_right},
+            {QStringLiteral("horizontal_margin_mode"), model.m_horizontal_margin_mode},
+            {QStringLiteral("origin_mode"), model.m_origin_mode},
+            {QStringLiteral("cursor_visible"), model.m_modes.cursor_visible},
+            {QStringLiteral("pending_wrap"), model.m_pending_wrap},
+            {QStringLiteral("synchronized_output"), model.m_modes.synchronized_output},
+            {QStringLiteral("primary_buffer"), model.m_active_buffer_id == Terminal_buffer_id::PRIMARY},
+            {QStringLiteral("history_rows"), model.scrollback_size()},
+            {QStringLiteral("clear_page_start_row"), model.m_clear_page_start_row},
+            {QStringLiteral("backend_owns_screen_buffers"), model.m_config.backend_owns_screen_buffers},
+            {QStringLiteral("recover_primary_repaints"),
+                model.m_config.recover_scrollback_from_primary_repaints},
+            {QStringLiteral("repaint_resize_guard_remaining"),
+                model.m_primary_repaint_recovery_resize_guard_remaining},
+        };
+    }
+
+    void begin_ingest(
+        QByteArrayView bytes,
+        const terminal_screen_model_resize_transition_sink_t* sink)
+    {
+        ++input.ingest;
+        input.sequence        = sink != nullptr ? sink->sequence : 0U;
+        input.consumed_before = consumed_bytes;
+        input.chunk_size      = bytes.size();
+        input.batch_begin     = 0;
+        input.batch_end       = 0;
+        input.action_ordinal  = 0U;
+        input.in_ingest       = true;
+        chunk                 = bytes;
+        action                = nullptr;
+    }
+
+    QJsonObject action_json() const
+    {
+        if (action == nullptr) {
+            return {{QStringLiteral("boundary"), input.in_ingest
+                ? QStringLiteral("visible-cursor-ingest-end")
+                : QStringLiteral("outside-model-ingest")}};
+        }
+        QJsonObject result{
+            {QStringLiteral("kind"), static_cast<int>(parser_action_kind(*action))},
+        };
+        if (const auto* sequence = std::get_if<Parser_control_sequence>(&action->payload)) {
+            result.insert(QStringLiteral("control_sequence_hex"),
+                QString::fromLatin1(sequence->raw_bytes.left(128).toHex()));
+            result.insert(QStringLiteral("control_sequence_bytes"), sequence->raw_bytes.size());
+        }
+        if (const auto* mutation = std::get_if<Screen_mutation>(&action->payload)) {
+            const Screen_mutation_kind kind = screen_mutation_kind(*mutation);
+            result.insert(QStringLiteral("screen_mutation_kind"),
+                static_cast<int>(kind));
+            if (kind == Screen_mutation_kind::LINE_FEED || kind == Screen_mutation_kind::PRINT_TEXT) {
+                result.insert(QStringLiteral("screen_mutation"), kind == Screen_mutation_kind::LINE_FEED
+                    ? QStringLiteral("LINE_FEED") : QStringLiteral("PRINT_TEXT"));
+            }
+        }
+        return result;
+    }
+
+    void record_repaint(
+        const Terminal_screen_model& model,
+        const primary_repaint_recovery_candidate_t& candidate,
+        const terminal_repaint_recovery_shift_result_t& shift)
+    {
+        repaint = {
+            {QStringLiteral("reason"), QStringLiteral("PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS")},
+            {QStringLiteral("match_kind"), shift.match_kind == Terminal_repaint_recovery_match_kind::FULL
+                ? QStringLiteral("FULL")
+                : shift.match_kind == Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED
+                    ? QStringLiteral("PARTIAL_ANCHORED") : QStringLiteral("PARTIAL")},
+            {QStringLiteral("selected_shift"), shift.shifted_rows},
+            {QStringLiteral("matched_prefix_rows"), shift.matched_prefix_rows},
+            {QStringLiteral("unmatched_tail_rows"), shift.unmatched_tail_rows},
+            {QStringLiteral("anchored_suffix_rows"), shift.anchored_suffix_rows},
+            {QStringLiteral("candidate_history_rows"), candidate.scrollback_rows},
+            {QStringLiteral("candidate_active"), candidate.active},
+            {QStringLiteral("history_rows_unchanged"), candidate.scrollback_rows == model.scrollback_size()},
+            {QStringLiteral("candidate_visible_rows"), static_cast<qint64>(candidate.rows.size())},
+            {QStringLiteral("visible_row_identity_ambiguous"), candidate.visible_row_identity_ambiguous},
+            {QStringLiteral("line_start_clear_before_text"), candidate.line_start_clear_before_text},
+            {QStringLiteral("explicit_non_home_repaint_address"), candidate.explicit_non_home_repaint_address},
+            {QStringLiteral("continuing_repaint_episode"), model.m_primary_repaint_recovery_episode_active},
+            {QStringLiteral("candidate_started_at"), input_json(candidate_input)},
+        };
+        QJsonArray comparisons;
+        QJsonArray appended_rows;
+        for (int row = 0; row < std::min(64, shift.shifted_rows); ++row) {
+            const QString text = model.row_text_from_cells(
+                candidate.rows[static_cast<std::size_t>(row)].cells,
+                0, model.m_config.grid_size.columns);
+            appended_rows.push_back(QJsonObject{
+                {QStringLiteral("candidate_row"), row},
+                {QStringLiteral("text"), text.left(256)},
+                {QStringLiteral("text_truncated"), text.size() > 256},
+            });
+        }
+        const auto& current_rows = model.active_grid_rows();
+        const int   rows         = std::min(64, static_cast<int>(current_rows.size()));
+        for (int row = 0; row < rows; ++row) {
+            const int predecessor = shift.match_kind == Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED &&
+                    row >= static_cast<int>(current_rows.size()) - shift.anchored_suffix_rows
+                ? row : row + shift.shifted_rows;
+            const bool has_predecessor = predecessor < static_cast<int>(candidate.rows.size());
+            const QString candidate_text = has_predecessor
+                ? model.row_text_from_cells(candidate.rows[static_cast<std::size_t>(predecessor)].cells,
+                    0, model.m_config.grid_size.columns)
+                : QString();
+            const QString current_text = model.row_text_from_cells(
+                current_rows[static_cast<std::size_t>(row)].cells,
+                0, model.m_config.grid_size.columns);
+            comparisons.push_back(QJsonObject{
+                {QStringLiteral("current_row"), row},
+                {QStringLiteral("candidate_row"), has_predecessor ? predecessor : -1},
+                {QStringLiteral("equal"), has_predecessor && candidate_text == current_text},
+                {QStringLiteral("matched_by_decision"), row < shift.matched_prefix_rows ||
+                    (shift.match_kind == Terminal_repaint_recovery_match_kind::PARTIAL_ANCHORED &&
+                        row >= static_cast<int>(current_rows.size()) - shift.anchored_suffix_rows)},
+                {QStringLiteral("candidate_text"), candidate_text.left(256)},
+                {QStringLiteral("current_text"), current_text.left(256)},
+                {QStringLiteral("text_truncated"), candidate_text.size() > 256 || current_text.size() > 256},
+            });
+        }
+        repaint.insert(QStringLiteral("row_comparisons"), comparisons);
+        repaint.insert(QStringLiteral("appended_candidate_rows"), appended_rows);
+        repaint.insert(QStringLiteral("rows_truncated"), current_rows.size() > 64U);
+        repaint.insert(QStringLiteral("appended_rows_truncated"), shift.shifted_rows > 64);
+    }
+
+    void record_append(
+        const Terminal_screen_model& model,
+        const char* append_path,
+        Terminal_retained_line_provenance_source source,
+        const QJsonObject& before)
+    {
+        finished = true;
+        document.insert(QStringLiteral("status"), QStringLiteral("captured"));
+        document.insert(QStringLiteral("steady_ns"), QString::number(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()));
+        document.insert(QStringLiteral("append_path"), QString::fromLatin1(append_path));
+        document.insert(QStringLiteral("provenance"), source ==
+                Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT
+            ? QStringLiteral("RECOVERED_PRIMARY_REPAINT") : QStringLiteral("TERMINAL_STORAGE"));
+        document.insert(QStringLiteral("before"), before);
+        document.insert(QStringLiteral("after"), state(model));
+        document.insert(QStringLiteral("input"), input_json(input));
+        document.insert(QStringLiteral("action"), action_json());
+        if (input.in_ingest) {
+            document.insert(QStringLiteral("chunk_sha256"), QString::fromLatin1(
+                QCryptographicHash::hash(chunk, QCryptographicHash::Sha256).toHex()));
+        }
+        if (source == Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT) {
+            document.insert(QStringLiteral("repaint"), repaint);
+        }
+        if (!save()) {
+            document.insert(QStringLiteral("status"), QStringLiteral("capture-save-failed"));
+            save();
+        }
+    }
+
+    bool save()
+    {
+        QSaveFile file(path);
+        const QByteArray bytes = QJsonDocument(document).toJson();
+        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
+            document.insert(QStringLiteral("previous_save_error"), file.errorString());
+            return false;
+        }
+        return true;
+    }
+
+    QString       path;
+    QJsonObject   document;
+    QJsonObject   repaint;
+    Input_context input;
+    Input_context candidate_input;
+    QByteArrayView chunk;
+    const Parser_action* action = nullptr;
+    std::uint64_t consumed_bytes = 0U;
+    bool          finished       = false;
+};
+
 Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config)
 :
     m_config(config),
@@ -559,6 +838,12 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
 
     reset_grid();
     refresh_active_grid_retained_lookup_indexes();
+    const QString history_diagnostic_directory =
+        qEnvironmentVariable("VNM_TERMINAL_HISTORY_DIAGNOSTIC_DIR");
+    if (!history_diagnostic_directory.isEmpty()) {
+        m_history_growth_observation =
+            std::make_shared<History_growth_observation>(history_diagnostic_directory);
+    }
 }
 
 Terminal_screen_model::Resize_transition_scope::Resize_transition_scope(
@@ -599,6 +884,12 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
     std::size_t* macro_replay_bytes_remaining)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::ingest");
+
+    History_growth_observation* history_observation =
+        m_history_growth_observation.get();
+    if (history_observation != nullptr && !history_observation->finished) {
+        history_observation->begin_ingest(bytes, resize_transition_sink);
+    }
 
     Terminal_screen_model_result result;
     m_scrollback_evicted_rows = 0;
@@ -659,10 +950,16 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
         {
             VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::parser_ingest");
             const qsizetype parsed_before = parsed;
+            if (history_observation != nullptr && !history_observation->finished) {
+                history_observation->input.batch_begin = parsed_before;
+            }
             const bool budget_spent_before =
                 sixel_work_budget != nullptr && sixel_work_budget->exhausted();
             parser_actions = m_parser.ingest(
                 bytes, parsed, sixel_work_budget, macro_replay_bytes_remaining);
+            if (history_observation != nullptr && !history_observation->finished) {
+                history_observation->input.batch_end = parsed;
+            }
             // Every parse makes progress: it takes bytes, or it resolves input
             // it held before (a recovery at a held ESC emits its diagnostic).
             // Only a budget work earlier in the step already spent, such as a
@@ -678,7 +975,12 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
             result.actions.reserve(parser_actions.size());
         }
 
+        std::size_t history_action_ordinal = 0U;
         for (const Parser_action& action : parser_actions) {
+            if (history_observation != nullptr && !history_observation->finished) {
+                history_observation->input.action_ordinal = history_action_ordinal++;
+                history_observation->action = &action;
+            }
             const std::size_t result_action_begin = result.actions.size();
             if (m_config.retain_structural_actions || action_is_session_visible(action)) {
                 result.actions.push_back(action);
@@ -747,6 +1049,9 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
 
     // The chunk's end is where an unbudgeted ingest would have finished it.
     if (!deferred && m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
+        if (history_observation != nullptr && !history_observation->finished) {
+            history_observation->action = nullptr;
+        }
         clear_dirty();
         finish_primary_repaint_recovery_candidate(false);
         accumulate_pending_changes(resize_transition_publication);
@@ -774,6 +1079,12 @@ Terminal_screen_model_result Terminal_screen_model::ingest(
     }
     result.consumed_bytes     = parsed;
     result.parser_work_pending = deferred;
+    if (history_observation != nullptr) {
+        history_observation->consumed_bytes += static_cast<std::uint64_t>(parsed);
+        history_observation->input.in_ingest = false;
+        history_observation->chunk = {};
+        history_observation->action = nullptr;
+    }
     return result;
 }
 
@@ -4478,6 +4789,7 @@ void Terminal_screen_model::resize_buffer_state(
         if (primary) {
             append_scrollback_row(
                 state.rows[(std::size_t)row],
+                "resize-active-grid-prefix",
                 Terminal_retained_line_provenance_source::TERMINAL_STORAGE);
         }
     }
@@ -7168,11 +7480,17 @@ void Terminal_screen_model::clear_all_tab_stops()
 
 std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollback_row(
     const Terminal_screen_row&               row,
+    const char*                              append_path,
     Terminal_retained_line_provenance_source source,
     const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
     const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id)
 {
     std::optional<terminal_history_handle_t> appended_handle;
+    History_growth_observation* history_observation =
+        m_history_growth_observation.get();
+    const QJsonObject history_before = history_observation != nullptr &&
+            !history_observation->finished
+        ? History_growth_observation::state(*this) : QJsonObject();
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
         ++m_profile_stats.scrollback_appends_from_text_writes;
@@ -7278,6 +7596,11 @@ std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollbac
             1);
     }
     mark_viewport_changed();
+    if (history_observation != nullptr && !history_observation->finished &&
+        scrollback_size() > history_before.value(QStringLiteral("history_rows")).toInt())
+    {
+        history_observation->record_append(*this, append_path, source, history_before);
+    }
     return appended_handle;
 }
 
@@ -7475,6 +7798,7 @@ void Terminal_screen_model::scroll_up_region(
         if (append_scrollback) {
             append_scrollback_row(
                 active_grid_rows()[static_cast<std::size_t>(top)],
+                "scroll-up-region",
                 Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
                 nullptr,
                 active_identity_keys);
@@ -7668,6 +7992,9 @@ void Terminal_screen_model::begin_primary_repaint_recovery_candidate()
     m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous =
         false;
     m_primary_repaint_recovery_candidate.active                       = true;
+    if (m_history_growth_observation != nullptr && !m_history_growth_observation->finished) {
+        m_history_growth_observation->candidate_input = m_history_growth_observation->input;
+    }
 }
 
 void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
@@ -7751,6 +8078,9 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
         static_cast<int>(candidate.rows.size()),
         shift.shifted_rows,
     });
+    if (m_history_growth_observation != nullptr && !m_history_growth_observation->finished) {
+        m_history_growth_observation->record_repaint(*this, candidate, shift);
+    }
     accept_primary_repaint_recovery_proposal(*proposal);
     std::vector<Terminal_screen_row>& active_rows = active_grid_rows();
     terminal_selection_continuity_capability_t& continuity = selection_continuity();
@@ -7926,6 +8256,7 @@ void Terminal_screen_model::accept_primary_repaint_recovery_proposal(
                 recovered_row.retained_line_provenance);
         const std::optional<terminal_history_handle_t> final_handle = append_scrollback_row(
             recovered_row,
+            "accept-primary-repaint-recovery-proposal",
             proposal.metadata.provenance_source,
             &proposal.hyperlink_identity_keys,
             active_identity_keys);
@@ -8309,9 +8640,8 @@ std::uint64_t Terminal_screen_model::sixel_band_cost(
             static_cast<std::uint64_t>(std::max<std::int64_t>(0, band_height));
 }
 
-// Drawing a band over its row's earlier image composites the union of their
-// columns: the union is cleared, the earlier image copied, resampled first
-// when its cell differs, and the band drawn over it.
+// Charge for the general composite's clear, copy and possible resampling.
+// Equal extents use less work but keep the same placement yield boundaries.
 std::uint64_t Terminal_screen_model::sixel_composite_cost(
     const Sixel_placement& placement,
     int                    row) const
@@ -8494,8 +8824,8 @@ std::size_t Terminal_screen_model::place_image_band(
     int                        end_column,
     terminal_cell_pixel_size_t cell)
 {
-    // Clip at the right margin, and copy the band out of the decoder's raster,
-    // which may be a view keeping a larger capacity buffer alive.
+    // Borrow the clipped band only while preparing the row. Published pixels
+    // must own their storage instead of retaining the decoder's larger raster.
     const int band_width = static_cast<int>(std::min<std::int64_t>(
         raster.width(),
         static_cast<std::int64_t>(end_column - first_column) * cell.width));
@@ -8503,8 +8833,13 @@ std::size_t Terminal_screen_model::place_image_band(
 
     // The band is laid out as the slice it may become, so its columns come
     // from the one slice rule; make_image_slice gives it a revision.
-    Terminal_image_slice band{
-        QImage(band_width, band_height, QImage::Format_RGBA8888_Premultiplied),
+    const Terminal_image_slice band{
+        QImage(
+            raster.constScanLine(band_top),
+            band_width,
+            band_height,
+            raster.bytesPerLine(),
+            raster.format()),
         first_column,
         cell,
         0U,
@@ -8522,10 +8857,6 @@ std::size_t Terminal_screen_model::place_image_band(
     for (int y = 0; y < band_height; ++y) {
         const auto* source =
             reinterpret_cast<const std::uint32_t*>(raster.constScanLine(band_top + y));
-        std::memcpy(
-            band.pixels.scanLine(y),
-            source,
-            static_cast<std::size_t>(band_width) * sizeof(std::uint32_t));
         for (int column = 0; column < band_columns; ++column) {
             if (covered_columns[static_cast<std::size_t>(column)] != 0U) {
                 continue;
@@ -8556,6 +8887,7 @@ std::size_t Terminal_screen_model::place_image_band(
     // replaces the earlier image, and the refused size is reported.
     std::size_t refused_composite_bytes = 0U;
     int         slice_first_column      = first_column;
+    QImage pixels;
     if (screen_row.image_slice != nullptr) {
         const composite_layout_t layout = composite_image_layout(
             *screen_row.image_slice,
@@ -8566,12 +8898,18 @@ std::size_t Terminal_screen_model::place_image_band(
             refused_composite_bytes = static_cast<std::size_t>(layout.bytes);
         }
         else {
-            band.pixels        = composite_image_band(*screen_row.image_slice, band.pixels, layout);
+            pixels             = composite_image_band(*screen_row.image_slice, band.pixels, layout);
             slice_first_column = layout.first_column;
         }
     }
+    if (pixels.isNull()) {
+        pixels = band.pixels.copy();
+        if (pixels.isNull()) {
+            throw std::bad_alloc();
+        }
+    }
     std::shared_ptr<const Terminal_image_slice> image =
-        make_image_slice(std::move(band.pixels), slice_first_column, cell);
+        make_image_slice(std::move(pixels), slice_first_column, cell);
 
     // Text under an image would draw over it, so a covered cell loses its
     // text and hyperlink and keeps its style, the way an erase leaves a cell;

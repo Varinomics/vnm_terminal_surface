@@ -2072,6 +2072,110 @@ bool test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint()
     return ok;
 }
 
+bool test_primary_repaint_recovery_suppresses_broad_graphic_repaint()
+{
+    bool ok = true;
+
+    // The matcher depends on blankness and row equality. These labels preserve
+    // the complete 52-row relation captured across two heart-fadeout frames,
+    // including repeated rows and the independently rewritten footer.
+    struct row_pair_t
+    {
+        int candidate;
+        int current;
+    };
+    constexpr std::array<row_pair_t, 52> row_ids = {{
+        {27,  1},
+        { 1,  2},
+        { 2,  3},
+        { 3,  4},
+        { 4,  5},
+        { 5,  7},
+        { 6,  8},
+        { 7,  8},
+        { 7,  9},
+        { 8,  9},
+        { 8,  9},
+        { 8,  9},
+        { 8,  9},
+        { 8,  9},
+        { 7,  8},
+        { 7,  8},
+        { 5,  7},
+        { 4,  7},
+        {10,  5},
+        {11, 10},
+        {12, 14},
+        {13, 12},
+        {15, 17},
+        {16, 15},
+        {18, 20},
+        {19, 18},
+        {21, 19},
+        {22, 21},
+        {23, 22},
+        {24, 23},
+        {25, 26},
+    }};
+    const auto row_text = [](int identity) {
+        return identity == 0 ? QString() : QStringLiteral("graphic-row-%1").arg(identity);
+    };
+
+    term::terminal_repaint_recovery_shift_input_t input;
+    input.candidate_active          = true;
+    input.primary_buffer_active     = true;
+    input.scrollback_rows_unchanged = true;
+    for (const row_pair_t& row : row_ids) {
+        input.candidate_rows.push_back(row_text(row.candidate));
+        input.current_rows.push_back(row_text(row.current));
+    }
+    const term::terminal_repaint_recovery_shift_result_t shift =
+        term::primary_repaint_recovery_shift_result(input);
+    ok &= check(shift.shifted_rows == 0,
+        "recovery helper rejects a graphic repaint with a five-row prefix and 46-row unmatched tail");
+    if (shift.shifted_rows != 0) {
+        std::cerr
+            << "graphic repaint recovery: shift=" << shift.shifted_rows
+            << " matched_prefix=" << shift.matched_prefix_rows
+            << " unmatched_tail=" << shift.unmatched_tail_rows << '\n';
+    }
+
+    const auto frame_stream = [](const std::vector<QString>& rows) {
+        QByteArray stream = QByteArrayLiteral("\x1b[?25l\x1b[H");
+        for (int row = 0; row < 31; ++row) {
+            stream += rows[static_cast<std::size_t>(row)].toUtf8().leftJustified(80, ' ');
+            if (row < 30) {
+                stream += QByteArrayLiteral("\r\n");
+            }
+        }
+        return stream;
+    };
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {52, 144};
+    config.scrollback_limit                         = 64;
+    config.recover_scrollback_from_primary_repaints = true;
+    config.backend_owns_screen_buffers              = true;
+    term::Terminal_screen_model model(config);
+    model.ingest(frame_stream(input.candidate_rows));
+    model.ingest(frame_stream(input.current_rows));
+    ok &= check(model.scrollback_size() == 0 &&
+            model.cursor_position().row == 30 &&
+            model.cursor_position().column == 80,
+        "captured graphic repaint fits the grid without moving the cursor to its bottom");
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(QByteArrayLiteral("\x1b[H"));
+    ok &= check(model.scrollback_size() == 0 &&
+            result.backing_deltas.empty() &&
+            result.recovery_proposals.empty(),
+        "HOME after a broad graphic repaint does not archive part of the animation as history");
+    ok &= check(model.row_text(0) == input.current_rows[0] &&
+            model.row_text(30) == input.current_rows[30] &&
+            model.row_text(31).isEmpty(),
+        "suppressed recovery preserves the repainted graphic and footer");
+    return ok;
+}
+
 bool test_flat_ring_retained_record_producer_contract()
 {
     bool ok = true;
@@ -2638,6 +2742,29 @@ bool test_repaint_recovery_shift_helper_matches_policy()
             partial_shift.matched_prefix_rows == 3 &&
             partial_shift.unmatched_tail_rows == 2,
         "recovery helper accepts a blank displaced row on a strong partial-suffix match");
+
+    input.candidate_rows = {
+        QStringLiteral("header"),
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("bb"),
+        QStringLiteral("old"),
+        QStringLiteral("tail"),
+    };
+    input.current_rows = {
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("bb"),
+        QStringLiteral("new"),
+        QStringLiteral("tail2"),
+        QStringLiteral("tail3"),
+    };
+    const term::terminal_repaint_recovery_shift_result_t text_partial_shift =
+        term::primary_repaint_recovery_shift_result(input);
+    ok &= check(text_partial_shift.shifted_rows == 1 &&
+            text_partial_shift.matched_prefix_rows == 3 &&
+            text_partial_shift.unmatched_tail_rows == 2,
+        "recovery helper preserves bounded text partials with two distinct surviving rows");
 
     input.candidate_rows = {
         QString(),
@@ -6736,6 +6863,7 @@ int main()
     ok &= test_model_selection_attachment_resolver_matrix();
     ok &= test_model_selection_attachment_resolver_row_eviction();
     ok &= test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
+    ok &= test_primary_repaint_recovery_suppresses_broad_graphic_repaint();
     ok &= test_flat_ring_retained_record_producer_contract();
     ok &= test_flat_ring_recovery_shared_producer_boundary();
     ok &= test_flat_ring_resize_projects_retained_history_without_mutation();
