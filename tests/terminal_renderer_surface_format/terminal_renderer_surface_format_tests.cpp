@@ -3,6 +3,7 @@
 
 #include <QGuiApplication>
 #include <QOpenGLContext>
+#include <QQuickWindow>
 #include <QSurfaceFormat>
 
 #include <iostream>
@@ -74,12 +75,23 @@ bool check_applied(
 
 int main(int argc, char** argv)
 {
-    // The module type that decides an unspecified renderable type is a
-    // platform query, so the minimum is applied after the application exists,
-    // as every host does.
     QGuiApplication application(argc, argv);
     bool            ok = true;
 
+#if defined(Q_OS_WIN)
+    QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11);
+#else
+    QQuickWindow::setGraphicsApi(QSGRendererInterface::Null);
+#endif
+    const QSurfaceFormat non_gl_format = requested_format(QSurfaceFormat::DefaultRenderableType, 2, 0);
+    QSurfaceFormat::setDefaultFormat(non_gl_format);
+    vnm_terminal::apply_terminal_renderer_minimum_surface_format();
+    ok &= check(QSurfaceFormat::defaultFormat() == non_gl_format,
+        "a non-OpenGL Qt Quick backend preserves the complete requested format");
+
+    // These cases exercise the OpenGL contract rather than the platform's
+    // default Qt Quick backend. No window or QRhi has been created yet.
+    QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     ok &= check_applied(
         "desktop OpenGL 2.0 is raised to 3.3",
         requested_format(QSurfaceFormat::OpenGL, 2, 0), 3, 3);

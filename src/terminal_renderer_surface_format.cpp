@@ -2,12 +2,17 @@
 
 #include <QOpenGLContext>
 #include <QPair>
+#include <QQuickWindow>
 #include <QSurfaceFormat>
 
 namespace vnm_terminal {
 
 void apply_terminal_renderer_minimum_surface_format()
 {
+    if (QQuickWindow::graphicsApi() != QSGRendererInterface::OpenGL) {
+        return;
+    }
+
     QSurfaceFormat format = QSurfaceFormat::defaultFormat();
     const bool uses_gles =
         format.renderableType() == QSurfaceFormat::OpenGLES ||

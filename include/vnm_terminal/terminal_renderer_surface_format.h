@@ -8,10 +8,11 @@ namespace vnm_terminal {
 // offscreen GLX platform reports the requested version rather than the one the
 // driver provides, so a default request leaves the atlas without either.
 //
-// Raises QSurfaceFormat::defaultFormat() to that minimum, keeping a higher
-// requested version and every other format option. Call it in each process
-// that renders a terminal, after its QGuiApplication exists and before it
-// creates its first window or QRhi.
+// For Qt Quick's selected OpenGL backend, raises QSurfaceFormat::defaultFormat()
+// to that minimum, keeping a higher requested version and every other option.
+// Other RHI backends leave the format unchanged without querying OpenGL.
+// Call it on the GUI thread after QGuiApplication and backend selection, before
+// the process creates its first window or QRhi.
 void apply_terminal_renderer_minimum_surface_format();
 
 } // namespace vnm_terminal
