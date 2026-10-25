@@ -67,6 +67,8 @@ constexpr std::chrono::milliseconds k_wait_timeout(20000);
 constexpr std::chrono::milliseconds k_file_marker_wait_timeout(20000);
 constexpr std::chrono::milliseconds k_console_host_exit_timeout(1000);
 constexpr std::uint64_t k_cpu_accounting_work_usec = 100'000U;
+constexpr int k_cpu_accounting_failure_resample_count = 20;
+constexpr std::chrono::milliseconds k_cpu_accounting_failure_resample_interval(10);
 // The slowest recorded cold ASan completion of this entire test executable was
 // 57.73 seconds, and it reached 80 seconds under full CPU saturation. Bound the
 // first scenario's progressing-output phase at 60 seconds, comfortably inside
@@ -926,7 +928,15 @@ term::Terminal_launch_config launch_config(
     return config;
 }
 
-std::optional<std::uint64_t> process_cpu_time_usec(HANDLE process)
+struct cpu_accounting_process_times_t
+{
+    std::uint64_t kernel_ticks = 0;
+    std::uint64_t user_ticks   = 0;
+};
+
+std::optional<std::uint64_t> process_cpu_time_usec(
+    HANDLE                          process,
+    cpu_accounting_process_times_t* out_times = nullptr)
 {
     FILETIME creation{}, exit{}, kernel{}, user{};
     if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
@@ -936,6 +946,9 @@ std::optional<std::uint64_t> process_cpu_time_usec(HANDLE process)
     const auto ticks = [](FILETIME time) {
         return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
     };
+    if (out_times) {
+        *out_times = {ticks(kernel), ticks(user)};
+    }
     return (ticks(kernel) + ticks(user)) / 10;
 }
 
@@ -999,10 +1012,12 @@ int run_cpu_accounting_root(const QString& executable_path, const QString& direc
 }
 
 bool check_cpu_accounting_sample(
-    term::Windows_conpty_backend&      backend,
-    std::uint64_t                      minimum_cpu_usec,
-    std::string_view                   phase,
-    vnm_terminal::process_cpu_time_t*  out_sample)
+    term::Windows_conpty_backend&         backend,
+    std::uint64_t                         minimum_cpu_usec,
+    std::string_view                      phase,
+    vnm_terminal::process_cpu_time_t*      out_sample,
+    const cpu_accounting_process_times_t* root_times = nullptr,
+    const cpu_accounting_process_times_t* child_times = nullptr)
 {
     const auto before = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1021,6 +1036,27 @@ bool check_cpu_accounting_sample(
     if (!ok) {
         std::cerr << "Job CPU usec=" << sample->cpu_time_usec
             << ", root and child CPU usec=" << minimum_cpu_usec << '\n';
+        if (root_times && child_times) {
+            std::cerr << "Independent process CPU (100 ns ticks): root kernel=" << root_times->kernel_ticks
+                << " user=" << root_times->user_ticks
+                << ", child kernel=" << child_times->kernel_ticks
+                << " user=" << child_times->user_ticks << '\n';
+        }
+        // Preserve the failed sample and verdict while exposing whether the native total settles later.
+        for (int index = 0; index < k_cpu_accounting_failure_resample_count; ++index) {
+            std::this_thread::sleep_for(k_cpu_accounting_failure_resample_interval);
+            const auto later = backend.process_cpu_time();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() - after;
+            std::cerr << "Job CPU failure resample=" << index + 1 << " elapsed_usec=" << elapsed;
+            if (later) {
+                std::cerr << " cpu_usec=" << later->cpu_time_usec
+                    << " sampled_at_usec=" << later->sampled_at_usec << '\n';
+            }
+            else {
+                std::cerr << " unavailable\n";
+            }
+        }
     }
     ok &= check(sample->sampled_at_usec >= static_cast<std::uint64_t>(before) &&
             sample->sampled_at_usec <= static_cast<std::uint64_t>(after),
@@ -1067,11 +1103,13 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     {
         return false;
     }
-    const auto live_root_cpu  = process_cpu_time_usec(root.get());
-    const auto live_child_cpu = process_cpu_time_usec(child.get());
+    cpu_accounting_process_times_t live_root_times{}, live_child_times{};
+    const auto live_root_cpu  = process_cpu_time_usec(root.get(), &live_root_times);
+    const auto live_child_cpu = process_cpu_time_usec(child.get(), &live_child_times);
     if (!check(live_root_cpu && live_child_cpu && *live_child_cpu >= k_cpu_accounting_work_usec,
             "independent process accounting confirms substantial child CPU") ||
-        !check_cpu_accounting_sample(backend, *live_root_cpu + *live_child_cpu, "live child", &live))
+        !check_cpu_accounting_sample(backend, *live_root_cpu + *live_child_cpu, "live child", &live,
+            &live_root_times, &live_child_times))
     {
         return false;
     }
@@ -1083,12 +1121,13 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     {
         return false;
     }
-    const auto final_child_cpu  = process_cpu_time_usec(child.get());
-    const auto waiting_root_cpu = process_cpu_time_usec(root.get());
+    cpu_accounting_process_times_t final_child_times{}, waiting_root_times{};
+    const auto final_child_cpu  = process_cpu_time_usec(child.get(), &final_child_times);
+    const auto waiting_root_cpu = process_cpu_time_usec(root.get(), &waiting_root_times);
     child.reset();
     if (!check(final_child_cpu && waiting_root_cpu, "exited child CPU remains independently readable") ||
         !check_cpu_accounting_sample(backend, *final_child_cpu + *waiting_root_cpu,
-            "child handles closed", &child_exited))
+            "child handles closed", &child_exited, &waiting_root_times, &final_child_times))
     {
         return false;
     }
@@ -1102,11 +1141,12 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     const auto exit = capture.exit_snapshot();
     ok &= check(exit && exit->reason == term::Terminal_exit_reason::EXITED && exit->exit_code == 0,
         "CPU accounting fixture exits successfully");
-    const auto final_root_cpu = process_cpu_time_usec(root.get());
+    cpu_accounting_process_times_t final_root_times{};
+    const auto final_root_cpu = process_cpu_time_usec(root.get(), &final_root_times);
     root.reset();
     if (!check(final_root_cpu.has_value(), "root final CPU is available") ||
         !check_cpu_accounting_sample(backend, *final_root_cpu + *final_child_cpu,
-            "root exited", &root_exited))
+            "root exited", &root_exited, &final_root_times, &final_child_times))
     {
         return false;
     }
