@@ -5,6 +5,7 @@
 #include "native_backend_io_core.h"
 #include "native_backend_cleanup_owner.h"
 #include "posix_process_group_custody.h"
+#include "posix_terminal_descriptors.h"
 #include "posix_terminal_process_owner.h"
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
 #include "posix_pty_io_test_hook.h"
@@ -315,51 +316,16 @@ int set_fd_nonblocking(int fd)
     return 0;
 }
 
-int set_fd_cloexec(int fd)
-{
-    const int flags = ::fcntl(fd, F_GETFD, 0);
-    if (flags < 0) {
-        return errno;
-    }
-
-    if (::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
-        return errno;
-    }
-
-    return 0;
-}
-
 int create_pipe(Unique_fd& read_end, Unique_fd& write_end, bool nonblocking)
 {
     int fds[2] = {-1, -1};
-    if (::pipe(fds) < 0) {
-        return errno;
+    const int error = create_terminal_pipe(fds, nonblocking);
+    if (error != 0) {
+        return error;
     }
 
     read_end.reset(fds[0]);
     write_end.reset(fds[1]);
-
-    int result = set_fd_cloexec(read_end.get());
-    if (result != 0) {
-        return result;
-    }
-
-    result = set_fd_cloexec(write_end.get());
-    if (result != 0) {
-        return result;
-    }
-
-    if (nonblocking) {
-        result = set_fd_nonblocking(read_end.get());
-        if (result != 0) {
-            return result;
-        }
-
-        result = set_fd_nonblocking(write_end.get());
-        if (result != 0) {
-            return result;
-        }
-    }
 
     return 0;
 }

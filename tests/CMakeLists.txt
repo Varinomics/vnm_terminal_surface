@@ -99,6 +99,27 @@ set_tests_properties(vnm_terminal_bounded_render_retry_tests PROPERTIES TIMEOUT 
 
 
 if(UNIX)
+    add_executable(vnm_terminal_posix_owner_launch_tests
+        posix_terminal_process_owner/launch_tests.cpp
+        "${PROJECT_SOURCE_DIR}/src/posix_terminal_process_owner.cpp")
+    set_target_properties(vnm_terminal_posix_owner_launch_tests PROPERTIES AUTOMOC OFF)
+    target_include_directories(vnm_terminal_posix_owner_launch_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include")
+    target_compile_options(vnm_terminal_posix_owner_launch_tests PRIVATE
+        -include "${CMAKE_CURRENT_SOURCE_DIR}/posix_terminal_process_owner/launch_syscalls.h")
+    target_link_libraries(vnm_terminal_posix_owner_launch_tests PRIVATE Threads::Threads)
+    set(owner_launch_cases master slave signal fork_failure)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND owner_launch_cases pipe)
+        target_link_libraries(vnm_terminal_posix_owner_launch_tests PRIVATE util)
+    endif()
+    foreach(scenario IN LISTS owner_launch_cases)
+        add_test(NAME vnm_terminal_posix_owner_launch_${scenario}
+            COMMAND vnm_terminal_posix_owner_launch_tests "${scenario}")
+        set_tests_properties(vnm_terminal_posix_owner_launch_${scenario} PROPERTIES
+            TIMEOUT 30 LABELS "native;shutdown;custody;pty")
+    endforeach()
+
     add_executable(vnm_terminal_posix_pty_foreground_custody_tests
         posix_pty_foreground_custody_tests.cpp)
     set_target_properties(vnm_terminal_posix_pty_foreground_custody_tests PROPERTIES AUTOMOC OFF)

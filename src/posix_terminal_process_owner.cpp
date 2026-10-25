@@ -1,6 +1,7 @@
 #include "posix_terminal_process_owner.h"
 
 #include "posix_process_group_custody.h"
+#include "posix_terminal_descriptors.h"
 #if defined(__linux__)
 #include "linux_terminal_foreground_custody.h"
 #endif
@@ -12,10 +13,12 @@
 #include <condition_variable>
 #include <cstddef>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <thread>
@@ -27,7 +30,6 @@
 #include <sys/sysctl.h>
 #include <util.h>
 #else
-#include <pty.h>
 #include <utmp.h>
 #include <sys/syscall.h>
 #endif
@@ -473,6 +475,19 @@ public:
 
 private:
 #if defined(__APPLE__)
+    bool cleanup_is_settled() const noexcept
+    {
+        if (!m_root_observed.load() || m_foreground_attempted) {
+            return false;
+        }
+        // proc_listpids copies live and zombie membership under one kernel
+        // list lock. A two-PID buffer distinguishes the held, exited root
+        // alone from additional members without a racy per-process state scan.
+        pid_t members[2]{};
+        const int bytes = ::proc_listpids(PROC_PGRP_ONLY, m_pid, members, sizeof(members));
+        return bytes == sizeof(pid_t) && members[0] == m_pid;
+    }
+
     void resume_exiting_output() noexcept
     {
         if (m_root_observed.load()) {
@@ -512,6 +527,7 @@ private:
     {
         const pid_t foreground = ::tcgetpgrp(m_master.get());
 #if defined(__APPLE__)
+        m_foreground_attempted |= foreground > 1 && foreground != m_pid;
         if (foreground > 1 && ::ioctl(m_master.get(), TIOCSIG, signal) < 0) {
             record_cleanup_error(errno);
         }
@@ -556,6 +572,9 @@ private:
 #if defined(__APPLE__)
             (void)signal;
             resume_exiting_output();
+            if (cleanup_is_settled()) {
+                return;
+            }
 #else
             refresh_foreground(signal);
 #endif
@@ -705,8 +724,9 @@ terminal_process_launch_result_t Posix_terminal_process_owner::launch(
         return result;
     }
     int descriptors[2] = {-1, -1};
-    if (::pipe(descriptors) < 0) {
-        result.error = native_error("terminal exec pipe", errno);
+    const int pipe_error = create_terminal_pipe(descriptors, false);
+    if (pipe_error != 0) {
+        result.error = native_error("terminal exec pipe", pipe_error);
         return result;
     }
     Owned_descriptor startup_read(descriptors[0]);
@@ -748,14 +768,23 @@ terminal_process_launch_result_t Posix_terminal_process_owner::launch(
     dimensions.ws_col = static_cast<unsigned short>(request.columns);
     dimensions.ws_xpixel = static_cast<unsigned short>(request.pixel_width);
     dimensions.ws_ypixel = static_cast<unsigned short>(request.pixel_height);
-    int master_descriptor = -1;
-    int slave_descriptor = -1;
-    if (::openpty(&master_descriptor, &slave_descriptor, nullptr, nullptr, &dimensions) < 0) {
+    Owned_descriptor master(::posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC));
+    if (master.get() < 0 || ::grantpt(master.get()) < 0 || ::unlockpt(master.get()) < 0) {
         result.error = native_error("openpty", errno);
         return result;
     }
-    Owned_descriptor master(master_descriptor);
-    Owned_descriptor slave(slave_descriptor);
+    char slave_path[PATH_MAX];
+    const int name_error = ::ptsname_r(master.get(), slave_path, sizeof(slave_path));
+    if (name_error != 0) {
+        // Darwin reports -1/errno; glibc returns the error number itself.
+        result.error = native_error("openpty", name_error > 0 ? name_error : errno);
+        return result;
+    }
+    Owned_descriptor slave(::open(slave_path, O_RDWR | O_NOCTTY | O_CLOEXEC));
+    if (slave.get() < 0 || ::ioctl(slave.get(), TIOCSWINSZ, &dimensions) < 0) {
+        result.error = native_error("openpty", errno);
+        return result;
+    }
     if (!elevate_descriptor(master, minimum) || !elevate_descriptor(slave, minimum)) {
         result.error = native_error("retain terminal descriptors", errno);
         return result;
@@ -780,9 +809,19 @@ terminal_process_launch_result_t Posix_terminal_process_owner::launch(
             return result;
         }
     }
+    sigset_t blocked_signals;
+    sigset_t previous_signals;
+    sigfillset(&blocked_signals);
+    const int mask_error = ::pthread_sigmask(SIG_BLOCK, &blocked_signals, &previous_signals);
+    if (mask_error != 0) {
+        result.error = native_error("prepare terminal signals", mask_error);
+        return result;
+    }
     const pid_t child = ::fork();
+    const int fork_error = errno;
     if (child < 0) {
-        result.error = native_error("fork terminal", errno);
+        (void)::pthread_sigmask(SIG_SETMASK, &previous_signals, nullptr);
+        result.error = native_error("fork terminal", fork_error);
         return result;
     }
     if (child == 0) {
@@ -797,6 +836,9 @@ terminal_process_launch_result_t Posix_terminal_process_owner::launch(
     m_master = std::move(master);
     m_slave = std::move(slave);
     m_confirmed.store(false);
+    // The saved mask and SIG_SETMASK are valid. Restore promptly after custody
+    // adoption; only the child keeps signals blocked through handler reset.
+    (void)::pthread_sigmask(SIG_SETMASK, &previous_signals, nullptr);
     {
         const std::lock_guard lock(m_stop_mutex);
         m_birth_ready = true;
