@@ -2088,12 +2088,12 @@ bool test_model_selection_attachment_resolver_row_eviction()
     return ok;
 }
 
-bool test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint()
+bool test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint(int viewport_rows)
 {
     bool ok = true;
 
     term::Terminal_screen_model model =
-        make_recovery_enabled_primary_repaint_model(16, 32, 16);
+        make_recovery_enabled_primary_repaint_model(viewport_rows, 32, 16);
     model.ingest(visible_row_write_stream({
         QByteArray(),
         QByteArrayLiteral("frame-top"),
@@ -2137,11 +2137,16 @@ bool test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint()
             result.backing_deltas.empty() &&
             result.recovery_proposals.empty(),
         "recovery suppresses broad blank-spacer layout repaints");
+    if (model.scrollback_size() != 0) {
+        std::cerr
+            << "banner repaint viewport_rows=" << viewport_rows
+            << " history_rows=" << model.scrollback_size() << '\n';
+    }
 
     return ok;
 }
 
-bool test_primary_repaint_recovery_suppresses_broad_graphic_repaint()
+bool test_primary_repaint_recovery_suppresses_broad_graphic_repaint(int viewport_rows)
 {
     bool ok = true;
 
@@ -2198,13 +2203,16 @@ bool test_primary_repaint_recovery_suppresses_broad_graphic_repaint()
         input.candidate_rows.push_back(row_text(row.candidate));
         input.current_rows.push_back(row_text(row.current));
     }
+    input.candidate_rows.resize(static_cast<std::size_t>(viewport_rows));
+    input.current_rows.resize(static_cast<std::size_t>(viewport_rows));
     const term::terminal_repaint_recovery_shift_result_t shift =
         term::primary_repaint_recovery_shift_result(input);
     ok &= check(shift.shifted_rows == 0,
-        "recovery helper rejects a graphic repaint with a five-row prefix and 46-row unmatched tail");
+        "recovery helper rejects the same graphic repaint at each blank-padded viewport height");
     if (shift.shifted_rows != 0) {
         std::cerr
-            << "graphic repaint recovery: shift=" << shift.shifted_rows
+            << "graphic repaint viewport_rows=" << viewport_rows
+            << " shift=" << shift.shifted_rows
             << " matched_prefix=" << shift.matched_prefix_rows
             << " unmatched_tail=" << shift.unmatched_tail_rows << '\n';
     }
@@ -2220,7 +2228,7 @@ bool test_primary_repaint_recovery_suppresses_broad_graphic_repaint()
         return stream;
     };
     term::Terminal_screen_model_config config;
-    config.grid_size                                = {52, 144};
+    config.grid_size                                = {viewport_rows, 144};
     config.scrollback_limit                         = 64;
     config.recover_scrollback_from_primary_repaints = true;
     config.backend_owns_screen_buffers              = true;
@@ -2916,8 +2924,12 @@ bool test_repaint_recovery_shift_helper_matches_policy()
         QString(),
         QStringLiteral("footer"),
     };
-    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "recovery helper suppresses broad blank-spacer layout repaints");
+    for (const int viewport_rows : {16, 32}) {
+        input.candidate_rows.resize(static_cast<std::size_t>(viewport_rows));
+        input.current_rows.resize(static_cast<std::size_t>(viewport_rows));
+        ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+            "recovery helper suppresses the same banner at each blank-padded viewport height");
+    }
 
     const auto anchored_footer_input = []() {
         term::terminal_repaint_recovery_shift_input_t anchored_input;
@@ -6978,8 +6990,12 @@ int main()
     ok &= test_primary_repaint_recovery_selection_proof_matrix();
     ok &= test_model_selection_attachment_resolver_matrix();
     ok &= test_model_selection_attachment_resolver_row_eviction();
-    ok &= test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
-    ok &= test_primary_repaint_recovery_suppresses_broad_graphic_repaint();
+    for (const int viewport_rows : {16, 32}) {
+        ok &= test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint(viewport_rows);
+    }
+    for (const int viewport_rows : {52, 104}) {
+        ok &= test_primary_repaint_recovery_suppresses_broad_graphic_repaint(viewport_rows);
+    }
     ok &= test_flat_ring_retained_record_producer_contract();
     ok &= test_flat_ring_recovery_shared_producer_boundary();
     ok &= test_flat_ring_resize_projects_retained_history_without_mutation();

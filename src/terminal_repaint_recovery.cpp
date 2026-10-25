@@ -66,7 +66,8 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
 
     const int row_count = static_cast<int>(input.candidate_rows.size());
     int rewritten_tail_end = row_count;
-    // Unchanged blank viewport rows below the content are not a rewritten tail.
+    // Unchanged blank viewport rows below the content neither rewrite the tail
+    // nor increase the amount of rewritten content accepted as a scroll.
     // Keep nonblank footers within the bound; they need the separate anchored
     // continuation proof below.
     while (rewritten_tail_end > 0 &&
@@ -139,7 +140,7 @@ terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
         const int rewritten_tail_rows = std::max(
             0, std::min(row_count - shift, rewritten_tail_end) - matched_prefix);
         const int max_partial_rewritten_tail_rows =
-            std::max(k_min_partial_rewritten_tail_rows, row_count / 4);
+            std::max(k_min_partial_rewritten_tail_rows, rewritten_tail_end / 4);
         if (rewritten_tail_rows > max_partial_rewritten_tail_rows) {
             continue;
         }
