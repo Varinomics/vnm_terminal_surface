@@ -1016,6 +1016,8 @@ bool check_cpu_accounting_sample(
     *out_sample = *sample;
     bool ok = check(sample->cpu_time_usec >= minimum_cpu_usec,
         label + ": Job CPU includes independent root and child process totals");
+    ok &= check(sample->scope == vnm_terminal::Process_cpu_scope::WORKLOAD_FAMILY,
+        label + ": Job sample declares native family accounting");
     if (!ok) {
         std::cerr << "Job CPU usec=" << sample->cpu_time_usec
             << ", root and child CPU usec=" << minimum_cpu_usec << '\n';

@@ -143,6 +143,33 @@ private:
 };
 #endif
 
+#if defined(__APPLE__)
+/// Best-effort CPU observations of one root and its discoverable descendants.
+/// The root uses its original PROC_PIDTBSDINFO birth time in microseconds.
+/// New members establish a baseline; subsequent per-process deltas accrue to
+/// a monotonic counter that retains credited CPU when members disappear.
+/// Short-lived children and CPU outside the observation window can be missed.
+/// Surviving observed descendants remain tracked after reparenting. This owns
+/// no process control or wait authority. Callers serialize all access.
+class Process_cpu_tracker
+{
+public:
+    Process_cpu_tracker();
+    ~Process_cpu_tracker();
+    Process_cpu_tracker(const Process_cpu_tracker&) = delete;
+    Process_cpu_tracker& operator=(const Process_cpu_tracker&) = delete;
+
+    void set_root(std::int64_t process_id, std::uint64_t birth_token) noexcept;
+    // Discovery or counter failures are unavailable, never an idle sample.
+    std::optional<std::uint64_t> cpu_time_usec();
+    void reset() noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+#endif
+
 /// The custodian's ownership of one generation's process tree. Linux: this
 /// process becomes the subreaper of everything below it, the root (the
 /// supervisor) is spawned into its own session and process group, and this

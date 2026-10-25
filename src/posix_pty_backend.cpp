@@ -977,8 +977,13 @@ public:
         {
             return std::nullopt;
         }
+#if defined(__APPLE__)
+        constexpr auto scope = Process_cpu_scope::OBSERVED_FAMILY;
+#else
+        constexpr auto scope = Process_cpu_scope::WORKLOAD_FAMILY;
+#endif
         return process_cpu_time_t{*cpu_time, static_cast<std::uint64_t>(sampled_at),
-            static_cast<std::uint32_t>(processor_count)};
+            static_cast<std::uint32_t>(processor_count), scope};
     }
 
     void shutdown()

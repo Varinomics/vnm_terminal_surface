@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <libproc.h>
+#include <mach/mach_time.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -15,12 +16,73 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
+#include <map>
 
 namespace vnm::process_custody {
 namespace {
 
 constexpr auto k_scope = Cleanup_scope::OWNED_PROCESS_GROUPS;
 constexpr int k_group_probe_ms = 20;
+
+// Bound discovery even if processes keep forking during a sample. Reaching
+// the bound is unavailable, rather than a silently truncated family sample.
+constexpr std::size_t k_max_cpu_members = 262144;
+
+struct cpu_observation_t
+{
+    pid_t process_id = 0;
+    pid_t parent_id = 0;
+    std::uint64_t birth_token = 0;
+    std::uint64_t cpu_ticks = 0;
+};
+
+std::uint64_t birth_token(const proc_bsdinfo& info)
+{
+    return info.pbi_start_tvsec * 1'000'000ULL + info.pbi_start_tvusec;
+}
+
+bool read_cpu_observation(pid_t process_id, cpu_observation_t* observation)
+{
+    struct proc_taskallinfo info{};
+    errno = 0;
+    if (proc_pidinfo(process_id, PROC_PIDTASKALLINFO, 0, &info, sizeof(info)) != sizeof(info)) {
+        return false;
+    }
+    if (info.pbsd.pbi_pid != static_cast<std::uint32_t>(process_id) || birth_token(info.pbsd) == 0 ||
+        info.ptinfo.pti_total_user > std::numeric_limits<std::uint64_t>::max() - info.ptinfo.pti_total_system)
+    {
+        errno = EINVAL;
+        return false;
+    }
+    *observation = {process_id, static_cast<pid_t>(info.pbsd.pbi_ppid), birth_token(info.pbsd),
+        info.ptinfo.pti_total_user + info.ptinfo.pti_total_system};
+    return true;
+}
+
+bool list_cpu_children(pid_t parent, std::vector<pid_t>* children)
+{
+    children->resize(64);
+    while (true) {
+        errno = 0;
+        // libproc returns a PID count here, although buffersize is in bytes.
+        // Its underlying proc_listpids returns zero on error, as well as for
+        // an empty result; clearing errno distinguishes those two cases.
+        const int count = proc_listchildpids(parent, children->data(),
+            static_cast<int>(children->size() * sizeof(pid_t)));
+        if (count < 0 || (count == 0 && errno != 0)) {
+            return false;
+        }
+        if (static_cast<std::size_t>(count) < children->size()) {
+            children->resize(static_cast<std::size_t>(count));
+            return true;
+        }
+        if (children->size() >= k_max_cpu_members) {
+            return false;
+        }
+        children->resize(children->size() * 2);
+    }
+}
 
 int observe_child(pid_t pid, siginfo_t* info)
 {
@@ -47,6 +109,162 @@ Exit_status exit_status(const siginfo_t& info)
 }
 
 } // namespace
+
+struct Process_cpu_tracker::Impl
+{
+    struct member_t
+    {
+        std::uint64_t birth_token = 0;
+        std::optional<std::uint64_t> cpu_ticks;
+    };
+
+    std::map<pid_t, member_t> members;
+    pid_t root = 0;
+    std::uint64_t root_birth_token = 0;
+    std::uint64_t observed_ticks = 0;
+    bool overflowed = false;
+};
+
+Process_cpu_tracker::Process_cpu_tracker()
+:
+    m_impl(std::make_unique<Impl>())
+{}
+Process_cpu_tracker::~Process_cpu_tracker() = default;
+
+void Process_cpu_tracker::set_root(std::int64_t process_id, std::uint64_t root_birth_token) noexcept
+{
+    reset();
+    if (process_id > 1 && process_id <= std::numeric_limits<pid_t>::max() && root_birth_token != 0) {
+        m_impl->root = static_cast<pid_t>(process_id);
+        m_impl->root_birth_token = root_birth_token;
+    }
+}
+
+void Process_cpu_tracker::reset() noexcept
+{
+    m_impl->members.clear();
+    m_impl->root = 0;
+    m_impl->root_birth_token = 0;
+    m_impl->observed_ticks = 0;
+    m_impl->overflowed = false;
+}
+
+std::optional<std::uint64_t> Process_cpu_tracker::cpu_time_usec()
+{
+    if (m_impl->root > 1 && m_impl->members.count(m_impl->root) == 0) {
+        m_impl->members.emplace(m_impl->root, Impl::member_t{m_impl->root_birth_token, std::nullopt});
+    }
+    std::map<pid_t, Impl::member_t> next_members;
+    std::vector<cpu_observation_t> observations;
+    auto observed_ticks = m_impl->observed_ticks;
+    bool overflowed = m_impl->overflowed;
+    bool available = true;
+    for (const auto& [process_id, member] : m_impl->members) {
+        cpu_observation_t current;
+        if (!read_cpu_observation(process_id, &current)) {
+            if (errno != ESRCH) {
+                // A transient read failure retains the identity for retry;
+                // confirmed disappearance and PID reuse retire it below.
+                next_members.emplace(process_id, member);
+                available = false;
+            }
+            continue;
+        }
+        if (current.birth_token != member.birth_token) {
+            continue;
+        }
+        if (member.cpu_ticks) {
+            if (current.cpu_ticks < *member.cpu_ticks) {
+                available = false;
+            }
+            else {
+                const auto delta = current.cpu_ticks - *member.cpu_ticks;
+                if (delta > std::numeric_limits<std::uint64_t>::max() - observed_ticks) {
+                    overflowed = true;
+                }
+                else {
+                    observed_ticks += delta;
+                }
+            }
+        }
+        next_members.emplace(process_id, Impl::member_t{current.birth_token, current.cpu_ticks});
+        observations.push_back(current);
+    }
+
+    for (std::size_t index = 0; index < observations.size(); ++index) {
+        const auto parent = observations[index];
+        std::vector<pid_t> children;
+        if (!list_cpu_children(parent.process_id, &children)) {
+            available = false;
+            continue;
+        }
+        std::vector<cpu_observation_t> candidates;
+        for (pid_t child : children) {
+            if (child <= 1 || next_members.count(child) != 0) {
+                continue;
+            }
+            cpu_observation_t current;
+            if (!read_cpu_observation(child, &current)) {
+                if (errno != ESRCH) {
+                    available = false;
+                }
+                continue;
+            }
+            if (current.parent_id == parent.process_id && current.birth_token >= parent.birth_token) {
+                candidates.push_back(current);
+            }
+        }
+        // The parent can exit or its PID can be reused during enumeration.
+        // Admit new children only while both sides of that relationship are
+        // observed against the same parent occurrence.
+        struct proc_bsdinfo parent_info{};
+        errno = 0;
+        if (proc_pidinfo(parent.process_id, PROC_PIDTBSDINFO, 0, &parent_info, sizeof(parent_info)) !=
+            sizeof(parent_info))
+        {
+            if (errno != ESRCH) {
+                available = false;
+            }
+            continue;
+        }
+        if (parent_info.pbi_pid != static_cast<std::uint32_t>(parent.process_id) ||
+            birth_token(parent_info) != parent.birth_token)
+        {
+            continue;
+        }
+        for (const auto& child : candidates) {
+            if (next_members.size() >= k_max_cpu_members) {
+                available = false;
+                break;
+            }
+            // Baseline newly seen processes. Adding their lifetime counters
+            // would attribute old work to the current sampling interval.
+            if (next_members.emplace(child.process_id,
+                Impl::member_t{child.birth_token, child.cpu_ticks}).second)
+            {
+                observations.push_back(child);
+            }
+        }
+    }
+    m_impl->members = std::move(next_members);
+    m_impl->observed_ticks = observed_ticks;
+    m_impl->overflowed = overflowed;
+    if (!available || observations.empty() || m_impl->overflowed) {
+        return std::nullopt;
+    }
+    // PROC_PIDTASKALLINFO reports Mach absolute ticks, including terminated
+    // threads. The timebase differs between Intel and Apple silicon.
+    mach_timebase_info_data_t timebase{};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.denom == 0) {
+        return std::nullopt;
+    }
+    const auto microseconds = static_cast<__uint128_t>(m_impl->observed_ticks) * timebase.numer /
+        (static_cast<std::uint64_t>(timebase.denom) * 1000);
+    if (microseconds > std::numeric_limits<std::uint64_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(microseconds);
+}
 
 struct Process_tree_containment::Impl {};
 

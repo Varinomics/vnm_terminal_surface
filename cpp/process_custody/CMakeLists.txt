@@ -59,6 +59,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             VNM_PROCESS_CUSTODY_DARWIN_PTY_OUTPUT_RETIREMENT 1)
         set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
             VNM_PROCESS_CUSTODY_DARWIN_PTY_OUTPUT_RETIREMENT)
+        set_property(TARGET vnm_process_custody PROPERTY
+            VNM_PROCESS_CUSTODY_DARWIN_CPU_OBSERVATION 1)
+        set_property(TARGET vnm_process_custody APPEND PROPERTY EXPORT_PROPERTIES
+            VNM_PROCESS_CUSTODY_DARWIN_CPU_OBSERVATION)
     endif()
     target_sources(vnm_process_custody PRIVATE src/owner_protocol.cpp)
     add_executable(vnm_process_custody_owner src/owner_main_posix.cpp)
@@ -86,6 +90,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             COMMAND vnm_process_custody_tests $<TARGET_FILE:vnm_process_custody_owner>)
         set_tests_properties(vnm_process_custody_tests PROPERTIES TIMEOUT 60)
         if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+            add_executable(vnm_process_custody_cpu_observation_tests tests/cpu_observation_darwin_tests.cpp)
+            target_link_libraries(vnm_process_custody_cpu_observation_tests PRIVATE vnm_process_custody)
+            set_target_properties(vnm_process_custody_cpu_observation_tests PROPERTIES
+                AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+            add_test(NAME vnm_process_custody_cpu_observation_tests
+                COMMAND vnm_process_custody_cpu_observation_tests)
+            set_tests_properties(vnm_process_custody_cpu_observation_tests PROPERTIES TIMEOUT 15)
             add_test(NAME vnm_process_custody_truncated_rights_tests
                 COMMAND vnm_process_custody_tests --truncated-rights)
             set_tests_properties(vnm_process_custody_truncated_rights_tests PROPERTIES TIMEOUT 10)

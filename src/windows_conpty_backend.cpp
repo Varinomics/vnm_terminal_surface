@@ -781,7 +781,8 @@ public:
         return process_cpu_time_t{
             *cumulative,
             static_cast<std::uint64_t>(sampled_at),
-            static_cast<std::uint32_t>(processor_count)};
+            static_cast<std::uint32_t>(processor_count),
+            Process_cpu_scope::WORKLOAD_FAMILY};
     }
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing()

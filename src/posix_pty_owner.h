@@ -338,6 +338,9 @@ public:
         // owner's native receipt. No further getter accesses the retiring fd.
         while (!m_cpu_scope.terminate_and_release(std::chrono::seconds(1), nullptr)) {
         }
+#elif defined(__APPLE__)
+        const std::lock_guard lock(m_cpu_mutex);
+        m_cpu_tracker.reset();
 #endif
     }
 
@@ -348,6 +351,9 @@ public:
         if (m_cpu_accounting_admitted) {
             return m_cpu_scope.cpu_time_usec();
         }
+#elif defined(__APPLE__)
+        const std::lock_guard lock(m_cpu_mutex);
+        return m_cpu_tracker.cpu_time_usec();
 #endif
         return std::nullopt;
     }
@@ -423,6 +429,8 @@ private:
                 m_receipt.root_pid = static_cast<std::uint32_t>(event->root_exit.process_id);
                 m_receipt.root_birth_token = event->root_birth_token;
                 m_root_retained = publish_native_receipt(Terminal_native_receipt_kind::ROOT_BORN);
+                const std::lock_guard lock(m_cpu_mutex);
+                m_cpu_tracker.set_root(event->root_exit.process_id, event->root_birth_token);
             }
             else if (event->kind == pty_custody::Owner_event_kind::ROOT_EXITED) {
                 m_receipt.root_exit_code = event->root_exit.exit_code;
@@ -464,12 +472,13 @@ private:
     bool m_helper_reaped = false;
     pid_t m_root = -1;
     std::optional<pty_custody::Exit_status> m_root_exit;
-#if defined(__linux__)
     mutable std::mutex m_cpu_mutex;
+#if defined(__linux__)
     pty_custody::Process_cpu_scope m_cpu_scope;
     bool m_cpu_accounting_admitted = false;
 #endif
 #if defined(__APPLE__)
+    mutable pty_custody::Process_cpu_tracker m_cpu_tracker;
     Terminal_native_receipt_hook m_receipt_hook;
     Terminal_native_receipt m_receipt;
     bool m_root_retained = false;

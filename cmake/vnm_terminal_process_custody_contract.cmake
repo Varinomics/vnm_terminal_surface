@@ -13,6 +13,14 @@ function(vnm_terminal_require_process_custody)
         endif()
     endif()
     if(APPLE)
+        get_target_property(observes_cpu vnm_process_custody::vnm_process_custody
+            VNM_PROCESS_CUSTODY_DARWIN_CPU_OBSERVATION)
+        if(NOT observes_cpu)
+            message(FATAL_ERROR
+                "Selected process_custody provider lacks Darwin observed-family CPU accounting. "
+                "Update the maintained source or installed provider to expose Process_cpu_tracker "
+                "and the exported VNM_PROCESS_CUSTODY_DARWIN_CPU_OBSERVATION capability.")
+        endif()
         get_target_property(retains_output vnm_process_custody::vnm_process_custody
             VNM_PROCESS_CUSTODY_DARWIN_PTY_OUTPUT_RETIREMENT)
         if(NOT retains_output)

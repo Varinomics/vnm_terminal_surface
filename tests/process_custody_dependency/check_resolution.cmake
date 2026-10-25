@@ -16,7 +16,8 @@ endforeach()
 
 foreach(system_name IN ITEMS Linux Darwin)
     foreach(mode IN ITEMS existing installed source fallback invalid old-existing old-installed old-source
-            no-retirement-existing no-retirement-installed no-retirement-source no-retirement-fallback)
+            no-retirement-existing no-retirement-installed no-retirement-source no-retirement-fallback
+            no-cpu-existing no-cpu-installed no-cpu-source no-cpu-fallback)
         execute_process(
             COMMAND "${CMAKE_COMMAND}"
                 -S "${CMAKE_CURRENT_LIST_DIR}"
@@ -39,11 +40,16 @@ foreach(system_name IN ITEMS Linux Darwin)
             if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "lacks Darwin PTY output retirement")
                 message(FATAL_ERROR "Darwin custody provider without output retirement was accepted: ${output}${error}")
             endif()
+        elseif(system_name STREQUAL "Darwin" AND mode MATCHES "^no-cpu-")
+            if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "lacks Darwin observed-family CPU accounting")
+                message(FATAL_ERROR "Darwin custody provider without CPU observation was accepted: ${output}${error}")
+            endif()
         elseif(NOT result EQUAL 0)
             message(FATAL_ERROR "Custody resolver ${system_name} ${mode} failed: ${output}${error}")
         endif()
     endforeach()
-    foreach(mode IN ITEMS existing installed no-retirement-existing no-retirement-installed)
+    foreach(mode IN ITEMS existing installed no-retirement-existing no-retirement-installed
+            no-cpu-existing no-cpu-installed)
         execute_process(
             COMMAND "${CMAKE_COMMAND}"
                 -S "${CMAKE_CURRENT_LIST_DIR}"
@@ -58,6 +64,10 @@ foreach(system_name IN ITEMS Linux Darwin)
         if(system_name STREQUAL "Darwin" AND mode MATCHES "^no-retirement-")
             if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "lacks Darwin PTY output retirement")
                 message(FATAL_ERROR "Surface package accepted Darwin custody without output retirement: ${output}${error}")
+            endif()
+        elseif(system_name STREQUAL "Darwin" AND mode MATCHES "^no-cpu-")
+            if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "lacks Darwin observed-family CPU accounting")
+                message(FATAL_ERROR "Surface package accepted Darwin custody without CPU observation: ${output}${error}")
             endif()
         elseif(NOT result EQUAL 0)
             message(FATAL_ERROR "Surface package ${system_name} ${mode} failed: ${output}${error}")

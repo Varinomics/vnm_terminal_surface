@@ -935,6 +935,15 @@ bool test_interrupt(const QString& fixture_path)
     ok &= check(capture.wait_for_output(QByteArrayLiteral("hold-open")),
         "interrupt fixture ready marker reaches output");
 
+    const auto cpu = backend->process_cpu_time();
+#if defined(__APPLE__)
+    ok &= check(cpu && cpu->scope == vnm_terminal::Process_cpu_scope::OBSERVED_FAMILY,
+        "live Darwin PTY supplies observed-family CPU accounting");
+#else
+    ok &= check(!cpu || cpu->scope == vnm_terminal::Process_cpu_scope::WORKLOAD_FAMILY,
+        "available Linux cgroup CPU declares native family accounting");
+#endif
+
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "POSIX PTY backend accepts interrupt");

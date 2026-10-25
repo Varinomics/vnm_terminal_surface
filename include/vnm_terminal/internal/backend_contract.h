@@ -488,8 +488,8 @@ public:
     virtual Terminal_backend_result interrupt() = 0;
     virtual Terminal_backend_result terminate() = 0;
 
-    // Native cumulative accounting covers the workload family, including
-    // exited descendants. Missing capability or a failed read is unavailable.
+    // Cumulative CPU with explicit native or observed family coverage.
+    // Missing capability or a failed read is unavailable.
     virtual std::optional<process_cpu_time_t> process_cpu_time() const
     {
         return std::nullopt;
