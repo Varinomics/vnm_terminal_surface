@@ -1385,6 +1385,26 @@ foreach(test_name group IN ZIP_LISTS
         TIMEOUT "${vnm_terminal_surface_host_timeout}")
 endforeach()
 
+set(vnm_terminal_wheel_modifier_conventions physical)
+if(APPLE)
+    list(APPEND vnm_terminal_wheel_modifier_conventions qt_swapped)
+endif()
+foreach(convention IN LISTS vnm_terminal_wheel_modifier_conventions)
+    set(convention_argument)
+    if(convention STREQUAL "qt_swapped")
+        set(convention_argument --qt-swaps-control-and-meta)
+    endif()
+    add_test(NAME vnm_terminal_surface_host_wheel_modifiers_${convention}
+        COMMAND "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --physical-control-wheel-only ${convention_argument})
+    set_tests_properties(vnm_terminal_surface_host_wheel_modifiers_${convention} PROPERTIES
+        LABELS "conformance;surface;input;wheel" TIMEOUT 30)
+endforeach()
+
 # Fractional display scaling makes neighbouring font sizes round up to the same
 # device-pixel advance even where whole-pixel hinting keeps them apart at 100%.
 add_test(

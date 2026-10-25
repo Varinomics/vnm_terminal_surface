@@ -374,6 +374,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/terminal_canvas_export.h
     include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/terminal_process_owner.h
+    include/vnm_terminal/keyboard_modifiers.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/native_backend_cleanup_owner.h
     src/backend_output_capture.cpp
@@ -577,6 +578,7 @@ if(VNM_TERMINAL_SURFACE_BUILD_FULL)
     install(FILES
         include/vnm_terminal/backend_output_capture.h
         include/vnm_terminal/font_metrics.h
+        include/vnm_terminal/keyboard_modifiers.h
         include/vnm_terminal/terminal_canvas_export.h
         include/vnm_terminal/terminal_message_submission.h
         include/vnm_terminal/vnm_terminal_surface.h

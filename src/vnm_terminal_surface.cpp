@@ -1,4 +1,5 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
+#include "vnm_terminal/keyboard_modifiers.h"
 #include "vnm_terminal/terminal_canvas_appearance.h"
 #include "vnm_terminal/terminal_canvas_frame.h"
 
@@ -7420,7 +7421,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 std::move(object));
         };
 
-    if ((event->modifiers() & Qt::ControlModifier) != 0) {
+    if (vnm_terminal::physical_keyboard_modifiers(event->modifiers()).testFlag(Qt::ControlModifier)) {
         const int steps = term::vertical_wheel_steps(
             *event,
             term::k_angle_delta_per_wheel_step,

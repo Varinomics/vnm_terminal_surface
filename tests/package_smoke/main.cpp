@@ -1,6 +1,7 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "vnm_terminal/diagnostics/metrics_json.h"
 #include "vnm_terminal/font_metrics.h"
+#include "vnm_terminal/keyboard_modifiers.h"
 #include "vnm_terminal/terminal_canvas_export.h"
 #include "vnm_terminal/vnm_terminal_canvas.h"
 

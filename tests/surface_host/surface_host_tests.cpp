@@ -6810,6 +6810,30 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
     return ok;
 }
 
+bool test_wheel_uses_physical_control(QGuiApplication& app, bool qt_swaps_control_and_meta)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+    const auto control = qt_swaps_control_and_meta ? Qt::MetaModifier : Qt::ControlModifier;
+    const auto command = qt_swaps_control_and_meta ? Qt::ControlModifier : Qt::MetaModifier;
+    const qreal initial_font_size = fixture.surface.font_size();
+    int changes = 0;
+    QObject::connect(&fixture.surface, &VNM_TerminalSurface::font_size_changed,
+        &fixture.surface, [&changes] { ++changes; });
+
+    bool ok = send_wheel_event(fixture.surface, command, 120, false,
+        "physical Command/Meta wheel is not a Control zoom gesture");
+    ok &= check(fixture.surface.font_size() == initial_font_size && changes == 0,
+        "physical Command/Meta leaves font size and its notification unchanged");
+    ok &= send_wheel_event(fixture.surface, Qt::NoModifier, 120, false,
+        "plain wheel without a session remains unconsumed");
+    ok &= send_wheel_event(fixture.surface, control, 120, true,
+        "physical Control wheel zooms under the selected Qt convention");
+    ok &= check(fixture.surface.font_size() > initial_font_size && changes == 1,
+        "physical Control wheel produces one font-size change");
+    return ok;
+}
+
 bool test_control_wheel_font_zoom(QGuiApplication& app)
 {
     bool ok = true;
@@ -23208,8 +23232,22 @@ bool test_async_surface_resize_receipt_updates_geometry_snapshot(QGuiApplication
 
 int main(int argc, char** argv)
 {
+    bool qt_swaps_control_and_meta = false;
+#if defined(Q_OS_MACOS)
+    for (int index = 1; index < argc; ++index) {
+        if (QByteArray(argv[index]) == "--qt-swaps-control-and-meta") {
+            qt_swaps_control_and_meta = true;
+        }
+    }
+    // Existing synthetic fixtures name physical Control with the Control bit,
+    // as the product does. A separate process covers Qt's default swap mode.
+    QGuiApplication::setAttribute(Qt::AA_MacDontSwapCtrlAndMeta, !qt_swaps_control_and_meta);
+#endif
     QGuiApplication app(argc, argv);
 
+    if (app.arguments().contains(QStringLiteral("--physical-control-wheel-only"))) {
+        return test_wheel_uses_physical_control(app, qt_swaps_control_and_meta) ? 0 : 1;
+    }
     if (app.arguments().contains(QStringLiteral("--content-tail-presentation"))) {
         return test_presentation_render_and_input(app) ? 0 : 1;
     }
@@ -23371,6 +23409,7 @@ int main(int argc, char** argv)
     if (all_groups || input_group) {
         ok &= test_copy_shortcut_policy(app);
         ok &= test_no_payload_copy_fallback_states(app);
+        ok &= test_wheel_uses_physical_control(app, false);
         ok &= test_control_wheel_font_zoom(app);
         ok &= test_control_wheel_zoom_changes_the_rendering_every_notch(app);
         ok &= test_plain_wheel_scrolls_primary_scrollback(app);
