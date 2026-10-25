@@ -873,7 +873,8 @@ bool explicit_hyperlink_activation_modifiers(Qt::KeyboardModifiers modifiers)
         Qt::ShiftModifier   |
         Qt::AltModifier     |
         Qt::MetaModifier;
-    return (modifiers & k_relevant_modifiers) == Qt::ControlModifier;
+    return (vnm_terminal::physical_keyboard_modifiers(modifiers) & k_relevant_modifiers) ==
+        Qt::ControlModifier;
 }
 
 std::optional<term::terminal_grid_position_t> clamped_grid_position_for_local_point(
@@ -2632,7 +2633,7 @@ struct VNM_TerminalSurface::Private
             button,
             native_position->row,
             native_position->column,
-            modifiers,
+            vnm_terminal::physical_keyboard_modifiers(modifiers),
         };
         const QByteArray bytes = term::encode_terminal_mouse_event(
             mouse_event,
@@ -6543,7 +6544,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                     button,
                     report_position->row,
                     report_position->column,
-                    event->modifiers(),
+                    vnm_terminal::physical_keyboard_modifiers(event->modifiers()),
                 });
             if (!mouse_result.has_value()) {
                 viewport_position = report_position;
@@ -7231,7 +7232,7 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
             term::Terminal_mouse_button::NONE,
             position->row,
             position->column,
-            event->modifiers(),
+            vnm_terminal::physical_keyboard_modifiers(event->modifiers()),
         });
     if (!mouse_result.has_value()) {
         event->accept();
@@ -7673,7 +7674,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                         button,
                         position->row,
                         position->column,
-                        event->modifiers(),
+                        vnm_terminal::physical_keyboard_modifiers(event->modifiers()),
                         },
                         published_input_modes);
                 if (mouse_bytes.isEmpty()) {

@@ -6810,6 +6810,130 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
     return ok;
 }
 
+bool test_pointer_uses_physical_modifiers(QGuiApplication& app, bool qt_swaps_control_and_meta)
+{
+    const auto control = qt_swaps_control_and_meta ? Qt::MetaModifier : Qt::ControlModifier;
+    const auto command = qt_swaps_control_and_meta ? Qt::ControlModifier : Qt::MetaModifier;
+    bool ok = true;
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+        std::vector<QByteArray> activation_targets;
+        observe_hyperlink_activation_requests(fixture.surface, activation_targets);
+        const QByteArray target = QByteArrayLiteral("https://example.test/physical-control");
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            osc8_hyperlink_sequence({}, target, QByteArrayLiteral("linked")),
+        };
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "physical-modifier hyperlink surface starts");
+        const QPointF press_point = point_in_grid_cell(fixture.surface, 0, 0);
+        const QPointF move_point = point_in_grid_cell(fixture.surface, 0, 1);
+        const std::size_t write_index = backend_ptr->writes.size();
+
+        for (const auto modifiers : {command, control}) {
+            ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+                press_point, Qt::LeftButton, Qt::LeftButton, modifiers, true,
+                "physical-modifier hyperlink press is accepted");
+            ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
+                move_point, Qt::NoButton, Qt::LeftButton, modifiers, true,
+                "physical-modifier movement within the hyperlink is accepted");
+            ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+                move_point, Qt::LeftButton, Qt::NoButton, modifiers, true,
+                "physical-modifier hyperlink release is accepted");
+            ok &= check(activation_targets == (modifiers == control
+                    ? std::vector<QByteArray>{target} : std::vector<QByteArray>{}),
+                "only physical Control activates a hyperlink across press, movement and release");
+        }
+
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+            press_point, Qt::LeftButton, Qt::LeftButton, control, true,
+            "physical Control begins a cancellable hyperlink gesture");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
+            move_point, Qt::NoButton, Qt::LeftButton, command, true,
+            "changing to physical Command cancels the hyperlink target");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+            move_point, Qt::LeftButton, Qt::NoButton, control, true,
+            "restoring physical Control releases the cancelled gesture");
+        ok &= check(activation_targets == std::vector<QByteArray>{target},
+            "restoring Control after Command movement cannot revive hyperlink activation");
+        ok &= check(backend_ptr->writes.size() == write_index,
+            "local hyperlink gestures send no terminal input");
+    }
+
+    struct Report_case
+    {
+        Qt::KeyboardModifiers modifiers;
+        int                   report_bits;
+        bool                  physical_control;
+    };
+    const Report_case report_cases[] = {
+        {control,                   16, true },
+        {command,                    0, false},
+        {control | Qt::AltModifier,  24, true },
+        {command | Qt::AltModifier,   8, false},
+    };
+    for (const Report_case& report : report_cases) {
+        Surface_fixture fixture;
+        pump_events(app);
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1003;1006hphysical-modifier-reporting"),
+        };
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface, std::move(backend), {QStringLiteral("scripted-terminal")}, &started);
+        ok &= check(started, "physical-modifier mouse-reporting surface starts");
+        const std::size_t write_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, 1, 2), Qt::LeftButton, Qt::LeftButton,
+            report.modifiers, true, "physical-modifier reporting press is accepted");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
+            point_in_grid_cell(fixture.surface, 1, 3), Qt::NoButton, Qt::LeftButton,
+            report.modifiers, true, "physical-modifier reporting drag is accepted");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease,
+            point_in_grid_cell(fixture.surface, 1, 3), Qt::LeftButton, Qt::NoButton,
+            report.modifiers, true, "physical-modifier reporting release is accepted");
+        ok &= send_hover_move(fixture.surface, point_in_grid_cell(fixture.surface, 2, 4),
+            report.modifiers, true, "physical-modifier reporting hover is accepted");
+        ok &= send_mouse_event(fixture.surface, QEvent::MouseMove,
+            point_in_grid_cell(fixture.surface, 2, 5), Qt::NoButton, Qt::NoButton,
+            report.modifiers, true, "physical-modifier unbuttoned mouse movement is accepted");
+        ok &= check_write_chunks_equal(backend_ptr->writes, write_index,
+            {
+                sgr_mouse_report(report.report_bits,      1, 2, 'M'),
+                sgr_mouse_report(report.report_bits + 32, 1, 3, 'M'),
+                sgr_mouse_report(report.report_bits,      1, 3, 'm'),
+                sgr_mouse_report(report.report_bits + 35, 2, 4, 'M'),
+                sgr_mouse_report(report.report_bits + 35, 2, 5, 'M'),
+            },
+            "SGR press, drag, release and motion encode physical Control and preserve Alt");
+
+        const qreal initial_font_size = fixture.surface.font_size();
+        const std::size_t wheel_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(fixture.surface, report.modifiers,
+            point_in_grid_cell(fixture.surface, 1, 2), 0, 120, true,
+            "physical-modifier wheel is accepted while mouse reporting is active");
+        if (report.physical_control) {
+            ok &= check(fixture.surface.font_size() > initial_font_size,
+                "physical Control wheel retains local zoom precedence over mouse reporting");
+            ok &= check(backend_ptr->writes.size() == wheel_index,
+                "physical Control zoom sends no terminal mouse report");
+        }
+        else {
+            ok &= check(fixture.surface.font_size() == initial_font_size,
+                "physical Command wheel does not zoom a reporting terminal");
+            ok &= check_write_chunks_equal(backend_ptr->writes, wheel_index,
+                {sgr_mouse_report(64 + report.report_bits, 1, 2, 'M')},
+                "physical Command wheel sends SGR without adding the Control bit");
+        }
+    }
+    return ok;
+}
+
 bool test_wheel_uses_physical_control(QGuiApplication& app, bool qt_swaps_control_and_meta)
 {
     Surface_fixture fixture;
@@ -23247,6 +23371,9 @@ int main(int argc, char** argv)
 
     if (app.arguments().contains(QStringLiteral("--physical-control-wheel-only"))) {
         return test_wheel_uses_physical_control(app, qt_swaps_control_and_meta) ? 0 : 1;
+    }
+    if (app.arguments().contains(QStringLiteral("--physical-pointer-modifiers-only"))) {
+        return test_pointer_uses_physical_modifiers(app, qt_swaps_control_and_meta) ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--content-tail-presentation"))) {
         return test_presentation_render_and_input(app) ? 0 : 1;

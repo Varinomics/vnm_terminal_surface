@@ -1403,6 +1403,15 @@ foreach(convention IN LISTS vnm_terminal_wheel_modifier_conventions)
             --physical-control-wheel-only ${convention_argument})
     set_tests_properties(vnm_terminal_surface_host_wheel_modifiers_${convention} PROPERTIES
         LABELS "conformance;surface;input;wheel" TIMEOUT 30)
+    add_test(NAME vnm_terminal_surface_host_pointer_modifiers_${convention}
+        COMMAND "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qt_offscreen_environment}
+            ${vnm_terminal_qt_unscaled_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_surface_host>"
+            --physical-pointer-modifiers-only ${convention_argument})
+    set_tests_properties(vnm_terminal_surface_host_pointer_modifiers_${convention} PROPERTIES
+        LABELS "conformance;surface;input;mouse;hyperlink" TIMEOUT 30)
 endforeach()
 
 # Fractional display scaling makes neighbouring font sizes round up to the same

@@ -37,6 +37,7 @@ enum class Terminal_mouse_button
     WHEEL_DOWN,
 };
 
+// Modifier bits name physical keys, independently of the host's Qt convention.
 struct Terminal_mouse_event
 {
     Terminal_mouse_event_kind  kind      = Terminal_mouse_event_kind::MOVE;
