@@ -37,7 +37,9 @@ if(MSVC AND VNM_TERMINAL_SANITIZE_ADDRESS)
         _DISABLE_STRING_ANNOTATION)
 endif()
 if(WIN32)
-    target_compile_definitions(vnm_process_custody PRIVATE NOMINMAX)
+    # Atomic job admission through PROC_THREAD_ATTRIBUTE_JOB_LIST requires Windows 10.
+    target_compile_definitions(vnm_process_custody PRIVATE
+        NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00)
     option(VNM_PROCESS_CUSTODY_ENABLE_TEST_HOOKS "Enable the maintained Windows native observation fixtures" OFF)
     if(VNM_PROCESS_CUSTODY_ENABLE_TEST_HOOKS)
         target_compile_definitions(vnm_process_custody PRIVATE

@@ -19,10 +19,6 @@
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
 #endif
 
-#if defined(__MINGW32__)
-DECLARE_HANDLE(HPCON);
-#endif
-
 #include <QDir>
 #include <QFileInfo>
 #include <QProcessEnvironment>
