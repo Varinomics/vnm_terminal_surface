@@ -3,7 +3,11 @@
 #undef posix_openpt
 #undef login_tty
 #undef fork
-#if defined(__linux__)
+#if defined(__APPLE__)
+#undef pipe
+#undef kevent
+#undef sysctl
+#else
 #undef pipe2
 #endif
 
@@ -33,8 +37,23 @@ namespace terminal = vnm_terminal;
 
 constexpr int k_control_descriptor = 64;
 
-enum class Probe { NONE, MASTER, SLAVE, PIPE, SIGNAL, FORK_FAILURE };
+enum class Probe
+{
+    NONE, MASTER, SLAVE, PIPE, SIGNAL, FORK_FAILURE,
+    PIPE_EXEC_EVENT, PIPE_EXITED, PIPE_REJECTED, PIPE_SIGNAL,
+};
 Probe probe = Probe::NONE;
+
+bool inherited_startup_probe(Probe kind)
+{
+#if defined(__APPLE__)
+    return kind == Probe::PIPE || kind == Probe::PIPE_EXEC_EVENT || kind == Probe::PIPE_EXITED ||
+        kind == Probe::PIPE_REJECTED || kind == Probe::PIPE_SIGNAL;
+#else
+    (void)kind;
+    return false;
+#endif
+}
 
 void require(bool condition, const char* message)
 {
@@ -106,6 +125,8 @@ struct Barrier
     std::condition_variable changed;
     bool captured = false;
     bool released = false;
+    bool launch_finished = false;
+    pid_t foreign_child = -1;
     int first     = -1;
     int second    = -1;
     int flags     =  0;
@@ -115,6 +136,8 @@ Barrier* descriptor_barrier = nullptr;
 int signal_ready_writer    = -1;
 int signal_release_reader  = -1;
 int signal_handler_writer  = -1;
+int exec_release_reader    = -1;
+int exec_release_writer    = -1;
 
 void capture_descriptor(int first, int second = -1)
 {
@@ -165,6 +188,8 @@ void finish_owner(terminal::Terminal_process_owner& owner, pid_t child)
 
 void descriptor_test(const std::string& executable, Probe kind)
 {
+    const bool inherited_startup = inherited_startup_probe(kind);
+    const bool rejected = kind == Probe::PIPE_REJECTED || kind == Probe::PIPE_SIGNAL;
     sigset_t blocked;
     sigset_t original;
     sigemptyset(&blocked);
@@ -175,6 +200,9 @@ void descriptor_test(const std::string& executable, Probe kind)
     Pipe control;
     Pipe foreign_control;
     Pipe foreign_events;
+    Pipe exec_release;
+    exec_release_reader = exec_release.reader();
+    exec_release_writer = exec_release.writer();
     Barrier barrier;
     descriptor_barrier = &barrier;
     probe              = kind;
@@ -182,7 +210,8 @@ void descriptor_test(const std::string& executable, Probe kind)
     std::string foreign_error;
     auto owner = terminal::internal::make_posix_terminal_process_owner();
     std::thread foreign([
-            &barrier, &foreign_control, &foreign_events, &foreign_ok, &foreign_error, &executable
+            &barrier, &foreign_control, &foreign_events, &foreign_ok, &foreign_error, &executable,
+            inherited_startup
         ]
         {
             try {
@@ -207,6 +236,12 @@ void descriptor_test(const std::string& executable, Probe kind)
                 }
                 char report = 0;
                 const bool reported = transfer(foreign_events.reader(), &report, 1, false);
+                if (inherited_startup) {
+                    barrier.foreign_child = child;
+                    barrier.released = true;
+                    barrier.changed.notify_all();
+                    (void)barrier.changed.wait_for(lock, 20s, [&barrier] { return barrier.launch_finished; });
+                }
                 char release = 'R';
                 (void)transfer(foreign_control.writer(), &release, 1, true);
                 int status = 0;
@@ -214,7 +249,7 @@ void descriptor_test(const std::string& executable, Probe kind)
                 do {
                     waited = ::waitpid(child, &status, 0);
                 } while (waited < 0 && errno == EINTR);
-                foreign_ok = reported && report == 'C' && waited == child &&
+                foreign_ok = reported && report == (inherited_startup ? 'W' : 'C') && waited == child &&
                     WIFEXITED(status) && WEXITSTATUS(status) == 0;
                 barrier.released = true;
                 barrier.changed.notify_all();
@@ -228,13 +263,36 @@ void descriptor_test(const std::string& executable, Probe kind)
         });
 
     terminal::terminal_process_launch_result_t launched;
+    bool foreign_still_running = false;
+    const auto launch_started = Clock::now();
     try {
-        launched = owner->launch(launch_request(executable, control));
+        auto request = launch_request(executable, control);
+        if (kind == Probe::PIPE_EXITED) {
+            request.argv[1] = "--terminal-immediate-child";
+        }
+        if (kind == Probe::PIPE_REJECTED) {
+            request.executable = "/unavailable/terminal-owner-launch-fixture";
+        }
+        launched = owner->launch(request);
+        const std::lock_guard lock(barrier.mutex);
+        if (inherited_startup && barrier.foreign_child > 0) {
+            siginfo_t observed{};
+            foreign_still_running = ::waitid(P_PID, (id_t)barrier.foreign_child, &observed,
+                WEXITED | WNOWAIT | WNOHANG) == 0 && observed.si_pid == 0;
+        }
+        barrier.launch_finished = true;
+        barrier.changed.notify_all();
     }
     catch (...) {
+        {
+            const std::lock_guard lock(barrier.mutex);
+            barrier.launch_finished = true;
+            barrier.changed.notify_all();
+        }
         foreign.join();
         throw;
     }
+    const auto launch_duration = Clock::now() - launch_started;
     foreign.join();
     probe = Probe::NONE;
     descriptor_barrier = nullptr;
@@ -242,15 +300,40 @@ void descriptor_test(const std::string& executable, Probe kind)
     (void)::pthread_sigmask(SIG_SETMASK, nullptr, &after);
     (void)::pthread_sigmask(SIG_SETMASK, &original, nullptr);
     require(masks_match(before, after), "successful fork restores the exact nonempty parent mask");
-    require(launched.accepted, "terminal exec remains confirmed during independent spawn");
-    char release = 'R';
-    require(transfer(control.writer(), &release, 1, true), "release terminal child cooperatively");
+    require(launched.accepted == !rejected, "native image replacement decides terminal launch acceptance");
+    if (launched.accepted && kind != Probe::PIPE_EXITED) {
+        char release = 'R';
+        require(transfer(control.writer(), &release, 1, true), "release terminal child cooperatively");
+    }
     const auto exited = owner->wait_root();
-    ::close(launched.master_descriptor);
+    if (launched.master_descriptor >= 0) {
+        ::close(launched.master_descriptor);
+    }
     finish_owner(*owner, (pid_t)launched.root_process_id);
-    require(exited && exited->exit_code == 0 && exited->signal == 0, "terminal child exits normally");
-    require(foreign_error.empty() && foreign_ok && (barrier.flags & FD_CLOEXEC) != 0,
-        "descriptor is close-on-exec at creation and absent from independent exec");
+    if (kind == Probe::PIPE_REJECTED) {
+        require(exited && exited->exit_code == 127 && launched.start_outcome_determinate &&
+            launched.error == std::string("terminal exec: ") + std::strerror(ENOENT),
+            "complete child errno establishes rejected exec with its actual cause");
+    }
+    else
+    if (kind == Probe::PIPE_SIGNAL) {
+        require(exited && exited->signal == SIGKILL && !launched.start_outcome_determinate,
+            "pre-exec death cannot establish successful image replacement");
+    }
+    else {
+        require(exited && exited->exit_code == 0 && exited->signal == 0, "terminal child exits normally");
+    }
+    if (inherited_startup) {
+        require(foreign_error.empty() && foreign_ok && foreign_still_running && launch_duration < 4s,
+            "launch completes while an independent exec still holds the startup writer");
+        std::printf("inherited_writer case=%d launch_ms=%lld accepted=%d determinate=%d held_foreign=1\n",
+            (int)kind, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(launch_duration).count(),
+            launched.accepted, launched.start_outcome_determinate);
+    }
+    else {
+        require(foreign_error.empty() && foreign_ok && (barrier.flags & FD_CLOEXEC) != 0,
+            "descriptor is close-on-exec at creation and absent from independent exec");
+    }
 }
 
 void inherited_signal_handler(int)
@@ -360,7 +443,48 @@ extern "C" int owner_test_posix_openpt(int flags)
     return descriptor;
 }
 
-#if defined(__linux__)
+#if defined(__APPLE__)
+extern "C" int owner_test_pipe(int descriptors[2])
+{
+    const int result = ::pipe(descriptors);
+    if (result == 0 && inherited_startup_probe(probe)) {
+        capture_descriptor(descriptors[0], descriptors[1]);
+    }
+    return result;
+}
+
+extern "C" int owner_test_kevent(int queue, const struct kevent* changes, int change_count,
+    struct kevent* events, int event_count, const struct timespec* timeout)
+{
+    if (probe == Probe::PIPE_EXITED || probe == Probe::PIPE_REJECTED) {
+        for (int index = 0; index < change_count; ++index) {
+            if (changes[index].filter == EVFILT_PROC && (changes[index].flags & EV_ADD) != 0) {
+                siginfo_t observed{};
+                if (::waitid(P_PID, (id_t)changes[index].ident, &observed, WEXITED | WNOWAIT) < 0) {
+                    return -1;
+                }
+            }
+        }
+    }
+    return ::kevent(queue, changes, change_count, events, event_count, timeout);
+}
+
+extern "C" int owner_test_sysctl(int* name, u_int length, void* data, size_t* size,
+    void* replacement, size_t replacement_size)
+{
+    const int result = ::sysctl(name, length, data, size, replacement, replacement_size);
+    if (probe == Probe::PIPE_EXEC_EVENT && length == 4 && name[0] == CTL_KERN &&
+        name[1] == KERN_PROC && name[2] == KERN_PROC_PID)
+    {
+        char release = 'R';
+        if (!transfer(exec_release_writer, &release, 1, true)) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return result;
+}
+#else
 extern "C" int owner_test_pipe2(int descriptors[2], int flags)
 {
     const int result = ::pipe2(descriptors, flags);
@@ -382,6 +506,16 @@ extern "C" pid_t owner_test_fork()
 
 extern "C" int owner_test_login_tty(int descriptor)
 {
+    if (probe == Probe::PIPE_SIGNAL) {
+        ::kill(::getpid(), SIGKILL);
+        ::_exit(114);
+    }
+    if (probe == Probe::PIPE_EXEC_EVENT) {
+        char command = 0;
+        if (!transfer(exec_release_reader, &command, 1, false)) {
+            ::_exit(115);
+        }
+    }
     if (probe == Probe::SIGNAL) {
         pid_t child = ::getpid();
         if (!transfer(signal_ready_writer, &child, sizeof(child), true)) {
@@ -398,6 +532,9 @@ extern "C" int owner_test_login_tty(int descriptor)
 int main(int argc, char** argv)
 {
     ::alarm(25);
+    if (argc == 2 && std::strcmp(argv[1], "--terminal-immediate-child") == 0) {
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--terminal-child") == 0) {
         char release = 0;
         sigset_t mask;
@@ -411,10 +548,11 @@ int main(int argc, char** argv)
         const int second = std::atoi(argv[3]);
         const bool closed = ::fcntl(first, F_GETFD) < 0 && errno == EBADF &&
             (second < 0 || (::fcntl(second, F_GETFD) < 0 && errno == EBADF));
-        char report = closed ? 'C' : 'L';
+        const bool writer_retained = second >= 0 && ::fcntl(second, F_GETFD) >= 0;
+        char report = closed ? 'C' : writer_retained ? 'W' : 'L';
         char release = 0;
         return transfer(std::atoi(argv[5]), &report, 1, true) &&
-            transfer(std::atoi(argv[4]), &release, 1, false) && release == 'R' ? 0 : 5;
+            transfer(std::atoi(argv[4]), &release, 1, false, 20000) && release == 'R' ? 0 : 5;
     }
     try {
         require(argc == 2, "one native launch case is required");
@@ -429,6 +567,22 @@ int main(int argc, char** argv)
         else
         if (std::strcmp(argv[1], "pipe") == 0) {
             descriptor_test(executable, Probe::PIPE);
+        }
+        else
+        if (std::strcmp(argv[1], "pipe_exec_event") == 0) {
+            descriptor_test(executable, Probe::PIPE_EXEC_EVENT);
+        }
+        else
+        if (std::strcmp(argv[1], "pipe_exited") == 0) {
+            descriptor_test(executable, Probe::PIPE_EXITED);
+        }
+        else
+        if (std::strcmp(argv[1], "pipe_rejected") == 0) {
+            descriptor_test(executable, Probe::PIPE_REJECTED);
+        }
+        else
+        if (std::strcmp(argv[1], "pipe_signal") == 0) {
+            descriptor_test(executable, Probe::PIPE_SIGNAL);
         }
         else
         if (std::strcmp(argv[1], "signal") == 0) {

@@ -112,6 +112,8 @@ if(UNIX)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         list(APPEND owner_launch_cases pipe)
         target_link_libraries(vnm_terminal_posix_owner_launch_tests PRIVATE util)
+    elseif(APPLE)
+        list(APPEND owner_launch_cases pipe pipe_exec_event pipe_exited pipe_rejected pipe_signal)
     endif()
     foreach(scenario IN LISTS owner_launch_cases)
         add_test(NAME vnm_terminal_posix_owner_launch_${scenario}

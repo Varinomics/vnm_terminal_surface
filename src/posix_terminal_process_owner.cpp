@@ -26,6 +26,7 @@
 #include <utility>
 #if defined(__APPLE__)
 #include <libproc.h>
+#include <sys/event.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <util.h>
@@ -310,6 +311,109 @@ struct exec_confirmation_t
     bool child_rejected = false;
 };
 
+#if defined(__APPLE__)
+exec_confirmation_t confirm_exec(int descriptor, int events, pid_t child) noexcept
+{
+    const auto deadline = std::chrono::steady_clock::now() + k_exec_confirmation_timeout;
+    struct kevent registrations[2];
+    EV_SET(&registrations[0], descriptor, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+    EV_SET(&registrations[1], child, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXEC | NOTE_EXIT, 0, nullptr);
+    const int registration_error = ::kevent(events, registrations, 2, nullptr, 0, nullptr) < 0
+        ? errno : 0;
+    if (registration_error != 0 && registration_error != ESRCH) {
+        return {registration_error, false};
+    }
+
+    // Events cover later execs; this snapshot covers an image committed before
+    // registration, including an already-exited child. Our retained wait pins
+    // the identity, and fork does not inherit P_EXEC from the host.
+    int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, child};
+    kinfo_proc process{};
+    std::size_t size = sizeof(process);
+    if (::sysctl(query, 4, &process, &size, nullptr, 0) < 0) {
+        return {errno, false};
+    }
+    if (size != sizeof(process) || process.kp_proc.p_pid != child) {
+        return {ESRCH, false};
+    }
+    if ((process.kp_proc.p_flag & P_EXEC) != 0) {
+        return {};
+    }
+    bool child_exited = process.kp_proc.p_stat == SZOMB || (process.kp_proc.p_flag & P_WEXIT) != 0;
+    if (registration_error != 0 && !child_exited) {
+        return {registration_error, false};
+    }
+
+    int child_error = 0;
+    std::size_t received = 0;
+    auto* bytes = reinterpret_cast<char*>(&child_error);
+    bool channel_closed = false;
+    for (;;) {
+        // Read only available errno bytes: an unrelated fork may still own a
+        // pipe writer. Neither its lifetime nor EOF establishes our child's exec.
+        while (!channel_closed) {
+            const auto count = ::read(descriptor, bytes + received, sizeof(child_error) - received);
+            if (count > 0) {
+                received += (std::size_t)count;
+                if (received == sizeof(child_error)) {
+                    return {child_error != 0 ? child_error : EIO, child_error != 0};
+                }
+            }
+            else
+            if (count == 0) {
+                channel_closed = true;
+                struct kevent removal;
+                EV_SET(&removal, descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+                if (::kevent(events, &removal, 1, nullptr, 0, nullptr) < 0) {
+                    return {errno, false};
+                }
+            }
+            else
+            if (errno == EINTR) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return {ETIMEDOUT, false};
+                }
+            }
+            else
+            if (errno == EAGAIN) {
+                break;
+            }
+            else {
+                return {errno, false};
+            }
+        }
+        if (child_exited) {
+            return {EIO, false};
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) {
+            return {ETIMEDOUT, false};
+        }
+        const timespec timeout{remaining / 1000000000, remaining % 1000000000};
+        struct kevent observations[2];
+        const int count = ::kevent(events, nullptr, 0, observations, 2, &timeout);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return {errno, false};
+        }
+        for (int index = 0; index < count; ++index) {
+            const auto& observation = observations[index];
+            if ((observation.flags & EV_ERROR) != 0) {
+                return {observation.data != 0 ? (int)observation.data : EIO, false};
+            }
+            if (observation.filter == EVFILT_PROC && observation.ident == (uintptr_t)child) {
+                if ((observation.fflags & NOTE_EXEC) != 0) {
+                    return {};
+                }
+                child_exited |= (observation.fflags & NOTE_EXIT) != 0;
+            }
+        }
+    }
+}
+#else
 exec_confirmation_t confirm_exec(int descriptor) noexcept
 {
     const auto deadline = std::chrono::steady_clock::now() + k_exec_confirmation_timeout;
@@ -348,6 +452,7 @@ exec_confirmation_t confirm_exec(int descriptor) noexcept
         }
     }
 }
+#endif
 
 class Posix_terminal_process_owner final : public Terminal_process_owner
 {
@@ -735,6 +840,19 @@ terminal_process_launch_result_t Posix_terminal_process_owner::launch(
         result.error = native_error("retain terminal exec pipe", errno);
         return result;
     }
+#if defined(__APPLE__)
+    const int startup_flags = ::fcntl(startup_read.get(), F_GETFL);
+    if (startup_flags < 0 || ::fcntl(startup_read.get(), F_SETFL, startup_flags | O_NONBLOCK) < 0) {
+        result.error = native_error("set terminal exec pipe nonblocking", errno);
+        return result;
+    }
+    // Darwin creates kqueues close-on-exec and non-inheritable by fork.
+    Owned_descriptor startup_events(::kqueue());
+    if (startup_events.get() < 0) {
+        result.error = native_error("observe terminal exec", errno);
+        return result;
+    }
+#endif
     prepared.kept_descriptors.push_back(startup_write.get());
     std::sort(prepared.kept_descriptors.begin(), prepared.kept_descriptors.end());
 #if defined(__APPLE__)
@@ -847,7 +965,11 @@ terminal_process_launch_result_t Posix_terminal_process_owner::launch(
     startup_write.reset();
     result.native_dispatch_occurred = true;
     result.root_process_id = child;
+#if defined(__APPLE__)
+    const auto confirmation = confirm_exec(startup_read.get(), startup_events.get(), child);
+#else
     const auto confirmation = confirm_exec(startup_read.get());
+#endif
     if (confirmation.error != 0) {
         // The child's complete errno payload establishes rejected exec, not
         // completed cleanup. A timeout or channel failure establishes neither.
