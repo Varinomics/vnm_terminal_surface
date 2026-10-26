@@ -31,16 +31,19 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -931,27 +934,176 @@ term::Terminal_launch_config launch_config(
 
 struct cpu_accounting_process_times_t
 {
-    std::uint64_t kernel_ticks = 0;
-    std::uint64_t user_ticks   = 0;
+    std::uint64_t kernel_ticks   = 0;
+    std::uint64_t user_ticks     = 0;
+    std::uint64_t creation_ticks = 0;
+    std::uint64_t exit_ticks     = 0;
+    std::int64_t  before_qpc     = 0;
+    std::int64_t  after_qpc      = 0;
+    DWORD         pid            = 0;
+    DWORD         signal         = WAIT_FAILED;
+    DWORD         error          = 0;
 };
 
 std::optional<std::uint64_t> process_cpu_time_usec(
     HANDLE                          process,
-    cpu_accounting_process_times_t* out_times = nullptr)
+    cpu_accounting_process_times_t* out_times = nullptr,
+    bool                            report_error = true)
 {
     FILETIME creation{}, exit{}, kernel{}, user{};
-    if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
-        std::cerr << "GetProcessTimes failed: " << GetLastError() << '\n';
+    LARGE_INTEGER before{}, after{};
+    if (out_times) {
+        QueryPerformanceCounter(&before);
+    }
+    const bool queried = GetProcessTimes(process, &creation, &exit, &kernel, &user);
+    const DWORD error = queried ? ERROR_SUCCESS : GetLastError();
+    if (out_times) {
+        QueryPerformanceCounter(&after);
+    }
+    if (!queried) {
+        if (out_times) {
+            out_times->error = error;
+        }
+        if (report_error) {
+            std::cerr << "GetProcessTimes failed: " << error << '\n';
+        }
         return std::nullopt;
     }
     const auto ticks = [](FILETIME time) {
         return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
     };
     if (out_times) {
-        *out_times = {ticks(kernel), ticks(user)};
+        *out_times = {ticks(kernel), ticks(user), ticks(creation), ticks(exit),
+            before.QuadPart, after.QuadPart, GetProcessId(process), WaitForSingleObject(process, 0)};
     }
     return (ticks(kernel) + ticks(user)) / 10;
 }
+
+void write_cpu_process_times(std::ostream& output, const cpu_accounting_process_times_t& times)
+{
+    output << " pid=" << times.pid << " kernel_ticks=" << times.kernel_ticks
+        << " user_ticks=" << times.user_ticks << " creation_ticks=" << times.creation_ticks
+        << " exit_ticks=" << times.exit_ticks << " signal=" << times.signal
+        << " qpc=[" << times.before_qpc << ',' << times.after_qpc << "]\n";
+}
+
+class Cpu_accounting_diagnostics
+{
+public:
+    void observe(
+        const char* event,
+        HANDLE job,
+        HANDLE root,
+        const term::windows_conpty_cpu_query_for_testing_t& query)
+    {
+        std::ostringstream output;
+        output << "Native CPU event=" << event << " qpc=[" << query.before_qpc << ',' << query.after_qpc
+            << "] error=" << query.error;
+        if (std::string_view(event) == "sample" || std::string_view(event) == "settlement") {
+            output << " kernel_ticks=" << query.kernel_ticks << " user_ticks=" << query.user_ticks
+                << " active=" << query.active_processes << " total=" << query.total_processes << '\n';
+        }
+        else {
+            // Assignment records bracket admission before the suspended root is resumed.
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+            LARGE_INTEGER before{}, after{};
+            QueryPerformanceCounter(&before);
+            const bool queried = QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                &accounting, sizeof(accounting), nullptr);
+            const DWORD error = queried ? ERROR_SUCCESS : GetLastError();
+            QueryPerformanceCounter(&after);
+            output << "\n  assignment Job qpc=[" << before.QuadPart << ',' << after.QuadPart
+                << "] error=" << error << " kernel_ticks=" << accounting.TotalKernelTime.QuadPart
+                << " user_ticks=" << accounting.TotalUserTime.QuadPart
+                << " active=" << accounting.ActiveProcesses << " total=" << accounting.TotalProcesses << '\n';
+        }
+        cpu_accounting_process_times_t root_times{};
+        output << "  retained root";
+        if (process_cpu_time_usec(root, &root_times, false)) {
+            write_cpu_process_times(output, root_times);
+        }
+        else {
+            output << " unavailable error=" << root_times.error << '\n';
+        }
+
+        // A bounded live snapshot identifies auxiliary members without retaining
+        // handles or claiming to reconstruct members that exited between samples.
+        struct member_list_t
+        {
+            DWORD assigned = 0;
+            DWORD count = 0;
+            ULONG_PTR ids[16]{};
+        } members;
+        LARGE_INTEGER members_before{}, members_after{};
+        QueryPerformanceCounter(&members_before);
+        const bool listed = QueryInformationJobObject(job, JobObjectBasicProcessIdList,
+            &members, sizeof(members), nullptr);
+        const DWORD list_error = listed ? ERROR_SUCCESS : GetLastError();
+        QueryPerformanceCounter(&members_after);
+        output << "  member snapshot qpc=[" << members_before.QuadPart << ',' << members_after.QuadPart
+            << "] error=" << list_error << " assigned=" << members.assigned << " returned=" << members.count
+            << " capacity=" << std::size(members.ids) << '\n';
+        if (listed || list_error == ERROR_MORE_DATA) {
+            for (DWORD index = 0; index < std::min<DWORD>(members.count, std::size(members.ids)); ++index) {
+                const DWORD pid = (DWORD)members.ids[index];
+                Win32_process_handle member(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid));
+                const DWORD open_error = member.is_valid() ? ERROR_SUCCESS : GetLastError();
+                output << "  member listed_pid=" << pid << " open_error=" << open_error;
+                if (!member.is_valid()) {
+                    output << '\n';
+                    continue;
+                }
+                BOOL in_job = FALSE;
+                const bool checked = IsProcessInJob(member.get(), job, &in_job);
+                const DWORD membership_error = checked ? ERROR_SUCCESS : GetLastError();
+                std::array<wchar_t, 1024> image{};
+                DWORD image_size = (DWORD)image.size();
+                const bool named = QueryFullProcessImageNameW(member.get(), 0, image.data(), &image_size);
+                const DWORD image_error = named ? ERROR_SUCCESS : GetLastError();
+                output << " in_job=" << in_job << " membership_error=" << membership_error
+                    << " image_error=" << image_error << " image="
+                    << (named ? QString::fromWCharArray(image.data(), image_size).toStdString() : std::string{});
+                cpu_accounting_process_times_t member_times{};
+                if (process_cpu_time_usec(member.get(), &member_times, false)) {
+                    write_cpu_process_times(output, member_times);
+                }
+                else {
+                    output << " counters unavailable error=" << member_times.error << '\n';
+                }
+            }
+        }
+        const std::lock_guard lock(m_mutex);
+        if (std::string_view(event) == "settlement") {
+            m_settlement = output.str();
+        }
+        else
+        if (m_records.size() < 32) {
+            m_records.push_back(output.str());
+        }
+        else {
+            ++m_dropped_records;
+        }
+    }
+
+    void dump() const
+    {
+        const std::lock_guard lock(m_mutex);
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        std::cerr << "Native CPU diagnostics: ticks=100ns qpc_frequency=" << frequency.QuadPart
+            << " dropped_records=" << m_dropped_records << '\n';
+        for (const auto& record : m_records) {
+            std::cerr << record;
+        }
+        std::cerr << "Last settlement observation:\n" << m_settlement;
+    }
+
+private:
+    mutable std::mutex       m_mutex;
+    std::vector<std::string> m_records;
+    std::string              m_settlement;
+    unsigned                 m_dropped_records = 0;
+};
 
 int run_cpu_accounting_child(const QString& directory)
 {
@@ -1014,6 +1166,7 @@ int run_cpu_accounting_root(const QString& executable_path, const QString& direc
 
 bool check_cpu_accounting_sample(
     term::Windows_conpty_backend&         backend,
+    const Cpu_accounting_diagnostics&     diagnostics,
     std::uint64_t                         minimum_cpu_usec,
     std::string_view                      phase,
     vnm_terminal::process_cpu_time_t*      out_sample,
@@ -1038,10 +1191,10 @@ bool check_cpu_accounting_sample(
         std::cerr << "Job CPU usec=" << sample->cpu_time_usec
             << ", root and child CPU usec=" << minimum_cpu_usec << '\n';
         if (root_times && child_times) {
-            std::cerr << "Independent process CPU (100 ns ticks): root kernel=" << root_times->kernel_ticks
-                << " user=" << root_times->user_ticks
-                << ", child kernel=" << child_times->kernel_ticks
-                << " user=" << child_times->user_ticks << '\n';
+            std::cerr << "Independent root";
+            write_cpu_process_times(std::cerr, *root_times);
+            std::cerr << "Independent child";
+            write_cpu_process_times(std::cerr, *child_times);
         }
         // Preserve the failed sample and verdict while exposing whether the native total settles later.
         for (int index = 0; index < k_cpu_accounting_failure_resample_count; ++index) {
@@ -1058,6 +1211,7 @@ bool check_cpu_accounting_sample(
                 std::cerr << " unavailable\n";
             }
         }
+        diagnostics.dump();
     }
     ok &= check(sample->sampled_at_usec >= static_cast<std::uint64_t>(before) &&
             sample->sampled_at_usec <= static_cast<std::uint64_t>(after),
@@ -1076,7 +1230,17 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     }
     const QDir gates(directory.path());
     Backend_capture capture;
+    auto diagnostics = std::make_shared<Cpu_accounting_diagnostics>();
     term::Windows_conpty_backend backend;
+    if (!check(backend.set_cpu_observer_for_testing(
+            [diagnostics](const char* event, void* job, void* root,
+                const term::windows_conpty_cpu_query_for_testing_t& query)
+            {
+                diagnostics->observe(event, job, root, query);
+            }), "CPU diagnostic observer is installed before admission"))
+    {
+        return false;
+    }
     if (!check(!backend.process_cpu_time(), "CPU is unavailable before Job admission")) {
         return false;
     }
@@ -1098,7 +1262,7 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
         return false;
     }
     vnm_terminal::process_cpu_time_t initial{}, live{}, child_exited{}, root_exited{};
-    if (!check_cpu_accounting_sample(backend, 0, "before workload", &initial) ||
+    if (!check_cpu_accounting_sample(backend, *diagnostics, 0, "before workload", &initial) ||
         !check(write_gate_file(gates.filePath(QStringLiteral("start-burn"))), "CPU child is released") ||
         !check(wait_for_file(gates.filePath(QStringLiteral("burn-finished"))), "CPU child finishes its work"))
     {
@@ -1109,7 +1273,7 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     const auto live_child_cpu = process_cpu_time_usec(child.get(), &live_child_times);
     if (!check(live_root_cpu && live_child_cpu && *live_child_cpu >= k_cpu_accounting_work_usec,
             "independent process accounting confirms substantial child CPU") ||
-        !check_cpu_accounting_sample(backend, *live_root_cpu + *live_child_cpu, "live child", &live,
+        !check_cpu_accounting_sample(backend, *diagnostics, *live_root_cpu + *live_child_cpu, "live child", &live,
             &live_root_times, &live_child_times))
     {
         return false;
@@ -1127,7 +1291,7 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     const auto waiting_root_cpu = process_cpu_time_usec(root.get(), &waiting_root_times);
     child.reset();
     if (!check(final_child_cpu && waiting_root_cpu, "exited child CPU remains independently readable") ||
-        !check_cpu_accounting_sample(backend, *final_child_cpu + *waiting_root_cpu,
+        !check_cpu_accounting_sample(backend, *diagnostics, *final_child_cpu + *waiting_root_cpu,
             "child handles closed", &child_exited, &waiting_root_times, &final_child_times))
     {
         return false;
@@ -1146,7 +1310,7 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     const auto final_root_cpu = process_cpu_time_usec(root.get(), &final_root_times);
     root.reset();
     if (!check(final_root_cpu.has_value(), "root final CPU is available") ||
-        !check_cpu_accounting_sample(backend, *final_root_cpu + *final_child_cpu,
+        !check_cpu_accounting_sample(backend, *diagnostics, *final_root_cpu + *final_child_cpu,
             "root exited", &root_exited, &final_root_times, &final_child_times))
     {
         return false;

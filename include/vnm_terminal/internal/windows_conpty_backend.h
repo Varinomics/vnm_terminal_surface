@@ -3,6 +3,8 @@
 #include "vnm_terminal/internal/backend_contract.h"
 #include <cstddef>
 #include <atomic>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <semaphore>
@@ -62,6 +64,22 @@ struct Windows_conpty_resize_control_for_testing
     std::binary_semaphore allow_resize{0};
 };
 
+struct windows_conpty_cpu_query_for_testing_t
+{
+    std::int64_t  before_qpc       = 0;
+    std::int64_t  after_qpc        = 0;
+    std::uint64_t kernel_ticks     = 0;
+    std::uint64_t user_ticks       = 0;
+    std::uint32_t active_processes = 0;
+    std::uint32_t total_processes  = 0;
+    std::uint32_t error            = 0;
+};
+
+// Installed before start. Handles are borrowed only for the callback, which
+// runs under native ownership and must not re-enter the backend or retain them.
+using Windows_conpty_cpu_observer_for_testing = std::function<void(
+    const char* event, void* job, void* root, const windows_conpty_cpu_query_for_testing_t& query)>;
+
 class Windows_conpty_backend final : public Terminal_backend
 {
 public:
@@ -102,6 +120,7 @@ public:
     bool set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate);
     bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control);
     bool set_resize_control_for_testing(std::shared_ptr<Windows_conpty_resize_control_for_testing> control);
+    bool set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer);
 
 private:
     class Impl;

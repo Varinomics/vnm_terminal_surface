@@ -770,9 +770,7 @@ public:
         }
         // Root exit does not retire the Job's accumulated descendant time.
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-        if (!QueryInformationJobObject(m_process_job.get(), JobObjectBasicAccountingInformation,
-                &accounting, sizeof(accounting), nullptr))
-        {
+        if (!query_cpu_accounting(accounting, "sample")) {
             return std::nullopt;
         }
         const auto user_ticks   = static_cast<std::uint64_t>(accounting.TotalUserTime.QuadPart);
@@ -818,6 +816,16 @@ public:
             return false;
         }
         m_start_fault_for_testing = fault;
+        return true;
+    }
+
+    bool set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_start_attempted || m_start_in_progress) {
+            return false;
+        }
+        m_cpu_observer_for_testing = std::move(observer);
         return true;
     }
 
@@ -1140,9 +1148,22 @@ public:
         QString post_birth_failure;
         const bool inject_assignment_failure =
             m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT;
-        if (inject_assignment_failure || !AssignProcessToJobObject(m_process_job.get(), m_process.get())) {
-            const DWORD error = inject_assignment_failure ? ERROR_ACCESS_DENIED : GetLastError();
-            post_birth_failure = windows_error_message(QStringLiteral("AssignProcessToJobObject"), error);
+        LARGE_INTEGER assignment_before{}, assignment_after{};
+        if (m_cpu_observer_for_testing) {
+            m_cpu_observer_for_testing("before assignment", m_process_job.get(), m_process.get(), {});
+            QueryPerformanceCounter(&assignment_before);
+        }
+        const bool assigned = !inject_assignment_failure &&
+            AssignProcessToJobObject(m_process_job.get(), m_process.get());
+        const DWORD assignment_error = assigned ? ERROR_SUCCESS :
+            (inject_assignment_failure ? ERROR_ACCESS_DENIED : GetLastError());
+        if (m_cpu_observer_for_testing) {
+            QueryPerformanceCounter(&assignment_after);
+            m_cpu_observer_for_testing("assignment", m_process_job.get(), m_process.get(),
+                {assignment_before.QuadPart, assignment_after.QuadPart, 0, 0, 0, 0, assignment_error});
+        }
+        if (!assigned) {
+            post_birth_failure = windows_error_message(QStringLiteral("AssignProcessToJobObject"), assignment_error);
         }
         else {
             {
@@ -2363,8 +2384,7 @@ private:
         }
         if (m_process_assigned_to_job) {
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-            if (!m_process_job || !QueryInformationJobObject(m_process_job.get(),
-                    JobObjectBasicAccountingInformation, &accounting, sizeof(accounting), nullptr) ||
+            if (!m_process_job || !query_cpu_accounting(accounting, "settlement") ||
                 accounting.ActiveProcesses != 0)
             {
                 return false;
@@ -2383,6 +2403,29 @@ private:
             request_native_process_tree_termination();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+    }
+
+    bool query_cpu_accounting(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION& accounting, const char* event) const
+    {
+        LARGE_INTEGER before{}, after{};
+        if (m_cpu_observer_for_testing) {
+            QueryPerformanceCounter(&before);
+        }
+        const bool queried = QueryInformationJobObject(m_process_job.get(), JobObjectBasicAccountingInformation,
+            &accounting, sizeof(accounting), nullptr);
+        const DWORD error = queried ? ERROR_SUCCESS : GetLastError();
+        if (m_cpu_observer_for_testing) {
+            QueryPerformanceCounter(&after);
+            m_cpu_observer_for_testing(event, m_process_job.get(), m_process.get(), {
+                before.QuadPart,
+                after.QuadPart,
+                (std::uint64_t)accounting.TotalKernelTime.QuadPart,
+                (std::uint64_t)accounting.TotalUserTime.QuadPart,
+                accounting.ActiveProcesses,
+                accounting.TotalProcesses,
+                error});
+        }
+        return queried;
     }
 
     void cancel_blocking_io()
@@ -2483,6 +2526,7 @@ private:
     std::uint64_t                      m_child_output_sequence    = 0U;
     Windows_conpty_start_fault_for_testing m_start_fault_for_testing =
         Windows_conpty_start_fault_for_testing::NONE;
+    Windows_conpty_cpu_observer_for_testing m_cpu_observer_for_testing;
     bool m_cleanup_observation_blocked_for_testing = false;
     std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
     std::shared_ptr<Windows_conpty_close_control_for_testing> m_close_control_for_testing;
@@ -2602,6 +2646,11 @@ Windows_conpty_backend::write_state_for_testing()
 bool Windows_conpty_backend::set_start_fault_for_testing(Windows_conpty_start_fault_for_testing fault)
 {
     return m_impl->set_start_fault_for_testing(fault);
+}
+
+bool Windows_conpty_backend::set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer)
+{
+    return m_impl->set_cpu_observer_for_testing(std::move(observer));
 }
 
 void Windows_conpty_backend::set_cleanup_observation_blocked_for_testing(bool blocked)
