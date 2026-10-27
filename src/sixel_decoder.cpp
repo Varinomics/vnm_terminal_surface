@@ -341,13 +341,24 @@ void Sixel_decoder::finish(std::vector<Parser_action>& actions, Sixel_work_budge
         image.raster = view_of_extent(std::move(m_raster), image.width, image.height);
     }
 
+    const bool completed_raster = !image.raster.isNull();
     actions.push_back({Screen_mutation{std::move(image)}});
+    const std::int64_t previous_pixels  = m_previous_extent_width * m_previous_extent_height;
+    const std::int64_t completed_pixels = m_extent_width * m_extent_height;
+    // Subtract floor(10%) to test ceil(90%) without scaling a large area.
+    m_previous_extent_stable = completed_raster && previous_pixels > 0 &&
+        completed_pixels <= previous_pixels && completed_pixels >= previous_pixels - previous_pixels / 10;
+    m_previous_extent_width  = completed_raster ? m_extent_width  : 0;
+    m_previous_extent_height = completed_raster ? m_extent_height : 0;
     release();
     m_active = false;
 }
 
 void Sixel_decoder::abort()
 {
+    m_previous_extent_width  = 0;
+    m_previous_extent_height = 0;
+    m_previous_extent_stable = false;
     release();
     m_active = false;
 }
@@ -587,7 +598,33 @@ void Sixel_decoder::reserve(std::int64_t width, std::int64_t height)
         grown.fill(0U);
     }
     else {
-        grown = m_raster.copy(0, 0, static_cast<int>(grown_width), static_cast<int>(grown_height));
+        if (m_previous_extent_stable && m_declared_width == 0 && m_declared_height == 0 &&
+            m_previous_extent_width > 0 && m_previous_extent_height > 0)
+        {
+            const std::int64_t hinted_width  = std::max(grown_width,  m_previous_extent_width);
+            const std::int64_t hinted_height = std::max(grown_height, m_previous_extent_height);
+            if ((hinted_width > grown_width || hinted_height > grown_height) &&
+                hinted_width <= limit / hinted_height)
+            {
+                const std::int64_t normal_pixels = grown_width * grown_height;
+                const std::int64_t hinted_pixels = hinted_width * hinted_height;
+                // Bound speculation to one more doubling of this reservation,
+                // rather than making a small image pay for an earlier large one.
+                if (hinted_pixels - normal_pixels <= normal_pixels) {
+                    grown = m_raster.copy(
+                        0, 0, static_cast<int>(hinted_width), static_cast<int>(hinted_height));
+                    if (!grown.isNull()) {
+                        grown_width  = hinted_width;
+                        grown_height = hinted_height;
+                    }
+                }
+            }
+        }
+        // A hint is optional: a failed larger allocation still gets the
+        // reservation the geometric policy would have made without it.
+        if (grown.isNull()) {
+            grown = m_raster.copy(0, 0, static_cast<int>(grown_width), static_cast<int>(grown_height));
+        }
     }
 
     // QImage reports a failed allocation with a null image, not an exception.

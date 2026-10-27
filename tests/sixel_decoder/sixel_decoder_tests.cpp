@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/parser_action.h"
+#include "vnm_terminal/internal/sixel_decoder.h"
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
@@ -257,6 +258,58 @@ bool check_pixel(
 {
     return check(pixel_at(image, x, y) == expected,
         label + ": pixel " + std::to_string(x) + "," + std::to_string(y));
+}
+
+struct Sixel_parse_work
+{
+    std::vector<term::Parser_action> actions;
+    std::uint64_t                  allocations = 0U;
+    std::uint64_t                  units       = 0U;
+    bool                           complete    = false;
+};
+
+Sixel_parse_work parse_sixel_work(term::Terminal_byte_stream_parser& parser, const QByteArray& bytes)
+{
+    Sixel_parse_work result;
+    qsizetype offset = 0;
+    for (int step = 0; offset < bytes.size() && step < 100000; ++step) {
+        // With no units left, the overrun ledger records every unit charged.
+        // The first step still runs, then the parser yields after its byte.
+        term::Sixel_work_budget budget(0U);
+        const auto actions = parser.ingest(bytes, offset, &budget);
+        result.actions.insert(result.actions.end(), actions.begin(), actions.end());
+        result.allocations += budget.raster_allocations();
+        result.units += budget.overrun();
+    }
+    result.complete = offset == bytes.size();
+    return result;
+}
+
+QByteArray sixel_growth_data(int bands)
+{
+    QByteArray data("\"1;1#1;2;100;0;0#2;2;0;100;0#3;2;0;0;100");
+    for (int band = 0; band < bands; ++band) {
+        data += "#1!400~!399?#3@$#2!200A";
+        if (band + 1 < bands) {
+            data += '-';
+        }
+    }
+    return data;
+}
+
+bool all_pixels_are(const term::Screen_sixel_image_mutation& image, QRgb color)
+{
+    if (image.raster.isNull()) {
+        return false;
+    }
+    for (int y = 0; y < image.height; ++y) {
+        for (int x = 0; x < image.width; ++x) {
+            if (image.raster.pixel(x, y) != color) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // The color a lone six-pixel sixel is drawn in, square pixels, no background.
@@ -772,6 +825,248 @@ bool test_sixel_growth_near_the_cap()
     return ok;
 }
 
+bool test_sixel_previous_extent_work()
+{
+    bool ok = true;
+    const QByteArray data = sixel_growth_data(100);
+    const QByteArray stream = sixel_dcs("0;1", data);
+    term::Terminal_byte_stream_parser parser;
+    const auto cold = parse_sixel_work(parser, stream);
+    const auto second = parse_sixel_work(parser, stream);
+    const auto warm = parse_sixel_work(parser, stream);
+    ok &= check(cold.complete && second.complete && warm.complete, "extent hint: all three images finish");
+    ok &= check(cold.allocations == 9U && second.allocations == 9U && warm.allocations == 8U,
+        "extent hint: only the third 800 by 600 image avoids one reservation");
+    // The drawing costs 2602 units per band. Reservation areas sum to
+    // 1,226,400 pixels cold and 784,800 once two completed extents agree.
+    ok &= check(cold.units == 260200U + 1226400U && second.units == cold.units &&
+        warm.units == 260200U + 784800U,
+        "extent hint: the ledger charges the actual reserved areas");
+    ok &= check(same_actions(cold.actions, second.actions) && same_actions(cold.actions, warm.actions),
+        "extent hint: identical complete actions");
+    const auto images = images_in(cold.actions);
+    bool pixels_match = images.size() == 1U && !images[0].raster.isNull();
+    if (pixels_match) {
+        ok &= check_size(images[0], 800, 600, "extent hint");
+        for (int y = 0; y < 600; ++y) {
+            for (int x = 0; x < 800; ++x) {
+                const QRgb expected = x < 400
+                    ? (x < 200 && y % 6 == 1 ? k_green : k_red)
+                    : (x == 799 && y % 6 == 0 ? k_blue : k_transparent);
+                pixels_match = pixels_match && pixel_at(images[0], x, y) == expected;
+            }
+        }
+    }
+    ok &= check(pixels_match, "extent hint: every colored and transparent pixel");
+    const QImage held_pixels = images.empty() ? QImage{} : images[0].raster.copy();
+
+    const QByteArray smaller_stream = sixel_dcs("0;1", sixel_growth_data(64));
+    term::Terminal_byte_stream_parser smaller_parser;
+    const auto smaller_cold = parse_sixel_work(smaller_parser, smaller_stream);
+    const auto surprise = parse_sixel_work(parser, smaller_stream);
+    ok &= check(surprise.complete && surprise.allocations == 8U && surprise.units == 166528U + 784800U,
+        "extent hint: the first unexpected shrink still uses the stable history");
+    ok &= check(same_actions(smaller_cold.actions, surprise.actions),
+        "extent hint: a surprising shrink keeps its actual pixels and geometry");
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        const auto larger = parse_sixel_work(parser, stream);
+        const auto smaller = parse_sixel_work(parser, smaller_stream);
+        ok &= check(larger.complete && larger.allocations == 9U && larger.units == cold.units &&
+            same_actions(cold.actions, larger.actions),
+            "extent hint: an alternating larger image uses the normal reservation policy");
+        ok &= check(smaller.complete && smaller.allocations == 8U && smaller.units == 166528U + 612000U &&
+            same_actions(smaller_cold.actions, smaller.actions),
+            "extent hint: repeated alternation does not speculate on the smaller image");
+    }
+
+    const auto declared = parse_sixel_work(parser,
+        sixel_dcs("0;1", QByteArray("\"1;1;800;600") + data.mid(4)));
+    ok &= check(declared.complete && declared.allocations == 1U &&
+        declared.units == 260200U + 480000U,
+        "extent hint: declared raster allocation is unchanged");
+    ok &= check(same_actions(cold.actions, declared.actions), "extent hint: declared pixels agree");
+    for (const QByteArray& dimensions : {QByteArray(";800"), QByteArray(";;600")}) {
+        const auto partial = parse_sixel_work(parser,
+            sixel_dcs("0;1", QByteArray("\"1;1") + dimensions + data.mid(4)));
+        ok &= check(partial.complete && partial.allocations == 9U &&
+            same_actions(cold.actions, partial.actions),
+            "extent hint: a partial declaration keeps the normal policy");
+    }
+
+    const auto expect_cold = [&](const QByteArray& boundary, const std::string& label) {
+        ingest_all(parser, boundary);
+        const auto recovered = parse_sixel_work(parser, stream);
+        const auto unconfirmed = parse_sixel_work(parser, stream);
+        ok &= check(recovered.complete && unconfirmed.complete &&
+            recovered.allocations == 9U && unconfirmed.allocations == 9U,
+            label + ": the old extent and stability are cleared");
+        ok &= check(same_actions(cold.actions, recovered.actions) && same_actions(cold.actions, unconfirmed.actions),
+            label + ": pixels and actions agree");
+    };
+    expect_cold(QByteArray("\x1bP0;1q!100~\x18"), "cancelled image");
+    expect_cold(QByteArray("\x1bP0;1q!100~\x1b[0m"), "recovered image");
+    expect_cold(sixel_dcs("0;1", {}), "empty image");
+
+    parser.set_sixel_raster_limit_bytes(64U);
+    ingest_all(parser, sixel_dcs("0;1", "!100~"));
+    parser.set_sixel_raster_limit_bytes(term::terminal_history_ring_max_record_bytes(
+        term::k_terminal_default_retained_history_capacity_bytes));
+    const auto after_limit = parse_sixel_work(parser, stream);
+    const auto second_after_limit = parse_sixel_work(parser, stream);
+    ok &= check(after_limit.complete && after_limit.allocations == 9U &&
+        second_after_limit.complete && second_after_limit.allocations == 9U &&
+        same_actions(cold.actions, after_limit.actions) && same_actions(cold.actions, second_after_limit.actions),
+        "over-limit image clears the extent and stability before later valid input");
+    ok &= check(images.size() == 1U && images[0].raster == held_pixels,
+        "extent hint: later images leave the held raster unchanged");
+    return ok;
+}
+
+bool test_sixel_previous_extent_stability()
+{
+    bool ok = true;
+    const auto declared_stream = [](int width, int height, int aspect = 1) {
+        return sixel_dcs("0;0", '"' + QByteArray::number(aspect) + ";1;" +
+            QByteArray::number(width) + ';' + QByteArray::number(height));
+    };
+    const auto solid_stream = [](int width, int height) {
+        QByteArray data("\"1;1#1;2;100;0;0");
+        for (int y = 0; y < height; y += 6) {
+            if (y != 0) {
+                data += '-';
+            }
+            const int rows = std::min(6, height - y);
+            data += '!' + QByteArray::number(width);
+            data += static_cast<char>('?' + ((1 << rows) - 1));
+        }
+        return sixel_dcs("0;1", data);
+    };
+    // A declared background rectangle completes with exactly its physical
+    // dimensions. Probe the next, unhinted image through its allocation ledger.
+    const std::vector<std::tuple<int, int, int, int, std::uint64_t>> cases = {
+        {100, 60, 100,   60, 4U}, // equal area
+        {100, 60,  90,   60, 4U}, // exactly 90% of the area
+        {100, 60, 100,   54, 4U}, // the same boundary in the other dimension
+        {100, 60, 120,   45, 3U}, // 90% area despite a wider image
+        {100, 60,  90,   54, 5U}, // 90% of each dimension is only 81% area
+        {100, 60,  89,   60, 5U}, // below the area boundary
+        {100, 60, 100,   53, 5U}, // below the area boundary in the other dimension
+        {100, 60, 101,   60, 5U}, // larger area
+        {100, 60, 100,   61, 5U}, // larger area in the other dimension
+        {100, 60,  60,  100, 5U}, // equal area with different dimensions
+        {101, 61,   5, 1109, 8U}, // ceil(90% of 6161) is 5545
+        {101, 61,  56,   99, 6U}, // 5544 is just outside, despite truncating 90%
+    };
+    for (const auto& [prior_width, prior_height, width, height, allocations] : cases) {
+        term::Terminal_byte_stream_parser parser;
+        ingest_all(parser, declared_stream(prior_width, prior_height));
+        ingest_all(parser, declared_stream(width, height));
+        const auto probe = parse_sixel_work(parser, solid_stream(width, height));
+        const auto images = images_in(probe.actions);
+        const std::string label = "history " + std::to_string(width) + "x" + std::to_string(height);
+        ok &= check(probe.complete && probe.allocations == allocations,
+            label + ": only stable area history enables the next hint");
+        ok &= check(images.size() == 1U && diagnostics_in(probe.actions).empty(), label + ": one valid image");
+        if (images.size() == 1U) {
+            ok &= check_size(images[0], width, height, label);
+            ok &= check(all_pixels_are(images[0], k_red), label + ": every pixel");
+        }
+    }
+
+    term::Terminal_byte_stream_parser parser;
+    ingest_all(parser, declared_stream(100, 60, 2));
+    ingest_all(parser, declared_stream(100, 60, 1));
+    const auto physical_match = parse_sixel_work(parser, solid_stream(100, 60));
+    ok &= check(physical_match.complete && physical_match.allocations == 4U,
+        "history: equal physical extents remain stable across aspect parameter changes");
+    return ok;
+}
+
+bool test_sixel_previous_extent_bounds()
+{
+    bool ok = true;
+    term::Terminal_byte_stream_parser parser;
+    const QByteArray large = sixel_dcs("0;0", "\"1;1;2048;1024");
+    const auto expect_small = [&](const QByteArray& data, int width, std::uint64_t units,
+                                 const std::string& label) {
+        const auto seed = ingest_all(parser, large);
+        ok &= check(diagnostics_in(seed).empty(), label + ": the prior large image fits");
+        ingest_all(parser, large);
+        const auto small = parse_sixel_work(parser, sixel_dcs("0;1", "#1;2;100;0;0" + data));
+        const auto images = images_in(small.actions);
+        ok &= check(small.complete && small.allocations == 2U && small.units == units,
+            label + ": no speculative large reservation");
+        ok &= check(images.size() == 1U && diagnostics_in(small.actions).empty(), label + ": one valid image");
+        if (images.size() == 1U) {
+            ok &= check_size(images[0], width, 12, label);
+            ok &= check(all_pixels_are(images[0], k_red), label + ": every pixel");
+        }
+    };
+    expect_small("\"1;1!2~-!2~", 2, 60U, "large then tiny");
+    expect_small("\"1;1!2048~-!2048~", 2048, 61440U, "large then same-width short");
+
+    // The remembered 64x12 fits the cap alone. Combining its height with
+    // the normal 170x6 reservation does not, even though it meets the 2x bound.
+    parser.set_sixel_raster_limit_bytes(4096U);
+    ingest_all(parser, sixel_dcs("0;0", "\"1;1;64;12"));
+    ingest_all(parser, sixel_dcs("0;0", "\"1;1;64;12"));
+    const auto wide = parse_sixel_work(parser, sixel_dcs("0;1", "\"1;1#1;2;100;0;0!128~!22~"));
+    const auto wide_images = images_in(wide.actions);
+    ok &= check(wide.complete && wide.allocations == 2U && wide.units == 2688U,
+        "combined hint: charge only the cap-bounded normal reservation");
+    ok &= check(wide_images.size() == 1U && diagnostics_in(wide.actions).empty(),
+        "combined hint: valid input stays valid");
+    if (wide_images.size() == 1U) {
+        ok &= check_size(wide_images[0], 150, 6, "combined hint");
+        ok &= check(all_pixels_are(wide_images[0], k_red), "combined hint: every pixel");
+    }
+
+    ingest_all(parser, sixel_dcs("0;0", "\"1;1;150;6"));
+    ingest_all(parser, sixel_dcs("0;0", "\"1;1;150;6"));
+    parser.set_sixel_raster_limit_bytes(192U);
+    const auto shrunk = parse_sixel_work(parser, sixel_dcs("0;1", "\"1;1#1;2;100;0;0!2~-!2~"));
+    const auto shrunk_images = images_in(shrunk.actions);
+    ok &= check(shrunk.complete && shrunk.allocations == 2U && shrunk.units == 60U &&
+        diagnostics_in(shrunk.actions).empty(), "limit shrink ignores the earlier large hint");
+    ok &= check(shrunk_images.size() == 1U && all_pixels_are(shrunk_images[0], k_red),
+        "limit shrink: the small image keeps its pixels");
+    return ok;
+}
+
+bool test_sixel_previous_extent_pixels()
+{
+    bool ok = true;
+    term::Terminal_byte_stream_parser parser;
+    for (int aspect : {1, 2}) {
+        for (bool transparent : {true, false}) {
+            const QByteArray data = '"' + QByteArray::number(aspect) +
+                ";1#0;2;0;0;0#1;2;100;0;0#2;2;0;100;0#3;2;0;0;100#4;2;100;100;100"
+                "#1!10~-#2!13@-#3!5@-#4!13@";
+            const QByteArray stream = sixel_dcs(transparent ? "0;1" : "0;0", data);
+            ingest_all(parser, stream);
+            ingest_all(parser, stream);
+            const auto actions = ingest_all(parser, stream);
+            const auto images = images_in(actions);
+            bool pixels_match = images.size() == 1U && !images[0].raster.isNull();
+            if (pixels_match) {
+                ok &= check_size(images[0], 13, 19 * aspect, "hinted pixel regions");
+                for (int y = 0; y < 19 * aspect; ++y) {
+                    for (int x = 0; x < 13; ++x) {
+                        QRgb expected = transparent ? k_transparent : k_black;
+                        if (y < 6 * aspect && x < 10) { expected = k_red;   }
+                        if (y >= 6 * aspect && y < 7 * aspect) { expected = k_green; }
+                        if (y >= 12 * aspect && y < 13 * aspect && x < 5) { expected = k_blue; }
+                        if (y >= 18 * aspect) { expected = k_white; }
+                        pixels_match = pixels_match && pixel_at(images[0], x, y) == expected;
+                    }
+                }
+            }
+            ok &= check(pixels_match, "hinted pixel regions: all pixels follow sixel semantics");
+        }
+    }
+    return ok;
+}
+
 bool test_sixel_geometry_saturates()
 {
     bool ok = true;
@@ -819,9 +1114,14 @@ bool test_sixel_geometry_saturates()
     }
     widest.append('G');
 
+    term::Terminal_byte_stream_parser widest_parser;
+    const QByteArray warm_image = sixel_dcs("0;1",
+        QByteArray("\"1;1#1!100~") + QByteArray("-!100~").repeated(9));
+    const auto before_saturation = ingest_all(widest_parser, warm_image);
+    ingest_all(widest_parser, warm_image);
     std::vector<term::Parser_action> widest_actions;
     try {
-        widest_actions = parse(sixel_dcs("0;1", widest));
+        widest_actions = ingest_all(widest_parser, sixel_dcs("0;1", widest));
     }
     catch (const std::exception& error) {
         return check(false, std::string("saturated geometry: decoding threw ") + error.what());
@@ -830,6 +1130,8 @@ bool test_sixel_geometry_saturates()
     constexpr std::uint64_t k_saturated_bytes =
         static_cast<std::uint64_t>(k_int_max) * static_cast<std::uint64_t>(k_int_max) * 4ULL;
     static_assert(k_saturated_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+    static_assert(k_saturated_bytes / 4U >
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) / 10U);
     ok &= check_over_cap(
         widest_actions,
         static_cast<std::size_t>(k_saturated_bytes),
@@ -841,6 +1143,15 @@ bool test_sixel_geometry_saturates()
     const std::vector<term::Screen_sixel_image_mutation> widest_images = images_in(widest_actions);
     ok &= check(!widest_images.empty() && widest_images[0].final_cursor_y == k_int_max,
         "saturated geometry: the cursor saturates");
+    // This failed image's area is beyond the range where multiplying by ten
+    // would be safe. It must clear stable history, never enable a later hint.
+    const auto after_saturation = parse_sixel_work(widest_parser, warm_image);
+    const auto unconfirmed = parse_sixel_work(widest_parser, warm_image);
+    ok &= check(after_saturation.complete && unconfirmed.complete &&
+        after_saturation.allocations == 5U && unconfirmed.allocations == 5U &&
+        same_actions(before_saturation, after_saturation.actions) &&
+        same_actions(before_saturation, unconfirmed.actions),
+        "saturated geometry: later images start without a confirmed history");
     return ok;
 }
 
@@ -1072,11 +1383,13 @@ bool test_sixel_budget_steps_match_a_whole_parse()
     const QByteArray overdraw =
         QByteArray("\x1bP0;1q\"1;1#1;2;100;0;0#2;2;0;100;0") +
         QByteArray("#1!300~$#2!300~-").repeated(6) + QByteArray("\x1b\\");
+    const QByteArray repeated_extent = sixel_dcs("0;1", "\"1;1#1!10~-!13@-!5@-!13@");
     const std::vector<std::pair<std::string, QByteArray>> streams = {
         {"images between text",
             "A" + sixel_dcs({}, "#1~~-~") + "B" + sixel_dcs("2;1", "#1!20~$!40~-!10~") + "C"},
         {"a background raster", sixel_dcs("0;0", "\"1;1;64;48#0;2;0;0;100#1!64~")},
         {"overdraw at 2:1", overdraw},
+        {"a repeated hinted extent", repeated_extent + repeated_extent + repeated_extent},
         {"8-bit controls", QByteArray("\x90q#1!9~-~\x9c", 10) + QByteArray("x")},
         {"a cancelled and a recovered image",
             QByteArray("\x1bPq!50~\x18") + QByteArray("\x1bPq!50~\x1b[0m") + sixel_dcs({}, "~~")},
@@ -1367,6 +1680,10 @@ int main()
     ok &= test_sixel_background();
     ok &= test_sixel_decoded_size_cap();
     ok &= test_sixel_growth_near_the_cap();
+    ok &= test_sixel_previous_extent_work();
+    ok &= test_sixel_previous_extent_stability();
+    ok &= test_sixel_previous_extent_bounds();
+    ok &= test_sixel_previous_extent_pixels();
     ok &= test_sixel_geometry_saturates();
     ok &= test_sixel_cap_trips_inside_a_scaled_band();
     ok &= test_sixel_header_limit_is_chunk_independent();

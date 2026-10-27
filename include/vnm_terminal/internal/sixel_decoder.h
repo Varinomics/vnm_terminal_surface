@@ -197,6 +197,12 @@ private:
     std::uint64_t              m_reservations        = 0U;
     std::uint64_t              m_reserved_pixels     = 0U;
 
+    // Two similar completed areas may hint at the next unhinted capacity,
+    // never geometry. The next image can still change size unexpectedly.
+    std::int64_t               m_previous_extent_width  = 0;
+    std::int64_t               m_previous_extent_height = 0;
+    bool                       m_previous_extent_stable = false;
+
     std::size_t                m_limit_bytes;
     std::size_t                m_exceeded_bytes      = 0U;
     bool                       m_limit_exceeded      = false;
