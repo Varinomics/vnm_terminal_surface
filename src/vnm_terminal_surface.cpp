@@ -5777,6 +5777,12 @@ VNM_TerminalSurface::process_cpu_time() const
         ? m_private->session->process_cpu_time() : std::nullopt;
 }
 
+std::optional<vnm_terminal::Process_snapshot> VNM_TerminalSurface::process_snapshot() const
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    return m_private->session ? m_private->session->process_snapshot() : std::nullopt;
+}
+
 bool VNM_TerminalSurface::interrupt_process()
 {
     Q_ASSERT(thread() == QThread::currentThread());

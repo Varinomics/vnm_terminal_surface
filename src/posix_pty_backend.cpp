@@ -937,6 +937,11 @@ public:
         return m_owner->process_cpu_time();
     }
 
+    std::optional<Process_snapshot> process_snapshot() const
+    {
+        return m_owner->process_snapshot();
+    }
+
     void shutdown()
     {
         {
@@ -1822,6 +1827,13 @@ std::optional<process_cpu_time_t> Posix_pty_backend::process_cpu_time() const
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->process_cpu_time();
+}
+
+std::optional<Process_snapshot> Posix_pty_backend::process_snapshot() const
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
+    return impl->process_snapshot();
 }
 
 Terminal_backend_result Posix_pty_backend::set_cell_pixel_size(

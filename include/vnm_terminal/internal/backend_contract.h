@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/process_cpu_time.h"
+#include "vnm_terminal/process_snapshot.h"
 #include <QProcessEnvironment>
 #include <QString>
 #include <QStringList>
@@ -487,6 +488,11 @@ public:
     // Cumulative CPU with explicit native or observed family coverage.
     // Missing capability or a failed read is unavailable.
     virtual std::optional<process_cpu_time_t> process_cpu_time() const
+    {
+        return std::nullopt;
+    }
+
+    virtual std::optional<Process_snapshot> process_snapshot() const
     {
         return std::nullopt;
     }

@@ -3,6 +3,7 @@
 #include "vnm_terminal/backend_output_capture.h"
 #include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/process_cpu_time.h"
+#include "vnm_terminal/process_snapshot.h"
 #include "vnm_terminal/terminal_message_submission.h"
 #include "vnm_terminal/terminal_process_owner.h"
 #include "vnm_terminal/terminal_touch_selection.h"
@@ -812,6 +813,8 @@ public:
     // An aggregate whose scope states native or observed family coverage.
     // Absence means accounting is unavailable; it is not zero usage.
     std::optional<vnm_terminal::process_cpu_time_t> process_cpu_time() const;
+    // Active workload observations only; no process-control authority is exposed.
+    std::optional<vnm_terminal::Process_snapshot> process_snapshot() const;
     Q_INVOKABLE bool interrupt_process();
     Q_INVOKABLE bool terminate_process();
 

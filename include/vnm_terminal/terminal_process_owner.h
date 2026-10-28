@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/process_cpu_time.h"
+#include "vnm_terminal/process_snapshot.h"
 
 #include <chrono>
 #include <cstdint>
@@ -81,6 +82,11 @@ public:
     virtual bool confirmed() const noexcept = 0;
 
     virtual std::optional<process_cpu_time_t> process_cpu_time() const
+    {
+        return std::nullopt;
+    }
+
+    virtual std::optional<Process_snapshot> process_snapshot() const
     {
         return std::nullopt;
     }

@@ -10,6 +10,7 @@
 #include "vnm_terminal/internal/utf8_scan.h"
 #include "vnm_terminal/terminal_message_submission.h"
 #include "vnm_terminal/process_cpu_time.h"
+#include "vnm_terminal/process_snapshot.h"
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
@@ -249,6 +250,7 @@ public:
 
     Terminal_process_state process_state() const;
     std::optional<process_cpu_time_t> process_cpu_time() const;
+    std::optional<Process_snapshot> process_snapshot() const;
     bool backend_ready() const;
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;

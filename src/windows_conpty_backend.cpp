@@ -789,6 +789,13 @@ public:
             Process_cpu_scope::WORKLOAD_FAMILY};
     }
 
+    std::optional<Process_snapshot> process_snapshot() const
+    {
+        const std::lock_guard lock(m_mutex);
+        return m_process_assigned_to_job
+            ? vnm::process_custody::job_process_snapshot(m_process_job.get()) : std::nullopt;
+    }
+
     Windows_conpty_backend_write_state_for_testing write_state_for_testing()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2621,6 +2628,13 @@ std::optional<process_cpu_time_t> Windows_conpty_backend::process_cpu_time() con
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->process_cpu_time();
+}
+
+std::optional<Process_snapshot> Windows_conpty_backend::process_snapshot() const
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
+    return impl->process_snapshot();
 }
 
 std::optional<terminal_cell_pixel_size_t> Windows_conpty_backend::fixed_cell_pixel_size() const
