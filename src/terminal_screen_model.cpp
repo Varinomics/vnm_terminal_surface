@@ -321,7 +321,8 @@ QImage composite_image_band(
             const auto* prior  = reinterpret_cast<const std::uint32_t*>(earlier_pixels.constScanLine(y));
             for (int x = 0; x < band_width; ++x) {
                 const std::uint32_t pixel = source[x];
-                target[x] = pixel != 0U ? pixel : prior[x];
+                const std::uint32_t keep  = 0U - static_cast<std::uint32_t>(pixel == 0U);
+                target[x] = pixel | (prior[x] & keep);
             }
         }
         return combined;

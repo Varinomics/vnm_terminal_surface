@@ -151,9 +151,11 @@ preedit, text, decorations, cursors, and the visual bell, so overlays stay
 visible over images; the model erases the text of cells an image covers, so
 text and image pixels do not share a cell. The textures the committed frame
 draws are kept; other image textures stay for reuse up to a fixed byte limit,
-least recently used first out. Only a committing prepare creates, uploads, or
-retires image textures, and a failed image resource drops images only, never
-the frame's text.
+least recently used first out. When the textures absent from the complete next
+draw plan would exceed that limit, unpinned same-size textures may be reassigned
+to new slice revisions. Only a committing
+prepare creates, uploads, or retires image textures, and a failed image resource
+drops images only, never the frame's text.
 
 The GPU glyph-atlas renderer caches glyphs rasterized by Qt's font engine
 (`QRawFont::alphaMapForGlyph`) into atlas textures and composites cells through

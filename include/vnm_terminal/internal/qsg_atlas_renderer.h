@@ -486,8 +486,9 @@ struct Qsg_atlas_image_summary
 
 // Image textures keyed by image slice revision. The textures the committed
 // draw list samples are pinned and never evicted; the others stay for reuse,
-// least recently used first out once their bytes pass the limit. A revision's
-// texels never change, so dropping any entry costs only a later upload.
+// either reassigned to a new revision or evicted least recently used first
+// once their bytes pass the limit. A cached revision's texels never change,
+// so dropping any entry costs only a later upload.
 template <typename Texture>
 class Qsg_atlas_image_texture_cache final
 {
@@ -509,6 +510,46 @@ public:
         [[maybe_unused]] const bool inserted =
             m_entries.emplace(revision, Entry{std::move(texture), bytes, ++m_clock, false}).second;
         Q_ASSERT(inserted);
+    }
+
+    // Reassigns an unpinned match only when revisions absent from the next
+    // draw plan exceed the byte limit. Planned revisions must be sorted.
+    template <typename Match>
+    const Texture* reuse_unpinned(
+        std::uint64_t                     revision,
+        const std::vector<std::uint64_t>& planned_revisions,
+        Match                             match)
+    {
+        auto candidate = m_entries.end();
+        std::uint64_t unpinned_bytes = 0U;
+        for (auto entry = m_entries.begin(); entry != m_entries.end(); ++entry) {
+            if (std::binary_search(
+                planned_revisions.begin(), planned_revisions.end(), entry->first))
+            {
+                continue;
+            }
+            // A committed pin may disappear from the next plan, but its
+            // texture remains protected until that plan replaces the draws.
+            unpinned_bytes += entry->second.bytes;
+            if (entry->second.pinned || !match(entry->second.texture)) {
+                continue;
+            }
+            if (candidate == m_entries.end() ||
+                entry->second.last_use < candidate->second.last_use)
+            {
+                candidate = entry;
+            }
+        }
+        if (unpinned_bytes <= m_unpinned_byte_limit || candidate == m_entries.end()) {
+            return nullptr;
+        }
+
+        auto node = m_entries.extract(candidate);
+        node.key()            = revision;
+        node.mapped().last_use = ++m_clock;
+        const auto reused = m_entries.insert(std::move(node));
+        Q_ASSERT(reused.inserted);
+        return &reused.position->second.texture;
     }
 
     // Pins exactly these revisions as the most recently used, and returns the

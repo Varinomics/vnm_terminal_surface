@@ -7088,6 +7088,7 @@ private:
         }
         if (pipelines_ready) {
             const int texture_size_max = rhi->resourceLimit(QRhi::TextureSizeMax);
+            std::vector<std::uint64_t> planned_revisions;
             for (const Atlas_image_draw& draw : m_image_draw_plan) {
                 // Capability-local: a slice no texture can hold is skipped.
                 const QImage& pixels = draw.slice->pixels;
@@ -7098,11 +7099,33 @@ private:
 
                 const Atlas_image_texture* texture = m_image_textures.find(draw.slice->revision);
                 if (texture == nullptr) {
-                    std::optional<Atlas_image_texture> created =
-                        create_image_texture(rhi, pixels.size());
-                    if (!created.has_value()) {
-                        ++summary.resource_failures;
-                        continue;
+                    if (planned_revisions.empty()) {
+                        planned_revisions.reserve(m_image_draw_plan.size());
+                        for (const Atlas_image_draw& planned : m_image_draw_plan) {
+                            planned_revisions.push_back(planned.slice->revision);
+                        }
+                        std::sort(planned_revisions.begin(), planned_revisions.end());
+                    }
+                    texture = m_image_textures.reuse_unpinned(
+                        draw.slice->revision,
+                        planned_revisions,
+                        [&](const Atlas_image_texture& cached) {
+                            return cached.texture->pixelSize() == pixels.size();
+                        });
+                    const std::uint64_t bytes =
+                        static_cast<std::uint64_t>(pixels.width()) *
+                        static_cast<std::uint64_t>(pixels.height()) *
+                        k_atlas_image_bytes_per_texel;
+                    if (texture == nullptr) {
+                        std::optional<Atlas_image_texture> created =
+                            create_image_texture(rhi, pixels.size());
+                        if (!created.has_value()) {
+                            ++summary.resource_failures;
+                            continue;
+                        }
+                        m_image_textures.insert(draw.slice->revision, *created, bytes);
+                        texture = m_image_textures.find(draw.slice->revision);
+                        ++summary.texture_creations;
                     }
 
                     // Some backends upload a whole image as tightly packed
@@ -7112,14 +7135,7 @@ private:
                     if (updates == nullptr) {
                         updates = rhi->nextResourceUpdateBatch();
                     }
-                    updates->uploadTexture(created->texture, pixels);
-                    const std::uint64_t bytes =
-                        static_cast<std::uint64_t>(pixels.width()) *
-                        static_cast<std::uint64_t>(pixels.height()) *
-                        k_atlas_image_bytes_per_texel;
-                    m_image_textures.insert(draw.slice->revision, *created, bytes);
-                    texture = m_image_textures.find(draw.slice->revision);
-                    ++summary.texture_creations;
+                    updates->uploadTexture(texture->texture, pixels);
                     summary.uploaded_bytes += bytes;
                 }
 

@@ -7442,6 +7442,36 @@ bool test_image_texture_cache()
     ok &= check(pinned_only.pin({8U}) == std::vector<int>{70} && pinned_only.size() == 1U,
         "image cache evicts a texture once the committed frame stops drawing it");
 
+    term::Qsg_atlas_image_texture_cache<int> reusable(100U);
+    reusable.insert(1U, 10, 50U);
+    reusable.insert(2U, 20, 50U);
+    reusable.insert(3U, 30, 50U);
+    reusable.pin({3U});
+    ok &= check(reusable.reuse_unpinned(4U, {3U, 4U}, [](int) { return true; }) == nullptr &&
+            reusable.find(1U) != nullptr && reusable.find(2U) != nullptr,
+        "image cache preserves historical revisions at the unpinned byte limit");
+    ok &= check(reusable.reuse_unpinned(4U, {4U}, [](int) { return false; }) == nullptr &&
+            reusable.size() == 3U && reusable.bytes() == 150U,
+        "image cache leaves its entries untouched when the predicate rejects them");
+    const int* reused = reusable.reuse_unpinned(4U, {4U}, [](int) { return true; });
+    ok &= check(reused != nullptr && *reused == 10 &&
+            reusable.find(1U) == nullptr && reusable.find(4U) == reused &&
+            reusable.size() == 3U && reusable.bytes() == 150U &&
+            reusable.pinned_bytes() == 50U,
+        "image cache counts departing pins when reusing the oldest unpinned texture");
+    reusable.pin({2U, 3U, 4U});
+    ok &= check(reusable.reuse_unpinned(5U, {5U}, [](int) { return true; }) == nullptr &&
+            reusable.pinned_bytes() == 150U,
+        "image cache never reuses a pinned texture");
+    reusable.pin({4U});
+    reused = reusable.reuse_unpinned(5U, {5U}, [](int) { return true; });
+    ok &= check(reused != nullptr && *reused == 20 && reusable.find(2U) == nullptr,
+        "image cache reuses the least recently used eligible historical texture");
+    std::vector<int> reused_released = reusable.take_all();
+    std::sort(reused_released.begin(), reused_released.end());
+    ok &= check(reused_released == std::vector<int>{10, 20, 30} && reusable.bytes() == 0U,
+        "image cache releases each rekeyed resource exactly once");
+
     std::vector<int> released = cache.take_all();
     std::sort(released.begin(), released.end());
     ok &= check(released == std::vector<int>{20, 40, 50} && cache.size() == 0U &&
@@ -13230,6 +13260,46 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
     return ok;
 }
 
+// Pumps frames until the predicate holds. An MSDF atlas bake runs on the global
+// thread pool and can take many seconds in a Debug build. Every prepare reports
+// the pending-bake message until the prepare that adopts the bake, so the frame
+// budget restarts on each such frame; a failed bake reports its failure
+// instead. The deadline bounds a bake that never completes.
+bool pump_until_msdf_bakes_settle(
+    QGuiApplication&     app,
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>&
+                         predicate)
+{
+    constexpr qint64 k_settled_budget_ms = 3000;
+    constexpr qint64 k_deadline_ms       = 60000;
+    QElapsedTimer deadline;
+    QElapsedTimer settled;
+    deadline.start();
+    settled.start();
+    while (deadline.elapsed() < k_deadline_ms &&
+        settled.elapsed() < k_settled_budget_ms)
+    {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_frame_report report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        if (predicate(report)) {
+            return true;
+        }
+        if (report.render.msdf_text_message ==
+            QStringLiteral("MSDF atlas build pending"))
+        {
+            settled.restart();
+        }
+    }
+
+    return false;
+}
+
 // Shared readiness predicate for the zoom tests: render state usable and, when
 // MSDF is enabled on this backend, the MSDF resources and texture are ready.
 bool atlas_msdf_zoom_report_ready(const term::Qsg_atlas_frame_report& report)
@@ -13410,7 +13480,7 @@ bool test_atlas_msdf_zoom_crosses_bake_bucket(QGuiApplication& app)
         surface,
         std::make_shared<const term::Terminal_render_snapshot>(
             make_atlas_msdf_resource_stability_snapshot(991U, false)));
-    const bool ready_large = pump_until(
+    const bool ready_large = pump_until_msdf_bakes_settle(
         app,
         window,
         surface,
@@ -14596,46 +14666,6 @@ bool test_atlas_repeated_snapshot_skips_upload(QGuiApplication& app)
     return ok;
 }
 
-// Pumps frames until the predicate holds. An MSDF atlas bake runs on the global
-// thread pool and can take many seconds in a Debug build. Every prepare reports
-// the pending-bake message until the prepare that adopts the bake, so the frame
-// budget restarts on each such frame; a failed bake reports its failure
-// instead. The deadline bounds a bake that never completes.
-bool pump_until_msdf_bakes_settle(
-    QGuiApplication&     app,
-    QQuickWindow&        window,
-    VNM_TerminalSurface& surface,
-    const std::function<bool(const term::Qsg_atlas_frame_report&)>&
-                         predicate)
-{
-    constexpr qint64 k_settled_budget_ms = 3000;
-    constexpr qint64 k_deadline_ms       = 60000;
-    QElapsedTimer deadline;
-    QElapsedTimer settled;
-    deadline.start();
-    settled.start();
-    while (deadline.elapsed() < k_deadline_ms &&
-        settled.elapsed() < k_settled_budget_ms)
-    {
-        surface.update();
-        window.requestUpdate();
-        app.processEvents(QEventLoop::AllEvents, 50);
-        QThread::msleep(20);
-        const term::Qsg_atlas_frame_report report =
-            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-        if (predicate(report)) {
-            return true;
-        }
-        if (report.render.msdf_text_message ==
-            QStringLiteral("MSDF atlas build pending"))
-        {
-            settled.restart();
-        }
-    }
-
-    return false;
-}
-
 bool seed_atlas_prepare_transaction_msdf_baseline(
     QGuiApplication&              app,
     QQuickWindow&                 window,
@@ -15342,7 +15372,7 @@ bool test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(
     // rejects every prepare of the new snapshot, including the one that adopts
     // the re-baked atlas.
     constexpr std::uint64_t k_rebake_sequence  = 19846U;
-    constexpr qreal         k_rebake_font_size = 72.0;
+    constexpr qreal         k_rebake_font_size = 48.0;
     const auto rebake_snapshot = std::make_shared<const term::Terminal_render_snapshot>(
         make_atlas_msdf_resource_stability_snapshot(k_rebake_sequence, false));
     term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
@@ -22124,7 +22154,7 @@ bool test_atlas_image_pass_draws_between_backgrounds_and_overlays(QGuiApplicatio
 
 // Oracle: I4 (a revision's texels are uploaded once). A repeat frame and a
 // history row decoded again into a new image with the same revision upload
-// nothing; only a new revision creates a texture.
+// nothing; a new revision uploads into its own or an eligible reused texture.
 bool test_atlas_image_textures_upload_once_per_revision(QGuiApplication& app)
 {
     QQuickWindow        window;
@@ -22214,6 +22244,188 @@ bool test_atlas_image_textures_upload_once_per_revision(QGuiApplication& app)
                 oversized_report.render.images.resource_failures == 0 &&
                 oversized_report.frame_build.glyph_instances > 0,
             "a slice wider than the largest texture is skipped and costs nothing else");
+    }
+    return ok;
+}
+
+// Oracle: reassigning storage must preserve every image in the committed draw
+// plan, including cached revisions encountered before and after a new revision.
+bool test_atlas_image_texture_reuse_preserves_planned_revisions(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20160U, fixture)) {
+        return false;
+    }
+
+    const QColor red(220, 30, 30);
+    const QColor blue(30, 40, 220);
+    const QColor green(20, 180, 60);
+    const QColor yellow(230, 190, 30);
+    // Each two-cell image occupies the existing 16 MiB historical-cache budget.
+    // Rescaling large source cells keeps the pressure fixture's window small.
+    const term::terminal_cell_pixel_size_t image_cell{2048, 1024};
+    const auto retained = make_atlas_test_image_slice(2, image_cell, 1, red, 20160001U);
+    const auto earlier = make_atlas_test_image_slice(2, image_cell, 1, green, 20160003U);
+    const std::uint64_t slice_bytes =
+        static_cast<std::uint64_t>(retained->pixels.width()) *
+        static_cast<std::uint64_t>(retained->pixels.height()) * 4U;
+
+    term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(20161U);
+    term::set_render_snapshot_row_image(snapshot, 1, retained);
+    term::Qsg_atlas_frame_report first;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, first, 1),
+        "image reuse fixture commits its first revision"))
+    {
+        return false;
+    }
+
+    snapshot = make_atlas_image_text_snapshot(20162U);
+    term::set_render_snapshot_row_image(
+        snapshot, 0, make_atlas_test_image_slice(2, image_cell, 1, blue, 20160002U));
+    term::Qsg_atlas_frame_report second;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, second, 1) &&
+            second.render.images.cached_textures == 2,
+        "replacing a pinned image retains its texture for subsequent reuse"))
+    {
+        return false;
+    }
+
+    snapshot = make_atlas_image_text_snapshot(20163U);
+    term::set_render_snapshot_row_image(snapshot, 0, earlier);
+    term::set_render_snapshot_row_image(snapshot, 1, retained);
+    term::Qsg_atlas_frame_report protected_report;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, protected_report, 2),
+        "image reuse fixture draws the new and retained revisions"))
+    {
+        return false;
+    }
+    const QImage protected_image = window.grabWindow();
+    bool ok = true;
+    ok &= check(protected_report.image_texture_creations_total ==
+            second.image_texture_creations_total + 1U &&
+            protected_report.image_uploaded_bytes_total ==
+            second.image_uploaded_bytes_total + slice_bytes &&
+            protected_report.render.images.cached_textures == 3,
+        "a later planned revision remains cached while an earlier new revision gets a texture");
+    ok &= check(!protected_image.isNull() &&
+            colors_near(atlas_image_cell_color(protected_image, fixture, 0, 1), green) &&
+            colors_near(atlas_image_cell_color(protected_image, fixture, 1, 1), red),
+        "protecting a later planned revision preserves both image colors");
+
+    snapshot = make_atlas_image_text_snapshot(20164U);
+    term::set_render_snapshot_row_image(
+        snapshot, 0, make_atlas_test_image_slice(2, image_cell, 1, yellow, 20160004U));
+    term::set_render_snapshot_row_image(snapshot, 1, retained);
+    term::Qsg_atlas_frame_report reused_report;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, reused_report, 2),
+        "image reuse fixture commits the next same-size revision"))
+    {
+        return false;
+    }
+    const QImage reused_image = window.grabWindow();
+    ok &= check(reused_report.image_texture_creations_total ==
+            protected_report.image_texture_creations_total &&
+            reused_report.image_uploaded_bytes_total ==
+            protected_report.image_uploaded_bytes_total + slice_bytes &&
+            reused_report.render.images.cached_textures == 3 &&
+            reused_report.render.images.cached_bytes == 3U * slice_bytes &&
+            reused_report.render.images.pinned_bytes == 2U * slice_bytes,
+        "a same-size revision reuses unpinned storage and still uploads its new pixels");
+    ok &= check(!reused_image.isNull() &&
+            colors_near(atlas_image_cell_color(reused_image, fixture, 0, 1), yellow) &&
+            colors_near(atlas_image_cell_color(reused_image, fixture, 1, 1), red),
+        "reusing an unpinned texture changes only its intended image");
+
+    snapshot = make_atlas_image_text_snapshot(20165U);
+    term::set_render_snapshot_row_image(snapshot, 0, earlier);
+    term::set_render_snapshot_row_image(
+        snapshot, 1, make_atlas_test_image_slice(2, image_cell, 1, blue, 20160005U));
+    term::Qsg_atlas_frame_report earlier_report;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, earlier_report, 2),
+        "image reuse fixture encounters a retained revision before a new revision"))
+    {
+        return false;
+    }
+    const QImage earlier_image = window.grabWindow();
+    ok &= check(earlier_report.image_texture_creations_total ==
+            reused_report.image_texture_creations_total + 1U &&
+            earlier_report.image_uploaded_bytes_total ==
+            reused_report.image_uploaded_bytes_total + slice_bytes &&
+            earlier_report.render.images.cached_textures == 3 &&
+            !earlier_image.isNull() &&
+            colors_near(atlas_image_cell_color(earlier_image, fixture, 0, 1), green) &&
+            colors_near(atlas_image_cell_color(earlier_image, fixture, 1, 1), blue),
+        "an earlier retained revision keeps its pixels when a later image needs a texture");
+
+    snapshot = make_atlas_image_text_snapshot(20166U);
+    term::set_render_snapshot_row_image(
+        snapshot, 0, make_atlas_test_image_slice(3, image_cell, 1, blue, 20160006U));
+    term::set_render_snapshot_row_image(snapshot, 1, retained);
+    term::Qsg_atlas_frame_report resized_report;
+    if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, resized_report, 2),
+        "image reuse fixture commits an image with a different extent"))
+    {
+        return false;
+    }
+    const QImage resized_image = window.grabWindow();
+    ok &= check(resized_report.image_texture_creations_total ==
+            earlier_report.image_texture_creations_total + 1U &&
+            resized_report.render.images.cached_textures == 3 &&
+            !resized_image.isNull() &&
+            colors_near(atlas_image_cell_color(resized_image, fixture, 0, 3), blue) &&
+            colors_near(atlas_image_cell_color(resized_image, fixture, 1, 1), red),
+        "a different-sized image receives a matching texture and preserves retained pixels");
+    return ok;
+}
+
+// Oracle: historical revisions within the byte budget remain available without
+// another upload when the viewport revisits them.
+bool test_atlas_image_cache_retains_pages_within_budget(QGuiApplication& app)
+{
+    QQuickWindow        window;
+    VNM_TerminalSurface surface;
+    Atlas_image_fixture fixture;
+    if (!seed_atlas_image_fixture(app, window, surface, 20170U, fixture)) {
+        return false;
+    }
+
+    const std::array<QColor, 3> colors{
+        QColor(220, 30, 30), QColor(30, 40, 220), QColor(20, 180, 60)};
+    std::array<std::shared_ptr<const term::Terminal_image_slice>, 3> pages;
+    for (std::size_t page = 0; page < pages.size(); ++page) {
+        pages[page] = make_atlas_test_image_slice(
+            2, fixture.device_cell, 1, colors[page], 20170001U + page);
+    }
+
+    bool ok = true;
+    std::uint64_t sequence = 20171U;
+    std::uint64_t creations = 0U;
+    std::uint64_t uploads   = 0U;
+    for (const std::size_t page : {0U, 1U, 2U, 1U, 0U}) {
+        term::Terminal_render_snapshot snapshot = make_atlas_image_text_snapshot(sequence++);
+        term::set_render_snapshot_row_image(snapshot, 0, pages[page]);
+        term::Qsg_atlas_frame_report report;
+        if (!check(publish_atlas_image_snapshot(app, window, surface, snapshot, report, 1),
+            "image cache paging fixture commits its requested page"))
+        {
+            return false;
+        }
+        const QImage image = window.grabWindow();
+        ok &= check(!image.isNull() &&
+                colors_near(atlas_image_cell_color(image, fixture, 0, 1), colors[page]),
+            "image cache paging shows the requested revision's pixels");
+        if (page == 2U) {
+            creations = report.image_texture_creations_total;
+            uploads   = report.image_uploaded_bytes_total;
+        }
+        if (sequence > 20174U) {
+            ok &= check(report.render.images.cached_textures == 3 &&
+                    report.image_texture_creations_total == creations &&
+                    report.image_uploaded_bytes_total == uploads,
+                "returning to either cached page creates and uploads nothing");
+        }
     }
     return ok;
 }
@@ -22663,6 +22875,8 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_msdf_zoom_crosses_bake_bucket(app);
     ok &= test_atlas_image_pass_draws_between_backgrounds_and_overlays(app);
     ok &= test_atlas_image_textures_upload_once_per_revision(app);
+    ok &= test_atlas_image_texture_reuse_preserves_planned_revisions(app);
+    ok &= test_atlas_image_cache_retains_pages_within_budget(app);
     ok &= test_atlas_rejected_prepare_keeps_committed_images(app);
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
