@@ -417,7 +417,8 @@ vnm_terminal::Terminal_process_start_result start_terminal_fixture(
     QString working_directory,
     std::vector<vnm_terminal::Terminal_environment_entry> base_environment,
     std::optional<std::vector<vnm_terminal::Terminal_environment_entry>>
-        capability_environment = std::nullopt)
+        capability_environment = std::nullopt,
+    std::optional<QString> terminal_identity = std::nullopt)
 {
     vnm_terminal::Terminal_process_start_request request{
         std::move(argv),
@@ -425,6 +426,9 @@ vnm_terminal::Terminal_process_start_result start_terminal_fixture(
         std::move(base_environment),
         std::move(capability_environment),
     };
+    if (terminal_identity.has_value()) {
+        request.terminal_identity = std::move(*terminal_identity);
+    }
     return fixture.surface.start_terminal(std::move(request));
 }
 
@@ -639,7 +643,8 @@ bool test_exact_environment_rejection_allows_retry(
     const QString&              fixture_path,
     std::vector<vnm_terminal::Terminal_environment_entry>
                                   invalid_environment,
-    std::string_view            label)
+    std::string_view            label,
+    std::optional<QString>      terminal_identity = std::nullopt)
 {
     QTemporaryDir marker_dir;
     if (!check(marker_dir.isValid(), "exact-environment rejection marker directory is valid")) {
@@ -693,10 +698,17 @@ bool test_exact_environment_rejection_allows_retry(
             fixture,
             argv,
             QFileInfo(fixture_path).absolutePath(),
-            std::move(invalid_environment));
+            std::move(invalid_environment),
+            std::nullopt,
+            std::move(terminal_identity));
     const bool invalid_started = invalid_result.accepted;
     pump_events(app);
-    ok &= case_check(!invalid_started, " rejects the invalid exact environment");
+    ok &= case_check(
+        !invalid_started &&
+            !invalid_result.native_dispatch_occurred &&
+            invalid_result.determinacy ==
+                vnm_terminal::Terminal_process_start_determinacy::DETERMINATE,
+        " rejects before native dispatch with a determinate outcome");
     ok &= case_check(
         backend_error_codes.size() == 1U &&
             backend_error_codes.front() ==
@@ -773,6 +785,18 @@ bool test_exact_environment_rejections(QGuiApplication& app, const QString& fixt
         fixture_path,
         std::move(nul_value_environment),
         "NUL-value exact environment");
+    ok &= test_exact_environment_rejection_allows_retry(
+        app,
+        fixture_path,
+        {},
+        "empty terminal identity",
+        QString());
+    ok &= test_exact_environment_rejection_allows_retry(
+        app,
+        fixture_path,
+        {},
+        "NUL-value terminal identity",
+        nul_value);
     return ok;
 }
 
@@ -856,7 +880,10 @@ bool test_capability_environment_rejections(
     return ok;
 }
 
-bool test_exact_process_environment(QGuiApplication& app, const QString& fixture_path)
+bool test_exact_process_environment(
+    QGuiApplication&       app,
+    const QString&         fixture_path,
+    std::optional<QString> terminal_identity = std::nullopt)
 {
     const QString inherited_name = QStringLiteral("VNM_INHERITED_PROBE");
     const QString exact_name     = QStringLiteral("VNM_EXACT_PROBE");
@@ -958,7 +985,8 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
             std::vector<vnm_terminal::Terminal_environment_entry>{{
                 capability_name,
                 QStringLiteral("capability-value"),
-            }});
+            }},
+            terminal_identity);
     const bool started = start_result.accepted;
     ok &= check(started, "explicit-environment structured surface launch starts fixture");
     if (!started) {
@@ -1006,13 +1034,13 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
                 *snapshot,
                 present_environment_probe_line(
                     QStringLiteral("TERM"),
-                    QStringLiteral("xterm-256color"))) &&
+                    terminal_identity.value_or(QStringLiteral("xterm-256color")))) &&
             snapshot_contains_text(
                 *snapshot,
                 present_environment_probe_line(
                     QStringLiteral("COLORTERM"),
                     QStringLiteral("truecolor"))),
-            "surface owns final TERM and COLORTERM values");
+            "surface applies the requested TERM and owns the COLORTERM value");
 
 #if defined(_WIN32)
         ok &= check(
@@ -1876,6 +1904,7 @@ int main(int argc, char** argv)
     ok &= test_exact_environment_rejections(app, fixture_path);
     ok &= test_capability_environment_rejections(app, fixture_path);
     ok &= test_exact_process_environment(app, fixture_path);
+    ok &= test_exact_process_environment(app, fixture_path, QStringLiteral("screen-256color"));
     ok &= test_caller_captured_process_environment(app, fixture_path);
     ok &= test_final_path_and_executable_token_semantics(app, fixture_path);
     ok &= test_invalid_second_start_preserves_live_session(app, fixture_path);
