@@ -15366,18 +15366,32 @@ bool test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(
     const term::Qsg_atlas_frame_report committed_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
 
-    // A draw height above the minimum bake size re-bakes the atlas at the same
-    // texture size, so the texture object and the committed instances stay in
-    // place while the cache holds the new generation. The injected failure
-    // rejects every prepare of the new snapshot, including the one that adopts
-    // the re-baked atlas.
-    constexpr std::uint64_t k_rebake_sequence  = 19846U;
-    constexpr qreal         k_rebake_font_size = 48.0;
+    // The bake bucket uses snapped ascent rather than the requested font size.
+    // Select the first larger font that crosses the committed bake height, so
+    // this case exercises a rebake while retaining the same atlas texture size.
+    qreal rebake_font_size   = surface.font_size();
+    int   rebake_draw_height = committed_report.render.msdf_text_pixel_height;
+    while (rebake_font_size < 96.0 &&
+        rebake_draw_height <= committed_report.render.msdf_text_baked_pixel_height)
+    {
+        surface.set_font_size(++rebake_font_size);
+        rebake_draw_height = term::qsg_atlas_msdf_draw_pixel_height(
+            term::VNM_TerminalSurface_render_bridge::cell_metrics(surface),
+            pixel_window_device_pixel_ratio(window));
+    }
+    if (!check(rebake_draw_height > committed_report.render.msdf_text_baked_pixel_height,
+        "atlas forced MSDF rejected rebake selects a font above the committed bake height"))
+    {
+        return false;
+    }
+
+    // The injected failure rejects every prepare of the new snapshot, including
+    // the one that adopts the re-baked atlas.
+    constexpr std::uint64_t k_rebake_sequence = 19846U;
     const auto rebake_snapshot = std::make_shared<const term::Terminal_render_snapshot>(
         make_atlas_msdf_resource_stability_snapshot(k_rebake_sequence, false));
     term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
         k_rebake_sequence);
-    surface.set_font_size(k_rebake_font_size);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(surface, rebake_snapshot);
     const bool rebake_adopted = pump_until_msdf_bakes_settle(
         app,
@@ -15435,7 +15449,7 @@ bool test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(
     configure_atlas_prepare_transaction_forced_msdf_surface(
         reference_window,
         reference_surface);
-    reference_surface.set_font_size(k_rebake_font_size);
+    reference_surface.set_font_size(rebake_font_size);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         reference_surface,
         rebake_snapshot);
