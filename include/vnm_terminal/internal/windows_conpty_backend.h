@@ -109,7 +109,6 @@ public:
     Terminal_backend_result terminate() override;
 
     std::optional<process_cpu_time_t> process_cpu_time() const override;
-    std::optional<Process_snapshot> process_snapshot() const override;
     std::optional<terminal_cell_pixel_size_t> fixed_cell_pixel_size() const override;
     bool owns_screen_buffers() const override;
 

@@ -13,7 +13,7 @@ if(VNM_TERMINAL_DISTRIBUTION_BUILD AND VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_RE
         "VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=OFF")
 endif()
 
-project(vnm_terminal_surface LANGUAGES CXX VERSION 1.7.3)
+project(vnm_terminal_surface LANGUAGES CXX VERSION 1.8.0)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -134,19 +134,6 @@ vnm_acquire_owned_dependency(NAME vnm_fonts
     GIT_REPOSITORY https://github.com/Varinomics/vnm_fonts.git
     TARGET vnm::fonts)
 
-if(NOT TARGET vnm_process_custody::vnm_process_custody)
-    if(VNM_PROCESS_CUSTODY_SOURCE_DIR)
-        FetchContent_Declare(vnm_process_custody
-            SOURCE_DIR "${VNM_PROCESS_CUSTODY_SOURCE_DIR}")
-        FetchContent_MakeAvailable(vnm_process_custody)
-    else()
-        vnm_acquire_owned_dependency(NAME vnm_process_custody
-            GIT_REPOSITORY https://github.com/Varinomics/vnm_process_custody.git
-            TARGET vnm_process_custody::vnm_process_custody)
-    endif()
-endif()
-
-
 if(COMMAND vnm_fonts_install_package)
     vnm_fonts_install_package()
 endif()
@@ -178,8 +165,6 @@ add_library(vnm_terminal_process_owner_contract INTERFACE)
 add_library(vnm_terminal_surface::process_owner_contract ALIAS vnm_terminal_process_owner_contract)
 set_target_properties(vnm_terminal_process_owner_contract PROPERTIES EXPORT_NAME process_owner_contract)
 target_compile_features(vnm_terminal_process_owner_contract INTERFACE cxx_std_20)
-target_link_libraries(vnm_terminal_process_owner_contract INTERFACE
-    vnm_process_custody::vnm_process_custody)
 target_include_directories(vnm_terminal_process_owner_contract INTERFACE
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
@@ -464,7 +449,6 @@ target_include_directories(vnm_terminal_surface PUBLIC
 target_link_libraries(vnm_terminal_surface PUBLIC
     ${vnm_terminal_qt_targets}
     vnm_terminal_surface::vnm_terminal_surface_renderer
-    vnm_process_custody::vnm_process_custody
 )
 
 target_link_libraries(vnm_terminal_surface PRIVATE

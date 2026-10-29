@@ -813,7 +813,8 @@ public:
     // An aggregate whose scope states native or observed family coverage.
     // Absence means accounting is unavailable; it is not zero usage.
     std::optional<vnm_terminal::process_cpu_time_t> process_cpu_time() const;
-    // Active workload observations only; no process-control authority is exposed.
+    // Optional owner-supplied workload observations, without process-control
+    // authority. Absence means that no snapshot is available, not an empty family.
     std::optional<vnm_terminal::Process_snapshot> process_snapshot() const;
     Q_INVOKABLE bool interrupt_process();
     Q_INVOKABLE bool terminate_process();

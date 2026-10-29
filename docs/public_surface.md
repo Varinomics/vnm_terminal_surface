@@ -206,6 +206,13 @@ owner before birth. The backend retains terminal I/O, resize, and session
 integration in either case. See
 [Backend lifecycle and signals](backend_lifecycle_and_signals.md).
 
+`process_snapshot()` returns optional workload observations supplied by the
+selected process owner. The public value records contain process identity,
+names, and optional CPU and resident-memory measurements; they confer no
+process-control authority. An absent result means observations are unavailable,
+not an empty workload. Native launch and rendering do not require an optional
+process owner or its dependencies.
+
 The request carries ordered argv, a caller-chosen absolute working directory,
 a policy-sanitized explicit base environment, and a separate optional
 capability contribution. `argv[0]` names the executable; the surface never

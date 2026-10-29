@@ -7,7 +7,6 @@ endif()
 
 include(CMakeFindDependencyMacro)
 find_dependency(vnm_fonts CONFIG REQUIRED)
-find_dependency(vnm_process_custody CONFIG REQUIRED)
 
 set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR
     "@VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR@")
