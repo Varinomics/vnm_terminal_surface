@@ -1,11 +1,12 @@
 include("${PROJECT_SOURCE_DIR}/cmake/vnm_cmake_dependency.cmake")
+vnm_write_toolchain_context("${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake")
 add_test(NAME vnm_terminal_conpty_source_package
     COMMAND "${CMAKE_COMMAND}"
+        "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
         "-Dtest_root=${CMAKE_CURRENT_BINARY_DIR}/conpty_source_package"
         "-Dhelper=${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_conpty_source.cmake"
         -P "${PROJECT_SOURCE_DIR}/tests/conpty_package/verify_source_package.cmake")
 set_tests_properties(vnm_terminal_conpty_source_package PROPERTIES LABELS "package" TIMEOUT 30)
-vnm_write_toolchain_context("${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake")
 add_test(NAME vnm_terminal_surface_source_package_argument_transport
     COMMAND "${CMAKE_COMMAND}"
         "-DVNM_TOOLCHAIN_CONTEXT=${CMAKE_CURRENT_BINARY_DIR}/nested-toolchain.cmake"
