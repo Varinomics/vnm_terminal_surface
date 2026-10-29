@@ -15455,6 +15455,33 @@ bool test_atlas_forced_msdf_rejected_rebake_keeps_committed_frame(
         "atlas forced MSDF rebake reference surface uploads its atlas once");
     ok &= check_same_frame(reference_image, recovered_image,
         "atlas forced MSDF rebake recovers to the frame a fresh surface renders");
+    if (!ok) {
+        const auto print_report = [](
+            const char*                         stage,
+            const term::Qsg_atlas_frame_report& report)
+        {
+            const term::Qsg_atlas_render_summary& render = report.render;
+            std::cerr << "atlas rejected rebake " << stage
+                << " sequence=" << report.captured_snapshot_sequence
+                << " prepared_sequence=" << report.prepared_snapshot_sequence
+                << " committed=" << report.prepared_generation_committed
+                << " ready=" << render.msdf_text_atlas_ready
+                << " draw_height=" << render.msdf_text_pixel_height
+                << " baked_height=" << render.msdf_text_baked_pixel_height
+                << " generation=" << render.msdf_text_atlas_generation
+                << " atlas_size=" << render.msdf_text_atlas_size
+                << " build_attempts=" << render.msdf_text_atlas_build_attempts_total
+                << " build_successes=" << render.msdf_text_atlas_build_successes_total
+                << " uploads=" << render.msdf_text_atlas_texture_uploads_total
+                << " message=" << render.msdf_text_message.toStdString()
+                << '\n';
+        };
+        std::cerr << "atlas rejected rebake waits adopted=" << rebake_adopted
+            << " recovered=" << recovered << '\n';
+        print_report("baseline", committed_report);
+        print_report("rejected", rejected_report);
+        print_report("recovered", recovered_report);
+    }
     return ok;
 }
 

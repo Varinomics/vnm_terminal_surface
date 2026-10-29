@@ -5,6 +5,15 @@ on:
     branches: [ master, main, dev ]
   pull_request:
     branches: [ master, main, dev ]
+  workflow_dispatch:
+    inputs:
+      test_scope:
+        description: Windows checks to run
+        type: choice
+        default: all
+        options:
+          - all
+          - atlas-report-d3d11
 
 defaults:
   run:
@@ -17,6 +26,7 @@ env:
   CCACHE_MAXSIZE: 2GiB
   CCACHE_COMPILERCHECK: content
   CMAKE_BUILD_PARALLEL_LEVEL: '4'
+  VNM_TEST_SCOPE: ${{ inputs.test_scope || 'all' }}
 
 jobs:
   build-and-test:
@@ -141,7 +151,11 @@ jobs:
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
-          cmake --build build --config %CMAKE_BUILD_TYPE% --parallel 4
+          if /I "%VNM_TEST_SCOPE%"=="atlas-report-d3d11" (
+            cmake --build build --config %CMAKE_BUILD_TYPE% --target vnm_terminal_qsg_atlas --parallel 4
+          ) else (
+            cmake --build build --config %CMAKE_BUILD_TYPE% --parallel 4
+          )
 
       - name: Run tests
         working-directory: build
@@ -151,17 +165,23 @@ jobs:
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
-          ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -E "^vnm_terminal_compat_smoke$"
+          if /I "%VNM_TEST_SCOPE%"=="atlas-report-d3d11" (
+            ctest --output-on-failure --no-tests=error -C %CMAKE_BUILD_TYPE% -R "^vnm_terminal_qsg_atlas_report_d3d11$"
+          ) else (
+            ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -E "^vnm_terminal_compat_smoke$"
+          )
 
       # The package fixture builds a real LCD-only provider and a separate
       # atlas-disabled surface against it. Reuse that producer for distribution;
       # the main source-atlas build remains a development configuration.
       - name: Install package
+        if: env.VNM_TEST_SCOPE == 'all'
         run: |
           cmake --install build/package_smoke/source_package/surface-build \
             --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
 
       - name: Configure package smoke
+        if: env.VNM_TEST_SCOPE == 'all'
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
@@ -177,6 +197,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="%GITHUB_WORKSPACE%/install"
 
       - name: Verify configured MSVC compiler (package-smoke)
+        if: env.VNM_TEST_SCOPE == 'all'
         shell: pwsh
         run: |
           $compiler_files = @(Get-ChildItem -Path 'package-smoke/CMakeFiles' -Recurse -Filter CMakeCXXCompiler.cmake)
@@ -196,6 +217,7 @@ jobs:
           }
 
       - name: Build package smoke
+        if: env.VNM_TEST_SCOPE == 'all'
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
@@ -214,6 +236,7 @@ jobs:
           key: ${{ steps.restore_compiler_cache.outputs.cache-primary-key }}
 
   conpty-asan:
+    if: github.event_name != 'workflow_dispatch' || inputs.test_scope == 'all'
     name: Qt Quick Terminal Surface ConPTY ASan (Windows)
     runs-on: windows-2025-vs2026
 
