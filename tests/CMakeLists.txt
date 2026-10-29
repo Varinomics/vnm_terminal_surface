@@ -2255,6 +2255,19 @@ if(WIN32)
     )
 
     add_test(
+        NAME vnm_terminal_windows_conpty_process_snapshot
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --process-snapshot
+    )
+    set_tests_properties(vnm_terminal_windows_conpty_process_snapshot PROPERTIES
+        LABELS "conformance;windows;conpty;process-snapshot"
+        TIMEOUT 120
+    )
+
+    add_test(
         NAME vnm_terminal_windows_conpty_close_ownership
         COMMAND
             "${CMAKE_COMMAND}" -E env

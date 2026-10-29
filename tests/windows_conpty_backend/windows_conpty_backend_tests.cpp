@@ -10,6 +10,7 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 #include "vnm_terminal/process_cpu_time.h"
+#include "vnm_terminal/process_snapshot.h"
 
 #include <QByteArray>
 #include <QDir>
@@ -1317,6 +1318,133 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     }
     ok &= check(root_exited.cpu_time_usec >= child_exited.cpu_time_usec,
         "root exit does not hide the retained Job's final CPU total");
+    return ok;
+}
+
+bool test_process_snapshot_observes_native_job(const QString& executable_path)
+{
+    QTemporaryDir directory;
+    if (!check(directory.isValid(), "process snapshot gate directory is available")) {
+        return false;
+    }
+    const QDir gates(directory.path());
+    Backend_capture capture;
+    term::Windows_conpty_backend backend;
+    const term::Terminal_backend& observer = backend;
+    if (!check(!observer.process_snapshot(), "process snapshot is unavailable before Job admission")) {
+        return false;
+    }
+    const auto result = backend.start(launch_config(executable_path,
+        {QStringLiteral("--cpu-accounting-root"), directory.path()}), capture.callbacks());
+    if (!check(result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "process snapshot fixture starts in the native ConPTY Job"))
+    {
+        return false;
+    }
+    const auto root_pid  = capture.wait_for_pid_output(QByteArrayLiteral("cpu-root-pid="));
+    const auto child_pid = capture.wait_for_pid_output(QByteArrayLiteral("cpu-child-pid="));
+    if (!check(root_pid && child_pid, "process snapshot fixture reports the root and detached child")) {
+        return false;
+    }
+    auto root  = open_process_handle(*root_pid);
+    auto child = open_process_handle(*child_pid);
+    if (!check(root.is_valid() && child.is_valid(), "process snapshot holds exact fixture identities")) {
+        return false;
+    }
+    cpu_accounting_process_times_t root_times{}, child_times{};
+    const auto root_cpu  = process_cpu_time_usec(root.get(), &root_times);
+    const auto child_cpu = process_cpu_time_usec(child.get(), &child_times);
+    if (!check(root_cpu && child_cpu, "independent process times are available for both members")) {
+        return false;
+    }
+    const auto find_member = [](const vnm_terminal::Process_snapshot& snapshot, DWORD pid)
+        -> const vnm_terminal::Process_snapshot_entry*
+    {
+        const auto found = std::find_if(snapshot.processes.begin(), snapshot.processes.end(),
+            [pid](const auto& entry) { return entry.process_id == pid; });
+        return found == snapshot.processes.end() ? nullptr : &*found;
+    };
+    const auto before_sample = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto initial = observer.process_snapshot();
+    const auto after_sample = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!check(initial.has_value(), "the native backend supplies a process snapshot through its contract")) {
+        return false;
+    }
+    const auto root_cpu_after  = process_cpu_time_usec(root.get());
+    const auto child_cpu_after = process_cpu_time_usec(child.get());
+    if (!check(root_cpu_after && child_cpu_after, "independent CPU readings bracket the snapshot")) {
+        return false;
+    }
+    bool ok = check(initial->sampled_at_usec >= (std::uint64_t)before_sample &&
+        initial->sampled_at_usec <= (std::uint64_t)after_sample &&
+        initial->logical_processor_count == GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+        "process snapshot includes sample time and processor normalization");
+    ok &= check(initial->processes.size() == 2U && !find_member(*initial, GetCurrentProcessId()),
+        "process snapshot contains only the two admitted Job members");
+    const auto check_member = [
+            &initial, &find_member, &executable_path
+        ](
+            DWORD                                 pid,
+            const cpu_accounting_process_times_t& times,
+            std::uint64_t                         minimum_cpu,
+            std::uint64_t                         maximum_cpu)
+        {
+            const auto* entry = find_member(*initial, pid);
+            if (!check(entry != nullptr, "process snapshot includes the expected Job member")) {
+                return false;
+            }
+            bool member_ok = check(entry->birth_token != 0U && entry->birth_token == times.creation_ticks,
+                "process snapshot birth token identifies the independently observed process");
+            member_ok &= check(QString::fromStdString(entry->name).compare(
+                QFileInfo(executable_path).fileName(), Qt::CaseInsensitive) == 0,
+                "process snapshot includes the executable name");
+            member_ok &= check(entry->cpu_time_usec && *entry->cpu_time_usec >= minimum_cpu &&
+                *entry->cpu_time_usec <= maximum_cpu,
+                "process snapshot CPU lies within independent readings before and after sampling");
+            member_ok &= check(entry->resident_memory_bytes && *entry->resident_memory_bytes > 0U,
+                "process snapshot includes resident memory for an observable member");
+            return member_ok;
+        };
+    ok &= check_member(*root_pid, root_times, *root_cpu, *root_cpu_after);
+    ok &= check_member(*child_pid, child_times, *child_cpu, *child_cpu_after);
+    if (!ok ||
+        !check(write_gate_file(gates.filePath(QStringLiteral("start-burn"))), "snapshot child may do CPU work") ||
+        !check(wait_for_file(gates.filePath(QStringLiteral("burn-finished"))), "snapshot child completes CPU work"))
+    {
+        return false;
+    }
+    const auto live = observer.process_snapshot();
+    const auto* initial_child = find_member(*initial, *child_pid);
+    const auto* live_child = live ? find_member(*live, *child_pid) : nullptr;
+    if (!check(live_child && live_child->birth_token == initial_child->birth_token &&
+            live_child->cpu_time_usec &&
+            *live_child->cpu_time_usec >= *initial_child->cpu_time_usec + k_cpu_accounting_work_usec &&
+            live->sampled_at_usec > initial->sampled_at_usec,
+            "successive native snapshots retain identity and observe the detached child's CPU work"))
+    {
+        return false;
+    }
+    if (!check(write_gate_file(gates.filePath(QStringLiteral("child-exit"))), "snapshot child may exit") ||
+        !check(wait_for_process_exit(child.get()), "snapshot child actually exits") ||
+        !check(capture.wait_for_output(QByteArrayLiteral("cpu-child-exited")), "root observes snapshot child exit"))
+    {
+        return false;
+    }
+    const auto child_exited = observer.process_snapshot();
+    ok &= check(child_exited && find_member(*child_exited, *root_pid) &&
+        !find_member(*child_exited, *child_pid), "snapshot retires the exited child while retaining the live root");
+    if (!check(write_gate_file(gates.filePath(QStringLiteral("root-exit"))), "snapshot root may exit") ||
+        !check(capture.wait_for_exit(), "snapshot root actually exits"))
+    {
+        return false;
+    }
+    const auto exit = capture.exit_snapshot();
+    ok &= check(exit && exit->reason == term::Terminal_exit_reason::EXITED && exit->exit_code == 0,
+        "process snapshot fixture exits successfully");
+    const auto root_exited = observer.process_snapshot();
+    ok &= check(!root_exited || root_exited->processes.empty(), "snapshot does not retain exited process rows");
     return ok;
 }
 
@@ -7304,6 +7432,13 @@ int main(int argc, char** argv)
     if (argc == 2 && std::string_view(argv[1]) == "--cpu-accounting") {
         bool ok = test_cpu_accounting_retains_exited_descendants(QString::fromLocal8Bit(argv[0]));
         ok &= wait_for_console_host_children_to_exit("CPU accounting");
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--process-snapshot") {
+        bool ok = test_process_snapshot_observes_native_job(QString::fromLocal8Bit(argv[0]));
+        ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
+            std::chrono::steady_clock::now() + k_wait_timeout), "process snapshot cleanup settles");
+        ok &= wait_for_console_host_children_to_exit("process snapshot");
         return ok ? 0 : 1;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--native-cmd-startup-growth") {

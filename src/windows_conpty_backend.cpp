@@ -13,6 +13,7 @@
 #include "native_backend_io_core.h"
 #include "native_backend_cleanup_owner.h"
 #include <windows.h>
+#include <psapi.h>
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
@@ -135,6 +136,109 @@ public:
 private:
     HANDLE m_handle = nullptr;
 };
+
+std::optional<Process_snapshot> sample_job_processes(HANDLE job)
+{
+    // Job membership is the observation boundary. Do not walk the system
+    // process tree: descendants can detach from the console and root can exit.
+    constexpr std::size_t k_header_slots =
+        offsetof(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / sizeof(ULONG_PTR);
+    std::vector<ULONG_PTR> process_ids(64U + k_header_slots);
+    JOBOBJECT_BASIC_PROCESS_ID_LIST* members = nullptr;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        members = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(process_ids.data());
+        if (QueryInformationJobObject(job, JobObjectBasicProcessIdList, members,
+                static_cast<DWORD>(process_ids.size() * sizeof(ULONG_PTR)), nullptr))
+        {
+            break;
+        }
+        if (GetLastError() != ERROR_MORE_DATA || attempt == 3) {
+            return std::nullopt;
+        }
+        const auto assigned = static_cast<std::size_t>(members->NumberOfAssignedProcesses);
+        if (assigned > std::numeric_limits<DWORD>::max() / sizeof(ULONG_PTR) - k_header_slots) {
+            return std::nullopt;
+        }
+        process_ids.resize(assigned + k_header_slots);
+        members = nullptr;
+    }
+    if (!members || members->NumberOfProcessIdsInList > process_ids.size() - k_header_slots) {
+        return std::nullopt;
+    }
+
+    Process_snapshot snapshot;
+    snapshot.logical_processor_count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (snapshot.logical_processor_count == 0U) {
+        return std::nullopt;
+    }
+    snapshot.processes.reserve(members->NumberOfProcessIdsInList);
+    for (DWORD index = 0; index < members->NumberOfProcessIdsInList; ++index) {
+        const auto process_id = members->ProcessIdList[index];
+        if (process_id == 0U || process_id > std::numeric_limits<DWORD>::max()) {
+            continue;
+        }
+        Process_snapshot_entry entry;
+        entry.process_id = static_cast<std::int64_t>(process_id);
+        Unique_handle process(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, (DWORD)process_id));
+        if (!process) {
+            if (GetLastError() != ERROR_INVALID_PARAMETER) {
+                // Access to optional details may be denied. A zero birth token
+                // deliberately prevents consumers from calculating a CPU rate.
+                snapshot.processes.push_back(std::move(entry));
+            }
+            continue;
+        }
+        BOOL belongs_to_job = FALSE;
+        if (!IsProcessInJob(process.get(), job, &belongs_to_job)) {
+            return std::nullopt;
+        }
+        if (!belongs_to_job) {
+            continue; // The enumerated PID exited and was reused outside the Job.
+        }
+        // GetProcessTimes leaves the exit time undefined for a live process.
+        const DWORD process_state = WaitForSingleObject(process.get(), 0);
+        if (process_state == WAIT_OBJECT_0) {
+            continue;
+        }
+        if (process_state == WAIT_FAILED) {
+            return std::nullopt;
+        }
+
+        const auto ticks = [](FILETIME time) {
+            return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) |
+                time.dwLowDateTime;
+        };
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        if (GetProcessTimes(process.get(), &creation, &exit, &kernel, &user)) {
+            entry.birth_token = ticks(creation);
+            const auto kernel_ticks = ticks(kernel);
+            const auto user_ticks = ticks(user);
+            if (kernel_ticks <= std::numeric_limits<std::uint64_t>::max() - user_ticks) {
+                entry.cpu_time_usec = (kernel_ticks + user_ticks) / 10U;
+            }
+        }
+        std::wstring image_path(32768U, L'\0');
+        DWORD image_path_length = static_cast<DWORD>(image_path.size());
+        if (QueryFullProcessImageNameW(process.get(), 0, image_path.data(), &image_path_length)) {
+            entry.name = QFileInfo(QString::fromWCharArray(image_path.data(), image_path_length))
+                .fileName().toUtf8().toStdString();
+        }
+        PROCESS_MEMORY_COUNTERS memory{};
+        memory.cb = sizeof(memory);
+        if (GetProcessMemoryInfo(process.get(), &memory, sizeof(memory))) {
+            entry.resident_memory_bytes = static_cast<std::uint64_t>(memory.WorkingSetSize);
+        }
+        snapshot.processes.push_back(std::move(entry));
+    }
+    const auto sampled_at = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (sampled_at <= 0) {
+        return std::nullopt;
+    }
+    snapshot.sampled_at_usec = static_cast<std::uint64_t>(sampled_at);
+    return snapshot;
+}
 
 Unique_handle duplicate_handle(HANDLE source)
 {
@@ -787,6 +891,15 @@ public:
             static_cast<std::uint64_t>(sampled_at),
             static_cast<std::uint32_t>(processor_count),
             Process_cpu_scope::WORKLOAD_FAMILY};
+    }
+
+    std::optional<Process_snapshot> process_snapshot() const
+    {
+        const std::lock_guard lock(m_mutex);
+        if (!m_process_assigned_to_job || !m_process_job) {
+            return std::nullopt;
+        }
+        return sample_job_processes(m_process_job.get());
     }
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing()
@@ -2621,6 +2734,13 @@ std::optional<process_cpu_time_t> Windows_conpty_backend::process_cpu_time() con
     Impl* impl = m_impl.get();
     auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->process_cpu_time();
+}
+
+std::optional<Process_snapshot> Windows_conpty_backend::process_snapshot() const
+{
+    Impl* impl = m_impl.get();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
+    return impl->process_snapshot();
 }
 
 std::optional<terminal_cell_pixel_size_t> Windows_conpty_backend::fixed_cell_pixel_size() const

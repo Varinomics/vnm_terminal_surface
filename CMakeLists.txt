@@ -422,10 +422,12 @@ if(WIN32)
     target_compile_definitions(vnm_terminal_surface PRIVATE
         _WIN32_WINNT=0x0A00
         WINVER=0x0A00)
-    # Windows system APIs used by font discovery, clipboard, and audible bell support.
+    # Windows system APIs used by font discovery, clipboard, process observations,
+    # and audible bell support.
     target_link_libraries(vnm_terminal_surface PRIVATE
         dwrite
         ole32
+        psapi
         user32
     )
 endif()
