@@ -43,6 +43,8 @@ struct Terminal_process_start_request
     // The tail is passed verbatim, without argv escaping. Embedded NUL and use
     // on other platforms are rejected; absence preserves ordinary argv handling.
     std::optional<QString> windows_native_arguments = std::nullopt;
+    // Select TERM per launch without importing identity hints from the base environment.
+    QString terminal_identity = QStringLiteral("xterm-256color");
 };
 
 enum class Terminal_process_start_determinacy

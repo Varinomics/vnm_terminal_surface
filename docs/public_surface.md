@@ -230,9 +230,11 @@ The base is trusted to contain Windows drive pseudo-variables such as `=C:` and
 preserves them through the native environment block. Capability contributions
 cannot contain pseudo-variables, collide with the base, or alter terminal-owned
 `TERM`, `COLORTERM`, and `NO_COLOR` names or executable-lookup names. The
-surface replaces terminal-owned base entries with its own identity. Embedded
-NULs, invalid names, and platform-equivalent duplicates are rejected before
-native dispatch.
+surface replaces terminal-owned base entries with its own identity. The
+request's `terminal_identity` selects `TERM` for that launch and defaults to
+`xterm-256color`; `COLORTERM` remains `truecolor`, and `NO_COLOR` is removed.
+Empty or whitespace-only terminal identities, embedded NULs, invalid names,
+and platform-equivalent duplicates are rejected before native dispatch.
 
 `Terminal_process_start_result` reports acceptance, whether native dispatch
 occurred, and whether the outcome is determinate. A rejected determinate result
