@@ -84,7 +84,7 @@ bool marker(const QDir& directory, const char* name)
     return file.open(QIODevice::WriteOnly);
 }
 
-bool spawn(const QString& executable, const QString& arguments, DWORD flags)
+bool spawn(const QString& executable, const QString& arguments, DWORD flags, HANDLE* retained_process = nullptr)
 {
     const auto application = QDir::toNativeSeparators(executable).toStdWString();
     auto command = (QStringLiteral("\"%1\" ").arg(executable) + arguments).toStdWString();
@@ -100,12 +100,24 @@ bool spawn(const QString& executable, const QString& arguments, DWORD flags)
         return false;
     }
     CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
+    if (retained_process) {
+        *retained_process = process.hProcess;
+    }
+    else {
+        CloseHandle(process.hProcess);
+    }
     return true;
 }
 
-int run_parent(const QString& packaged_shell, const QDir& directory)
+int run_parent(const QString& packaged_shell, const QDir& directory, bool exit_after_launch)
 {
+    std::cout << "packaged intermediary ready\n" << std::flush;
+    if (!marker(directory, "parent-ready") || !wait_until([&] {
+            return QFileInfo::exists(directory.filePath(QStringLiteral("allow-launch")));
+        }))
+    {
+        return 1;
+    }
     QString quoted_directory = directory.absolutePath();
     quoted_directory.replace(QLatin1Char('\''), QStringLiteral("''"));
     const QString script = QStringLiteral(
@@ -119,8 +131,17 @@ int run_parent(const QString& packaged_shell, const QDir& directory)
     if (!spawn(packaged_shell, arguments, CREATE_NEW_CONSOLE)) {
         return 1;
     }
-    // This unpackaged intermediary stays alive, so S2 can prove the packaged
-    // grandchild's creator even when its own console is detached from ConPTY.
+    if (!wait_until([&] { return QFileInfo::exists(directory.filePath(QStringLiteral("ready"))); })) {
+        return 1;
+    }
+    if (exit_after_launch) {
+        // No ConPTY output after launch: the retained creator's EXIT must be
+        // sufficient to discover its detached child while the root is blocked.
+        return 0;
+    }
+    std::cout << "detached packaged child ready\n" << std::flush;
+    // The non-root intermediary supplies activity on the terminal transport;
+    // its detached child supplies none. The root remains blocked throughout.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     while (std::chrono::steady_clock::now() < deadline &&
         !QFileInfo::exists(directory.filePath(QStringLiteral("root-exit"))))
@@ -130,10 +151,11 @@ int run_parent(const QString& packaged_shell, const QDir& directory)
     return 0;
 }
 
-int run_root(const QString& self, const QString& packaged_shell, const QDir& directory)
+int run_root(const QString& self, const QString& packaged_shell, const QDir& directory, bool exit_after_launch)
 {
-    if (!spawn(self, QStringLiteral("--packaged-descendant-parent \"%1\" \"%2\"")
-        .arg(packaged_shell, directory.absolutePath()), 0))
+    if (!spawn(self, QStringLiteral("--packaged-descendant-parent \"%1\" \"%2\" %3")
+        .arg(packaged_shell, directory.absolutePath(),
+            exit_after_launch ? QStringLiteral("parent-exit") : QStringLiteral("io")), 0))
     {
         return 1;
     }
@@ -158,15 +180,13 @@ std::optional<std::uint64_t> process_cpu(HANDLE process)
     return (ticks(kernel) + ticks(user)) / 10U;
 }
 
-bool test_lifecycle(const QString& self, const QString& shell, const QString& package, std::string_view mode)
+bool test_lifecycle_in_directory(
+    const QString&    self,
+    const QString&    shell,
+    const QString&    package,
+    std::string_view  mode,
+    const QDir&       directory)
 {
-    // Every fixture relaunch must preserve paths outside the active ANSI code page.
-    QTemporaryDir temporary(QDir::temp().filePath(
-        QStringLiteral("vnm-packaged-\u03a9\u6f22\u5b57\U0001f680-XXXXXX")));
-    if (!check(temporary.isValid(), "packaged descendant directory is available")) {
-        return false;
-    }
-    const QDir directory(temporary.path());
     const auto membership = std::make_shared<Membership_observation>();
     std::atomic_bool exited{false};
     auto backend = std::make_unique<term::Windows_conpty_backend>();
@@ -189,11 +209,20 @@ bool test_lifecycle(const QString& self, const QString& shell, const QString& pa
     callbacks.process_exited = [&](auto) { exited.store(true, std::memory_order_release); };
     callbacks.error_reported = [](const auto& error) { std::cerr << error.message.toStdString() << '\n'; };
     term::Terminal_launch_config config;
-    config.argv = {self, QStringLiteral("--packaged-descendant-root"), shell, temporary.path()};
+    config.argv = {self, QStringLiteral("--packaged-descendant-root"), shell, directory.absolutePath(),
+        mode == "parent-exit" ? QStringLiteral("parent-exit") : QStringLiteral("io")};
     config.initial_grid_size = {24, 80};
     const auto started = backend->start(config, std::move(callbacks));
     if (!check(!term::is_backend_rejection(started) && membership->root_admitted.load(),
         "packaged grandchild fixture starts in the terminal Job"))
+    {
+        return false;
+    }
+    if (!check(wait_until([&] {
+            return QFileInfo::exists(directory.filePath(QStringLiteral("parent-ready"))) &&
+                backend->discovery_state_for_testing().retained_process_count >= 2;
+        }), "the native member event retains the intermediary before it launches a child") ||
+        !check(marker(directory, "allow-launch"), "the retained intermediary may launch its detached child"))
     {
         return false;
     }
@@ -234,18 +263,21 @@ bool test_lifecycle(const QString& self, const QString& shell, const QString& pa
         const std::lock_guard lock(membership->mutex);
         membership->child = child;
     }
-    ok &= check(wait_until([&] {
-        const auto snapshot = backend->process_snapshot();
-        if (!snapshot) {
-            return false;
-        }
+    // Observing ownership must not itself request discovery. Only after the
+    // native/I/O trigger adopted the child do we inspect one process snapshot.
+    ok &= check(wait_until([&] { return backend->write_state_for_testing().adoption_job_count > 0; }),
+        mode == "parent-exit" ? "retained parent exit adopts the detached child without later output" :
+            "non-root terminal output adopts the detached child while the root is blocked");
+    const auto snapshot = backend->process_snapshot();
+    bool child_observed = false;
+    if (snapshot) {
         for (const auto& entry : snapshot->processes) {
             if (entry.process_id == pid && entry.birth_token != 0) {
-                return true;
+                child_observed = true;
             }
         }
-        return false;
-    }), "the scanner adopts the detached packaged grandchild into its observed family");
+    }
+    ok &= check(child_observed, "one process snapshot reports the adopted detached child identity");
     const auto cpu = process_cpu(child->get());
     const auto sample = backend->process_cpu_time();
     ok &= check(backend->write_state_for_testing().adoption_job_count > 0,
@@ -255,6 +287,14 @@ bool test_lifecycle(const QString& self, const QString& shell, const QString& pa
     ok &= check(cpu && sample && sample->cpu_time_usec >= *cpu &&
         sample->scope == vnm_terminal::Process_cpu_scope::OBSERVED_FAMILY,
         "family accounting includes all OS-reported packaged process CPU with observed scope");
+
+    if (mode == "host-death") {
+        if (!ok || !check(marker(directory, "adopted"), "the helper host confirms adoption before host death")) {
+            return false;
+        }
+        Sleep(INFINITE);
+        return false;
+    }
 
     if (mode == "exited-child") {
         ok &= check(marker(directory, "child-exit") &&
@@ -291,6 +331,62 @@ bool test_lifecycle(const QString& self, const QString& shell, const QString& pa
     return ok;
 }
 
+bool test_lifecycle(const QString& self, const QString& shell, const QString& package, std::string_view mode)
+{
+    // Every fixture relaunch must preserve paths outside the active ANSI code page.
+    QTemporaryDir temporary(QDir::temp().filePath(
+        QStringLiteral("vnm-packaged-\u03a9\u6f22\u5b57\U0001f680-XXXXXX")));
+    if (!check(temporary.isValid(), "packaged descendant directory is available")) {
+        return false;
+    }
+    const QDir directory(temporary.path());
+    if (mode != "host-death") {
+        return test_lifecycle_in_directory(self, shell, package, mode, directory);
+    }
+
+    HANDLE host_handle = nullptr;
+    if (!check(spawn(self, QStringLiteral("--packaged-descendant-host \"%1\" \"%2\" \"%3\"")
+            .arg(shell, package, directory.absolutePath()), 0, &host_handle), "the isolated backend host starts"))
+    {
+        return false;
+    }
+    const Process_handle host(host_handle);
+    const auto cleanup_host = qScopeGuard([&] {
+        if (WaitForSingleObject(host.get(), 0) != WAIT_OBJECT_0) {
+            TerminateProcess(host.get(), 1);
+            WaitForSingleObject(host.get(), 5000);
+        }
+    });
+    bool ok = check(wait_until([&] {
+        return QFileInfo::exists(directory.filePath(QStringLiteral("adopted"))) ||
+            WaitForSingleObject(host.get(), 0) == WAIT_OBJECT_0;
+    }) && QFileInfo::exists(directory.filePath(QStringLiteral("adopted"))),
+        "the isolated host adopts the escaped child before it is killed");
+    QFile pid_file(directory.filePath(QStringLiteral("packaged.pid")));
+    if (!check(pid_file.open(QIODevice::ReadOnly), "host-death child PID is readable")) {
+        marker(directory, "child-exit");
+        return false;
+    }
+    const Process_handle child(OpenProcess(
+        SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid_file.readAll().trimmed().toUInt()));
+    if (!check(child.get() != nullptr, "host-death test retains the exact child handle")) {
+        marker(directory, "child-exit");
+        return false;
+    }
+    const auto cleanup_child = qScopeGuard([&] {
+        if (WaitForSingleObject(child.get(), 0) != WAIT_OBJECT_0) {
+            TerminateProcess(child.get(), 1);
+            WaitForSingleObject(child.get(), 5000);
+        }
+    });
+    ok &= check(TerminateProcess(host.get(), 1) != FALSE &&
+        WaitForSingleObject(host.get(), 20000) == WAIT_OBJECT_0, "the backend host dies without graceful teardown");
+    ok &= check(WaitForSingleObject(child.get(), 20000) == WAIT_OBJECT_0,
+        "closing the dead host's adoption Job kills the escaped child");
+    std::cerr << "packaged descendant lifecycle host-death" << (ok ? " passed\n" : " failed\n");
+    return ok;
+}
+
 }
 
 std::optional<int> run_packaged_descendant_tests(int argc, char** argv)
@@ -301,6 +397,7 @@ std::optional<int> run_packaged_descendant_tests(int argc, char** argv)
     const std::string_view mode(argv[1]);
     if (mode != "--packaged-descendant-parent" &&
         mode != "--packaged-descendant-root"   &&
+        mode != "--packaged-descendant-host"   &&
         mode != "--packaged-descendants")
     {
         return std::nullopt;
@@ -314,12 +411,18 @@ std::optional<int> run_packaged_descendant_tests(int argc, char** argv)
         return 1;
     }
     const auto release_arguments = qScopeGuard([&] { LocalFree(arguments); });
-    if (argument_count == 4 && mode == "--packaged-descendant-parent") {
-        return run_parent(QString::fromWCharArray(arguments[2]), QDir(QString::fromWCharArray(arguments[3])));
+    if (argument_count == 5 && mode == "--packaged-descendant-parent") {
+        return run_parent(QString::fromWCharArray(arguments[2]), QDir(QString::fromWCharArray(arguments[3])),
+            std::wstring_view(arguments[4]) == L"parent-exit");
     }
-    if (argument_count == 4 && mode == "--packaged-descendant-root") {
+    if (argument_count == 5 && mode == "--packaged-descendant-root") {
         return run_root(QString::fromWCharArray(arguments[0]), QString::fromWCharArray(arguments[2]),
-            QDir(QString::fromWCharArray(arguments[3])));
+            QDir(QString::fromWCharArray(arguments[3])), std::wstring_view(arguments[4]) == L"parent-exit");
+    }
+    if (argument_count == 5 && mode == "--packaged-descendant-host") {
+        return test_lifecycle_in_directory(QString::fromWCharArray(arguments[0]),
+            QString::fromWCharArray(arguments[2]), QString::fromWCharArray(arguments[3]),
+            "host-death", QDir(QString::fromWCharArray(arguments[4]))) ? 0 : 1;
     }
     if (argument_count != 2 || mode != "--packaged-descendants") {
         return std::nullopt;
@@ -331,7 +434,7 @@ std::optional<int> run_packaged_descendant_tests(int argc, char** argv)
         return discovery;
     }
     bool ok = true;
-    for (const auto mode : {"natural", "terminate", "destroy", "exited-child"}) {
+    for (const auto mode : {"natural", "terminate", "destroy", "exited-child", "parent-exit", "host-death"}) {
         ok &= test_lifecycle(QString::fromWCharArray(arguments[0]), executable, package, mode);
     }
     return ok ? 0 : 1;

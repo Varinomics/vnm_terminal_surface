@@ -24,8 +24,10 @@ template<class Process>
 using Windows_descendant_candidates = std::vector<Windows_descendant_candidate<Process>>;
 
 // Source binds every query and assignment to a retained process handle. A PID
-// from either snapshot is only a lookup hint until both live instances and the
-// strict creation order prove the parent relationship across the second scan.
+// from either snapshot is only a lookup hint. open_parent returns a previously
+// proven member handle, including an exited member retained across discovery.
+// Establish lifetime order before S2 so a child PID reused during S2 cannot
+// turn a newly created process into a candidate from the first snapshot.
 template<class Source>
 Windows_descendant_candidates<typename Source::Process> prepare_windows_descendants(
     Source& source,
@@ -38,11 +40,11 @@ Windows_descendant_candidates<typename Source::Process> prepare_windows_descenda
             continue;
         }
         auto parent = source.open_parent(parent_pid);
-        if (!parent || source.owned_membership(*parent) != std::optional<bool>(true)) {
+        if (!parent) {
             continue;
         }
         auto child = source.open_child(pid);
-        if (child) {
+        if (child && source.parent_precedes_child(*parent, *child)) {
             candidates.push_back({pid, parent_pid, std::move(*parent), std::move(*child)});
         }
     }
@@ -58,13 +60,9 @@ void adopt_windows_descendants(
     for (const auto& candidate : candidates) {
         const auto entry = second.find(candidate.pid);
         if (entry == second.end() || entry->second != candidate.parent_pid ||
-            !source.running(candidate.child) || !source.running(candidate.parent))
+            !source.running(candidate.child) ||
+            !source.parent_precedes_child(candidate.parent, candidate.child))
         {
-            continue;
-        }
-        const auto child_created  = source.creation_time(candidate.child);
-        const auto parent_created = source.creation_time(candidate.parent);
-        if (!child_created || !parent_created || *child_created <= *parent_created) {
             continue;
         }
         // Query failure is unproven, not evidence of nonmembership. Include
@@ -125,6 +123,9 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
         has_candidates = has_candidates || !scan.m_candidates.empty();
     }
     if (!has_candidates) {
+        for (const auto& scan : scans) {
+            scan.m_family->complete_scan();
+        }
         return;
     }
     const auto second = snapshots.snapshot();
@@ -133,6 +134,9 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
             if (!scan.m_candidates.empty()) {
                 scan.m_family->scan_failed();
             }
+            else {
+                scan.m_family->complete_scan();
+            }
         }
         return;
     }
@@ -140,6 +144,7 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
         if (!scan.m_candidates.empty()) {
             scan.m_family->finish_scan(scan.m_candidates, *second);
         }
+        scan.m_family->complete_scan();
     }
 }
 

@@ -56,9 +56,8 @@ jobs:
       # later git commands can authenticate, and removes it in a post-job step.
       # This job configures and compiles pull-request-controlled surface source
       # in between, and CMake is itself executable repository code, so the app
-      # checkout's token would be readable by the very code under test. Nothing
-      # in this job runs git, so none of the three checkouts needs the
-      # credential to survive the step that created it.
+      # checkout's token would be readable by the very code under test. Builds
+      # and local provenance queries do not need the checkout credential.
       - name: Checkout surface
         uses: actions/checkout@v5
         with:
@@ -209,6 +208,69 @@ jobs:
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
           ctest --output-on-failure -C %CMAKE_BUILD_TYPE%
+
+      - name: Stage unsigned downstream runtime
+        id: stage_runtime
+        shell: cmd
+        run: |
+          call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          cmake --install vnm_terminal/build --config %CMAKE_BUILD_TYPE% ^
+            --prefix "%RUNNER_TEMP%/downstream-terminal-runtime" --component vnm_terminal_runtime
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          windeployqt --release --no-translations --skip-plugin-types qmltooling ^
+            --include-plugins qoffscreen --no-opengl-sw --no-system-d3d-compiler --no-system-dxc-compiler ^
+            --qmldir vnm_terminal/packaging --dir "%RUNNER_TEMP%/downstream-terminal-runtime/bin" ^
+            "%RUNNER_TEMP%/downstream-terminal-runtime/bin/vnm_terminal.exe"
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          powershell -NoProfile -ExecutionPolicy Bypass -File vnm_terminal/tools/prune_windows_runtime.ps1 ^
+            -RuntimePath "%RUNNER_TEMP%/downstream-terminal-runtime/bin"
+
+      - name: Exercise deployed downstream runtime
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
+          VNM_TERMINAL_SETTINGS_NO_PERSIST: '1'
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'downstream-terminal-runtime'
+          $runtime = Join-Path $root 'bin/vnm_terminal.exe'
+          $surface = & git -C vnm_terminal_surface rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not identify the surface source.' }
+          $application = & git -C vnm_terminal rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not identify the application source.' }
+          @{
+              surface_source = $surface
+              application_source = $application
+              configuration = $env:CMAKE_BUILD_TYPE
+              runtime_sha256 = (Get-FileHash -LiteralPath $runtime -Algorithm SHA256).Hash
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'build-provenance.json')
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          foreach ($name in @('QT_PLUGIN_PATH', 'QT_QPA_PLATFORM_PLUGIN_PATH', 'QML_IMPORT_PATH', 'QML2_IMPORT_PATH')) {
+              [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+          }
+          $process = Start-Process -FilePath $runtime -WindowStyle Hidden -PassThru -ArgumentList @(
+              '--timeout-ms', '15000', '--require-output', '--',
+              "`"$env:ComSpec`"", '/d', '/c', 'echo downstream-runtime'
+          ) -WorkingDirectory $root -RedirectStandardOutput (Join-Path $root 'smoke.stdout.log') `
+              -RedirectStandardError (Join-Path $root 'smoke.stderr.log')
+          if (-not $process.WaitForExit(30000)) {
+              $process.Kill($true)
+              $process.WaitForExit()
+              throw 'The deployed downstream runtime did not finish within 30 seconds.'
+          }
+          if ($process.ExitCode -ne 0) {
+              Get-Content -LiteralPath (Join-Path $root 'smoke.stderr.log')
+              throw "The deployed downstream runtime exited with $($process.ExitCode)."
+          }
+
+      - name: Upload unsigned downstream runtime
+        if: always() && steps.stage_runtime.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: downstream-terminal-runtime-windows
+          path: ${{ runner.temp }}/downstream-terminal-runtime
+          if-no-files-found: error
 
       - name: Report compiler cache usage
         if: always() && steps.restore_compiler_cache.outcome == 'success'

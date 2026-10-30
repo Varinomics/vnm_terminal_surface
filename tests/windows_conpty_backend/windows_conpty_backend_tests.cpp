@@ -2,7 +2,7 @@
 #include "helpers/test_check.h"
 #include "store_powershell_fixture.h"
 #include "packaged_descendant_tests.h"
-#include "descendant_scope_tests.h"
+#include "discovery_host.h"
 #include "../posix_pty_backend/callback_lifetime_checks.h"
 #include "../posix_pty_backend/native_session_checks.h"
 #include "../../src/native_backend_io_core.h"
@@ -1314,8 +1314,8 @@ bool check_cpu_accounting_sample(
     *out_sample = *sample;
     bool ok = check(sample->cpu_time_usec >= minimum_cpu_usec,
         label + ": Job CPU includes independent root and child process totals");
-    ok &= check(sample->scope == vnm_terminal::Process_cpu_scope::WORKLOAD_FAMILY,
-        label + ": Job sample declares native family accounting");
+    ok &= check(sample->scope == vnm_terminal::Process_cpu_scope::OBSERVED_FAMILY,
+        label + ": Job sample declares best-effort descendant coverage");
     if (!ok) {
         std::cerr << "Job CPU usec=" << sample->cpu_time_usec
             << ", root and child CPU usec=" << minimum_cpu_usec << '\n';
@@ -7550,10 +7550,8 @@ int main(int argc, char** argv)
     if (const auto result = run_packaged_descendant_tests(argc, argv)) {
         return *result;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--descendant-scan-scope") {
-        bool ok = test_descendant_scan_failure_scopes();
-        ok &= wait_for_console_host_children_to_exit("descendant scan scope");
-        return ok ? 0 : 1;
+    if (const auto result = run_discovery_host(argc, argv)) {
+        return *result;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
         bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));

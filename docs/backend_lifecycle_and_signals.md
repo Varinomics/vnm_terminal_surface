@@ -321,36 +321,65 @@ callback reports the root's state; it does not establish transitive termination
 of every process that the terminal workload may have created. A supplied owner
 documents any stronger cleanup scope it provides.
 
-On Windows, one process-wide scanner checks running ConPTY terminals at 100 ms
-intervals. Packaged programs can escape Job inheritance even without a breakaway
-flag. The scanner adopts provable descendants into separate, initially empty
-kill-on-close Jobs. A packaged program launched from the terminal, including one
-with its own console, therefore closes with that terminal when discovery succeeds.
-Normal root exit, explicit termination, and backend destruction all stop discovery,
-terminate every owned Job, and require those Jobs to report zero active processes
-before native cleanup settles. A failed observation retains the exact Job handle
-for the existing deferred cleanup owner; it never counts as successful settlement.
+On Windows, descendant discovery is triggered by actual terminal input/output,
+owned Job creation/exit notifications, and explicit process-list requests. Quiet
+terminals have no discovery timer or periodic system-process enumeration. CPU
+queries do not trigger discovery. Each host process shares a discovery service;
+separate terminal host processes have separate services. Ordinary requests
+coalesce with at least one second between discovery starts. A process-list
+request joins an eligible or already-running pass that includes its family, or
+uses the recent observation while requesting the next eligible pass. It never
+waits for the throttle interval; owned Job members are queried on every request.
+A process window that refreshes once a second therefore requests work while it
+is visible, even if the underlying terminal is quiet.
+
+Packaged programs can escape Job inheritance even without a breakaway flag.
+Discovery adopts proven descendants into separate, initially empty kill-on-close
+Jobs. A packaged program launched from the terminal, including one with its own
+console, closes with that terminal when discovery succeeds. Normal root exit,
+explicit termination, and backend destruction share one final discovery and
+termination operation on the existing native cleanup workers. Final discovery
+bypasses the ordinary throttle. Public termination and facade destruction do not
+wait for global process enumeration. Every owned Job must report zero active
+processes before native cleanup settles; failed observations retain exact Job
+handles and never count as successful settlement.
 
 Discovery uses two process snapshots with retained parent and child handles.
-Each scan pass shares those snapshots across all running terminals: one first
-snapshot, and a second only when at least one family has candidate handles.
-The global snapshots run outside family ownership locks. Each family rechecks
-that discovery is enabled before committing adoption, so cleanup can stop it
-between snapshots without admitting a process after its termination request.
-The parent must belong to an owned Job, both instances must still be running
-after the second snapshot, that snapshot must name the same parent PID, and the
-child must have a strictly later creation time. Equal times are unproven. The
-child must be proven absent from every owned Job before assignment; a failed
-membership query is unproven. These checks prevent PID reuse from capturing an
-unrelated process and prevent repeat adoption or nesting among owned Jobs.
-Children escaping from adoption Jobs can themselves be adopted on later scans.
+Each round shares those snapshots across the participating families: one first
+snapshot, and a second only when candidates need validation. A triggered pass
+may perform up to eight rounds to include children of newly adopted processes.
+Global snapshots run outside backend and family ownership locks. Final cleanup
+stops ordinary admission, serializes with any pass already running, and prevents
+any adoption after its final termination commit.
 
-This is best-effort discovery. A parent that exits between scans cannot establish
-the relationship; short-lived children and processes that cannot be opened may
-remain outside custody. Windows also allows a creator with the required rights
-to name another process through `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`; such a
-process is treated as that named parent's child. The scanner does not establish
-transitive cleanup of processes it never observed or could not prove.
+Parents must have been proven members of an owned Job. Root and observed member
+handles retain process identity across exit. Before and after the second
+snapshot, the child's creation time must be strictly later than its parent's
+creation; if the parent has exited, it must also precede that parent's exit.
+Exit time is read only after observing termination. The child must remain live,
+S2 must name the same parent PID, and membership in every owned Job must be
+proven false before assignment. Failed queries and equal timestamps are
+unproven. These checks prevent PID reuse from capturing an unrelated process
+and prevent repeat adoption or nesting among owned Jobs. An exited member's
+proof handle retires only after a successful observation that began after its
+exit; the root remains retained until final cleanup.
+The timestamp checks retain the existing assumption that Windows process
+creation and exit wall-clock timestamps provide usable lifetime ordering;
+clock adjustments can make a relationship unprovable.
+
+This is best-effort discovery. Job notifications are not guaranteed, and a
+member can exit before its notification is consumed and its handle is opened.
+A silent descendant can launch an escapee while the root and its parent remain
+alive, producing no trigger until later I/O, an owned member's exit, a requested
+process list, or final cleanup. Discovery latency is therefore unbounded. An
+unobserved intermediate that exits can leave a surviving descendant unprovable,
+including at normal close. Abrupt host death kills already-owned processes but
+cannot discover unknown escapees. Short-lived or inaccessible processes and
+births racing final discovery can remain outside custody. Windows also allows a
+creator with the required rights to name another process through
+`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`; such a process is treated as that named
+parent's child. No transitive cleanup is promised for processes never observed
+or proven.
 
 ## Exit-Reason Resolution
 
@@ -462,16 +491,15 @@ teardown and a root-exit callback do not extend its scope.
 The default POSIX owner reports CPU accounting unavailable. A supplied owner
 can provide a sample with an explicit coverage scope. The Windows native backend
 sums its root and adoption Jobs, which do not nest within one another, including
-CPU credited to exited members. Before observing an escape, it reports
-`WORKLOAD_FAMILY` for the root Job's members; that is a membership scope, not a
-guarantee that every descendant is included. Once an escape is proven, or scanner
-resource failure prevents discovery, its scope becomes
-`OBSERVED_FAMILY`: other escaped processes may have been inaccessible or missed
-between scans. All cumulative CPU reported by Windows is preserved, including
-CPU Windows credits when assigning a process that has already run. No
-pre-adoption subtraction is made. Empty adoption Jobs are retired after their
-final CPU totals are retained; those totals remain available until backend
-retirement. Process snapshots include live members of all retained owned Jobs.
+CPU credited to exited members. It reports `OBSERVED_FAMILY` from launch because
+event-triggered discovery cannot establish continuous descendant coverage.
+All cumulative CPU reported by Windows is preserved, including CPU Windows
+credits when assigning a process that has already run. No pre-adoption
+subtraction is made. Late adoption can therefore produce a sampling spike;
+CPU from an escapee that exits before discovery may be lost entirely. Empty
+adoption Jobs are retired after their final CPU totals are retained; those totals
+remain available until backend retirement. Process snapshots include live
+members of all retained owned Jobs.
 
 `OBSERVED_FAMILY` identifies best-effort root and descendant observations and
 can miss short-lived or detached children and work outside the observation

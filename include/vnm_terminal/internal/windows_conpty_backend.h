@@ -76,21 +76,14 @@ struct windows_conpty_cpu_query_for_testing_t
     std::uint32_t error            = 0;
 };
 
-enum class Windows_conpty_descendant_scan_fault_for_testing
+// Host-wide discovery counters are passive reads. Measuring an idle boundary
+// never requests a snapshot or wakes the discovery service.
+struct windows_conpty_discovery_state_for_testing_t
 {
-    NONE,
-    MEMBER_QUERY,
-    ACTIVE_FAMILY_ALLOCATION,
-};
-
-// Installed before start. Faults occur at the scanner's native failure
-// boundaries without invalidating the Job used by public CPU accounting.
-struct Windows_conpty_descendant_scan_control_for_testing
-{
-    std::atomic<Windows_conpty_descendant_scan_fault_for_testing> fault{
-        Windows_conpty_descendant_scan_fault_for_testing::NONE};
-    std::atomic_uint injected_failures{0};
-    std::atomic_uint successful_member_queries{0};
+    std::uint64_t system_snapshot_count = 0;
+    std::uint64_t autonomous_discovery_wake_count = 0;
+    std::uint64_t discovery_pass_count = 0;
+    std::uint64_t retained_process_count = 0;
 };
 
 // Installed before start. Handles are borrowed only for the callback, which
@@ -140,8 +133,7 @@ public:
     bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control);
     bool set_resize_control_for_testing(std::shared_ptr<Windows_conpty_resize_control_for_testing> control);
     bool set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer);
-    bool set_descendant_scan_control_for_testing(
-        std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> control);
+    windows_conpty_discovery_state_for_testing_t discovery_state_for_testing() const;
 
 private:
     class Impl;

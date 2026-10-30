@@ -1,6 +1,8 @@
 #include "../../src/windows_descendant_adoption.h"
+#include "../../src/windows_discovery_schedule.h"
 #include "../helpers/test_check.h"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -21,6 +23,8 @@ struct process_instance_t
     std::uint64_t created;
     bool running = true;
     std::optional<bool> owned = false;
+    std::optional<std::uint64_t> exited;
+    bool retained = true;
 };
 
 class Process_handle
@@ -62,9 +66,13 @@ public:
             return std::nullopt;
         }
         std::set<std::uint32_t> members;
+        retirable.clear();
         for (const auto& [pid, process] : processes) {
-            if (process->running && process->owned == std::optional<bool>(true)) {
+            if (process->retained && process->owned == std::optional<bool>(true)) {
                 members.insert(pid);
+                if (!process->running) {
+                    retirable.insert(pid);
+                }
             }
         }
         return members;
@@ -82,8 +90,19 @@ public:
         }
     }
 
+    void complete_scan()
+    {
+        if (enabled) {
+            for (const auto pid : retirable) {
+                processes.at(pid)->retained = false;
+            }
+        }
+        retirable.clear();
+    }
+
     void scan_failed()
     {
+        retirable.clear();
         if (enabled) {
             ++scan_failures;
         }
@@ -92,6 +111,9 @@ public:
     std::optional<term::Windows_process_parents> snapshot()
     {
         ++snapshots;
+        if (snapshots % 2 == 1 && during_first_snapshot) {
+            during_first_snapshot();
+        }
         if (snapshots % 2 == 0 && during_second_snapshot) {
             during_second_snapshot();
         }
@@ -108,7 +130,11 @@ public:
         if (before_parent_open) {
             before_parent_open();
         }
-        return Process(processes.at(pid));
+        const auto& process = processes.at(pid);
+        if (!process->retained || process->owned != std::optional<bool>(true)) {
+            return std::nullopt;
+        }
+        return Process(process);
     }
 
     std::optional<Process> open_child(std::uint32_t pid)
@@ -121,7 +147,11 @@ public:
 
     std::optional<bool> owned_membership(const Process& process) { return process->owned; }
     bool running(const Process& process) { return process->running; }
-    std::optional<std::uint64_t> creation_time(const Process& process) { return process->created; }
+    bool parent_precedes_child(const Process& parent, const Process& child)
+    {
+        return parent->created < child->created &&
+            (parent->running || (parent->exited && child->created < *parent->exited));
+    }
 
     void adopt(const Process& process)
     {
@@ -137,7 +167,9 @@ public:
     std::vector<std::shared_ptr<process_instance_t>> adopted;
     std::function<void()> before_parent_open;
     std::function<void()> before_child_open;
+    std::function<void()> during_first_snapshot;
     std::function<void()> during_second_snapshot;
+    std::set<std::uint32_t> retirable;
     std::function<void()> after_adoption;
     int snapshots = 0;
     int scan_failures = 0;
@@ -281,8 +313,8 @@ bool test_stop_between_shared_snapshots()
 
 bool test_failed_shared_snapshot_reports_affected_families()
 {
-    // CPU accounting documents observed-family scope once discovery fails.
-    // Failure notification must reach each affected family even without adoption.
+    // Failed discovery retains its parent proof and cannot authorize adoption.
+    // Every affected family receives failure without an automatic retry.
     bool ok = true;
     for (const bool fail_first : {true, false}) {
         Injected_source first;
@@ -314,6 +346,109 @@ bool test_failed_shared_snapshot_reports_affected_families()
     return ok;
 }
 
+bool test_exited_parent_lifetime()
+{
+    bool ok = true;
+    for (const std::uint64_t exited : {19U, 20U, 21U}) {
+        Injected_source source;
+        source.processes[100]->running = false;
+        source.processes[100]->exited = exited;
+        scan(source);
+        ok &= check(source.adopted.size() == (exited > 20 ? 1U : 0U),
+            "an exited retained parent proves only children strictly inside its lifetime");
+    }
+    return ok;
+}
+
+bool test_parent_retirement_boundary()
+{
+    Injected_source source;
+    source.processes[200]->owned = true;
+    source.during_first_snapshot = [&] {
+        // S1 was taken before this birth. Its parent was live at begin_scan,
+        // so the first successful pass must retain proof for the next trigger.
+        source.processes[200]->running = false;
+        source.processes[200]->exited = 40;
+    };
+    scan(source);
+    bool ok = check(source.processes[200]->retained,
+        "a parent exiting after the pre-S1 observation keeps its proof handle");
+    source.during_first_snapshot = {};
+    source.processes[300] = std::make_shared<process_instance_t>(process_instance_t{300, 30});
+    source.parents[300] = 200;
+    scan(source);
+    ok &= check(source.adopted.size() == 1 && source.adopted.front()->pid == 300,
+        "the next triggered scan finds the child using its exited retained parent");
+    ok &= check(!source.processes[200]->retained,
+        "a completed observation retires the parent that exited before S1");
+    return ok;
+}
+
+bool test_failed_scan_retains_parent()
+{
+    Injected_source source;
+    source.processes[100]->running = false;
+    source.processes[100]->exited = 30;
+    source.fail_second_snapshot = true;
+    scan(source);
+    bool ok = check(source.processes[100]->retained && source.adopted.empty(),
+        "failed S2 retains an exited parent and cannot adopt its candidate");
+    source.fail_second_snapshot = false;
+    scan(source);
+    ok &= check(source.adopted.size() == 1,
+        "a later explicit trigger can reuse proof retained after a failed observation");
+    return ok;
+}
+
+bool test_closing_between_observation_phases()
+{
+    Injected_source source;
+    source.processes[100]->running = false;
+    source.processes[100]->exited = 30;
+    source.during_first_snapshot = [&] { source.enabled = false; };
+    scan(source);
+    bool ok = check(source.processes[100]->retained && source.adopted.empty(),
+        "closing during S1 preserves exited parent proof when candidate preparation is skipped");
+    source.during_first_snapshot = {};
+    source.enabled = true; // The exclusive final observation owns admission.
+    scan(source);
+    ok &= check(source.adopted.size() == 1,
+        "final observation can still prove a child using the retained exited parent");
+    return ok;
+}
+
+bool test_activity_schedule()
+{
+    using namespace std::chrono_literals;
+    using Schedule = term::Windows_discovery_schedule;
+    const auto start = Schedule::Clock::time_point{};
+    Schedule schedule;
+    bool ok = check(!schedule.pending() && !schedule.deadline() && !schedule.ready(start + 24h),
+        "an idle family has no discovery deadline even after arbitrary elapsed time");
+    schedule.request();
+    ok &= check(schedule.ready(start), "the first actual event is immediately eligible");
+    schedule.started(start);
+    ok &= check(!schedule.deadline() && !schedule.ready(start + 24h),
+        "a completed event does not manufacture periodic work");
+    schedule.request();
+    for (int milliseconds = 1; milliseconds < 1000; ++milliseconds) {
+        schedule.request();
+        ok &= check(!schedule.ready(start + std::chrono::milliseconds(milliseconds)),
+            "notifications cannot shorten the current one-second spacing");
+    }
+    ok &= check(schedule.deadline() == start + 1s && schedule.ready(start + 1s),
+        "bursts coalesce without postponing the fixed deadline");
+    schedule.started(start + 1s);
+    schedule.request();
+    schedule.execution_started(start + 1500ms);
+    ok &= check(schedule.deadline() == start + 2500ms && !schedule.ready(start + 2s),
+        "waiting for cleanup serialization measures spacing from actual scan start");
+    schedule.started(start + 2500ms);
+    ok &= check(!schedule.pending() && !schedule.deadline(),
+        "one follow-up pass consumes activity received during execution");
+    return ok;
+}
+
 }
 
 int main()
@@ -329,5 +464,10 @@ int main()
     ok &= test_shared_snapshots();
     ok &= test_stop_between_shared_snapshots();
     ok &= test_failed_shared_snapshot_reports_affected_families();
+    ok &= test_exited_parent_lifetime();
+    ok &= test_parent_retirement_boundary();
+    ok &= test_failed_scan_retains_parent();
+    ok &= test_closing_between_observation_phases();
+    ok &= test_activity_schedule();
     return ok ? 0 : 1;
 }
