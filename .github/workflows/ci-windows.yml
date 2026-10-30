@@ -174,10 +174,31 @@ jobs:
           if-no-files-found: error
 
       - name: Try installing published PowerShell MSIX
+        id: store_powershell_setup
         if: env.VNM_TEST_SCOPE == 'all'
+        # The per-operation limits total eight minutes; this also bounds job
+        # startup, hashing, registration queries and cleanup if those hang.
+        timeout-minutes: 9
+        continue-on-error: true
         shell: powershell
         run: |
           ./.github/scripts/prepare_store_powershell.ps1 -EvidenceDirectory "$env:RUNNER_TEMP/store-powershell-evidence"
+
+      - name: Record interrupted MSIX setup as unavailable
+        if: always() && env.VNM_TEST_SCOPE == 'all' && steps.store_powershell_setup.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $directory = "$env:RUNNER_TEMP/store-powershell-evidence"
+          $null = New-Item -ItemType Directory -Path $directory -Force
+          $path = Join-Path $directory 'msix-install.json'
+          $evidence = if (Test-Path -LiteralPath $path) {
+            Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+          } else { @{} }
+          $evidence.status = 'unavailable'
+          $evidence.reason = 'Setup step failed or exceeded its nine-minute overall limit.'
+          $evidence | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding utf8
+          "Store PowerShell MSIX setup: **unavailable**. $($evidence.reason) Last phase: $($evidence.phase)" >> $env:GITHUB_STEP_SUMMARY
+          Write-Warning $evidence.reason
 
       - name: Check Store PowerShell root outside runner Job
         if: env.VNM_TEST_SCOPE == 'all'
