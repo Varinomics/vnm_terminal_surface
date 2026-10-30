@@ -7700,7 +7700,8 @@ int main(int argc, char** argv)
     }
     if (argc == 3 && std::string_view(argv[1]) == "--native-session") {
         bool ok = vnm_terminal::test_helpers::check_native_session_lifecycle(
-            term::make_windows_conpty_backend, launch_config(QString::fromLocal8Bit(argv[2]), {}));
+            [] { return term::make_windows_conpty_backend(); },
+            launch_config(QString::fromLocal8Bit(argv[2]), {}));
         ok &= wait_for_console_host_children_to_exit("native session");
         return ok ? 0 : 1;
     }
@@ -7799,7 +7800,7 @@ int main(int argc, char** argv)
         test_close_and_observer_retirement_remain_accounted(fixture_path));
     run_test("native Terminal_session lifecycle",
         vnm_terminal::test_helpers::check_native_session_lifecycle(
-            term::make_windows_conpty_backend, launch_config(fixture_path, {})));
+            [] { return term::make_windows_conpty_backend(); }, launch_config(fixture_path, {})));
     run_test("post-birth failure retains native custody",
         test_post_birth_failure_keeps_native_custody(fixture_path));
     run_test("failed-start cleanup retires CPU Job ownership",
