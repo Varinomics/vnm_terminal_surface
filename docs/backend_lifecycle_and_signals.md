@@ -80,48 +80,6 @@ launch config requests `Terminal_process_group_policy::CREATE_NEW_SESSION`, the
 backend adds `CREATE_NEW_PROCESS_GROUP` to the creation flags; this is the
 Windows mapping of the new-session request.
 
-The child joins the backend's private Job during `CreateProcessW`, through
-`PROC_THREAD_ATTRIBUTE_JOB_LIST`. The Job has `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-and its handle is not inherited. Compatible ambient Job membership is preserved
-as an outer containment scope; the terminal retains and terminates its own Job.
-Failed admission is never retried without that Job.
-
-The child executes immediately and may produce output or exit before backend
-adoption or worker startup. Pipes, pseudoconsole, cleanup reservations, and the
-compatibility-window observer are ready before creation. Output buffers or
-backpressures until the reader runs; startup does not wait for child readiness.
-The backend adopts the original process handle, Job, terminal resources, callbacks,
-and start bookkeeping together, including when the root has already exited.
-Normal exit delivery waits for output drain and native process settlement.
-
-Windows start outcomes distinguish native dispatch from successful birth:
-
-| Failure phase | `native_dispatch_occurred` | `start_outcome_determinate` |
-| --- | --- | --- |
-| Preparation or attribute rejection | `false` | `true` |
-| `CreateProcessW` rejects creation/admission | `true` | `true` |
-| Worker startup fails after creation | `true` | `false` |
-
-Only creation and Job admission form one native outcome; successful creation
-does not commit the complete terminal startup. After a worker-start failure,
-the reserved backend cleanup owner revokes callbacks and retains the exact native
-resources until settlement. Facade destruction can return while that work
-continues; a final exit callback is not promised for this rejected start.
-
-Settlement requires both the original root's observed exit and a successful
-query showing zero active members in the retained terminal Job. A missing Job
-or failed query cannot establish settlement. Termination deadlines diagnose
-non-completion without abandoning cleanup, and exact-root termination remains
-available if Job termination fails. Job settlement does not prove pseudoconsole
-or compatibility-window observer retirement; those resources retain their
-separate close ownership.
-
-CPU accounting and process snapshots are unavailable before adoption and after
-Job retirement. CPU totals include descendants and remain available after
-natural root exit while the Job is retained; an initial sample may already be
-nonzero. Snapshot PIDs describe observed membership and are not process-ownership
-handles or settlement receipts.
-
 ### Early-child setup-failure cleanup
 
 The selected process owner reports whether a child was born and whether the

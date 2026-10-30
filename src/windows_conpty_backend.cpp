@@ -799,6 +799,38 @@ std::wstring environment_block_from_process_environment(
     return block;
 }
 
+std::vector<std::byte> initialized_attribute_list_storage(
+    Conpty_handle                  conpty,
+    LPPROC_THREAD_ATTRIBUTE_LIST&  attribute_list,
+    Terminal_backend_result&       failure)
+{
+    SIZE_T attribute_list_size = 0U;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_list_size);
+
+    std::vector<std::byte> storage(attribute_list_size);
+    attribute_list =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    if (!InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_list_size)) {
+        failure = backend_reject(
+            Terminal_backend_error_code::START_FAILED,
+            windows_error_message(QStringLiteral("InitializeProcThreadAttributeList"), GetLastError()));
+        return {};
+    }
+
+    if (!UpdateProcThreadAttribute(
+            attribute_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, conpty, sizeof(conpty), nullptr, nullptr))
+    {
+        DeleteProcThreadAttributeList(attribute_list);
+        attribute_list = nullptr;
+        failure = backend_reject(
+            Terminal_backend_error_code::START_FAILED,
+            windows_error_message(QStringLiteral("UpdateProcThreadAttribute"), GetLastError()));
+        return {};
+    }
+
+    return storage;
+}
+
 }
 
 class Windows_conpty_backend::Impl
@@ -837,7 +869,7 @@ public:
     std::optional<process_cpu_time_t> process_cpu_time() const
     {
         const std::lock_guard lock(m_mutex);
-        if (!m_process_job) {
+        if (!m_process_assigned_to_job) {
             return std::nullopt;
         }
         // Root exit does not retire the Job's accumulated descendant time.
@@ -864,7 +896,7 @@ public:
     std::optional<Process_snapshot> process_snapshot() const
     {
         const std::lock_guard lock(m_mutex);
-        if (!m_process_job) {
+        if (!m_process_assigned_to_job || !m_process_job) {
             return std::nullopt;
         }
         return sample_job_processes(m_process_job.get());
@@ -885,7 +917,7 @@ public:
             m_exit_reason_override == Terminal_exit_reason::INTERRUPTED ||
                 m_interrupt_delivery_exit_code_pending,
             bool(m_process),
-            bool(m_process_job),
+            m_process_assigned_to_job,
             m_native_cleanup_settled,
         };
     }
@@ -907,26 +939,6 @@ public:
             return false;
         }
         m_cpu_observer_for_testing = std::move(observer);
-        return true;
-    }
-
-    bool set_creation_control_for_testing(std::shared_ptr<Windows_conpty_creation_control_for_testing> control)
-    {
-        const std::lock_guard lock(m_mutex);
-        if (m_start_attempted || m_start_in_progress || (control && !control->created)) {
-            return false;
-        }
-        m_creation_control_for_testing = std::move(control);
-        return true;
-    }
-
-    bool set_job_admission_restricted_for_testing(bool restricted)
-    {
-        const std::lock_guard lock(m_mutex);
-        if (m_start_attempted || m_start_in_progress) {
-            return false;
-        }
-        m_job_admission_restricted_for_testing = restricted;
         return true;
     }
 
@@ -1102,52 +1114,16 @@ public:
                 hresult_message(QStringLiteral("ConptyReparentPseudoConsole"), reparent_result));
         }
 
-        Job_object_create_result process_job_result = create_process_tree_job();
-        if (!process_job_result.handle) {
+        LPPROC_THREAD_ATTRIBUTE_LIST attribute_list = nullptr;
+        Terminal_backend_result attribute_failure;
+        std::vector<std::byte> attribute_storage = initialized_attribute_list_storage(
+            local_conpty,
+            attribute_list,
+            attribute_failure);
+        if (is_backend_rejection(attribute_failure)) {
             return reject_start(
-                Terminal_backend_error_code::START_FAILED,
-                windows_error_message(process_job_result.failed_operation, process_job_result.error_code));
-        }
-        Unique_handle process_job = std::move(process_job_result.handle);
-        Unique_handle restricted_job;
-        if (m_job_admission_restricted_for_testing) {
-            HANDLE duplicate = nullptr;
-            if (!DuplicateHandle(GetCurrentProcess(), process_job.get(), GetCurrentProcess(),
-                    &duplicate, JOB_OBJECT_QUERY, FALSE, 0))
-            {
-                const DWORD error = GetLastError();
-                return reject_start(Terminal_backend_error_code::START_FAILED,
-                    windows_error_message(QStringLiteral("DuplicateHandle terminal Job"), error));
-            }
-            restricted_job.reset(duplicate);
-        }
-
-        // Attribute values and their handles stay alive until list deletion.
-        // Admission needs Job access rights, not Job-handle inheritance.
-        HANDLE admission_jobs[] = {restricted_job ? restricted_job.get() : process_job.get()};
-        SIZE_T attribute_list_size = 0U;
-        InitializeProcThreadAttributeList(nullptr, 2, 0, &attribute_list_size);
-        std::vector<std::byte> attribute_storage(attribute_list_size);
-        auto* attribute_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
-        if (!InitializeProcThreadAttributeList(attribute_list, 2, 0, &attribute_list_size)) {
-            const DWORD error = GetLastError();
-            return reject_start(Terminal_backend_error_code::START_FAILED,
-                windows_error_message(QStringLiteral("InitializeProcThreadAttributeList"), error));
-        }
-        const auto delete_attributes = qScopeGuard([&] { DeleteProcThreadAttributeList(attribute_list); });
-        if (!UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                local_conpty, sizeof(local_conpty), nullptr, nullptr))
-        {
-            const DWORD error = GetLastError();
-            return reject_start(Terminal_backend_error_code::START_FAILED,
-                windows_error_message(QStringLiteral("UpdateProcThreadAttribute pseudoconsole"), error));
-        }
-        if (!UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-                admission_jobs, sizeof(admission_jobs), nullptr, nullptr))
-        {
-            const DWORD error = GetLastError();
-            return reject_start(Terminal_backend_error_code::START_FAILED,
-                windows_error_message(QStringLiteral("UpdateProcThreadAttribute Job list"), error));
+                attribute_failure.error->code,
+                attribute_failure.error->message);
         }
 
         STARTUPINFOEXW startup_info{};
@@ -1175,10 +1151,16 @@ public:
         std::wstring environment_block =
             environment_block_from_process_environment(effective_config.environment);
 
-        const auto output_delivery_limits = derive_native_backend_output_delivery_limits(
-            effective_config.output_delivery_limits,
-            k_conpty_paused_output_high_watermark_ceiling_bytes);
-        const auto creation_control = m_creation_control_for_testing;
+        Job_object_create_result process_job_result = create_process_tree_job();
+        if (!process_job_result.handle) {
+            return
+                reject_start(
+                    Terminal_backend_error_code::START_FAILED,
+                    windows_error_message(
+                        process_job_result.failed_operation,
+                        process_job_result.error_code));
+        }
+        Unique_handle process_job = std::move(process_job_result.handle);
 
         // A process hosting terminals may suppress loader and critical-error
         // dialogs for its own helpers, and Windows hands that error mode to
@@ -1188,7 +1170,8 @@ public:
         DWORD creation_flags =
             EXTENDED_STARTUPINFO_PRESENT |
             CREATE_UNICODE_ENVIRONMENT |
-            CREATE_DEFAULT_ERROR_MODE;
+            CREATE_DEFAULT_ERROR_MODE |
+            CREATE_SUSPENDED;
         if (effective_config.process_group_policy ==
             Terminal_process_group_policy::CREATE_NEW_SESSION)
         {
@@ -1197,10 +1180,6 @@ public:
 
         const std::wstring application_name =
             wide_from_qstring(QDir::toNativeSeparators(*resolved_executable));
-        LARGE_INTEGER creation_before{}, creation_after{};
-        if (m_cpu_observer_for_testing) {
-            QueryPerformanceCounter(&creation_before);
-        }
         const BOOL process_created = CreateProcessW(
             application_name.c_str(),
             command_line.data(),
@@ -1213,6 +1192,10 @@ public:
             &startup_info.StartupInfo,
             &process_information);
         const DWORD create_process_error = process_created ? ERROR_SUCCESS : GetLastError();
+
+        DeleteProcThreadAttributeList(attribute_list);
+        attribute_storage.clear();
+
         if (!process_created) {
             return
                 reject_start(
@@ -1223,16 +1206,12 @@ public:
 
         Unique_handle process_handle(process_information.hProcess);
         Unique_handle thread_handle(process_information.hThread);
-        if (m_cpu_observer_for_testing) {
-            QueryPerformanceCounter(&creation_after);
-        }
-        if (creation_control) {
-            creation_control->created(creation_control->context, process_job.get(), process_handle.get());
-        }
+        pty_input_read.reset();
+        pty_output_write.reset();
 
-        // Creation admits the executing child to the retained Job atomically.
-        // This allocation-free transfer also retains an already-exited root;
-        // worker startup can still fail and use the reserved cleanup owner.
+        // Adopt every native resource before Job assignment or ResumeThread
+        // can fail. A rejected start can still own a suspended/live process.
+        // The ordinary wait worker continues that custody after start returns.
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_api                = *conpty_api;
@@ -1245,6 +1224,7 @@ public:
             m_output_read        = std::move(pty_output_read);
             m_process_job        = std::move(process_job);
             m_process            = std::move(process_handle);
+            m_process_assigned_to_job = false;
             m_native_cleanup_settled = false;
             m_running            = true;
             m_start_attempted    = true;
@@ -1258,7 +1238,10 @@ public:
             m_writer_failed      = false;
             m_startup_aborted    = false;
             m_termination_policy = effective_config.termination_policy;
-            m_output_delivery_limits = output_delivery_limits;
+            m_output_delivery_limits =
+                derive_native_backend_output_delivery_limits(
+                    effective_config.output_delivery_limits,
+                    k_conpty_paused_output_high_watermark_ceiling_bytes);
             m_exit_reason_override.reset();
             m_queued_write_bytes                   = 0U;
             m_conpty_active_calls                  = 0U;
@@ -1275,14 +1258,49 @@ public:
             m_write_queue.clear();
         }
 
-        pty_input_read.reset();
-        pty_output_write.reset();
-        thread_handle.reset();
+        QString post_birth_failure;
+        const bool inject_assignment_failure =
+            m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT;
+        LARGE_INTEGER assignment_before{}, assignment_after{};
         if (m_cpu_observer_for_testing) {
-            const std::lock_guard lock(m_mutex);
-            // This is creation/admission timing, not an idle-workload sample.
-            m_cpu_observer_for_testing("creation", m_process_job.get(), m_process.get(),
-                {creation_before.QuadPart, creation_after.QuadPart, 0, 0, 0, 0, ERROR_SUCCESS});
+            m_cpu_observer_for_testing("before assignment", m_process_job.get(), m_process.get(), {});
+            QueryPerformanceCounter(&assignment_before);
+        }
+        const bool assigned = !inject_assignment_failure &&
+            AssignProcessToJobObject(m_process_job.get(), m_process.get());
+        const DWORD assignment_error = assigned ? ERROR_SUCCESS :
+            (inject_assignment_failure ? ERROR_ACCESS_DENIED : GetLastError());
+        if (m_cpu_observer_for_testing) {
+            QueryPerformanceCounter(&assignment_after);
+            m_cpu_observer_for_testing("assignment", m_process_job.get(), m_process.get(),
+                {assignment_before.QuadPart, assignment_after.QuadPart, 0, 0, 0, 0, assignment_error});
+        }
+        if (!assigned) {
+            post_birth_failure = windows_error_message(QStringLiteral("AssignProcessToJobObject"), assignment_error);
+        }
+        else {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_process_assigned_to_job = true;
+            }
+            const bool inject_resume_failure =
+                m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE;
+            if (inject_resume_failure || ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+                post_birth_failure = windows_error_message(QStringLiteral("ResumeThread"),
+                    inject_resume_failure ? ERROR_ACCESS_DENIED : GetLastError());
+            }
+        }
+        if (!post_birth_failure.isEmpty()) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_stopping = true;
+                m_exit_reason_override = Terminal_exit_reason::FAILED_TO_START;
+            }
+            // An empty Job says nothing about an unassigned suspended root.
+            // Always terminate that exact process handle independently.
+            request_native_process_tree_termination();
+            report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                Terminal_backend_error_code::START_FAILED, post_birth_failure);
         }
 
         Terminal_backend_result worker_result = start_native_backend_workers(
@@ -1324,6 +1342,12 @@ public:
                 resize_worker_result.start_outcome_determinate = false;
                 worker_result = std::move(resize_worker_result);
             }
+        }
+        if (!post_birth_failure.isEmpty()) {
+            // The logical start failed. Native cleanup is a separate result:
+            // keep the wait worker, Job and process until exact settlement.
+            return backend_start_reject(Terminal_backend_error_code::START_FAILED,
+                std::move(post_birth_failure), true, native_process_tree_settled());
         }
         return worker_result;
     }
@@ -1723,6 +1747,7 @@ public:
         m_output_read.reset();
         m_process.reset();
         m_process_job.reset();
+        m_process_assigned_to_job = false;
         m_reader_thread_handle.reset();
         m_writer_thread_handle.reset();
         clear_queued_writes_locked();
@@ -2443,11 +2468,11 @@ private:
     void request_native_process_tree_termination() noexcept
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_process_job) {
+        if (m_process_assigned_to_job && m_process_job) {
             (void)TerminateJobObject(m_process_job.get(), 1U);
         }
-        // Even a successful Job request cannot replace the root observation.
-        // Retain the exact-root fallback if Job termination itself fails.
+        // Even a successful Job request cannot replace the root observation,
+        // and a failed assignment means the Job never owned this root at all.
         if (m_process && WaitForSingleObject(m_process.get(), 0) != WAIT_OBJECT_0) {
             (void)TerminateProcess(m_process.get(), 1U);
         }
@@ -2470,11 +2495,13 @@ private:
         if (WaitForSingleObject(m_process.get(), 0) != WAIT_OBJECT_0) {
             return false;
         }
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-        if (!m_process_job || !query_cpu_accounting(accounting, "settlement") ||
-            accounting.ActiveProcesses != 0)
-        {
-            return false;
+        if (m_process_assigned_to_job) {
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+            if (!m_process_job || !query_cpu_accounting(accounting, "settlement") ||
+                accounting.ActiveProcesses != 0)
+            {
+                return false;
+            }
         }
         m_native_cleanup_settled = true;
         return true;
@@ -2493,10 +2520,6 @@ private:
 
     bool query_cpu_accounting(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION& accounting, const char* event) const
     {
-        // A null handle queries the caller's ambient Job, not this terminal.
-        if (!m_process_job) {
-            return false;
-        }
         LARGE_INTEGER before{}, after{};
         if (m_cpu_observer_for_testing) {
             QueryPerformanceCounter(&before);
@@ -2621,8 +2644,7 @@ private:
     std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
     std::shared_ptr<Windows_conpty_close_control_for_testing> m_close_control_for_testing;
     std::shared_ptr<Windows_conpty_resize_control_for_testing> m_resize_control_for_testing;
-    std::shared_ptr<Windows_conpty_creation_control_for_testing> m_creation_control_for_testing;
-    bool m_job_admission_restricted_for_testing = false;
+    bool m_process_assigned_to_job = false;
     bool                               m_native_cleanup_settled = false;
     bool                               m_running = false;
     bool                               m_start_attempted = false;
@@ -2771,17 +2793,6 @@ bool Windows_conpty_backend::set_resize_control_for_testing(
     std::shared_ptr<Windows_conpty_resize_control_for_testing> control)
 {
     return m_impl->set_resize_control_for_testing(std::move(control));
-}
-
-bool Windows_conpty_backend::set_creation_control_for_testing(
-    std::shared_ptr<Windows_conpty_creation_control_for_testing> control)
-{
-    return m_impl->set_creation_control_for_testing(std::move(control));
-}
-
-bool Windows_conpty_backend::set_job_admission_restricted_for_testing(bool restricted)
-{
-    return m_impl->set_job_admission_restricted_for_testing(restricted);
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()

@@ -44,7 +44,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <semaphore>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1006,7 +1005,7 @@ public:
                 << " active=" << query.active_processes << " total=" << query.total_processes << '\n';
         }
         else {
-            // Creation timing precedes this observation; the root may already have run or exited.
+            // Assignment records bracket admission before the suspended root is resumed.
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
             LARGE_INTEGER before{}, after{};
             QueryPerformanceCounter(&before);
@@ -1014,7 +1013,7 @@ public:
                 &accounting, sizeof(accounting), nullptr);
             const DWORD error = queried ? ERROR_SUCCESS : GetLastError();
             QueryPerformanceCounter(&after);
-            output << "\n  creation Job qpc=[" << before.QuadPart << ',' << after.QuadPart
+            output << "\n  assignment Job qpc=[" << before.QuadPart << ',' << after.QuadPart
                 << "] error=" << error << " kernel_ticks=" << accounting.TotalKernelTime.QuadPart
                 << " user_ticks=" << accounting.TotalUserTime.QuadPart
                 << " active=" << accounting.ActiveProcesses << " total=" << accounting.TotalProcesses << '\n';
@@ -6415,9 +6414,9 @@ bool test_facade_hands_off_unconfirmed_native_cleanup(const QString& fixture_pat
     auto first = std::make_unique<term::Windows_conpty_backend>();
     bool ok = check(first->set_cleanup_observation_gate_for_testing(blocked),
         "reserve an observation gate that outlives the public facade");
-    ok &= check(first->set_start_fault_for_testing(term::Windows_conpty_start_fault_for_testing::RESIZE_WORKER_START),
-        "arm post-birth worker startup failure before native dispatch");
-    const auto result = first->start(launch_config(fixture_path, {QStringLiteral("--hold-open")}),
+    ok &= check(first->set_start_fault_for_testing(term::Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT),
+        "arm post-birth unassigned-root failure before native dispatch");
+    const auto result = first->start(launch_config(fixture_path, {QStringLiteral("--quick-exit")}),
         first_capture.callbacks());
     ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
             result.native_dispatch_occurred && !result.start_outcome_determinate,
@@ -6450,462 +6449,47 @@ bool test_facade_hands_off_unconfirmed_native_cleanup(const QString& fixture_pat
     return ok;
 }
 
-struct Creation_observation
-{
-    std::binary_semaphore entered{0};
-    std::binary_semaphore release{0};
-    Win32_process_handle  root;
-    HANDLE                outer_job = nullptr;
-    bool                  admitted = false;
-    bool                  in_outer_job = false;
-    bool                  released = false;
-
-    static void observe(void* context, void* job, void* process) noexcept
-    {
-        auto& state = *static_cast<Creation_observation*>(context);
-        HANDLE duplicate = nullptr;
-        if (DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &duplicate,
-                0, FALSE, DUPLICATE_SAME_ACCESS))
-        {
-            state.root.reset(duplicate);
-        }
-        BOOL member = FALSE;
-        state.admitted = IsProcessInJob(process, job, &member) && member;
-        if (state.outer_job != nullptr) {
-            member = FALSE;
-            state.in_outer_job = IsProcessInJob(process, state.outer_job, &member) && member;
-        }
-        state.entered.release();
-        state.released = state.release.try_acquire_for(2 * k_wait_timeout);
-    }
-};
-
-int run_admission_output_child(const QString& marker, bool large_output)
-{
-    std::cout << "admission-output-begin\r\n" << std::flush;
-    if (!write_gate_file(marker)) {
-        return 1;
-    }
-    if (large_output) {
-        const std::string row(120, 'x');
-        for (int index = 0; index < 8192; ++index) {
-            std::cout << row << "\r\n";
-        }
-    }
-    std::cout << "admission-output-end\r\n" << std::flush;
-    return 37;
-}
-
-bool test_execution_before_adoption(const QString& executable_path, HANDLE outer_job = nullptr)
+bool test_post_birth_failure_keeps_native_custody(const QString& fixture_path)
 {
     bool ok = true;
-    for (const bool large_output : {false, true}) {
-        QTemporaryDir directory;
-        if (!check(directory.isValid(), "pre-adoption fixture directory exists")) {
-            return false;
-        }
-        Creation_observation observation;
-        observation.outer_job = outer_job;
-        auto control = std::make_shared<term::Windows_conpty_creation_control_for_testing>();
-        control->created = Creation_observation::observe;
-        control->context = &observation;
-        Backend_capture capture;
+    for (const auto fault : {term::Windows_conpty_start_fault_for_testing::JOB_ASSIGNMENT,
+             term::Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE})
+    {
+        Backend_capture capture; // Outlives the backend and every native callback.
         term::Windows_conpty_backend backend;
-        if (!check(backend.set_creation_control_for_testing(control),
-                "creation barrier is installed before native dispatch"))
+        struct Observation_release
         {
-            return false;
-        }
-        term::Terminal_backend_result result;
-        const QString marker = directory.filePath(QStringLiteral("child-executed"));
-        const auto config = launch_config(executable_path,
-            {large_output ? QStringLiteral("--admission-large-output") : QStringLiteral("--admission-fast-exit"),
-             marker});
-        std::thread starter([&] { result = backend.start(config, capture.callbacks()); });
-        const bool created = observation.entered.try_acquire_for(k_wait_timeout);
-        ok &= check(created, "native creation reaches the barrier before adoption");
-        if (created) {
-            ok &= check(observation.root.is_valid() && observation.admitted,
-                "the original creation handle is already a terminal Job member");
-            ok &= check(!backend.process_cpu_time() && !backend.process_snapshot(),
-                "CPU and snapshots remain unavailable until native resources are adopted");
-            if (outer_job != nullptr) {
-                ok &= check(observation.in_outer_job, "terminal root also inherits outer Job membership");
-            }
-            ok &= check(wait_for_file(marker), "the terminal child executes before backend adoption");
-            if (observation.root.is_valid()) {
-                if (large_output) {
-                    ok &= check(WaitForSingleObject(observation.root.get(), 250) == WAIT_TIMEOUT,
-                        "early bulk output keeps the child live until reader workers can drain it");
-                }
-                else {
-                    ok &= check(wait_for_process_exit(observation.root.get()) &&
-                            process_exit_code(observation.root.get()) == 37U,
-                        "the exact root exits normally before backend adoption");
-                }
-            }
-        }
-        observation.release.release();
-        starter.join();
-        ok &= check(observation.released && result.code == term::Terminal_backend_result_code::ACCEPTED,
-            "adoption and worker startup accept the already executing child");
-        ok &= check(capture.wait_for_exit_while_output_progresses(),
-            "reader workers drain early output and final exit");
+            term::Windows_conpty_backend& backend;
+            ~Observation_release() { backend.set_cleanup_observation_blocked_for_testing(false); }
+        } release{backend};
+        ok &= check(backend.set_start_fault_for_testing(fault),
+            "post-birth failure injection is armed before native dispatch");
+        backend.set_cleanup_observation_blocked_for_testing(true);
+        const auto result = backend.start(
+            launch_config(fixture_path, {QStringLiteral("--quick-exit")}), capture.callbacks());
+        ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
+                result.native_dispatch_occurred && !result.start_outcome_determinate,
+            "post-birth rejection does not claim determinate cleanup before observation");
+        const auto state = backend.write_state_for_testing();
+        ok &= check(state.process_handle_retained && !state.native_cleanup_settled,
+            "a rejected start retains the exact process while cleanup is unconfirmed");
+        ok &= check(state.process_assigned_to_job ==
+                (fault == term::Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE),
+            "the empty-Job assignment-failure case remains distinct from an assigned root");
+        ok &= check(backend.process_cpu_time().has_value() == state.process_assigned_to_job,
+            "CPU counters require successful root admission to the retained Job");
+        ok &= check(capture.exit_count_snapshot() == 0,
+            "termination requests alone cannot publish a completed native exit");
+        backend.set_cleanup_observation_blocked_for_testing(false);
+        ok &= check(capture.wait_for_exit(), "exact native settlement eventually reports failed start");
         const auto exit = capture.exit_snapshot();
-        ok &= check(exit && exit->reason == term::Terminal_exit_reason::EXITED && exit->exit_code == 37 &&
-                capture.exit_count_snapshot() == 1 && capture.errors_snapshot().empty(),
-            "early execution publishes one normal exact exit without backend errors");
-        ok &= check(capture.output_precedes_exit(QByteArrayLiteral("admission-output-begin")) &&
-                capture.output_precedes_exit(QByteArrayLiteral("admission-output-end")),
-            "both early and final output are delivered before the final callback");
+        ok &= check(exit && exit->reason == term::Terminal_exit_reason::FAILED_TO_START &&
+                capture.exit_count_snapshot() == 1,
+            "both post-birth failure paths publish exactly one failed-start native exit");
+        ok &= check(backend.write_state_for_testing().native_cleanup_settled,
+            "settlement is recorded only after the root and assigned Job are observed empty");
     }
     return ok;
-}
-
-bool test_restricted_job_rejects_creation(const QString& fixture_path)
-{
-    Backend_capture capture;
-    auto backend = std::make_unique<term::Windows_conpty_backend>();
-    auto close = std::make_shared<term::Windows_conpty_close_control_for_testing>();
-    close->allow_close.release();
-    close->allow_observer.release();
-    auto creation = std::make_shared<term::Windows_conpty_creation_control_for_testing>();
-    std::atomic_uint birth_count{0};
-    creation->context = &birth_count;
-    creation->created = [](void* context, void*, void*) noexcept {
-        static_cast<std::atomic_uint*>(context)->fetch_add(1, std::memory_order_relaxed);
-    };
-    if (!check(backend->set_job_admission_restricted_for_testing(true) &&
-            backend->set_creation_control_for_testing(creation) && backend->set_close_control_for_testing(close),
-            "restricted Job input and exact native retirement observations are installed"))
-    {
-        return false;
-    }
-    const auto result = backend->start(
-        launch_config(fixture_path, {QStringLiteral("--hold-open")}), capture.callbacks());
-    std::cerr << "Restricted Job admission: native_dispatch=" << result.native_dispatch_occurred
-        << " determinate=" << result.start_outcome_determinate
-        << " error=" << (result.error ? result.error->message.toStdString() : std::string{}) << '\n';
-    bool ok = check(result.code == term::Terminal_backend_result_code::REJECTED &&
-            result.start_outcome_determinate && birth_count.load() == 0,
-        "a Job handle without assign access rejects admission without a fallback child");
-    // A rejection at attribute update is safe, but cannot qualify the creation-refusal gate.
-    ok &= check(result.native_dispatch_occurred,
-        "restricted Job fixture reaches real CreateProcessW admission refusal");
-    ok &= check(!backend->process_cpu_time() && !backend->process_snapshot(),
-        "creation refusal never publishes a terminal Job or process");
-    backend.reset();
-    ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
-            std::chrono::steady_clock::now() + k_wait_timeout),
-        "real admission refusal settles its attempt-local native cleanup");
-    ok &= check(close->close_count == 1U && close->observer_retirement_count == 1U &&
-            capture.exit_count_snapshot() == 0,
-        "creation refusal closes its exact pseudoconsole and observer once without an exit callback");
-    return ok;
-}
-
-struct Process_termination
-{
-    HANDLE process;
-    ~Process_termination() { terminate_process_if_running(process); }
-};
-
-Win32_process_handle spawn_admission_fixture(
-    const QString& executable_path,
-    const QString& arguments,
-    HANDLE         outer_job,
-    HANDLE*        inherited_handles = nullptr,
-    std::size_t    inherited_count = 0)
-{
-    const DWORD count = inherited_count == 0 ? 1 : 2;
-    SIZE_T size = 0;
-    InitializeProcThreadAttributeList(nullptr, count, 0, &size);
-    std::vector<std::byte> storage(size);
-    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-    if (!InitializeProcThreadAttributeList(attributes, count, 0, &size)) {
-        return {};
-    }
-    struct Attribute_cleanup
-    {
-        LPPROC_THREAD_ATTRIBUTE_LIST attributes;
-        ~Attribute_cleanup() { DeleteProcThreadAttributeList(attributes); }
-    } cleanup{attributes};
-    if ((outer_job != nullptr && !UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-            &outer_job, sizeof(outer_job), nullptr, nullptr)) ||
-        (inherited_count != 0 && !UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            inherited_handles, inherited_count * sizeof(HANDLE), nullptr, nullptr)))
-    {
-        return {};
-    }
-    STARTUPINFOEXW startup{};
-    startup.StartupInfo.cb   = sizeof(startup);
-    startup.lpAttributeList = attributes;
-    PROCESS_INFORMATION process{};
-    const std::wstring application = QDir::toNativeSeparators(executable_path).toStdWString();
-    std::wstring command = QStringLiteral("\"%1\" %2").arg(executable_path, arguments).toStdWString();
-    if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, inherited_count != 0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, nullptr, &startup.StartupInfo, &process))
-    {
-        std::cerr << "Admission fixture CreateProcessW failed: " << GetLastError() << '\n';
-        return {};
-    }
-    Win32_process_handle root(process.hProcess);
-    Win32_process_handle thread(process.hThread);
-    return root;
-}
-
-bool test_nested_job_membership(const QString& executable_path)
-{
-    Win32_process_handle outer(CreateJobObjectW(nullptr, nullptr));
-    if (!check(outer.is_valid() && AssignProcessToJobObject(outer.get(), GetCurrentProcess()),
-            "isolated membership host enters an outer Job without UI limits"))
-    {
-        return false;
-    }
-    const auto burn_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
-    const auto initial_cpu = process_cpu_time_usec(GetCurrentProcess());
-    auto host_cpu = initial_cpu;
-    std::atomic_uint work{0};
-    while (host_cpu && initial_cpu && *host_cpu - *initial_cpu < k_cpu_accounting_work_usec &&
-           std::chrono::steady_clock::now() < burn_deadline)
-    {
-        for (unsigned int index = 0; index < 4096; ++index) {
-            work.fetch_add(index, std::memory_order_relaxed);
-        }
-        host_cpu = process_cpu_time_usec(GetCurrentProcess());
-    }
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION host_accounting{};
-    if (!check(host_cpu && initial_cpu && *host_cpu - *initial_cpu >= k_cpu_accounting_work_usec &&
-            QueryInformationJobObject(nullptr, JobObjectBasicAccountingInformation,
-                &host_accounting, sizeof(host_accounting), nullptr) &&
-            host_accounting.TotalKernelTime.QuadPart + host_accounting.TotalUserTime.QuadPart > 0,
-            "pre-adoption host Job has independently measured CPU work and nonzero null-handle accounting"))
-    {
-        return false;
-    }
-    bool ok = test_execution_before_adoption(executable_path, outer.get());
-    // This child inherits the host's outer Job; it never enters a terminal Job.
-    auto unrelated = spawn_admission_fixture(executable_path, QStringLiteral("--admission-hold"), nullptr);
-    if (!check(unrelated.is_valid(), "unrelated outer Job member starts")) {
-        return false;
-    }
-    Process_termination unrelated_cleanup{unrelated.get()};
-    QTemporaryDir directory;
-    if (!check(directory.isValid(), "nested Job workload directory exists")) {
-        return false;
-    }
-    struct Membership_observation
-    {
-        std::mutex           mutex;
-        Win32_process_handle outer;
-        Win32_process_handle unrelated;
-        Win32_process_handle descendant;
-        bool                 root_in_both = false;
-        bool                 child_in_both = false;
-        bool                 unrelated_outside_terminal = false;
-    };
-    auto state = std::make_shared<Membership_observation>();
-    HANDLE retained_outer = nullptr;
-    if (!check(DuplicateHandle(GetCurrentProcess(), outer.get(), GetCurrentProcess(), &retained_outer,
-            0, FALSE, DUPLICATE_SAME_ACCESS), "membership observer retains the fixture outer Job"))
-    {
-        return false;
-    }
-    state->outer.reset(retained_outer);
-    HANDLE retained_unrelated = nullptr;
-    if (!check(DuplicateHandle(GetCurrentProcess(), unrelated.get(), GetCurrentProcess(), &retained_unrelated,
-            0, FALSE, DUPLICATE_SAME_ACCESS), "membership observer retains its unrelated process observation"))
-    {
-        return false;
-    }
-    state->unrelated.reset(retained_unrelated);
-    Backend_capture capture;
-    term::Windows_conpty_backend backend;
-    if (!check(backend.set_cpu_observer_for_testing(
-            [state](const char*, void* job, void* root, const term::windows_conpty_cpu_query_for_testing_t&)
-            {
-                const std::lock_guard lock(state->mutex);
-                BOOL inner_member = FALSE;
-                BOOL outer_member = FALSE;
-                state->root_in_both = IsProcessInJob(root, job, &inner_member) && inner_member &&
-                    IsProcessInJob(root, state->outer.get(), &outer_member) && outer_member;
-                if (state->descendant.is_valid()) {
-                    inner_member = FALSE;
-                    outer_member = FALSE;
-                    state->child_in_both = IsProcessInJob(state->descendant.get(), job, &inner_member) && inner_member &&
-                        IsProcessInJob(state->descendant.get(), state->outer.get(), &outer_member) && outer_member;
-                }
-                inner_member = TRUE;
-                state->unrelated_outside_terminal =
-                    IsProcessInJob(state->unrelated.get(), job, &inner_member) && !inner_member;
-            }), "membership observer borrows the exact retained Job and root"))
-    {
-        return false;
-    }
-    const auto result = backend.start(launch_config(executable_path,
-        {QStringLiteral("--cpu-accounting-root"), directory.path()}), capture.callbacks());
-    if (!check(result.code == term::Terminal_backend_result_code::ACCEPTED,
-            "terminal workload starts nested inside the host Job"))
-    {
-        return false;
-    }
-    const auto child_pid = capture.wait_for_pid_output(QByteArrayLiteral("cpu-child-pid="));
-    if (child_pid) {
-        const std::lock_guard lock(state->mutex);
-        state->descendant = open_process_handle(*child_pid);
-    }
-    (void)backend.process_cpu_time();
-    {
-        const std::lock_guard lock(state->mutex);
-        ok &= check(state->descendant.is_valid() && state->root_in_both && state->child_in_both &&
-                state->unrelated_outside_terminal,
-            "root and descendant belong to both Jobs while unrelated outer work stays outside the terminal Job");
-    }
-    (void)backend.terminate();
-    ok &= check(capture.wait_for_exit(), "terminal cleanup publishes root exit in its nested Job");
-    if (state->descendant.is_valid()) {
-        ok &= check(wait_for_process_exit(state->descendant.get()), "terminal cleanup also settles the descendant");
-    }
-    ok &= check(process_handle_is_running(unrelated.get()) == true,
-        "terminal cleanup leaves the unrelated outer Job member running");
-    return ok;
-}
-
-struct host_death_context_t
-{
-    HANDLE supervisor = nullptr;
-    HANDLE pipe = nullptr;
-};
-
-int run_admission_host(const QString& executable_path, HANDLE supervisor, HANDLE pipe)
-{
-    host_death_context_t context{supervisor, pipe};
-    auto control = std::make_shared<term::Windows_conpty_creation_control_for_testing>();
-    control->context = &context;
-    control->created = [](void* raw, void* job, void* root) noexcept {
-        const auto& state = *static_cast<host_death_context_t*>(raw);
-        BOOL member = FALSE;
-        if (!IsProcessInJob(root, job, &member) || !member) {
-            return;
-        }
-        HANDLE remote_root = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), root, state.supervisor, &remote_root,
-                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, 0))
-        {
-            return;
-        }
-        DWORD written = 0;
-        // The small fixed record cannot fill this dedicated pipe. No Job handle crosses the boundary.
-        if (!WriteFile(state.pipe, &remote_root, sizeof(remote_root), &written, nullptr) ||
-            written != sizeof(remote_root))
-        {
-            HANDLE local = nullptr;
-            if (DuplicateHandle(state.supervisor, remote_root, GetCurrentProcess(), &local,
-                    0, FALSE, DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE))
-            {
-                CloseHandle(local);
-            }
-            return;
-        }
-        (void)WaitForSingleObject(root, (DWORD)(2 * k_wait_timeout.count()));
-    };
-    Backend_capture capture;
-    term::Windows_conpty_backend backend;
-    if (!backend.set_creation_control_for_testing(control)) {
-        return 1;
-    }
-    (void)backend.start(launch_config(executable_path, {QStringLiteral("--admission-hold")}), capture.callbacks());
-    return 1; // The supervisor must kill this host while the creation callback is held.
-}
-
-bool test_host_death_after_creation(const QString& executable_path)
-{
-    Win32_process_handle outer(CreateJobObjectW(nullptr, nullptr));
-    if (!check(outer.is_valid(), "host-death outer Job exists")) {
-        return false;
-    }
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!check(SetInformationJobObject(outer.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)),
-            "fixture cleanup bounds every process after the host-death assertions"))
-    {
-        return false;
-    }
-    auto unrelated = spawn_admission_fixture(executable_path, QStringLiteral("--admission-hold"), outer.get());
-    if (!check(unrelated.is_valid(), "host-death unrelated outer member starts")) {
-        return false;
-    }
-    Process_termination unrelated_cleanup{unrelated.get()};
-    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
-    HANDLE read_handle = nullptr;
-    HANDLE write_handle = nullptr;
-    if (!check(CreatePipe(&read_handle, &write_handle, &security, 0), "host-death transfer pipe exists")) {
-        return false;
-    }
-    Win32_process_handle reader(read_handle);
-    Win32_process_handle writer(write_handle);
-    HANDLE supervisor_handle = nullptr;
-    if (!check(SetHandleInformation(reader.get(), HANDLE_FLAG_INHERIT, 0) &&
-            DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &supervisor_handle,
-                PROCESS_DUP_HANDLE, TRUE, 0), "host receives a restricted supervisor duplication handle"))
-    {
-        return false;
-    }
-    Win32_process_handle supervisor(supervisor_handle);
-    HANDLE inherited[] = {supervisor.get(), writer.get()};
-    const QString arguments = QStringLiteral("--admission-host %1 %2")
-        .arg((qulonglong)(std::uintptr_t)supervisor.get()).arg((qulonglong)(std::uintptr_t)writer.get());
-    auto host = spawn_admission_fixture(executable_path, arguments, outer.get(), inherited, std::size(inherited));
-    if (!check(host.is_valid(), "host-death subprocess starts in the outer Job")) {
-        return false;
-    }
-    Process_termination host_cleanup{host.get()};
-    writer.reset();
-    HANDLE root_handle = nullptr;
-    DWORD available = 0;
-    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
-    while (PeekNamedPipe(reader.get(), nullptr, 0, nullptr, &available, nullptr) &&
-           available < sizeof(root_handle) && std::chrono::steady_clock::now() < deadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    DWORD read = 0;
-    if (!check(available >= sizeof(root_handle) &&
-            ReadFile(reader.get(), &root_handle, sizeof(root_handle), &read, nullptr) && read == sizeof(root_handle),
-            "host transfers a duplicate of the original creation handle directly to its supervisor"))
-    {
-        return false;
-    }
-    Win32_process_handle root(root_handle);
-    Process_termination root_cleanup{root.get()};
-    BOOL member = FALSE;
-    bool ok = check(process_handle_is_running(root.get()) == true && process_handle_is_running(host.get()) == true &&
-            IsProcessInJob(root.get(), outer.get(), &member) && member,
-        "admitted root remains live in the inherited outer Job before host death");
-    ok &= check(TerminateProcess(host.get(), 19) && wait_for_process_exit(host.get()),
-        "supervisor kills the host while its successful creation is awaiting adoption");
-    ok &= check(wait_for_process_exit(root.get()),
-        "closing the dead host's last terminal Job handle terminates the exact original root");
-    ok &= check(process_handle_is_running(unrelated.get()) == true,
-        "the surviving outer Job and its unrelated member do not mask terminal Job ownership");
-    return ok;
-}
-
-bool test_admission_in_isolated_process(const QString& executable_path)
-{
-    QProcess child;
-    child.start(executable_path, {QStringLiteral("--admission-nested-host")});
-    if (!check(child.waitForStarted(k_wait_timeout.count()), "isolated nested Job host starts")) {
-        return false;
-    }
-    const bool finished = child.waitForFinished(4 * k_wait_timeout.count());
-    if (!finished) {
-        child.kill();
-        child.waitForFinished(k_wait_timeout.count());
-    }
-    std::cerr << child.readAllStandardError().constData();
-    return check(finished && child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0,
-        "isolated host verifies early execution and nested Job cleanup");
 }
 
 bool test_failed_start_retires_cpu_job(const QString& fixture_path)
@@ -6944,8 +6528,6 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
         term::Windows_conpty_backend& backend;
         ~Observation_release() { backend.set_cleanup_observation_blocked_for_testing(false); }
     } release{backend};
-    bool ok = check(!backend.process_cpu_time() && !backend.process_snapshot(),
-        "an unstarted backend cannot report the host Job as terminal accounting");
     if (!check(backend.set_start_fault_for_testing(
             term::Windows_conpty_start_fault_for_testing::RESIZE_WORKER_START),
             "worker startup failure is armed before native dispatch"))
@@ -6955,7 +6537,7 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
     backend.set_cleanup_observation_blocked_for_testing(true);
     const auto result = backend.start(
         launch_config(fixture_path, {QStringLiteral("--hold-open")}), capture.callbacks());
-    ok &= check(result.code == term::Terminal_backend_result_code::REJECTED &&
+    bool ok = check(result.code == term::Terminal_backend_result_code::REJECTED &&
             result.native_dispatch_occurred && !result.start_outcome_determinate,
         "worker startup failure rejects start while deferred cleanup retains the native child");
     const auto admitted = backend.write_state_for_testing();
@@ -6985,8 +6567,6 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
     }
     ok &= check(!sample,
         "the live failed-start facade never reports its host Job as terminal CPU");
-    ok &= check(!backend.process_snapshot() && capture.exit_count_snapshot() == 0,
-        "retired worker-start failure has no snapshot and never calls its revoked exit receiver");
     return ok;
 }
 
@@ -7832,29 +7412,6 @@ bool test_native_cmd_primary_resize_with_text_below_the_cursor()
 
 int main(int argc, char** argv)
 {
-    if (argc == 2 && std::string_view(argv[1]) == "--admission-hold") {
-        Sleep(60000);
-        return 0;
-    }
-    if (argc == 3 && (std::string_view(argv[1]) == "--admission-fast-exit" ||
-                     std::string_view(argv[1]) == "--admission-large-output"))
-    {
-        return run_admission_output_child(QString::fromLocal8Bit(argv[2]),
-            std::string_view(argv[1]) == "--admission-large-output");
-    }
-    if (argc == 4 && std::string_view(argv[1]) == "--admission-host") {
-        const auto supervisor = (std::uintptr_t)QString::fromLocal8Bit(argv[2]).toULongLong();
-        const auto pipe       = (std::uintptr_t)QString::fromLocal8Bit(argv[3]).toULongLong();
-        return run_admission_host(QString::fromLocal8Bit(argv[0]),
-            reinterpret_cast<HANDLE>(supervisor), reinterpret_cast<HANDLE>(pipe));
-    }
-    if (argc == 2 && std::string_view(argv[1]) == "--admission-nested-host") {
-        bool ok = test_nested_job_membership(QString::fromLocal8Bit(argv[0]));
-        ok &= check(term::Native_backend_cleanup_reservation::wait_until_idle(
-                std::chrono::steady_clock::now() + k_wait_timeout), "nested Job native cleanup settles");
-        ok &= wait_for_console_host_children_to_exit("nested Job admission");
-        return ok ? 0 : 1;
-    }
     if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
         bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));
         ok &= term::Native_backend_cleanup_reservation::wait_until_idle(
@@ -8003,11 +7560,6 @@ int main(int argc, char** argv)
         ok &= wait_for_console_host_children_to_exit(test_name);
     };
 
-    run_test("early execution and nested terminal Jobs",
-        test_admission_in_isolated_process(QString::fromLocal8Bit(argv[0])));
-    run_test("real restricted Job admission refusal", test_restricted_job_rejects_creation(fixture_path));
-    run_test("host death after admitted creation",
-        test_host_death_after_creation(QString::fromLocal8Bit(argv[0])));
     run_test("facade hands off unconfirmed native cleanup",
         test_facade_hands_off_unconfirmed_native_cleanup(fixture_path));
     run_test("start retry after pseudoconsole rejection",
@@ -8017,6 +7569,8 @@ int main(int argc, char** argv)
     run_test("native Terminal_session lifecycle",
         vnm_terminal::test_helpers::check_native_session_lifecycle(
             term::make_windows_conpty_backend, launch_config(fixture_path, {})));
+    run_test("post-birth failure retains native custody",
+        test_post_birth_failure_keeps_native_custody(fixture_path));
     run_test("failed-start cleanup retires CPU Job ownership",
         test_failed_start_cpu_in_isolated_process(QString::fromLocal8Bit(argv[0]), fixture_path));
     run_test("pid parser", test_pid_parser_requires_line_delimiter());

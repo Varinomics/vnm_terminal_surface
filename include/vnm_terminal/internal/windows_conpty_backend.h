@@ -16,6 +16,8 @@ namespace vnm_terminal::internal {
 enum class Windows_conpty_start_fault_for_testing
 {
     NONE,
+    JOB_ASSIGNMENT,
+    THREAD_RESUME_FAILURE,
     RESIZE_WORKER_START,
 };
 
@@ -60,16 +62,6 @@ struct Windows_conpty_resize_control_for_testing
 {
     std::binary_semaphore resize_entered{0};
     std::binary_semaphore allow_resize{0};
-};
-
-// Called after native creation while attempt-local owners retain every handle,
-// before backend adoption and without its mutex. The hook must not throw or
-// mutate the backend. It may query membership and duplicate the original root
-// into a supervisor for exact-exit observation, but must not retain the Job.
-struct Windows_conpty_creation_control_for_testing
-{
-    void (*created)(void* context, void* job, void* root) noexcept = nullptr;
-    void* context = nullptr;
 };
 
 struct windows_conpty_cpu_query_for_testing_t
@@ -129,10 +121,6 @@ public:
     bool set_cleanup_observation_gate_for_testing(std::shared_ptr<std::atomic_bool> gate);
     bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control);
     bool set_resize_control_for_testing(std::shared_ptr<Windows_conpty_resize_control_for_testing> control);
-    bool set_creation_control_for_testing(std::shared_ptr<Windows_conpty_creation_control_for_testing> control);
-    // Supply a query-only duplicate to JOB_LIST; retain the full-rights Job
-    // owner for cleanup. Windows itself decides the admission failure phase.
-    bool set_job_admission_restricted_for_testing(bool restricted);
     bool set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer);
 
 private:
