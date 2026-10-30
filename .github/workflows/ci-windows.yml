@@ -399,6 +399,7 @@ jobs:
           }
 
           $asan_runtime.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "VNM_MSVC_ASAN_RUNTIME=$($asan_runtime.FullName)" >> $env:GITHUB_ENV
 
       # Hosted CMake has no FASTBuild generator; Ninja supports compiler launchers.
       - name: Configure CMake
@@ -438,6 +439,7 @@ jobs:
           }
 
       - name: Build ConPTY backend ASan test
+        id: conpty_asan_build
         shell: cmd
         run: |
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
@@ -453,6 +455,25 @@ jobs:
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
           ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -R "^vnm_terminal_windows_conpty_backend$"
+
+      - name: Export native ConPTY ASan runtime
+        id: conpty_asan_export
+        if: always() && steps.conpty_asan_build.outcome == 'success'
+        shell: cmd
+        run: |
+          call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          cmake --build build-asan --config %CMAKE_BUILD_TYPE% --target vnm_terminal_windows_conpty_test_artifact --parallel 4
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          copy /y "%VNM_MSVC_ASAN_RUNTIME%" "build-asan\conpty-native-check\"
+
+      - name: Upload native ConPTY ASan runtime
+        if: always() && steps.conpty_asan_export.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: conpty-native-check-asan-windows
+          path: build-asan/conpty-native-check
+          if-no-files-found: error
 
       - name: Report compiler cache usage
         if: always() && steps.restore_compiler_cache.outcome == 'success'

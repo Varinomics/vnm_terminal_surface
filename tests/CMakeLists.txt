@@ -2254,6 +2254,9 @@ if(WIN32)
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" "${conpty_test_artifact_dir}/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+            "$<TARGET_FILE:vnm_terminal_error_mode_reporter>" "${conpty_test_artifact_dir}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             $<TARGET_RUNTIME_DLLS:vnm_terminal_windows_conpty_backend> "${conpty_test_artifact_dir}/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/windows_conpty_backend/run_store_powershell.ps1"
