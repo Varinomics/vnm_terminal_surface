@@ -2212,6 +2212,7 @@ set_tests_properties(vnm_terminal_backend_output_capture PROPERTIES
 if(WIN32)
     add_executable(vnm_terminal_windows_conpty_backend
         windows_conpty_backend/windows_conpty_backend_tests.cpp
+        windows_conpty_backend/store_powershell_fixture.cpp
     )
 
     # Kept out of vnm_terminal_test_process_targets: that setup replaces the
