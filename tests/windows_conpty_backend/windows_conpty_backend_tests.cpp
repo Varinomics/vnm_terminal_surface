@@ -1,6 +1,7 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
 #include "store_powershell_fixture.h"
+#include "packaged_descendant_tests.h"
 #include "../posix_pty_backend/callback_lifetime_checks.h"
 #include "../posix_pty_backend/native_session_checks.h"
 #include "../../src/native_backend_io_core.h"
@@ -7544,6 +7545,9 @@ int main(int argc, char** argv)
             return 1;
         }
         return result;
+    }
+    if (const auto result = run_packaged_descendant_tests(argc, argv)) {
+        return *result;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
         bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));

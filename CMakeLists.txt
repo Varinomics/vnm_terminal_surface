@@ -417,6 +417,7 @@ endif()
 if(WIN32)
     target_sources(vnm_terminal_surface PRIVATE
         src/windows_conpty_backend.cpp
+        src/windows_descendant_adoption.h
     )
     include(cmake/vnm_terminal_conpty_dependency.cmake)
     target_compile_definitions(vnm_terminal_surface PRIVATE

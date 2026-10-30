@@ -42,6 +42,7 @@ struct Windows_conpty_backend_write_state_for_testing
     bool        process_handle_retained = false;
     bool        process_assigned_to_job = false;
     bool        native_cleanup_settled = false;
+    std::size_t adoption_job_count = 0U;
 };
 
 // Installed before start; lets native integration tests retain each cleanup
