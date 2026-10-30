@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vnm_terminal/terminal_mouse_input.h"
+
 #include "vnm_terminal/backend_output_capture.h"
 #include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/process_cpu_time.h"
@@ -730,6 +732,11 @@ public:
     vnm_terminal::Terminal_touch_selection_result apply_touch_selection(
         const vnm_terminal::Terminal_touch_selection_request& request);
     vnm_terminal::Terminal_canvas_selection touch_selection_projection() const;
+    // The host owns this route. Changing it cancels the current contact.
+    vnm_terminal::Terminal_tap_policy terminal_tap_policy() const;
+    void set_terminal_tap_policy(vnm_terminal::Terminal_tap_policy policy);
+    vnm_terminal::Terminal_mouse_click_result apply_mouse_click(
+        const vnm_terminal::terminal_mouse_click_request_t& request);
     bool touch_selection_enabled() const;
     void set_touch_selection_enabled(bool enabled);
     QRectF touch_viewport() const;
@@ -881,7 +888,7 @@ signals:
     void selection_changed();
     void touch_selection_enabled_changed();
     void touch_viewport_changed();
-    void terminal_tapped();
+    void terminal_tapped(const vnm_terminal::terminal_tap_t& tap);
     void touch_selection_completed(const vnm_terminal::Terminal_touch_selection_result& result);
     void touch_context_menu_requested(
         vnm_terminal::Terminal_touch_menu menu, QRectF anchor, qulonglong selection_generation);

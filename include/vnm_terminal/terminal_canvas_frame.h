@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/terminal_touch_selection.h"
+#include "vnm_terminal/terminal_mouse_input.h"
 
 #include <QByteArray>
 #include <QChar>
@@ -522,6 +523,7 @@ struct Terminal_canvas_frame
     std::optional<Terminal_canvas_color_references> color_references;
     std::optional<Terminal_canvas_images> images;
     std::optional<Terminal_canvas_selection> selection;
+    std::optional<terminal_canvas_mouse_input_t> mouse_input;
     std::vector<Terminal_canvas_style> styles;
     std::vector<Terminal_canvas_cell>  cells;
     Terminal_canvas_cursor             cursor;
@@ -529,6 +531,28 @@ struct Terminal_canvas_frame
     std::optional<Terminal_canvas_row_coverage> row_coverage;
     std::optional<Terminal_canvas_presentation> presentation;
 };
+
+// Capability-local admission: malformed/unknown mouse metadata cannot make
+// terminal text unavailable or retain eligibility from a different publication.
+inline bool terminal_canvas_mouse_input_is_valid(const Terminal_canvas_frame& frame)
+{
+    if (!frame.mouse_input ||
+        frame.mouse_input->record_version != k_terminal_canvas_mouse_input_version ||
+        !frame.content_extent ||
+        frame.content_extent->record_version != k_terminal_canvas_content_extent_version)
+    {
+        return false;
+    }
+    const auto& source = frame.mouse_input->source;
+    return source.session_epoch != 0U && source.mapping_generation != 0U &&
+        source.rows == frame.rows && source.columns == frame.columns &&
+        source.row_origin_generation == frame.row_origin_generation &&
+        source.scrollback_rows == frame.content_extent->scrollback_rows &&
+        ((source.buffer == Terminal_mouse_buffer::ALTERNATE_SCREEN &&
+            frame.content_extent->active_buffer == Terminal_canvas_buffer::ALTERNATE_BUFFER) ||
+         (source.buffer == Terminal_mouse_buffer::PRIMARY_SCREEN &&
+            frame.content_extent->active_buffer == Terminal_canvas_buffer::PRIMARY_BUFFER));
+}
 
 // Zero rejects an unsupported marker instead of interpreting it as the
 // unmarked 256-style contract. Callers still validate cells and color references.

@@ -895,6 +895,7 @@ struct Qsg_atlas_frame_report
     std::uint64_t render_canvas_frame_generation  = 0U;
     // The touch basis follows the frame actually drawn, including while a
     // newer publication is still being prepared. It never freezes rendering.
+    std::uint64_t rendered_touch_ownership_generation = 0U;
     std::optional<Terminal_canvas_selection> rendered_touch_selection;
     std::shared_ptr<const Terminal_render_snapshot> rendered_snapshot;
     terminal_cell_metrics_t rendered_touch_cell_metrics;

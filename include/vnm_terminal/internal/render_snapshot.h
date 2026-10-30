@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/terminal_touch_selection.h"
+#include "vnm_terminal/terminal_mouse_input.h"
 
 #include "vnm_terminal/internal/ime_contract.h"
 #include "vnm_terminal/internal/metrics_contract.h"
@@ -545,6 +546,7 @@ struct Terminal_public_scroll_diagnostics
 
 struct Terminal_render_snapshot_request
 {
+    std::optional<terminal_canvas_mouse_input_t> mouse_input;
     std::uint64_t                         sequence                         = 0U;
     std::uint64_t                         publication_generation           = 0U;
     std::uint64_t                         processed_backend_callback_epoch = 0U;
@@ -595,6 +597,7 @@ struct Terminal_render_snapshot
     Terminal_render_metadata                           metadata;
     Terminal_mode_state                                modes;
     std::optional<Terminal_canvas_selection>            touch_selection;
+    std::optional<terminal_canvas_mouse_input_t>         mouse_input;
     int                                                native_content_bottom_row_exclusive = 0;
     int                                                clear_page_start_row = 0;
     // The independently sized consumer window acquired with this frame.

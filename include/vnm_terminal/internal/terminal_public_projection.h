@@ -130,6 +130,7 @@ public:
     const Ime_preedit_state& ime_preedit() const { return m_ime_preedit; }
     const Terminal_mode_state& modes() const { return m_modes; }
     const Terminal_render_metadata& metadata() const { return m_metadata; }
+    const std::optional<terminal_canvas_mouse_input_t>& mouse_input() const { return m_mouse_input; }
     const Terminal_public_scroll_diagnostics& public_scroll_diagnostics() const
     {
         return m_public_scroll_diagnostics;
@@ -176,6 +177,7 @@ private:
     Ime_preedit_state                                  m_ime_preedit;
     Terminal_mode_state                                m_modes;
     Terminal_render_metadata                           m_metadata;
+    std::optional<terminal_canvas_mouse_input_t>         m_mouse_input;
     Terminal_public_scroll_diagnostics                 m_public_scroll_diagnostics;
     std::vector<Terminal_render_dirty_row_range>
                                                        m_safe_basis_viewport_dirty_row_ranges;

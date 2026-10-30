@@ -283,11 +283,6 @@ inline bool environment_names_equal(const QString& lhs, const QString& rhs)
 #endif
 }
 
-inline bool is_valid_grid_size(terminal_grid_size_t grid_size)
-{
-    return grid_size.rows > 0 && grid_size.columns > 0;
-}
-
 inline Terminal_backend_result validate_launch_config(
     const Terminal_launch_config& config)
 {
@@ -464,6 +459,9 @@ public:
         const Terminal_launch_config&   config,
         Terminal_backend_callbacks      callbacks) = 0;
 
+    // Admission is all-or-none: REJECTED queues and writes none of these
+    // bytes. ACCEPTED admits the complete buffer; later asynchronous writer
+    // failure may still prevent delivery to the child.
     virtual Terminal_backend_result write(
         QByteArray                      bytes) = 0;
 

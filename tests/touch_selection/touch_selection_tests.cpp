@@ -12,6 +12,7 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
+#include "vnm_terminal/internal/terminal_mouse_input.h"
 #include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include <QGuiApplication>
 #include <QColor>
@@ -43,7 +44,19 @@ public:
         m_callbacks = std::move(callbacks);
         return term::backend_accept();
     }
-    term::Terminal_backend_result write(QByteArray) override { return term::backend_accept(); }
+    term::Terminal_backend_result write(QByteArray bytes) override
+    {
+        ++write_attempts;
+        if (refuse_write) {
+            return term::backend_reject(term::Terminal_backend_error_code::WRITE_FAILED,
+                QStringLiteral("The recording backend refused admission."));
+        }
+        writes.push_back(std::move(bytes));
+        return term::backend_accept();
+    }
+    std::vector<QByteArray> writes;
+    int write_attempts = 0;
+    bool refuse_write = false;
     term::Terminal_backend_result resize(term::Terminal_backend_resize_request) override { return term::backend_accept(); }
     term::Terminal_backend_result set_output_paused(bool) override { return term::backend_accept(); }
     term::Terminal_backend_result interrupt() override { return term::backend_accept(); }
@@ -53,6 +66,84 @@ public:
 private:
     term::Terminal_backend_callbacks m_callbacks;
 };
+
+bool semantic_click_contract()
+{
+    auto backend = std::make_unique<Touch_backend>();
+    auto* output = backend.get();
+    auto config = touch::test_helpers::recovery_disabled_primary_backing_session_config();
+    config.scrollback_limit = 2;
+    term::Terminal_session session(std::move(backend), config);
+    term::Terminal_launch_config launch;
+    launch.argv = {QStringLiteral("semantic-click")};
+    launch.initial_grid_size = term::terminal_grid_size_t{3, 20};
+    if (!check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+            "click fixture starts"))
+    {
+        return false;
+    }
+    const auto ingest = [&](QByteArray bytes) {
+        output->output(std::move(bytes));
+        session.process_backend_callback_events();
+    };
+    const auto capture = [&]() -> std::optional<touch::terminal_mouse_target_t> {
+        return term::terminal_mouse_target(session.latest_render_snapshot_handle(),
+            {10.0, 20.0, 14.0, 6.0}, QPointF(25, 30));
+    };
+    ingest(QByteArrayLiteral("one\r\ntwo\r\nthree\r\nfour\r\nfive"));
+    const auto displayed = capture();
+    if (!check(displayed.has_value(), "native live cell supplies a click target")) {
+        return false;
+    }
+    touch::terminal_mouse_click_request_t request{1U, *displayed};
+    using Status = touch::Terminal_mouse_click_status;
+    const QByteArray pair = QByteArrayLiteral("\x1b[<0;3;2M\x1b[<0;3;2m");
+    bool ok = true;
+    for (const auto mode : {QByteArrayLiteral("1000"), QByteArrayLiteral("1002"), QByteArrayLiteral("1003")}) {
+        ingest(QByteArrayLiteral("\x1b[?") + mode + QByteArrayLiteral("h\x1b[?1006h"));
+        output->writes.clear();
+        const int attempts = output->write_attempts;
+        const auto result = session.apply_mouse_click(request);
+        ok &= check(result.request_id == request.request_id && result.status == Status::ACCEPTED &&
+            output->write_attempts == attempts + 1 && output->writes == std::vector<QByteArray>{pair},
+            "each supported SGR tracking mode admits one complete left press/release buffer");
+        ingest(QByteArrayLiteral("\x1b[?") + mode + QByteArrayLiteral("l"));
+    }
+    output->writes.clear();
+    int attempts = output->write_attempts;
+    ok &= check(session.apply_mouse_click(request).status == Status::NO_REPORT &&
+        output->write_attempts == attempts, "disabled tracking produces no backend admission");
+    ingest(QByteArrayLiteral("\x1b[?1000h\x1b[?1006l"));
+    ok &= check(session.apply_mouse_click(request).status == Status::NO_REPORT &&
+        output->write_attempts == attempts, "unsupported encoding produces no backend admission");
+    ingest(QByteArrayLiteral("\x1b[?1006h\r\nsix\r\nseven"));
+    ok &= check(session.latest_render_snapshot_handle()->metadata.row_origin_generation !=
+            displayed->source.row_origin_generation &&
+        session.apply_mouse_click(request).status == Status::ACCEPTED &&
+        output->writes == std::vector<QByteArray>{pair},
+        "ordinary output and history eviction preserve the captured native screen cell");
+    output->refuse_write = true;
+    output->writes.clear();
+    attempts = output->write_attempts;
+    ok &= check(session.apply_mouse_click(request).status == Status::REFUSED &&
+        output->write_attempts == attempts + 1 && output->writes.empty(),
+        "backend refusal admits neither half of the click and is determinate");
+    output->refuse_write = false;
+    ingest(QByteArrayLiteral("\x1b[?1049h\x1b[?1049l"));
+    attempts = output->write_attempts;
+    ok &= check(session.apply_mouse_click(request).status == Status::STALE_SOURCE &&
+        output->write_attempts == attempts, "buffer away and back invalidates a captured click");
+    const auto before_resize = capture();
+    if (!check(before_resize.has_value(), "new buffer occurrence supplies its own target")) {
+        return false;
+    }
+    request.target = *before_resize;
+    (void)session.resize(QSizeF(200, 80), {4, 20});
+    (void)session.resize(QSizeF(200, 60), {3, 20});
+    ok &= check(session.apply_mouse_click(request).status == Status::STALE_SOURCE &&
+        output->write_attempts == attempts, "row-only resize away and back invalidates the old mapping");
+    return ok;
+}
 
 touch::Terminal_touch_selection_request request_at(
     const term::Terminal_render_snapshot& snapshot,
@@ -99,6 +190,12 @@ bool consumer_capacity_selection_contract()
     {
         return false;
     }
+    const term::terminal_cell_metrics_t mouse_metrics{10.0, 20.0, 14.0, 6.0};
+    const auto live_target = term::terminal_mouse_target(shown, mouse_metrics, QPointF(5, 50));
+    ok &= check(!term::terminal_mouse_target(shown, mouse_metrics, QPointF(5, 10)) &&
+        !term::terminal_mouse_target(shown, mouse_metrics, QPointF(5, 110)) &&
+        live_target && live_target->row == 0 && live_target->display_row == 2,
+        "presentation hit testing excludes history and filler while translating live native rows");
     auto coverage = *source->row_coverage_snapshot->touch_selection;
     // Presentation and word-query capabilities travel independently of the
     // base selection frame.
@@ -468,6 +565,78 @@ bool wait_for_touch_hold(QQuickItem& item)
         "the hold qualifies before release or presentation changes");
 }
 
+bool qualified_application_tap_contract()
+{
+    QGuiApplication::styleHints()->setMousePressAndHoldInterval(1000);
+    QQuickWindow window;
+    window.resize(200, 100);
+    Touch_item item(window.contentItem());
+    std::vector<touch::terminal_tap_t> taps;
+    touch::terminal_mouse_target_t target;
+    target.source = {1U, 1U, 0U, 5, 20, 0, touch::Terminal_mouse_buffer::PRIMARY_SCREEN};
+    target.frame_sequence = 1U;
+    target.publication_generation = 1U;
+    target.display_row = 1;
+    target.row = 1;
+    target.column = 5;
+    item.controller = std::make_unique<term::Terminal_touch_controller>(item,
+        term::Terminal_touch_controller::Callbacks{
+            []() -> std::optional<term::Terminal_touch_presentation> { return std::nullopt; },
+            [](const auto&) {},
+            [&](const touch::terminal_tap_t& tap) { taps.push_back(tap); },
+            [](touch::Terminal_touch_menu, QRectF, std::uint64_t) {},
+            [] {},
+            {},
+            [] { return true; },
+            [&](QPointF) { return std::optional(target); },
+            [] { return QSizeF(10, 20); },
+        }, true);
+    item.controller->set_tap_policy(touch::Terminal_tap_policy::APPLICATION);
+    window.show();
+    QTest::qWait(30);
+    auto* device = QTest::createTouchDevice();
+    QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
+    bool ok = check(taps.empty(), "touch down never dispatches an application click");
+    ++target.source.row_origin_generation;
+    ++target.source.scrollback_rows;
+    ++target.frame_sequence;
+    QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
+    ok &= check(taps.size() == 1 && taps.back().policy == touch::Terminal_tap_policy::APPLICATION &&
+        taps.back().target && taps.back().target->frame_sequence == 1U,
+        "release delivers the captured painted target despite ordinary output without selection metadata");
+
+    QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
+    item.controller->set_tap_policy(touch::Terminal_tap_policy::CONSUME);
+    QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
+    ok &= check(taps.size() == 1, "route changes cancel the original contact without click-through");
+    QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
+    QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
+    ok &= check(taps.size() == 2 && taps.back().policy == touch::Terminal_tap_policy::CONSUME &&
+        !taps.back().target, "a fresh consumed gesture carries no application target");
+
+    item.controller->set_tap_policy(touch::Terminal_tap_policy::APPLICATION);
+    QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
+    ++target.source.mapping_generation;
+    QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
+    ok &= check(taps.size() == 2, "changed native mapping cancels a pending application tap");
+    QTest::touchEvent(&window, device).press(0, QPoint(55, 30), &window);
+    item.setY(-10);
+    item.controller->set_viewport(QRectF(0, 10, 200, 90));
+    QTest::touchEvent(&window, device).release(0, QPoint(55, 30), &window);
+    ok &= check(taps.size() == 2, "moving presentation geometry cancels application taps");
+    item.setY(0);
+    item.controller->set_viewport(QRectF(50, 0, 150, 100));
+    QTest::touchEvent(&window, device).press(0, QPoint(49, 30), &window);
+    QTest::touchEvent(&window, device).release(0, QPoint(51, 30), &window);
+    ok &= check(taps.size() == 3 && !taps.back().target,
+        "a press outside the viewport cannot acquire a target by releasing just inside it");
+    item.controller->activate_tap();
+    ok &= check(taps.size() == 4 && !taps.back().target &&
+        taps.back().policy == touch::Terminal_tap_policy::APPLICATION,
+        "host-owned padding keeps its application route without inventing a cell");
+    return ok;
+}
+
 bool touch_intent_contract()
 {
     QGuiApplication::styleHints()->setMousePressAndHoldInterval(1000);
@@ -490,7 +659,7 @@ bool touch_intent_contract()
         term::Terminal_touch_controller::Callbacks{
             [&presentation] { return std::optional(presentation); },
             [&requests](const auto& request) { requests.push_back(request); },
-            [&taps] { ++taps; },
+            [&taps](const touch::terminal_tap_t&) { ++taps; },
             [&paste_menus, &copy_menus](touch::Terminal_touch_menu menu, QRectF, std::uint64_t) {
                 menu == touch::Terminal_touch_menu::PASTE ? ++paste_menus : ++copy_menus;
             },
@@ -608,7 +777,7 @@ bool direct_word_hold_contract()
         term::Terminal_touch_controller::Callbacks{
             [&] { return std::optional(shown); },
             [&](const auto& request) { requests.push_back(request); },
-            [&] { ++taps; },
+            [&](const touch::terminal_tap_t&) { ++taps; },
             [&](auto menu, QRectF, std::uint64_t) { menus.push_back(menu); },
             [&] { ++dismissals; },
             [&](QString notice) { notices.append(std::move(notice)); },
@@ -845,7 +1014,7 @@ bool cursor_hold_contract()
         term::Terminal_touch_controller::Callbacks{
             [&] { return std::optional(shown); },
             [&](const auto& request) { requests.push_back(request); },
-            [&] { ++taps; },
+            [&](const touch::terminal_tap_t&) { ++taps; },
             [&](auto menu, QRectF, std::uint64_t) { menus.push_back(menu); },
             [] {},
             {},
@@ -953,7 +1122,7 @@ bool touch_lifecycle_contract()
         term::Terminal_touch_controller::Callbacks{
             [&] { return available ? std::optional(shown) : std::nullopt; },
             [&](const auto& request) { requests.push_back(request); },
-            [&] { ++taps; },
+            [&](const touch::terminal_tap_t&) { ++taps; },
             [&](touch::Terminal_touch_menu, QRectF, std::uint64_t) { ++menus; },
             [&] { ++dismissals; },
         }, true);
@@ -1139,7 +1308,7 @@ bool moving_viewport_contract()
         term::Terminal_touch_controller::Callbacks{
             [&] { return std::optional(shown); },
             [&](const auto& request) { requests.push_back(request); },
-            [&] { ++taps; },
+            [&](const touch::terminal_tap_t&) { ++taps; },
             [&](touch::Terminal_touch_menu, QRectF, std::uint64_t) { ++menus; },
             [&] { ++dismissals; },
         }, true);
@@ -1444,10 +1613,12 @@ bool item_touch_routing_contract()
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
-    bool ok = owner_selection_contract();
+    bool ok = semantic_click_contract();
+    ok &= owner_selection_contract();
     ok &= consumer_capacity_selection_contract();
     ok &= desktop_content_end_selection_contract();
     ok &= native_canvas_selection_contract();
+    ok &= qualified_application_tap_contract();
     ok &= touch_intent_contract();
     ok &= direct_word_hold_contract();
     ok &= cursor_hold_contract();

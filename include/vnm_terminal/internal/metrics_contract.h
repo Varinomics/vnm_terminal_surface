@@ -41,6 +41,11 @@ struct terminal_grid_size_t
     int                        columns = 0;
 };
 
+inline bool is_valid_grid_size(terminal_grid_size_t grid_size)
+{
+    return grid_size.rows > 0 && grid_size.columns > 0;
+}
+
 inline bool grid_sizes_match(terminal_grid_size_t left, terminal_grid_size_t right)
 {
     return left.rows == right.rows && left.columns == right.columns;

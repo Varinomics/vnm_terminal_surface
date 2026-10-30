@@ -13,6 +13,7 @@
 #include <QString>
 #include <QtGlobal>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -468,6 +469,7 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
     snapshot.metadata                  = projection.metadata();
     snapshot.metadata.sequence         = sequence;
     snapshot.modes                     = projection.modes();
+    snapshot.mouse_input               = projection.mouse_input();
     snapshot.native_content_bottom_row_exclusive =
         viewport.active_buffer == Terminal_buffer_id::PRIMARY
             ? viewport.presentation.content_end_row_exclusive - viewport.scrollback_rows
@@ -1302,6 +1304,11 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     snapshot.ime_preedit             = public_snapshot.ime_preedit;
     snapshot.metadata                = public_snapshot.metadata;
     snapshot.modes                   = public_snapshot.modes;
+    // Frozen content never acquires a newer live mapping identity merely
+    // because its viewport geometry or selection overlay was republished.
+    if (content_preserved) {
+        snapshot.mouse_input = public_snapshot.mouse_input;
+    }
     const Terminal_render_snapshot_row_content_view public_rows(public_snapshot);
     snapshot.cells = cells_adapted_to_grid(public_rows, grid_size);
     // Rows keep their images like their cells; a renderer clips an image that
@@ -2313,6 +2320,73 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
         result,
         sequence,
         viewport_policy);
+}
+
+terminal_mouse_source_t Terminal_session::mouse_source() const
+{
+    if (!m_screen_model) {
+        return {};
+    }
+    const auto grid = m_screen_model->grid_size();
+    const bool alternate = m_screen_model->active_buffer_id() == Terminal_buffer_id::ALTERNATE;
+    return {
+        m_mouse_session_epoch, m_mouse_mapping_generation, m_row_origin_generation,
+        grid.rows, grid.columns, alternate ? 0 : m_screen_model->scrollback_size(),
+        alternate ? Terminal_mouse_buffer::ALTERNATE_SCREEN : Terminal_mouse_buffer::PRIMARY_SCREEN};
+}
+
+Terminal_mouse_click_result Terminal_session::apply_mouse_click(
+    const terminal_mouse_click_request_t& request)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Input_frontier_scope frontier(*this);
+    process_backend_callback_events_to_current_epoch();
+    using Status = Terminal_mouse_click_status;
+    Terminal_mouse_click_result result{request.request_id};
+    const auto& target = request.target;
+    if (request.request_id == 0U || target.frame_sequence == 0U ||
+        target.publication_generation == 0U || target.display_row < 0 ||
+        target.display_row >= k_terminal_canvas_max_rows || target.row < 0 || target.column < 0 ||
+        target.row >= target.source.rows || target.column >= target.source.columns)
+    {
+        result.status = Status::INVALID_REQUEST;
+        return result;
+    }
+    if (reject_unsettled_input_frontier()) {
+        result.status = Status::REFUSED;
+        return result;
+    }
+    if (!is_session_writable()) {
+        result.status = Status::UNAVAILABLE;
+        return result;
+    }
+    if (!m_backend_geometry_in_sync || !terminal_mouse_mapping_matches(target.source, mouse_source())) {
+        result.status = Status::STALE_SOURCE;
+        return result;
+    }
+    const auto modes = m_screen_model->input_mode_state();
+    Terminal_mouse_event event{
+        Terminal_mouse_event_kind::PRESS, Terminal_mouse_button::LEFT,
+        target.row, target.column, {}};
+    QByteArray bytes = encode_terminal_mouse_event(event, modes);
+    event.kind = Terminal_mouse_event_kind::RELEASE;
+    const QByteArray release = encode_terminal_mouse_event(event, modes);
+    if (bytes.isEmpty() || release.isEmpty()) {
+        result.status = Status::NO_REPORT;
+        return result;
+    }
+    // Resolve the complete balanced pair before accepted input can return the
+    // shared viewport to the tail. No callback drain can split its mode basis.
+    bytes += release;
+    const auto written = write_user_bytes_locked(std::move(bytes),
+        User_write_viewport_policy::RETURN_TO_TAIL,
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
+    result.status = written.code == Terminal_session_result_code::ACCEPTED
+        ? Status::ACCEPTED : Status::REFUSED;
+    if (written.error) {
+        result.reason = written.error->message;
+    }
+    return result;
 }
 
 Terminal_key_event_result Terminal_session::write_key_event(
@@ -8402,6 +8476,8 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_ime_preedit_generation            = 0U;
     m_alternate_scroll_mode_generation  = 0U;
     m_active_buffer_epoch               = 0U;
+    static std::atomic<std::uint64_t> next_mouse_session_epoch{1U};
+    m_mouse_session_epoch = next_mouse_session_epoch.fetch_add(1U, std::memory_order_relaxed);
     m_deferred_synchronized_evicted_scrollback_rows = 0;
     ++m_selection_session_epoch;
     if (m_selection_session_epoch == 0U) {
@@ -8874,6 +8950,7 @@ void Terminal_session::sync_viewport_from_model_result(
         ++m_alternate_scroll_mode_generation;
     }
     if (advance_publication_generations && result.active_buffer_changed) {
+        ++m_mouse_mapping_generation;
         ++m_active_buffer_epoch;
         if (m_active_buffer_epoch == 0U) {
             m_active_buffer_epoch = 1U;
@@ -9210,6 +9287,9 @@ void Terminal_session::advance_selection_content_basis_for_model_result(
     const bool grid_height_changed =
         previous_grid_size.rows != m_screen_model->grid_size().rows;
     const bool row_origin_changed        = result.evicted_scrollback_rows > 0;
+    if (grid_reflow_basis_changed || grid_height_changed) {
+        ++m_mouse_mapping_generation;
+    }
     if (content_basis_changed) {
         ++m_selection_content_basis.content_generation;
     }
@@ -10089,6 +10169,8 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
         m_last_processed_backend_callback_epoch;
     request.basis                            = Terminal_render_snapshot_basis::LIVE_CONTENT;
     request.row_origin_generation            = m_row_origin_generation;
+    request.mouse_input = terminal_canvas_mouse_input_t{
+        k_terminal_canvas_mouse_input_version, mouse_source()};
     request.purpose                          = purpose;
     request.public_scroll_diagnostics        = public_scroll_diagnostics;
     request.viewport                         = m_viewport_controller.state();

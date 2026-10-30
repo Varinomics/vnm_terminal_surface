@@ -152,6 +152,8 @@ public:
         try_write_user_bytes_without_backend_drain_if_callbacks_empty(
             QByteArray             bytes);
 
+    Terminal_mouse_click_result apply_mouse_click(const terminal_mouse_click_request_t& request);
+
     Terminal_key_event_result write_key_event(
         const QKeyEvent&           event,
         std::uint64_t              interaction_trace_id = 0U);
@@ -628,6 +630,8 @@ private:
         QString                        applied_message);
 
     void cancel_pending_backend_resizes();
+
+    terminal_mouse_source_t mouse_source() const;
 
     Terminal_session_result write_user_bytes_locked(
         QByteArray                         bytes,
@@ -1250,6 +1254,8 @@ private:
     std::uint64_t                                          m_ime_preedit_generation = 0U;
     std::uint64_t                                          m_alternate_scroll_mode_generation = 0U;
     std::uint64_t                                          m_active_buffer_epoch = 0U;
+    std::uint64_t                                          m_mouse_mapping_generation = 1U;
+    std::uint64_t                                          m_mouse_session_epoch = 0U;
     std::uint64_t                                          m_row_origin_generation = 0U;
     int                                                    m_deferred_synchronized_evicted_scrollback_rows = 0;
     std::uint64_t                                          m_selection_session_epoch = 0U;

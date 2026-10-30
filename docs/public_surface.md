@@ -483,7 +483,7 @@ clipboard only when the copy result is `OK`. Copy results are bounded to 1 MiB
 of UTF-8 text; an oversized selection reports `OVER_LIMIT`. Paste actions use
 the host's normal paste path. `dismiss_touch_selection()` clears an active
 selection, and `touch_selection_notice(reason)` reports an unavailable or
-changed word target. A tap without a selection emits `terminal_tapped()`.
+changed word target. A tap without a selection emits `terminal_tapped(tap)`.
 
 The full surface applies requests to its session. A canvas host forwards
 `touch_selection_requested(request)` to the owning terminal surface's
@@ -507,6 +507,55 @@ addresses the native publication's rows, including after a handle scrolls the
 view. The desktop surface names its rendered presentation in every request that
 addresses rows; an actual projected request cannot be downgraded to native
 coordinates.
+
+## Qualified Taps and Semantic Clicks
+
+The public types in `vnm_terminal/terminal_mouse_input.h` separate touch routing
+from terminal mouse reporting. Both items emit `terminal_tapped(terminal_tap_t)`
+only after ordinary single-contact release. Holds, scrolling, selection handles,
+selection/menu dismissal, canceled contacts, and multi-touch retain their own
+behavior. The default `Terminal_tap_policy::HOST` lets the host keep its normal
+keyboard action. `APPLICATION` asks the host to forward an available target;
+`CONSUME` keeps the gesture local. The library has no keyboard preference.
+
+Set the route with `set_terminal_tap_policy()`. A route change cancels the active
+contact. Hosts must choose `CONSUME` while a keyboard dismissal owns new contacts,
+and cancel gestures on session/connection changes. The route, displayed target,
+cell metrics and viewport geometry are captured at contact start. A changed
+mapping or geometry prevents application-tap delivery; ordinary text updates
+with the same mapping do not. Host keyboard taps retain their ordinary behavior
+when incoming output moves the content item or its viewport. Canvas `activate_terminal_tap()` emits the same typed signal
+without a target for host-owned padding. That padding recognizer must invalidate
+its pending activation when its route, session, or layout changes.
+
+A target comes from the renderer's actually drawn immutable snapshot, independently
+of selection support. It names that publication, the display row, the native
+screen cell, and its source mapping. History, unused presentation slots, uncovered
+rows and points outside the touch viewport supply no application target. Optional
+`Terminal_canvas_frame::mouse_input` is installed or cleared with its enclosing
+frame. Unknown, invalid or absent metadata disables only clicking. Transports
+must carry this attachment separately under their negotiated capability and
+include it in publication admission/deduplication; the base frame version does
+not change.
+
+The live owner accepts `apply_mouse_click(terminal_mouse_click_request_t)`. It
+validates the source incarnation, mapping generation, grid and active buffer
+against live state. The captured origin validates the displayed-to-native
+translation; later text output and history eviction do not invalidate the
+resolved screen-relative cell. It does not require equality with the latest
+text publication. The owner checks its current mouse policy and encoding,
+then encodes a complete left press/release using one mode snapshot and one ordered
+backend write. Both reports are resolved before accepted input returns a detached
+viewport to the tail. Disabled or unsupported reporting returns silent `NO_REPORT`.
+
+`ACCEPTED` means admission of the complete encoded pair, never application
+handling. `REFUSED`, `STALE_SOURCE`, `INVALID_REQUEST`, and `UNAVAILABLE` admit no
+click bytes. Backend queue rejection is `REFUSED`: it admitted none of the pair.
+An asynchronous writer failure after admission does not retroactively turn
+`ACCEPTED` into refusal. `INDETERMINATE` represents genuinely unknowable admission,
+such as a transport losing its acknowledgement. Hosts must not automatically
+replay positional clicks or put them in a retained typing queue. Request ids correlate results; transport owners supply
+deduplication and authorization, including session/runtime/surface routing.
 
 ## Clipboard Policy
 

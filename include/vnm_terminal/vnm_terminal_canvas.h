@@ -110,6 +110,9 @@ public:
     qulonglong rendered_publication_generation() const;
     QString render_error() const;
 
+    // The host owns this route. Changing it cancels the current contact.
+    vnm_terminal::Terminal_tap_policy terminal_tap_policy() const;
+    void set_terminal_tap_policy(vnm_terminal::Terminal_tap_policy policy);
     bool touch_selection_enabled() const;
     void set_touch_selection_enabled(bool enabled);
     QRectF touch_viewport() const;
@@ -145,7 +148,7 @@ signals:
     void cursor_blink_phase_changed(bool visible);
     void touch_selection_enabled_changed();
     void touch_viewport_changed();
-    void terminal_tapped();
+    void terminal_tapped(const vnm_terminal::terminal_tap_t& tap);
     void touch_selection_requested(const vnm_terminal::Terminal_touch_selection_request& request);
     void touch_selection_completed(const vnm_terminal::Terminal_touch_selection_result& result);
     void touch_context_menu_requested(

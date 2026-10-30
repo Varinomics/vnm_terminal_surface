@@ -12,6 +12,7 @@
 #include "vnm_terminal/internal/terminal_content_tail_projection.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
+#include "vnm_terminal/internal/terminal_mouse_input.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 
 #include <QColor>
@@ -270,6 +271,8 @@ std::shared_ptr<const term::Terminal_render_snapshot> materialize_snapshot(
                 }));
         }
     }
+
+    snapshot->mouse_input = frame.mouse_input;
 
     if (frame.selection &&
         frame.selection->record_version == vnm_terminal::k_terminal_canvas_selection_version)
@@ -548,7 +551,7 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
                 const auto report = m_private->recorder->snapshot();
                 if (!report.rendered_touch_selection ||
                     report.rendered_touch_selection->record_version != vnm_terminal::k_terminal_canvas_selection_version ||
-                    report.render_ownership_generation != m_private->ownership_generation)
+                    report.rendered_touch_ownership_generation != m_private->ownership_generation)
                 {
                     return std::nullopt;
                 }
@@ -559,13 +562,25 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
             [this](const vnm_terminal::Terminal_touch_selection_request& request) {
                 emit touch_selection_requested(request);
             },
-            [this] { emit terminal_tapped(); },
+            [this](const vnm_terminal::terminal_tap_t& tap) { emit terminal_tapped(tap); },
             [this](vnm_terminal::Terminal_touch_menu menu, QRectF rect, std::uint64_t generation) {
                 emit touch_context_menu_requested(menu, rect, generation);
             },
             [this] { emit touch_context_menu_dismissed(); },
             [this](QString reason) { emit touch_selection_notice(std::move(reason)); },
             [this] { return touch_paste_available(); },
+            [this](QPointF position) -> std::optional<vnm_terminal::terminal_mouse_target_t> {
+                const auto report = m_private->recorder->snapshot();
+                if (report.rendered_touch_ownership_generation != m_private->ownership_generation) {
+                    return std::nullopt;
+                }
+                return term::terminal_mouse_target(
+                    report.rendered_snapshot, report.rendered_touch_cell_metrics, position);
+            },
+            [this] {
+                const auto metrics = m_private->recorder->snapshot().rendered_touch_cell_metrics;
+                return QSizeF(metrics.width, metrics.height);
+            },
         },
         false);
     connect(this, &QQuickItem::visibleChanged, this,
@@ -797,6 +812,16 @@ QString VNM_TerminalCanvas::render_error() const
     return m_private->render_error;
 }
 
+vnm_terminal::Terminal_tap_policy VNM_TerminalCanvas::terminal_tap_policy() const
+{
+    return m_touch_controller->tap_policy();
+}
+
+void VNM_TerminalCanvas::set_terminal_tap_policy(vnm_terminal::Terminal_tap_policy policy)
+{
+    m_touch_controller->set_tap_policy(policy);
+}
+
 bool VNM_TerminalCanvas::touch_selection_enabled() const { return m_touch_controller->enabled(); }
 QRectF VNM_TerminalCanvas::touch_viewport() const { return m_touch_controller->viewport(); }
 
@@ -916,6 +941,9 @@ bool VNM_TerminalCanvas::set_canvas_frame(
     }
 
     auto owned_frame = std::make_shared<vnm_terminal::Terminal_canvas_frame>(*frame);
+    if (owned_frame->mouse_input && !vnm_terminal::terminal_canvas_mouse_input_is_valid(*owned_frame)) {
+        owned_frame->mouse_input.reset();
+    }
     if (owned_frame->selection && !vnm_terminal::terminal_canvas_selection_is_valid(
             *owned_frame->selection, owned_frame->rows, owned_frame->columns))
     {

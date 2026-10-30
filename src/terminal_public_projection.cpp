@@ -560,6 +560,7 @@ Terminal_public_projection Terminal_public_projection::capture_from_safe_model(
     projection.m_cursor                    = safe_basis.cursor;
     projection.m_modes                     = safe_basis.modes;
     projection.m_metadata                  = safe_basis.metadata;
+    projection.m_mouse_input               = safe_basis.mouse_input;
     projection.m_public_scroll_diagnostics = safe_basis.public_scroll_diagnostics;
     projection.m_public_scroll_diagnostics.public_projection_generation = generation;
     projection.m_safe_basis_viewport_dirty_row_ranges = safe_basis.dirty_row_ranges;

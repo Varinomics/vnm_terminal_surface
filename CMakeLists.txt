@@ -229,8 +229,10 @@ set(vnm_terminal_surface_renderer_sources
     include/vnm_terminal/process_cpu_time.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_touch_selection.h
+    include/vnm_terminal/terminal_mouse_input.h
     include/vnm_terminal/terminal_touch_selection_codec.h
     include/vnm_terminal/internal/terminal_touch_controller.h
+    include/vnm_terminal/internal/terminal_mouse_input.h
     include/vnm_terminal/terminal_renderer_surface_format.h
     include/vnm_terminal/vnm_terminal_canvas.h
     src/qsg_atlas_font_bytes.cpp
@@ -570,6 +572,7 @@ install(FILES
     include/vnm_terminal/terminal_canvas_appearance.h
     include/vnm_terminal/terminal_canvas_frame.h
     include/vnm_terminal/terminal_touch_selection.h
+    include/vnm_terminal/terminal_mouse_input.h
     include/vnm_terminal/terminal_touch_selection_codec.h
     include/vnm_terminal/terminal_renderer_surface_format.h
     include/vnm_terminal/vnm_terminal_canvas.h

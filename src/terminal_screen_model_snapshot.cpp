@@ -133,6 +133,7 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot_with_row_count(
             viewport,
             request.sequence,
             request.publication_generation);
+    snapshot.mouse_input               = request.mouse_input;
     snapshot.basis                     = request.basis;
     snapshot.purpose                   = request.purpose;
     snapshot.public_scroll_diagnostics = request.public_scroll_diagnostics;

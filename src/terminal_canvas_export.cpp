@@ -131,6 +131,14 @@ vnm_terminal::Terminal_canvas_export_result export_snapshot_frame(
     frame->sequence                    = snapshot->metadata.sequence;
     frame->publication_generation      = snapshot->metadata.publication_generation;
     frame->row_origin_generation       = snapshot->metadata.row_origin_generation;
+    if (snapshot->mouse_input &&
+        snapshot->mouse_input->source.rows == frame->rows &&
+        snapshot->mouse_input->source.columns == frame->columns &&
+        snapshot->mouse_input->source.row_origin_generation == frame->row_origin_generation &&
+        snapshot->mouse_input->source.scrollback_rows == snapshot->viewport.scrollback_rows)
+    {
+        frame->mouse_input = snapshot->mouse_input;
+    }
     frame->default_foreground_rgba      = snapshot->color_state.default_foreground_rgba;
     frame->default_background_rgba      = snapshot->color_state.default_background_rgba;
     frame->cursor_rgba                  = snapshot->color_state.cursor_rgba;

@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/terminal_touch_selection.h"
+#include "vnm_terminal/terminal_mouse_input.h"
 #include <QObject>
 #include <QPointF>
 #include <QRectF>
@@ -33,11 +34,14 @@ public:
     {
         std::function<std::optional<Terminal_touch_presentation>()> presentation;
         std::function<void(const Terminal_touch_selection_request&)> dispatch;
-        std::function<void()> tapped;
+        std::function<void(const terminal_tap_t&)> tapped;
         std::function<void(Terminal_touch_menu, QRectF, std::uint64_t)> menu_requested;
         std::function<void()> menu_dismissed;
         std::function<void(QString)> notice;
         std::function<bool()> paste_available = [] { return true; };
+        std::function<std::optional<terminal_mouse_target_t>(QPointF)> tap_target =
+            [](QPointF) { return std::nullopt; };
+        std::function<QSizeF()> tap_cell_size = [] { return QSizeF{}; };
     };
 
     Terminal_touch_controller(QQuickItem& item, Callbacks callbacks, bool enabled);
@@ -51,6 +55,8 @@ public:
     void presentation_changed();
     bool selection_active() const;
     void activate_tap();
+    Terminal_tap_policy tap_policy() const { return m_tap_policy; }
+    void set_tap_policy(Terminal_tap_policy policy);
     bool dismiss_selection(std::uint64_t generation = 0U);
     std::uint64_t request_copy(std::uint64_t generation);
     void request_padding_menu(QPointF position);
@@ -78,6 +84,13 @@ private:
     QTimer m_edge_timer;
     QTimer m_request_timer;
     bool m_enabled = false;
+    Terminal_tap_policy m_tap_policy = Terminal_tap_policy::HOST;
+    terminal_tap_t m_tap;
+    bool m_tap_cancelled = false;
+    QRectF m_tap_scene_bounds;
+    QRectF m_tap_viewport;
+    QPointF m_tap_position;
+    QSizeF m_tap_cell_size;
     QRectF m_viewport;
     Gesture m_gesture = Gesture::NONE;
     int m_point_id = -1;

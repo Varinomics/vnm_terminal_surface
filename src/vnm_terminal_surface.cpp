@@ -20,6 +20,7 @@
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_touch_controller.h"
+#include "vnm_terminal/internal/terminal_mouse_input.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
@@ -922,57 +923,8 @@ std::optional<term::terminal_grid_position_t> clamped_grid_position_for_local_po
         static_cast<int>(column_index)};
 }
 
-std::optional<term::terminal_grid_position_t> logical_grid_position_for_viewport_cell(
-    const std::shared_ptr<const term::Terminal_render_snapshot>&   snapshot,
-    term::terminal_grid_position_t                                 viewport_position)
-{
-    if (snapshot                 == nullptr                  ||
-        !term::is_valid_grid_size(snapshot->grid_size)       ||
-        viewport_position.row    <  0                        ||
-        viewport_position.row    >= snapshot->grid_size.rows ||
-        viewport_position.column <  0                        ||
-        viewport_position.column >= snapshot->grid_size.columns)
-    {
-        return std::nullopt;
-    }
-
-    const int first_visible_logical_row =
-        snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE
-            ? 0
-            : snapshot->viewport.scrollback_rows - snapshot->viewport.offset_from_tail;
-    if (snapshot->display_source) {
-        const int logical = snapshot->display_row_logical_rows[static_cast<std::size_t>(viewport_position.row)];
-        return logical >= 0 ? std::optional(term::terminal_grid_position_t{logical, viewport_position.column}) : std::nullopt;
-    }
-    return term::terminal_grid_position_t{
-        first_visible_logical_row + viewport_position.row,
-        viewport_position.column,
-    };
-}
-
-// While input follows the committed frame, mouse reports address the native
-// screen row it shows: a displayed history row or slot receives none.
-std::optional<term::terminal_grid_position_t> native_mouse_position(
-    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
-    term::terminal_grid_position_t position,
-    bool follows_committed_frame)
-{
-    if (!snapshot) {
-        return std::nullopt;
-    }
-    if (!follows_committed_frame || snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE) {
-        return position;
-    }
-    const auto logical = logical_grid_position_for_viewport_cell(snapshot, position);
-    if (!logical) {
-        return std::nullopt;
-    }
-    const int row = logical->row - snapshot->viewport.scrollback_rows;
-    if (row < 0 || row >= snapshot->grid_size.rows) {
-        return std::nullopt;
-    }
-    return term::terminal_grid_position_t{row, position.column};
-}
+using term::logical_grid_position_for_viewport_cell;
+using term::native_mouse_position;
 
 bool position_is_before(
     term::terminal_grid_position_t lhs,
@@ -3406,13 +3358,22 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
                 m_touch_controller->complete(result);
                 emit touch_selection_completed(result);
             },
-            [this] { forceActiveFocus(Qt::MouseFocusReason); emit terminal_tapped(); },
+            [this](const vnm_terminal::terminal_tap_t& tap) { forceActiveFocus(Qt::MouseFocusReason); emit terminal_tapped(tap); },
             [this](vnm_terminal::Terminal_touch_menu menu, QRectF rect, std::uint64_t generation) {
                 emit touch_context_menu_requested(menu, rect, generation);
             },
             [this] { emit touch_context_menu_dismissed(); },
             [this](QString reason) { emit touch_selection_notice(std::move(reason)); },
             [this] { return backend_ready(); },
+            [this](QPointF position) -> std::optional<vnm_terminal::terminal_mouse_target_t> {
+                const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(*this);
+                return term::terminal_mouse_target(
+                    report.rendered_snapshot, report.rendered_touch_cell_metrics, position);
+            },
+            [this] {
+                const auto metrics = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(*this).rendered_touch_cell_metrics;
+                return QSizeF(metrics.width, metrics.height);
+            },
         },
         true);
     connect(this, &VNM_TerminalSurface::selection_changed, this,
@@ -5057,6 +5018,42 @@ vnm_terminal::Terminal_canvas_selection VNM_TerminalSurface::touch_selection_pro
     projection.background_rgba = options.selection_background.rgba();
     projection.foreground_rgba = options.selection_foreground.rgba();
     return projection;
+}
+
+vnm_terminal::Terminal_mouse_click_result VNM_TerminalSurface::apply_mouse_click(
+    const vnm_terminal::terminal_mouse_click_request_t& request)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    Input_frontier_scope input_frontier(*this);
+    using Status = vnm_terminal::Terminal_mouse_click_status;
+    if (m_mouse_reporting_policy == Mouse_reporting_policy::DISABLED) {
+        return {request.request_id, Status::NO_REPORT, {}};
+    }
+    if (!m_private->session) {
+        return {request.request_id, Status::UNAVAILABLE, {}};
+    }
+    if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
+        !m_private->session)
+    {
+        return {request.request_id, Status::REFUSED, {}};
+    }
+    const auto result = m_private->session->apply_mouse_click(request);
+    if (result.status == Status::ACCEPTED) {
+        m_private->dismiss_copy_intent();
+        m_private->cancel_clipboard_paste();
+    }
+    sync_from_session();
+    return result;
+}
+
+vnm_terminal::Terminal_tap_policy VNM_TerminalSurface::terminal_tap_policy() const
+{
+    return m_touch_controller->tap_policy();
+}
+
+void VNM_TerminalSurface::set_terminal_tap_policy(vnm_terminal::Terminal_tap_policy policy)
+{
+    m_touch_controller->set_tap_policy(policy);
 }
 
 bool VNM_TerminalSurface::touch_selection_enabled() const { return m_touch_controller->enabled(); }

@@ -67,6 +67,7 @@ void Terminal_touch_controller::set_viewport(QRectF viewport)
     if (m_viewport == viewport) {
         return;
     }
+    m_tap_cancelled = m_tap_cancelled || m_tap.policy == Terminal_tap_policy::APPLICATION;
     m_viewport = viewport;
 }
 
@@ -130,8 +131,17 @@ bool Terminal_touch_controller::selection_active() const
 void Terminal_touch_controller::activate_tap()
 {
     if (!dismiss_selection()) {
-        m_callbacks.tapped();
+        m_callbacks.tapped({m_tap_policy, std::nullopt});
     }
+}
+
+void Terminal_touch_controller::set_tap_policy(Terminal_tap_policy policy)
+{
+    if (m_tap_policy == policy) {
+        return;
+    }
+    cancel();
+    m_tap_policy = policy;
 }
 
 bool Terminal_touch_controller::dismiss_selection(std::uint64_t generation)
@@ -226,6 +236,14 @@ void Terminal_touch_controller::touch_event(QTouchEvent& event)
         m_press_scene_position = point.scenePosition();
         m_scene_position       = point.scenePosition();
         m_handle_offset        = {};
+        m_tap_cancelled        = false;
+        m_tap_position         = position();
+        m_tap_cell_size        = m_callbacks.tap_cell_size();
+        m_tap_scene_bounds     = m_item.mapRectToScene(m_item.boundingRect());
+        m_tap_viewport         = viewport();
+        m_tap = {m_tap_policy,
+            m_tap_policy == Terminal_tap_policy::APPLICATION && m_tap_viewport.contains(m_tap_position)
+                ? m_callbacks.tap_target(m_tap_position) : std::nullopt};
         m_gesture_id           = QUuid::createUuid().toString(QUuid::WithoutBraces);
         m_released             = false;
         m_release_move_sent = false;
@@ -278,7 +296,23 @@ void Terminal_touch_controller::touch_event(QTouchEvent& event)
                     dismiss_selection();
                 }
                 else {
-                    activate_tap();
+                    const auto tap = m_tap;
+                    const auto current = m_callbacks.tap_target(m_tap_position);
+                    const bool mapping_matches = !tap.target || (current &&
+                        terminal_mouse_mapping_matches(current->source, tap.target->source) &&
+                        current->row == tap.target->row && current->column == tap.target->column &&
+                        current->display_row == tap.target->display_row);
+                    const bool geometry_matches =
+                        m_tap_scene_bounds == m_item.mapRectToScene(m_item.boundingRect()) &&
+                        m_tap_viewport == viewport() && m_tap_cell_size == m_callbacks.tap_cell_size();
+                    const bool application_target_current = !m_tap_cancelled && geometry_matches &&
+                        mapping_matches && viewport().contains(position());
+                    if ((tap.policy != Terminal_tap_policy::APPLICATION || application_target_current) &&
+                        (m_scene_position - m_press_scene_position).manhattanLength() <=
+                            QGuiApplication::styleHints()->startDragDistance() && !dismiss_selection())
+                    {
+                        m_callbacks.tapped(tap);
+                    }
                 }
             }
             else
