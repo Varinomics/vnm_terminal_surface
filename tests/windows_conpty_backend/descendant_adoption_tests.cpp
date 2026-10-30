@@ -23,10 +23,30 @@ struct process_instance_t
     std::optional<bool> owned = false;
 };
 
+class Process_handle
+{
+public:
+    explicit Process_handle(std::shared_ptr<process_instance_t> instance)
+    :
+        m_instance(std::move(instance))
+    {}
+
+    Process_handle(const Process_handle&) = delete;
+    Process_handle& operator=(const Process_handle&) = delete;
+    Process_handle(Process_handle&&) = default;
+    Process_handle& operator=(Process_handle&&) = default;
+
+    const process_instance_t* operator->() const { return m_instance.get(); }
+    const std::shared_ptr<process_instance_t>& instance() const { return m_instance; }
+
+private:
+    std::shared_ptr<process_instance_t> m_instance;
+};
+
 class Injected_source
 {
 public:
-    using Process = std::shared_ptr<process_instance_t>;
+    using Process = Process_handle;
     using Candidates = term::Windows_descendant_candidates<Process>;
 
     explicit Injected_source(std::uint32_t root = 100)
@@ -79,7 +99,7 @@ public:
         if (before_parent_open) {
             before_parent_open();
         }
-        return processes.at(pid);
+        return Process(processes.at(pid));
     }
 
     std::optional<Process> open_child(std::uint32_t pid)
@@ -87,7 +107,7 @@ public:
         if (before_child_open) {
             before_child_open();
         }
-        return processes.at(pid);
+        return Process(processes.at(pid));
     }
 
     std::optional<bool> owned_membership(const Process& process) { return process->owned; }
@@ -96,16 +116,16 @@ public:
 
     void adopt(const Process& process)
     {
-        adopted.push_back(process);
-        process->owned = true;
+        adopted.push_back(process.instance());
+        process.instance()->owned = true;
         if (after_adoption) {
             after_adoption();
         }
     }
 
-    std::map<std::uint32_t, Process> processes;
+    std::map<std::uint32_t, std::shared_ptr<process_instance_t>> processes;
     term::Windows_process_parents parents;
-    std::vector<Process> adopted;
+    std::vector<std::shared_ptr<process_instance_t>> adopted;
     std::function<void()> before_parent_open;
     std::function<void()> before_child_open;
     std::function<void()> during_second_snapshot;

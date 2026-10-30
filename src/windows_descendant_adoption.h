@@ -81,18 +81,32 @@ void adopt_windows_descendants(
 template<class Family, class Families, class Snapshots>
 void scan_windows_descendant_families(const Families& families, Snapshots& snapshots)
 {
-    struct Scan
+    class Scan
     {
-        typename Families::value_type family;
-        std::set<std::uint32_t> members;
-        Windows_descendant_candidates<typename Family::Process> candidates;
+    public:
+        Scan(typename Families::value_type family, std::set<std::uint32_t> members)
+        :
+            m_family(std::move(family)),
+            m_members(std::move(members))
+        {}
+
+        // Process handles cannot be copied. Relocation must move the scan
+        // even when the member set's move constructor can allocate and throw.
+        Scan(const Scan&) = delete;
+        Scan& operator=(const Scan&) = delete;
+        Scan(Scan&&) = default;
+        Scan& operator=(Scan&&) = default;
+
+        typename Families::value_type m_family;
+        std::set<std::uint32_t> m_members;
+        Windows_descendant_candidates<typename Family::Process> m_candidates;
     };
     std::vector<Scan> scans;
     scans.reserve(families.size());
     for (const auto& family : families) {
         auto members = family->begin_scan();
         if (members) {
-            scans.push_back({family, std::move(*members), {}});
+            scans.emplace_back(family, std::move(*members));
         }
     }
     if (scans.empty()) {
@@ -104,8 +118,8 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
     }
     bool has_candidates = false;
     for (auto& scan : scans) {
-        scan.candidates = scan.family->prepare_scan(scan.members, *first);
-        has_candidates = has_candidates || !scan.candidates.empty();
+        scan.m_candidates = scan.m_family->prepare_scan(scan.m_members, *first);
+        has_candidates = has_candidates || !scan.m_candidates.empty();
     }
     if (!has_candidates) {
         return;
@@ -115,8 +129,8 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
         return;
     }
     for (const auto& scan : scans) {
-        if (!scan.candidates.empty()) {
-            scan.family->finish_scan(scan.candidates, *second);
+        if (!scan.m_candidates.empty()) {
+            scan.m_family->finish_scan(scan.m_candidates, *second);
         }
     }
 }
