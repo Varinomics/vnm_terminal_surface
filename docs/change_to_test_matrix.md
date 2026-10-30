@@ -125,6 +125,5 @@ for local runs.
   change, the required capability target is absent, or the selected pair
   genuinely fails to configure, build, or test. Read the job log to distinguish
   those causes; a red is never benign by default.
-- All tests run offscreen with `QT_QPA_PLATFORM=offscreen`.
 - `ctest` works without the Visual Studio developer shell; the developer shell is
   needed only to configure and build native MSVC targets.
