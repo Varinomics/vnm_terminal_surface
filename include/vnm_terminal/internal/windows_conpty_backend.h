@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/backend_contract.h"
+#include "vnm_terminal/windows_terminal_lifecycle.h"
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
@@ -42,7 +43,6 @@ struct Windows_conpty_backend_write_state_for_testing
     bool        process_handle_retained = false;
     bool        process_assigned_to_job = false;
     bool        native_cleanup_settled = false;
-    std::size_t adoption_job_count = 0U;
 };
 
 // Installed before start; lets native integration tests retain each cleanup
@@ -76,23 +76,6 @@ struct windows_conpty_cpu_query_for_testing_t
     std::uint32_t error            = 0;
 };
 
-enum class Windows_conpty_descendant_scan_fault_for_testing
-{
-    NONE,
-    MEMBER_QUERY,
-    ACTIVE_FAMILY_ALLOCATION,
-};
-
-// Installed before start. Faults occur at the scanner's native failure
-// boundaries without invalidating the Job used by public CPU accounting.
-struct Windows_conpty_descendant_scan_control_for_testing
-{
-    std::atomic<Windows_conpty_descendant_scan_fault_for_testing> fault{
-        Windows_conpty_descendant_scan_fault_for_testing::NONE};
-    std::atomic_uint injected_failures{0};
-    std::atomic_uint successful_member_queries{0};
-};
-
 // Installed before start. Handles are borrowed only for the callback, which
 // runs under native ownership and must not re-enter the backend or retain them.
 using Windows_conpty_cpu_observer_for_testing = std::function<void(
@@ -101,7 +84,7 @@ using Windows_conpty_cpu_observer_for_testing = std::function<void(
 class Windows_conpty_backend final : public Terminal_backend
 {
 public:
-    Windows_conpty_backend();
+    explicit Windows_conpty_backend(std::shared_ptr<Windows_terminal_lifecycle> lifecycle = {});
     ~Windows_conpty_backend() override;
 
     Windows_conpty_backend(const Windows_conpty_backend&)            = delete;
@@ -140,8 +123,6 @@ public:
     bool set_close_control_for_testing(std::shared_ptr<Windows_conpty_close_control_for_testing> control);
     bool set_resize_control_for_testing(std::shared_ptr<Windows_conpty_resize_control_for_testing> control);
     bool set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer);
-    bool set_descendant_scan_control_for_testing(
-        std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> control);
 
 private:
     class Impl;
@@ -149,7 +130,8 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-std::unique_ptr<Terminal_backend> make_windows_conpty_backend();
+std::unique_ptr<Terminal_backend> make_windows_conpty_backend(
+    std::shared_ptr<Windows_terminal_lifecycle> lifecycle = {});
 
 #endif
 

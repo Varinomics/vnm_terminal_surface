@@ -119,6 +119,11 @@ callback delivery. The Qt-free extension contract is installed as
 supplied owner's failure never falls back to a second launch. Windows rejects
 the optional owner argument before dispatch.
 
+Windows hosts can explicitly supply a retained `Windows_terminal_lifecycle`
+for native admission and cleanup integration. The surface retains ConPTY and
+its root Job; broader process discovery, adoption and accounting belong to the
+host. The default Windows backend creates no workload-discovery service.
+
 The supported native product targets are Windows x64, Linux x86_64, and macOS
 Darwin builds. A build on a platform without a native backend may still compile
 library code, but process launch reports an unavailable-backend error instead

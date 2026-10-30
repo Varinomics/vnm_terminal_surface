@@ -113,14 +113,11 @@ MSVC and ConPTY runtime. After extracting the artifact, run:
 
 ```powershell
 ./run_store_powershell.ps1 -EvidenceDirectory C:/temp/store-root-check
-./run_store_powershell.ps1 -Scenario packaged-descendants -EvidenceDirectory C:/temp/packaged-descendants-check
 ```
 
 The script uses `Win32_Process.Create` to launch outside the invoking terminal's
 Job and records the outcome in a fresh evidence directory. The root check also
-verifies that launch context. The packaged-descendant check exercises a detached
-MSIX grandchild through natural root exit, termination, destruction, and CPU
-retention after child exit. No local build or package installation is performed
+verifies that launch context. No local build or package installation is performed
 by this script.
 
 ### Early-child setup-failure cleanup
@@ -321,36 +318,41 @@ callback reports the root's state; it does not establish transitive termination
 of every process that the terminal workload may have created. A supplied owner
 documents any stronger cleanup scope it provides.
 
-On Windows, one process-wide scanner checks running ConPTY terminals at 100 ms
-intervals. Packaged programs can escape Job inheritance even without a breakaway
-flag. The scanner adopts provable descendants into separate, initially empty
-kill-on-close Jobs. A packaged program launched from the terminal, including one
-with its own console, therefore closes with that terminal when discovery succeeds.
-Normal root exit, explicit termination, and backend destruction all stop discovery,
-terminate every owned Job, and require those Jobs to report zero active processes
-before native cleanup settles. A failed observation retains the exact Job handle
-for the existing deferred cleanup owner; it never counts as successful settlement.
+On Windows, the backend owns the root process and its native kill-on-close Job.
+Cleanup observes that exact root and requires the Job to report zero active
+processes. A failed observation retains native ownership for deferred cleanup.
+Packaged programs can escape Job inheritance even without a breakaway flag;
+the native Job does not establish containment of processes outside its members.
 
-Discovery uses two process snapshots with retained parent and child handles.
-Each scan pass shares those snapshots across all running terminals: one first
-snapshot, and a second only when at least one family has candidate handles.
-The global snapshots run outside family ownership locks. Each family rechecks
-that discovery is enabled before committing adoption, so cleanup can stop it
-between snapshots without admitting a process after its termination request.
-The parent must belong to an owned Job, both instances must still be running
-after the second snapshot, that snapshot must name the same parent PID, and the
-child must have a strictly later creation time. Equal times are unproven. The
-child must be proven absent from every owned Job before assignment; a failed
-membership query is unproven. These checks prevent PID reuse from capturing an
-unrelated process and prevent repeat adoption or nesting among owned Jobs.
-Children escaping from adoption Jobs can themselves be adopted on later scans.
+### Host-owned Windows lifecycle
 
-This is best-effort discovery. A parent that exits between scans cannot establish
-the relationship; short-lived children and processes that cannot be opened may
-remain outside custody. Windows also allows a creator with the required rights
-to name another process through `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`; such a
-process is treated as that named parent's child. The scanner does not establish
-transitive cleanup of processes it never observed or could not prove.
+Hosts that own broader workload supervision can pass a retained
+`Windows_terminal_lifecycle` as the third argument to `start_terminal`, with an
+empty POSIX owner argument. The Qt-free header is
+`vnm_terminal/windows_terminal_lifecycle.h`. A nonnull Windows lifecycle is
+rejected before birth on other platforms. The backend does not create a
+discovery worker, scan the system process table or aggregate a host's separately
+owned processes. Hosts query and control their own additional workload scope.
+
+The extension receives the empty borrowed root Job in `prepare`, before process
+creation, and the exact borrowed process handle in `root_admitted`, after Job
+assignment and before resume. A refusal or exception rejects that admission;
+there is no alternate owner or repeated native launch. Entering `prepare`
+consumes that extension's admission attempt, even when preparation or subsequent
+process creation fails. Both cleanup phases still run exactly once.
+
+Actual nonempty I/O calls `io_activity` on a native I/O worker. This notification
+must only mark or enqueue work; it can overlap cleanup while the pipe drains.
+`begin_cleanup` runs before native termination and ConPTY close. It lets the
+host stop observation/admission and request termination of its owned resources.
+`finish_cleanup` follows native termination and settlement, before the borrowed
+root handles are retired, and must retire every remaining use of those handles.
+These methods run on native cleanup workers outside backend locks, independently
+of revoked presentation callbacks. They must not reenter the surface/backend or
+require GUI dispatch. The backend retains the extension through Job closure;
+a separate host reference conveys no authority to use borrowed handles after
+`finish_cleanup` returns. Public termination and destruction do not wait for
+these cleanup phases.
 
 ## Exit-Reason Resolution
 
@@ -461,17 +463,12 @@ teardown and a root-exit callback do not extend its scope.
 `VNM_TerminalSurface::process_cpu_time()` returns an optional cumulative sample.
 The default POSIX owner reports CPU accounting unavailable. A supplied owner
 can provide a sample with an explicit coverage scope. The Windows native backend
-sums its root and adoption Jobs, which do not nest within one another, including
-CPU credited to exited members. Before observing an escape, it reports
-`WORKLOAD_FAMILY` for the root Job's members; that is a membership scope, not a
-guarantee that every descendant is included. Once an escape is proven, or scanner
-resource failure prevents discovery, its scope becomes
-`OBSERVED_FAMILY`: other escaped processes may have been inaccessible or missed
-between scans. All cumulative CPU reported by Windows is preserved, including
-CPU Windows credits when assigning a process that has already run. No
-pre-adoption subtraction is made. Empty adoption Jobs are retired after their
-final CPU totals are retained; those totals remain available until backend
-retirement. Process snapshots include live members of all retained owned Jobs.
+queries its retained root Job, including cumulative CPU credited to exited Job
+members. It reports `WORKLOAD_FAMILY` as a native membership scope, not a claim
+that every escaped descendant is included. Process snapshots observe live
+members of that Job. Neither query discovers or adopts processes outside it.
+A Windows lifecycle extension's broader accounting belongs to its host and is
+not implicitly included in these surface samples.
 
 `OBSERVED_FAMILY` identifies best-effort root and descendant observations and
 can miss short-lived or detached children and work outside the observation
