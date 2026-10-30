@@ -2209,21 +2209,11 @@ set_tests_properties(vnm_terminal_backend_output_capture PROPERTIES
     TIMEOUT 60
 )
 
-add_executable(vnm_terminal_windows_descendant_adoption
-    windows_conpty_backend/descendant_adoption_tests.cpp
-)
-set_target_properties(vnm_terminal_windows_descendant_adoption PROPERTIES AUTOMOC OFF)
-add_test(NAME vnm_terminal_windows_descendant_adoption
-    COMMAND vnm_terminal_windows_descendant_adoption)
-set_tests_properties(vnm_terminal_windows_descendant_adoption PROPERTIES
-    LABELS "conformance;windows;conpty;containment" TIMEOUT 30)
-
 if(WIN32)
     add_executable(vnm_terminal_windows_conpty_backend
         windows_conpty_backend/windows_conpty_backend_tests.cpp
         windows_conpty_backend/store_powershell_fixture.cpp
-        windows_conpty_backend/packaged_descendant_tests.cpp
-        windows_conpty_backend/descendant_scope_tests.cpp
+        windows_conpty_backend/native_lifecycle_tests.cpp
     )
 
     # Kept out of vnm_terminal_test_process_targets: that setup replaces the
@@ -2253,6 +2243,9 @@ if(WIN32)
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${conpty_test_artifact_dir}"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" "${conpty_test_artifact_dir}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
+            "$<TARGET_FILE:vnm_terminal_error_mode_reporter>" "${conpty_test_artifact_dir}/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             $<TARGET_RUNTIME_DLLS:vnm_terminal_windows_conpty_backend> "${conpty_test_artifact_dir}/"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -2291,17 +2284,11 @@ if(WIN32)
             "$<TARGET_FILE:vnm_terminal_error_mode_reporter>"
     )
 
-    add_test(NAME vnm_terminal_windows_conpty_packaged_descendants
+    add_test(NAME vnm_terminal_windows_conpty_native_lifecycle
         COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
-            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" --packaged-descendants)
-    set_tests_properties(vnm_terminal_windows_conpty_packaged_descendants PROPERTIES
-        LABELS "conformance;windows;conpty;containment" SKIP_RETURN_CODE 77 TIMEOUT 300)
-
-    add_test(NAME vnm_terminal_windows_conpty_descendant_scope
-        COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
-            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" --descendant-scan-scope)
-    set_tests_properties(vnm_terminal_windows_conpty_descendant_scope PROPERTIES
-        LABELS "conformance;windows;conpty;containment" TIMEOUT 180)
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" --native-lifecycle)
+    set_tests_properties(vnm_terminal_windows_conpty_native_lifecycle PROPERTIES
+        LABELS "conformance;windows;conpty;lifecycle" TIMEOUT 180)
 
     add_test(
         NAME vnm_terminal_windows_conpty_process_snapshot
@@ -2645,7 +2632,6 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_backend_session
     vnm_terminal_touch_selection
     vnm_terminal_backend_output_capture
-    vnm_terminal_windows_descendant_adoption
 )
 
 if(TARGET vnm_terminal_transcript)

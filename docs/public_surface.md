@@ -189,7 +189,8 @@ resize synchronization changes emit `geometry_sync_changed()`.
 ## Process Launch
 
 `start_terminal(Terminal_process_start_request request,
-std::unique_ptr<vnm_terminal::Terminal_process_owner> owner = {})` is the sole
+std::unique_ptr<vnm_terminal::Terminal_process_owner> owner = {},
+std::shared_ptr<vnm_terminal::Windows_terminal_lifecycle> windows_lifecycle = {})` is the sole
 public launch boundary and starts one built-in native terminal backend:
 
 - Windows uses ConPTY.
@@ -205,6 +206,15 @@ does not retry through the default implementation. Windows rejects a supplied
 owner before birth. The backend retains terminal I/O, resize, and session
 integration in either case. See
 [Backend lifecycle and signals](backend_lifecycle_and_signals.md).
+
+Windows hosts may supply `Windows_terminal_lifecycle` as the third argument,
+with an empty POSIX owner. It receives native Job/root admission facts and
+ordered cleanup phases, retained independently of the GUI through Job closure.
+This is an explicit host ownership extension; the default backend does not
+perform system-wide process discovery. See
+[the lifecycle contract](backend_lifecycle_and_signals.md#host-owned-windows-lifecycle)
+and `vnm_terminal/windows_terminal_lifecycle.h` for handle lifetime and threading.
+Other platforms reject a nonnull Windows lifecycle before birth.
 
 `process_snapshot()` returns optional workload observations supplied by the
 selected process owner. The public value records contain process identity,

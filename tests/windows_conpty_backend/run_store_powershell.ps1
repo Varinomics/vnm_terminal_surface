@@ -1,11 +1,11 @@
 param(
     [string]$TestExecutable,
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
-    [ValidateSet('store-root', 'packaged-descendants')][string]$Scenario = 'store-root',
     [switch]$Worker
 )
 
 $ErrorActionPreference = 'Stop'
+$Scenario = 'store-root'
 # Windows PowerShell 5.1 -File initializes PSScriptRoot after parameter defaults.
 if (-not $PSBoundParameters.ContainsKey('TestExecutable')) {
     $TestExecutable = Join-Path $PSScriptRoot 'vnm_terminal_windows_conpty_backend.exe'
@@ -15,8 +15,8 @@ $null = New-Item -ItemType Directory -Path $EvidenceDirectory -Force
 $EvidenceDirectory = (Resolve-Path -LiteralPath $EvidenceDirectory).Path
 $resultPath = Join-Path $EvidenceDirectory "$Scenario-result.json"
 $logPath = Join-Path $EvidenceDirectory "$Scenario.log"
-$testArguments = if ($Scenario -eq 'store-root') { '--store-powershell-root' } else { '--packaged-descendants' }
-$timeoutSeconds = if ($Scenario -eq 'store-root') { 100 } else { 300 }
+$testArguments = '--store-powershell-root'
+$timeoutSeconds = 100
 
 if ($Worker) {
     # The deployed runtime is self-contained; WMI need not inherit a Qt PATH.
@@ -73,8 +73,8 @@ if (Test-Path -LiteralPath $resultPath) {
 # WMI creation leaves the invoking terminal's Job hierarchy. The test itself
 # checks that premise and returns 77 if this host cannot supply the context.
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Worker -TestExecutable "{2}" -EvidenceDirectory "{3}" -Scenario "{4}"' -f `
-    $powershell, $PSCommandPath, $TestExecutable, $EvidenceDirectory, $Scenario
+$command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Worker -TestExecutable "{2}" -EvidenceDirectory "{3}"' -f `
+    $powershell, $PSCommandPath, $TestExecutable, $EvidenceDirectory
 $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command }
 if ($created.ReturnValue -ne 0) {
     throw "Win32_Process.Create failed: $($created.ReturnValue)"

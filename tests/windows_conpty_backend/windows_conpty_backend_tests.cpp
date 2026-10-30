@@ -1,8 +1,7 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
 #include "store_powershell_fixture.h"
-#include "packaged_descendant_tests.h"
-#include "descendant_scope_tests.h"
+#include "native_lifecycle_tests.h"
 #include "../posix_pty_backend/callback_lifetime_checks.h"
 #include "../posix_pty_backend/native_session_checks.h"
 #include "../../src/native_backend_io_core.h"
@@ -212,6 +211,37 @@ bool wait_for_console_host_children_to_exit(std::string_view test_name)
         std::cerr << ' ' << pid;
     }
     std::cerr << '\n';
+    // Preserve the original failure before retaining any diagnostic handles.
+    // A process-table entry alone does not say whether OpenConsole is still
+    // executing or an exited process object remains observable.
+    for (const DWORD pid : pids) {
+        const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+        if (!process) {
+            std::cerr << "ConPTY leftover pid=" << pid << " open_error=" << GetLastError() << '\n';
+            continue;
+        }
+        const DWORD state = WaitForSingleObject(process, 0);
+        const DWORD wait_error = state == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+        DWORD exit_code = 0;
+        const BOOL exit_known = GetExitCodeProcess(process, &exit_code);
+        const DWORD exit_error = exit_known ? ERROR_SUCCESS : GetLastError();
+        FILETIME created{}, exited{}, kernel{}, user{};
+        const BOOL times_known = GetProcessTimes(process, &created, &exited, &kernel, &user);
+        const DWORD times_error = times_known ? ERROR_SUCCESS : GetLastError();
+        const auto ticks = [](FILETIME time) {
+            return (std::uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+        };
+        std::cerr << "ConPTY leftover pid=" << pid << " signal=" << state
+            << " wait_error=" << wait_error << " exit_code=" << exit_code
+            << " exit_error=" << exit_error << " times_error=" << times_error
+            << " creation_ticks=" << ticks(created)
+            << " exit_ticks=" << (state == WAIT_OBJECT_0 ? ticks(exited) : 0)
+            << " kernel_ticks=" << ticks(kernel) << " user_ticks=" << ticks(user) << '\n';
+        CloseHandle(process);
+    }
+    std::cerr << "ConPTY cleanup registry retained="
+        << term::Native_backend_cleanup_reservation::retained_tasks()
+        << " unconfirmed=" << term::Native_backend_cleanup_reservation::unconfirmed_tasks() << '\n';
     return check(false, "ConPTY backend releases console host child processes");
 }
 
@@ -1202,6 +1232,10 @@ public:
             }
         }
         const std::lock_guard lock(m_mutex);
+        if (std::string_view(event) == "sample") {
+            ++m_sample_sequence;
+            m_sample_query = query;
+        }
         if (std::string_view(event) == "settlement") {
             m_settlement = output.str();
         }
@@ -1212,6 +1246,22 @@ public:
         else {
             ++m_dropped_records;
         }
+    }
+
+    std::uint64_t sample_sequence() const
+    {
+        const std::lock_guard lock(m_mutex);
+        return m_sample_sequence;
+    }
+
+    std::optional<term::windows_conpty_cpu_query_for_testing_t> sample_query_since(
+        std::uint64_t sequence) const
+    {
+        const std::lock_guard lock(m_mutex);
+        if (m_sample_sequence != sequence + 1) {
+            return std::nullopt;
+        }
+        return m_sample_query;
     }
 
     void dump() const
@@ -1232,6 +1282,8 @@ private:
     std::vector<std::string> m_records;
     std::string              m_settlement;
     unsigned                 m_dropped_records = 0;
+    std::uint64_t            m_sample_sequence = 0;
+    term::windows_conpty_cpu_query_for_testing_t m_sample_query;
 };
 
 int run_cpu_accounting_child(const QString& directory)
@@ -1296,29 +1348,37 @@ int run_cpu_accounting_root(const QString& executable_path, const QString& direc
 bool check_cpu_accounting_sample(
     term::Windows_conpty_backend&         backend,
     const Cpu_accounting_diagnostics&     diagnostics,
-    std::uint64_t                         minimum_cpu_usec,
     std::string_view                      phase,
     vnm_terminal::process_cpu_time_t*      out_sample,
     const cpu_accounting_process_times_t* root_times = nullptr,
     const cpu_accounting_process_times_t* child_times = nullptr)
 {
+    const auto sequence = diagnostics.sample_sequence();
     const auto before = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const auto sample = backend.process_cpu_time();
     const auto after = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto native_query = diagnostics.sample_query_since(sequence);
     const std::string label(phase);
-    if (!check(sample.has_value(), label + ": retained Job supplies a CPU sample")) {
+    bool ok = check(sample.has_value(), label + ": retained Job supplies a CPU sample");
+    ok &= check(native_query && native_query->error == ERROR_SUCCESS,
+        label + ": this CPU sampling call observes one successful native Job query");
+    if (!ok) {
+        diagnostics.dump();
         return false;
     }
     *out_sample = *sample;
-    bool ok = check(sample->cpu_time_usec >= minimum_cpu_usec,
-        label + ": Job CPU includes independent root and child process totals");
+    // Independent process totals witness workload execution. Retention is
+    // tested across lifecycle boundaries on the native Job counter itself.
+    const auto native_cpu_usec = (native_query->kernel_ticks + native_query->user_ticks) / 10U;
+    ok &= check(sample->cpu_time_usec == native_cpu_usec,
+        label + ": returned CPU matches this call's native Job accounting in microseconds");
     ok &= check(sample->scope == vnm_terminal::Process_cpu_scope::WORKLOAD_FAMILY,
-        label + ": Job sample declares native family accounting");
+        label + ": Job sample declares native workload coverage");
     if (!ok) {
         std::cerr << "Job CPU usec=" << sample->cpu_time_usec
-            << ", root and child CPU usec=" << minimum_cpu_usec << '\n';
+            << ", native Job CPU usec=" << native_cpu_usec << '\n';
         if (root_times && child_times) {
             std::cerr << "Independent root";
             write_cpu_process_times(std::cerr, *root_times);
@@ -1391,7 +1451,7 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
         return false;
     }
     vnm_terminal::process_cpu_time_t initial{}, live{}, child_exited{}, root_exited{};
-    if (!check_cpu_accounting_sample(backend, *diagnostics, 0, "before workload", &initial) ||
+    if (!check_cpu_accounting_sample(backend, *diagnostics, "before workload", &initial) ||
         !check(write_gate_file(gates.filePath(QStringLiteral("start-burn"))), "CPU child is released") ||
         !check(wait_for_file(gates.filePath(QStringLiteral("burn-finished"))), "CPU child finishes its work"))
     {
@@ -1402,7 +1462,7 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     const auto live_child_cpu = process_cpu_time_usec(child.get(), &live_child_times);
     if (!check(live_root_cpu && live_child_cpu && *live_child_cpu >= k_cpu_accounting_work_usec,
             "independent process accounting confirms substantial child CPU") ||
-        !check_cpu_accounting_sample(backend, *diagnostics, *live_root_cpu + *live_child_cpu, "live child", &live,
+        !check_cpu_accounting_sample(backend, *diagnostics, "live child", &live,
             &live_root_times, &live_child_times))
     {
         return false;
@@ -1419,14 +1479,16 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     const auto final_child_cpu  = process_cpu_time_usec(child.get(), &final_child_times);
     const auto waiting_root_cpu = process_cpu_time_usec(root.get(), &waiting_root_times);
     child.reset();
-    if (!check(final_child_cpu && waiting_root_cpu, "exited child CPU remains independently readable") ||
-        !check_cpu_accounting_sample(backend, *diagnostics, *final_child_cpu + *waiting_root_cpu,
+    if (!check(final_child_cpu && waiting_root_cpu &&
+            *final_child_cpu >= *live_child_cpu && *waiting_root_cpu >= *live_root_cpu,
+            "independent process counters remain readable and monotonic after child exit") ||
+        !check_cpu_accounting_sample(backend, *diagnostics,
             "child handles closed", &child_exited, &waiting_root_times, &final_child_times))
     {
         return false;
     }
     ok &= check(child_exited.cpu_time_usec >= live.cpu_time_usec,
-        "closing every exited-child handle preserves cumulative Job CPU");
+        "closing caller-owned exited-child handles preserves cumulative Job CPU");
     if (!check(write_gate_file(gates.filePath(QStringLiteral("root-exit"))), "CPU root may exit") ||
         !check(capture.wait_for_exit(), "CPU root actually exits"))
     {
@@ -1438,8 +1500,9 @@ bool test_cpu_accounting_retains_exited_descendants(const QString& executable_pa
     cpu_accounting_process_times_t final_root_times{};
     const auto final_root_cpu = process_cpu_time_usec(root.get(), &final_root_times);
     root.reset();
-    if (!check(final_root_cpu.has_value(), "root final CPU is available") ||
-        !check_cpu_accounting_sample(backend, *diagnostics, *final_root_cpu + *final_child_cpu,
+    if (!check(final_root_cpu && *final_root_cpu >= *waiting_root_cpu,
+            "root final CPU is independently readable and monotonic") ||
+        !check_cpu_accounting_sample(backend, *diagnostics,
             "root exited", &root_exited, &final_root_times, &final_child_times))
     {
         return false;
@@ -6651,6 +6714,29 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
 
     Backend_capture capture;
     term::Windows_conpty_backend backend;
+    const auto close_control = std::make_shared<term::Windows_conpty_close_control_for_testing>();
+    // Observe completion without holding either close phase. These permits
+    // exist before native birth and are consumed once by this backend.
+    close_control->allow_close.release();
+    close_control->allow_observer.release();
+    if (!check(backend.set_close_control_for_testing(close_control),
+            "failed-start close completion observer is installed before start"))
+    {
+        return false;
+    }
+    const auto diagnostic_start = std::chrono::steady_clock::now();
+    const auto record_cleanup_state = [&](const char* phase) {
+        const auto state = backend.write_state_for_testing();
+        std::cerr << "FAILED_START_CLEANUP phase=" << phase
+            << " elapsed_usec=" << std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - diagnostic_start).count()
+            << " process_retained=" << state.process_handle_retained
+            << " assigned=" << state.process_assigned_to_job
+            << " settled=" << state.native_cleanup_settled
+            << " close_returned=" << close_control->close_count.load()
+            << " observer_retired=" << close_control->observer_retirement_count.load()
+            << '\n';
+    };
     struct Observation_release
     {
         term::Windows_conpty_backend& backend;
@@ -6665,6 +6751,7 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
     backend.set_cleanup_observation_blocked_for_testing(true);
     const auto result = backend.start(
         launch_config(fixture_path, {QStringLiteral("--hold-open")}), capture.callbacks());
+    record_cleanup_state("start-rejected");
     bool ok = check(result.code == term::Terminal_backend_result_code::REJECTED &&
             result.native_dispatch_occurred && !result.start_outcome_determinate,
         "worker startup failure rejects start while deferred cleanup retains the native child");
@@ -6680,6 +6767,7 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         cleaned = backend.write_state_for_testing();
     }
+    record_cleanup_state("native-handles-released");
     ok &= check(cleaned.native_cleanup_settled && !cleaned.process_handle_retained,
         "deferred cleanup releases the exact native handles while the facade remains alive");
     ok &= check(!cleaned.process_assigned_to_job,
@@ -7547,13 +7635,13 @@ int main(int argc, char** argv)
         }
         return result;
     }
-    if (const auto result = run_packaged_descendant_tests(argc, argv)) {
+    if (const auto result = run_native_lifecycle_tests(argc, argv)) {
+        if (*result == 0 && argc == 2 && std::string_view(argv[1]) == "--native-lifecycle" &&
+            !wait_for_console_host_children_to_exit("native lifecycle"))
+        {
+            return 1;
+        }
         return *result;
-    }
-    if (argc == 2 && std::string_view(argv[1]) == "--descendant-scan-scope") {
-        bool ok = test_descendant_scan_failure_scopes();
-        ok &= wait_for_console_host_children_to_exit("descendant scan scope");
-        return ok ? 0 : 1;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
         bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));
@@ -7612,7 +7700,8 @@ int main(int argc, char** argv)
     }
     if (argc == 3 && std::string_view(argv[1]) == "--native-session") {
         bool ok = vnm_terminal::test_helpers::check_native_session_lifecycle(
-            term::make_windows_conpty_backend, launch_config(QString::fromLocal8Bit(argv[2]), {}));
+            [] { return term::make_windows_conpty_backend(); },
+            launch_config(QString::fromLocal8Bit(argv[2]), {}));
         ok &= wait_for_console_host_children_to_exit("native session");
         return ok ? 0 : 1;
     }
@@ -7711,7 +7800,7 @@ int main(int argc, char** argv)
         test_close_and_observer_retirement_remain_accounted(fixture_path));
     run_test("native Terminal_session lifecycle",
         vnm_terminal::test_helpers::check_native_session_lifecycle(
-            term::make_windows_conpty_backend, launch_config(fixture_path, {})));
+            [] { return term::make_windows_conpty_backend(); }, launch_config(fixture_path, {})));
     run_test("post-birth failure retains native custody",
         test_post_birth_failure_keeps_native_custody(fixture_path));
     run_test("failed-start cleanup retires CPU Job ownership",

@@ -12,10 +12,8 @@
 
 #include "native_backend_io_core.h"
 #include "native_backend_cleanup_owner.h"
-#include "windows_descendant_adoption.h"
 #include <windows.h>
 #include <psapi.h>
-#include <tlhelp32.h>
 
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
@@ -34,7 +32,6 @@
 #include <deque>
 #include <exception>
 #include <latch>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -309,404 +306,6 @@ Job_object_create_result create_process_tree_job()
 
     return {std::move(job), {}, ERROR_SUCCESS};
 }
-
-class Windows_process_snapshots
-{
-public:
-    std::optional<Windows_process_parents> snapshot() const
-    {
-        Unique_handle snapshot_handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-        if (!snapshot_handle) {
-            return std::nullopt;
-        }
-        PROCESSENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-        Windows_process_parents parents;
-        if (!Process32FirstW(snapshot_handle.get(), &entry)) {
-            return std::nullopt;
-        }
-        do {
-            parents.emplace(entry.th32ProcessID, entry.th32ParentProcessID);
-        } while (Process32NextW(snapshot_handle.get(), &entry));
-        if (GetLastError() != ERROR_NO_MORE_FILES) {
-            return std::nullopt;
-        }
-        return parents;
-    }
-};
-
-class Descendant_job_family
-{
-public:
-    using Process = Unique_handle;
-    using Candidates = Windows_descendant_candidates<Process>;
-
-    Descendant_job_family(HANDLE root_job,
-        std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> scan_control)
-    :
-        m_root_job(duplicate_handle(root_job)),
-        m_scan_control_for_testing(std::move(scan_control))
-    {
-        if (!m_root_job) {
-            throw std::system_error((int)GetLastError(), std::system_category(), "DuplicateHandle Job");
-        }
-    }
-
-    void enable() { m_enabled.store(true, std::memory_order_release); }
-    bool enabled() const { return m_enabled.load(std::memory_order_acquire); }
-
-    void prepare_collection_for_testing() const
-    {
-        if (m_scan_control_for_testing && m_scan_control_for_testing->fault.load() ==
-            Windows_conpty_descendant_scan_fault_for_testing::ACTIVE_FAMILY_ALLOCATION)
-        {
-            ++m_scan_control_for_testing->injected_failures;
-            throw std::bad_alloc();
-        }
-    }
-
-    std::optional<std::set<std::uint32_t>> begin_scan()
-    {
-        const std::lock_guard lock(m_mutex);
-        if (!enabled()) {
-            return std::nullopt;
-        }
-        retire_empty_jobs();
-        auto members = member_pids();
-        if (!members) {
-            m_observed_escape = true;
-        }
-        return members;
-    }
-
-    Candidates prepare_scan(const std::set<std::uint32_t>& members, const Windows_process_parents& first)
-    {
-        const std::lock_guard lock(m_mutex);
-        if (!enabled()) {
-            return {};
-        }
-        return prepare_windows_descendants(*this, members, first);
-    }
-
-    void finish_scan(const Candidates& candidates, const Windows_process_parents& second)
-    {
-        const std::lock_guard lock(m_mutex);
-        if (enabled()) {
-            adopt_windows_descendants(*this, candidates, second);
-        }
-    }
-
-    void scan_failed()
-    {
-        const std::lock_guard lock(m_mutex);
-        if (enabled()) {
-            m_observed_escape = true;
-        }
-    }
-
-    void terminate() noexcept
-    {
-        const std::lock_guard lock(m_mutex);
-        // Serializing with scan commit makes adoption after the last termination
-        // request impossible. The same Jobs remain available for settlement.
-        m_enabled.store(false, std::memory_order_release);
-        for (const auto& job : m_jobs) {
-            (void)TerminateJobObject(job.get(), 1U);
-        }
-    }
-
-    bool settled()
-    {
-        const std::lock_guard lock(m_mutex);
-        retire_empty_jobs();
-        return m_jobs.empty();
-    }
-
-    std::size_t job_count() const
-    {
-        const std::lock_guard lock(m_mutex);
-        return m_jobs.size();
-    }
-
-    bool append_cpu(std::uint64_t& ticks, bool& observed_escape) const
-    {
-        const std::lock_guard lock(m_mutex);
-        observed_escape = m_observed_escape;
-        std::uint64_t total = m_retired_cpu_ticks;
-        for (const auto& job : m_jobs) {
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-            if (!query_accounting(job.get(), accounting) || !add_ticks(total, accounting)) {
-                return false;
-            }
-        }
-        if (total > std::numeric_limits<std::uint64_t>::max() - ticks) {
-            return false;
-        }
-        ticks += total;
-        return true;
-    }
-
-    bool append_processes(Process_snapshot& snapshot) const
-    {
-        const std::lock_guard lock(m_mutex);
-        for (const auto& job : m_jobs) {
-            auto members = sample_job_processes(job.get());
-            if (!members) {
-                return false;
-            }
-            snapshot.processes.insert(snapshot.processes.end(),
-                std::make_move_iterator(members->processes.begin()),
-                std::make_move_iterator(members->processes.end()));
-        }
-        return true;
-    }
-
-    // The following source methods run only inside a scan phase's ownership lock.
-    std::optional<std::set<std::uint32_t>> member_pids() const
-    {
-        if (m_scan_control_for_testing && m_scan_control_for_testing->fault.load() ==
-            Windows_conpty_descendant_scan_fault_for_testing::MEMBER_QUERY)
-        {
-            ++m_scan_control_for_testing->injected_failures;
-            return std::nullopt;
-        }
-        std::set<std::uint32_t> members;
-        const auto append = [&](HANDLE job) {
-            const auto pids = job_member_pids(job);
-            if (!pids) {
-                return false;
-            }
-            members.insert(pids->begin(), pids->end());
-            return true;
-        };
-        if (!append(m_root_job.get())) {
-            return std::nullopt;
-        }
-        for (const auto& job : m_jobs) {
-            if (!append(job.get())) {
-                return std::nullopt;
-            }
-        }
-        if (m_scan_control_for_testing) {
-            ++m_scan_control_for_testing->successful_member_queries;
-        }
-        return members;
-    }
-
-    std::optional<Process> open_parent(std::uint32_t pid) const
-    {
-        return open(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE);
-    }
-
-    std::optional<Process> open_child(std::uint32_t pid) const
-    {
-        return open(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_SET_QUOTA | PROCESS_TERMINATE);
-    }
-
-    std::optional<bool> owned_membership(const Process& process) const
-    {
-        bool failed = false;
-        const auto belongs = [&](HANDLE job) {
-            BOOL member = FALSE;
-            if (!IsProcessInJob(process.get(), job, &member)) {
-                failed = true;
-                return false;
-            }
-            return member != FALSE;
-        };
-        if (belongs(m_root_job.get())) {
-            return true;
-        }
-        for (const auto& job : m_jobs) {
-            if (belongs(job.get())) {
-                return true;
-            }
-        }
-        return failed ? std::nullopt : std::optional<bool>(false);
-    }
-
-    bool running(const Process& process) const
-    {
-        return WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT;
-    }
-
-    std::optional<std::uint64_t> creation_time(const Process& process) const
-    {
-        FILETIME creation{}, exit{}, kernel{}, user{};
-        if (!GetProcessTimes(process.get(), &creation, &exit, &kernel, &user)) {
-            return std::nullopt;
-        }
-        return ((std::uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
-    }
-
-    void adopt(const Process& process)
-    {
-        m_observed_escape = true;
-        auto created = create_process_tree_job();
-        if (!created.handle) {
-            return;
-        }
-        // Allocate custody before assignment. No throwing operation may lose
-        // a newly assigned Job between successful adoption and retention.
-        m_jobs.push_back(std::move(created.handle));
-        if (!AssignProcessToJobObject(m_jobs.back().get(), process.get())) {
-            m_jobs.pop_back();
-        }
-    }
-
-private:
-    static std::optional<Process> open(std::uint32_t pid, DWORD access)
-    {
-        Process process(OpenProcess(access, FALSE, pid));
-        if (!process) {
-            return std::nullopt;
-        }
-        return process;
-    }
-
-    static bool query_accounting(HANDLE job, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION& accounting)
-    {
-        return QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
-            &accounting, sizeof(accounting), nullptr) != FALSE;
-    }
-
-    static bool add_ticks(std::uint64_t& total, const JOBOBJECT_BASIC_ACCOUNTING_INFORMATION& accounting)
-    {
-        for (const auto ticks : {accounting.TotalKernelTime.QuadPart, accounting.TotalUserTime.QuadPart}) {
-            if (ticks < 0 || (std::uint64_t)ticks > std::numeric_limits<std::uint64_t>::max() - total) {
-                return false;
-            }
-            total += (std::uint64_t)ticks;
-        }
-        return true;
-    }
-
-    void retire_empty_jobs()
-    {
-        std::erase_if(m_jobs, [&](const auto& job) {
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-            if (!query_accounting(job.get(), accounting) || accounting.ActiveProcesses != 0) {
-                return false;
-            }
-            auto total = m_retired_cpu_ticks;
-            if (!add_ticks(total, accounting)) {
-                return false;
-            }
-            // Windows reports cumulative process CPU, including CPU credited
-            // at assignment. Preserve every tick, also after Job retirement.
-            m_retired_cpu_ticks = total;
-            return true;
-        });
-    }
-
-    mutable std::mutex m_mutex;
-    Unique_handle m_root_job;
-    std::vector<Unique_handle> m_jobs;
-    std::uint64_t m_retired_cpu_ticks = 0;
-    std::atomic_bool m_enabled{false};
-    bool m_observed_escape = false;
-    std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> m_scan_control_for_testing;
-};
-
-class Descendant_scanner
-{
-public:
-    static Descendant_scanner& instance()
-    {
-        static Descendant_scanner scanner;
-        return scanner;
-    }
-
-    void reserve(const std::shared_ptr<Descendant_job_family>& family)
-    {
-        const std::lock_guard lock(m_mutex);
-        std::erase_if(m_families, [](const auto& entry) { return entry.expired(); });
-        m_families.push_back(family);
-    }
-
-    void enable(const std::shared_ptr<Descendant_job_family>& family)
-    {
-        const std::lock_guard lock(m_mutex);
-        family->enable();
-        m_changed.notify_one();
-    }
-
-    ~Descendant_scanner()
-    {
-        {
-            const std::lock_guard lock(m_mutex);
-            m_stopping = true;
-            m_changed.notify_one();
-        }
-        m_worker.join();
-    }
-
-private:
-    Descendant_scanner()
-    :
-        m_worker([this] { run(); })
-    {}
-
-    void run()
-    {
-        std::unique_lock lock(m_mutex);
-        while (!m_stopping) {
-            std::vector<std::shared_ptr<Descendant_job_family>> active;
-            try {
-                std::erase_if(m_families, [](const auto& entry) { return entry.expired(); });
-                for (const auto& entry : m_families) {
-                    if (auto family = entry.lock(); family && family->enabled()) {
-                        family->prepare_collection_for_testing();
-                        active.push_back(std::move(family));
-                    }
-                }
-            }
-            catch (const std::bad_alloc&) {
-                // Collection may fail before a family reaches active. Visit
-                // the registry without allocating so none lose the failure.
-                for (const auto& entry : m_families) {
-                    if (auto family = entry.lock()) {
-                        family->scan_failed();
-                    }
-                }
-                m_changed.wait_for(lock, std::chrono::milliseconds(100));
-                continue;
-            }
-            if (active.empty()) {
-                m_changed.wait(lock);
-                continue;
-            }
-            // Registration and family cleanup never wait for global snapshots.
-            // Every family shares S1 and S2, with exact candidate handles held
-            // across S2 and admission serialized against its own termination.
-            lock.unlock();
-            try {
-                Windows_process_snapshots snapshots;
-                scan_windows_descendant_families<Descendant_job_family>(active, snapshots);
-            }
-            catch (const std::exception& error) {
-                for (const auto& family : active) {
-                    family->scan_failed();
-                }
-                if (!std::exchange(m_scan_error_reported, true)) {
-                    qWarning("ConPTY descendant scan failed: %s", error.what());
-                }
-            }
-            active.clear();
-            lock.lock();
-            if (!m_stopping) {
-                m_changed.wait_for(lock, std::chrono::milliseconds(100));
-            }
-        }
-    }
-
-    std::mutex m_mutex;
-    std::condition_variable m_changed;
-    std::vector<std::weak_ptr<Descendant_job_family>> m_families;
-    bool m_stopping = false;
-    bool m_scan_error_reported = false;
-    std::thread m_worker;
-};
 
 struct Queued_write
 {
@@ -1249,8 +848,9 @@ std::vector<std::byte> initialized_attribute_list_storage(
 class Windows_conpty_backend::Impl
 {
 public:
-    Impl()
-        : m_cleanup(this,
+    explicit Impl(std::shared_ptr<Windows_terminal_lifecycle> lifecycle)
+        : m_lifecycle(std::move(lifecycle)),
+          m_cleanup(this,
             [](void* context) noexcept {
                 auto* impl = static_cast<Impl*>(context);
                 wait_for_native_backend_public_calls(impl->call_state());
@@ -1295,12 +895,7 @@ public:
         if (user_ticks > std::numeric_limits<std::uint64_t>::max() - kernel_ticks) {
             return std::nullopt;
         }
-        auto ticks = user_ticks + kernel_ticks;
-        bool observed_escape = false;
-        if (!m_descendants->append_cpu(ticks, observed_escape)) {
-            return std::nullopt;
-        }
-        const auto cumulative = ticks / 10U;
+        const auto cumulative = (user_ticks + kernel_ticks) / 10U;
         const auto sampled_at = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         const auto processor_count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -1311,7 +906,7 @@ public:
             cumulative,
             static_cast<std::uint64_t>(sampled_at),
             static_cast<std::uint32_t>(processor_count),
-            observed_escape ? Process_cpu_scope::OBSERVED_FAMILY : Process_cpu_scope::WORKLOAD_FAMILY};
+            Process_cpu_scope::WORKLOAD_FAMILY};
     }
 
     std::optional<Process_snapshot> process_snapshot() const
@@ -1320,13 +915,7 @@ public:
         if (!m_process_assigned_to_job || !m_process_job) {
             return std::nullopt;
         }
-        auto snapshot = sample_job_processes(m_process_job.get());
-        if (!snapshot || !m_descendants->append_processes(*snapshot)) {
-            return std::nullopt;
-        }
-        snapshot->sampled_at_usec = (std::uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        return snapshot;
+        return sample_job_processes(m_process_job.get());
     }
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing()
@@ -1346,7 +935,6 @@ public:
             bool(m_process),
             m_process_assigned_to_job,
             m_native_cleanup_settled,
-            m_descendants ? m_descendants->job_count() : 0U,
         };
     }
 
@@ -1367,17 +955,6 @@ public:
             return false;
         }
         m_cpu_observer_for_testing = std::move(observer);
-        return true;
-    }
-
-    bool set_descendant_scan_control_for_testing(
-        std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> control)
-    {
-        const std::lock_guard lock(m_mutex);
-        if (m_start_attempted || m_start_in_progress) {
-            return false;
-        }
-        m_descendant_scan_control_for_testing = std::move(control);
         return true;
     }
 
@@ -1442,12 +1019,16 @@ public:
             Terminal_backend_error_code code,
             QString                     message,
             bool                        native_dispatch_occurred = false) {
-            return reject_native_backend_start_attempt(
+            auto result = reject_native_backend_start_attempt(
                 callbacks,
                 start_gate,
                 code,
                 std::move(message),
                 native_dispatch_occurred);
+            if (m_lifecycle_prepared) {
+                request_deferred_cleanup();
+            }
+            return result;
         };
 
         const std::optional<QString> resolved_executable =
@@ -1600,16 +1181,26 @@ public:
                         process_job_result.error_code));
         }
         Unique_handle process_job = std::move(process_job_result.handle);
-        std::shared_ptr<Descendant_job_family> descendants;
-        try {
-            descendants = std::make_shared<Descendant_job_family>(
-                process_job.get(), m_descendant_scan_control_for_testing);
-            Descendant_scanner::instance().reserve(descendants);
-        }
-        catch (const std::exception& error) {
-            return reject_start(Terminal_backend_error_code::START_FAILED,
-                QStringLiteral("cannot reserve ConPTY descendant scanner: %1")
-                    .arg(QString::fromLocal8Bit(error.what())));
+        if (m_lifecycle) {
+            // An entered extension owns one admission attempt, even if no
+            // child is born. Retain its borrowed Job through deferred cleanup.
+            {
+                const std::lock_guard lock(m_mutex);
+                m_process_job = std::move(process_job);
+                m_api = *conpty_api;
+                m_close_owner = std::move(close_owner);
+                m_conpty = std::exchange(local_conpty, nullptr);
+                m_window_observer = std::move(window_observer);
+                m_input_write = std::move(pty_input_write);
+                m_output_read = std::move(pty_output_read);
+                m_start_attempted = true;
+                m_lifecycle_prepared = true;
+            }
+            const QString error = prepare_lifecycle();
+            if (!error.isEmpty()) {
+                DeleteProcThreadAttributeList(attribute_list);
+                return reject_start(Terminal_backend_error_code::START_FAILED, error);
+            }
         }
 
         // A process hosting terminals may suppress loader and critical-error
@@ -1669,16 +1260,18 @@ public:
         // The ordinary wait worker continues that custody after start returns.
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_api                = *conpty_api;
-            m_close_owner        = std::move(close_owner);
-            m_conpty             = local_conpty;
-            local_conpty         = nullptr;
-            m_window_observer    = std::move(window_observer);
+            if (local_conpty != nullptr) {
+                m_api             = *conpty_api;
+                m_close_owner     = std::move(close_owner);
+                m_conpty          = std::exchange(local_conpty, nullptr);
+                m_window_observer = std::move(window_observer);
+                m_input_write     = std::move(pty_input_write);
+                m_output_read     = std::move(pty_output_read);
+            }
             m_callbacks          = std::move(callbacks);
-            m_input_write        = std::move(pty_input_write);
-            m_output_read        = std::move(pty_output_read);
-            m_process_job        = std::move(process_job);
-            m_descendants        = std::move(descendants);
+            if (process_job) {
+                m_process_job = std::move(process_job);
+            }
             m_process            = std::move(process_handle);
             m_process_assigned_to_job = false;
             m_native_cleanup_settled = false;
@@ -1739,12 +1332,14 @@ public:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_process_assigned_to_job = true;
             }
-            Descendant_scanner::instance().enable(m_descendants);
-            const bool inject_resume_failure =
-                m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE;
-            if (inject_resume_failure || ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
-                post_birth_failure = windows_error_message(QStringLiteral("ResumeThread"),
-                    inject_resume_failure ? ERROR_ACCESS_DENIED : GetLastError());
+            post_birth_failure = admit_lifecycle_root();
+            if (post_birth_failure.isEmpty()) {
+                const bool inject_resume_failure =
+                    m_start_fault_for_testing == Windows_conpty_start_fault_for_testing::THREAD_RESUME_FAILURE;
+                if (inject_resume_failure || ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+                    post_birth_failure = windows_error_message(QStringLiteral("ResumeThread"),
+                        inject_resume_failure ? ERROR_ACCESS_DENIED : GetLastError());
+                }
             }
         }
         if (!post_birth_failure.isEmpty()) {
@@ -1753,9 +1348,6 @@ public:
                 m_stopping = true;
                 m_exit_reason_override = Terminal_exit_reason::FAILED_TO_START;
             }
-            // An empty Job says nothing about an unassigned suspended root.
-            // Always terminate that exact process handle independently.
-            request_native_process_tree_termination();
             report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
                 Terminal_backend_error_code::START_FAILED, post_birth_failure);
         }
@@ -1771,7 +1363,12 @@ public:
             [this] {
                 write_loop();
             },
-            [this] {
+            [this, failed_start = !post_birth_failure.isEmpty()] {
+                // The suspended root cannot exit until cleanup requests it.
+                // Host cleanup may wait, so it belongs to this native worker.
+                if (failed_start) {
+                    request_native_process_tree_termination();
+                }
                 wait_loop();
             },
             [this](const std::exception& error) {
@@ -1792,6 +1389,10 @@ public:
             // bounded response. Returning from start is not settlement.
             worker_result.start_outcome_determinate = false;
         }
+        if (!post_birth_failure.isEmpty()) {
+            return backend_start_reject(Terminal_backend_error_code::START_FAILED,
+                std::move(post_birth_failure), true, false);
+        }
         if (!is_backend_rejection(worker_result)) {
             Terminal_backend_result resize_worker_result = start_resize_worker();
             if (is_backend_rejection(resize_worker_result)) {
@@ -1799,12 +1400,6 @@ public:
                 resize_worker_result.start_outcome_determinate = false;
                 worker_result = std::move(resize_worker_result);
             }
-        }
-        if (!post_birth_failure.isEmpty()) {
-            // The logical start failed. Native cleanup is a separate result:
-            // keep the wait worker, Job and process until exact settlement.
-            return backend_start_reject(Terminal_backend_error_code::START_FAILED,
-                std::move(post_birth_failure), true, native_process_tree_settled());
         }
         return worker_result;
     }
@@ -2142,21 +1737,11 @@ public:
             [this, process, process_job, policy] {
                 termination_escalation_loop(process, process_job, policy);
             },
-            [this, process, process_job](const std::exception& error) {
-                m_descendants->terminate();
+            [this](const std::exception& error) {
                 const QString message =
                     QStringLiteral("ConPTY termination escalation worker failed: %1")
                         .arg(QString::fromLocal8Bit(error.what()));
-                if (!TerminateJobObject(process_job, 1U)) {
-                    const DWORD terminate_job_error = GetLastError();
-                    TerminateProcess(process, 1U);
-                    return
-                        backend_stop_error(
-                            windows_error_message(
-                                QStringLiteral("TerminateJobObject"),
-                                terminate_job_error));
-                }
-
+                request_deferred_cleanup();
                 return backend_stop_error(message);
             });
     }
@@ -2205,7 +1790,6 @@ public:
         m_output_read.reset();
         m_process.reset();
         m_process_job.reset();
-        m_descendants.reset();
         m_process_assigned_to_job = false;
         m_reader_thread_handle.reset();
         m_writer_thread_handle.reset();
@@ -2495,6 +2079,9 @@ private:
                 break;
             }
 
+            if (m_lifecycle) {
+                m_lifecycle->io_activity();
+            }
             mark_child_output_observed();
             deliver_or_buffer_output(QByteArray(
                 buffer.data(),
@@ -2792,6 +2379,9 @@ private:
                 };
             }
 
+            if (m_lifecycle) {
+                m_lifecycle->io_activity();
+            }
             offset += static_cast<qsizetype>(bytes_written);
         }
 
@@ -2881,7 +2471,7 @@ private:
             return;
         }
 
-        m_descendants->terminate();
+        begin_lifecycle_cleanup();
         if (!TerminateJobObject(process_job, 1U)) {
             const DWORD terminate_job_error = GetLastError();
             TerminateProcess(process, 1U);
@@ -2906,9 +2496,68 @@ private:
             QStringLiteral("ConPTY process remained active after forced termination"));
     }
 
+    QString prepare_lifecycle()
+    {
+        try {
+            std::string error;
+            if (m_lifecycle->prepare(m_process_job.get(), &error)) {
+                return {};
+            }
+            return QStringLiteral("Windows terminal lifecycle preparation failed: %1")
+                .arg(QString::fromStdString(error));
+        }
+        catch (const std::exception& error) {
+            return QStringLiteral("Windows terminal lifecycle preparation failed: %1")
+                .arg(QString::fromLocal8Bit(error.what()));
+        }
+        catch (...) {
+            return QStringLiteral("Windows terminal lifecycle preparation failed");
+        }
+    }
+
+    QString admit_lifecycle_root()
+    {
+        if (!m_lifecycle) {
+            return {};
+        }
+        try {
+            std::string error;
+            if (m_lifecycle->root_admitted(m_process.get(), &error)) {
+                return {};
+            }
+            return QStringLiteral("Windows terminal lifecycle admission failed: %1")
+                .arg(QString::fromStdString(error));
+        }
+        catch (const std::exception& error) {
+            return QStringLiteral("Windows terminal lifecycle admission failed: %1")
+                .arg(QString::fromLocal8Bit(error.what()));
+        }
+        catch (...) {
+            return QStringLiteral("Windows terminal lifecycle admission failed");
+        }
+    }
+
+    void begin_lifecycle_cleanup() noexcept
+    {
+        const std::lock_guard lock(m_lifecycle_mutex);
+        if (m_lifecycle_prepared && !m_lifecycle_cleanup_begun) {
+            m_lifecycle_cleanup_begun = true;
+            m_lifecycle->begin_cleanup();
+        }
+    }
+
+    void finish_lifecycle_cleanup() noexcept
+    {
+        const std::lock_guard lock(m_lifecycle_mutex);
+        if (m_lifecycle_prepared && !m_lifecycle_cleanup_finished) {
+            m_lifecycle_cleanup_finished = true;
+            m_lifecycle->finish_cleanup();
+        }
+    }
+
     void terminate_process_tree_after_root_exit()
     {
-        m_descendants->terminate();
+        begin_lifecycle_cleanup();
         HANDLE process_job = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -2928,10 +2577,8 @@ private:
 
     void request_native_process_tree_termination() noexcept
     {
+        begin_lifecycle_cleanup();
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_descendants) {
-            m_descendants->terminate();
-        }
         if (m_process_assigned_to_job && m_process_job) {
             (void)TerminateJobObject(m_process_job.get(), 1U);
         }
@@ -2967,9 +2614,6 @@ private:
                 return false;
             }
         }
-        if (m_descendants && !m_descendants->settled()) {
-            return false;
-        }
         m_native_cleanup_settled = true;
         return true;
     }
@@ -2983,6 +2627,7 @@ private:
             request_native_process_tree_termination();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        finish_lifecycle_cleanup();
     }
 
     bool query_cpu_accounting(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION& accounting, const char* event) const
@@ -3074,11 +2719,16 @@ private:
     Unique_handle                      m_input_write;
     Unique_handle                      m_output_read;
     Unique_handle                      m_process_job;
-    std::shared_ptr<Descendant_job_family> m_descendants;
     Unique_handle                      m_process;
     Unique_handle                      m_reader_thread_handle;
     Unique_handle                      m_writer_thread_handle;
     std::unique_ptr<Conpty_close_owner> m_close_owner;
+    // Declared before cleanup ownership so it survives that owner's retirement.
+    std::shared_ptr<Windows_terminal_lifecycle> m_lifecycle;
+    std::mutex                         m_lifecycle_mutex;
+    bool                               m_lifecycle_prepared = false;
+    bool                               m_lifecycle_cleanup_begun = false;
+    bool                               m_lifecycle_cleanup_finished = false;
     Native_backend_cleanup_reservation m_cleanup;
     std::thread                        m_reader_thread;
     std::thread                        m_writer_thread;
@@ -3108,7 +2758,6 @@ private:
     Windows_conpty_start_fault_for_testing m_start_fault_for_testing =
         Windows_conpty_start_fault_for_testing::NONE;
     Windows_conpty_cpu_observer_for_testing m_cpu_observer_for_testing;
-    std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> m_descendant_scan_control_for_testing;
     bool m_cleanup_observation_blocked_for_testing = false;
     std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
     std::shared_ptr<Windows_conpty_close_control_for_testing> m_close_control_for_testing;
@@ -3132,9 +2781,9 @@ private:
     bool                               m_interrupt_clear_waits_for_output = false;
 };
 
-Windows_conpty_backend::Windows_conpty_backend()
+Windows_conpty_backend::Windows_conpty_backend(std::shared_ptr<Windows_terminal_lifecycle> lifecycle)
 :
-    m_impl(std::make_unique<Impl>())
+    m_impl(std::make_unique<Impl>(std::move(lifecycle)))
 {}
 
 Windows_conpty_backend::~Windows_conpty_backend()
@@ -3242,12 +2891,6 @@ bool Windows_conpty_backend::set_cpu_observer_for_testing(Windows_conpty_cpu_obs
     return m_impl->set_cpu_observer_for_testing(std::move(observer));
 }
 
-bool Windows_conpty_backend::set_descendant_scan_control_for_testing(
-    std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> control)
-{
-    return m_impl->set_descendant_scan_control_for_testing(std::move(control));
-}
-
 void Windows_conpty_backend::set_cleanup_observation_blocked_for_testing(bool blocked)
 {
     m_impl->set_cleanup_observation_blocked_for_testing(blocked);
@@ -3270,9 +2913,10 @@ bool Windows_conpty_backend::set_resize_control_for_testing(
     return m_impl->set_resize_control_for_testing(std::move(control));
 }
 
-std::unique_ptr<Terminal_backend> make_windows_conpty_backend()
+std::unique_ptr<Terminal_backend> make_windows_conpty_backend(
+    std::shared_ptr<Windows_terminal_lifecycle> lifecycle)
 {
-    return std::make_unique<Windows_conpty_backend>();
+    return std::make_unique<Windows_conpty_backend>(std::move(lifecycle));
 }
 
 }

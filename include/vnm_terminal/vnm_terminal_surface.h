@@ -8,6 +8,7 @@
 #include "vnm_terminal/process_snapshot.h"
 #include "vnm_terminal/terminal_message_submission.h"
 #include "vnm_terminal/terminal_process_owner.h"
+#include "vnm_terminal/windows_terminal_lifecycle.h"
 #include "vnm_terminal/terminal_touch_selection.h"
 
 #include <QQuickItem>
@@ -807,6 +808,9 @@ public:
      * Starts one terminal child from explicit semantic inputs.
      * An omitted owner uses the built-in native lifetime policy. A supplied
      * POSIX owner is selected before birth; its failure never selects a fallback.
+     * Windows hosts can instead supply a retained native lifecycle extension
+     * as the third argument, with an empty POSIX owner. Its failure also rejects
+     * admission without selecting another implementation.
      *
      * `base_environment` is a caller-captured, policy-sanitized snapshot. The
      * optional capability contribution remains separate until this call and
@@ -818,7 +822,8 @@ public:
      */
     vnm_terminal::Terminal_process_start_result start_terminal(
         vnm_terminal::Terminal_process_start_request request,
-        std::unique_ptr<vnm_terminal::Terminal_process_owner> owner = {});
+        std::unique_ptr<vnm_terminal::Terminal_process_owner> owner = {},
+        std::shared_ptr<vnm_terminal::Windows_terminal_lifecycle> windows_lifecycle = {});
     // An aggregate whose scope states native or observed family coverage.
     // Absence means accounting is unavailable; it is not zero usage.
     std::optional<vnm_terminal::process_cpu_time_t> process_cpu_time() const;
@@ -1013,7 +1018,8 @@ private:
 
     vnm_terminal::Terminal_process_start_result start_native_terminal(
         vnm_terminal::internal::Terminal_launch_config launch_config,
-        std::unique_ptr<vnm_terminal::Terminal_process_owner> owner);
+        std::unique_ptr<vnm_terminal::Terminal_process_owner> owner,
+        std::shared_ptr<vnm_terminal::Windows_terminal_lifecycle> windows_lifecycle);
 
     vnm_terminal::Terminal_process_start_result start_backend_terminal(
         std::unique_ptr<vnm_terminal::internal::Terminal_backend>

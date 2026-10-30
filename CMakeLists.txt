@@ -374,6 +374,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/terminal_canvas_export.h
     include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/terminal_process_owner.h
+    include/vnm_terminal/windows_terminal_lifecycle.h
     include/vnm_terminal/keyboard_modifiers.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/native_backend_cleanup_owner.h
@@ -419,7 +420,6 @@ endif()
 if(WIN32)
     target_sources(vnm_terminal_surface PRIVATE
         src/windows_conpty_backend.cpp
-        src/windows_descendant_adoption.h
     )
     include(cmake/vnm_terminal_conpty_dependency.cmake)
     target_compile_definitions(vnm_terminal_surface PRIVATE
@@ -567,6 +567,7 @@ endif()
 
 install(FILES
     include/vnm_terminal/terminal_process_owner.h
+    include/vnm_terminal/windows_terminal_lifecycle.h
     include/vnm_terminal/process_cpu_time.h
     include/vnm_terminal/process_snapshot.h
     include/vnm_terminal/terminal_canvas_appearance.h
