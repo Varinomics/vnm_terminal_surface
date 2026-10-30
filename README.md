@@ -65,13 +65,13 @@ installation, see [CMake consumers](docs/repository_guide.md#cmake-consumers).
 
 ## Documentation
 
-- [Build and packaging guide](docs/repository_guide.md) — build options,
+- [Build and packaging guide](docs/repository_guide.md) - build options,
   installation, Windows runtime packaging, and tests.
-- [Public surface reference](docs/public_surface.md) — properties, process
+- [Public surface reference](docs/public_surface.md) - properties, process
   launch, input, selection, scrolling, and signals.
-- [Terminal sequence matrix](docs/terminal_sequence_matrix.md) — supported
+- [Terminal sequence matrix](docs/terminal_sequence_matrix.md) - supported
   terminal behavior.
-- [Documentation index](docs/README.md) — architecture, rendering, Unicode,
+- [Documentation index](docs/README.md) - architecture, rendering, Unicode,
   diagnostics, and other reference material.
 
 ## License
