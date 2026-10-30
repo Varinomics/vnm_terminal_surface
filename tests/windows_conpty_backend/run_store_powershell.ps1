@@ -1,11 +1,15 @@
 param(
-    [string]$TestExecutable = (Join-Path $PSScriptRoot 'vnm_terminal_windows_conpty_backend.exe'),
+    [string]$TestExecutable,
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
     [ValidateSet('store-root', 'packaged-descendants')][string]$Scenario = 'store-root',
     [switch]$Worker
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 -File initializes PSScriptRoot after parameter defaults.
+if (-not $PSBoundParameters.ContainsKey('TestExecutable')) {
+    $TestExecutable = Join-Path $PSScriptRoot 'vnm_terminal_windows_conpty_backend.exe'
+}
 $TestExecutable = (Resolve-Path -LiteralPath $TestExecutable).Path
 $null = New-Item -ItemType Directory -Path $EvidenceDirectory -Force
 $EvidenceDirectory = (Resolve-Path -LiteralPath $EvidenceDirectory).Path
