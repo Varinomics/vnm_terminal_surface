@@ -1,5 +1,6 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
+#include "store_powershell_fixture.h"
 #include "../posix_pty_backend/callback_lifetime_checks.h"
 #include "../posix_pty_backend/native_session_checks.h"
 #include "../../src/native_backend_io_core.h"
@@ -30,6 +31,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <appmodel.h>
 #include <tlhelp32.h>
 #include <algorithm>
 #include <array>
@@ -931,6 +933,130 @@ term::Terminal_launch_config launch_config(
     config.identity.term      = QStringLiteral("xterm-256color");
     config.identity.colorterm = QStringLiteral("truecolor");
     return config;
+}
+
+bool check_store_root_identity(HANDLE job, HANDLE root, const QString& package, const QString& executable)
+{
+    BOOL in_job = FALSE;
+    const bool membership_queried = IsProcessInJob(root, job, &in_job);
+    const DWORD membership_error = membership_queried ? ERROR_SUCCESS : GetLastError();
+    if (!check(membership_queried && in_job,
+            "the original backend-retained Store root belongs to the terminal Job"))
+    {
+        std::cerr << "IsProcessInJob: member=" << in_job << " error=" << membership_error << '\n';
+        return false;
+    }
+
+    UINT32 package_length = 0;
+    LONG status = GetPackageFullName(root, &package_length, nullptr);
+    if (!check(status == ERROR_INSUFFICIENT_BUFFER, "the running root has a package identity")) {
+        std::cerr << "GetPackageFullName: " << status << '\n';
+        return false;
+    }
+    std::vector<wchar_t> package_name(package_length);
+    status = GetPackageFullName(root, &package_length, package_name.data());
+    if (!check(status == ERROR_SUCCESS, "the running root package identity is readable")) {
+        std::cerr << "GetPackageFullName: " << status << '\n';
+        return false;
+    }
+
+    std::vector<wchar_t> image(32768);
+    DWORD image_length = (DWORD)image.size();
+    if (!check(QueryFullProcessImageNameW(root, 0, image.data(), &image_length),
+            "the original backend-retained Store root image is readable"))
+    {
+        std::cerr << "QueryFullProcessImageNameW: " << GetLastError() << '\n';
+        return false;
+    }
+    const QString actual_package = QString::fromWCharArray(package_name.data());
+    const QString actual_image   = QString::fromWCharArray(image.data(), image_length);
+    std::cout << "Store root pid=" << GetProcessId(root) << " terminal_job_member=true\n"
+        << "Store root package=" << actual_package.toUtf8().constData() << '\n'
+        << "Store root image=" << actual_image.toUtf8().constData() << '\n';
+    const QString canonical_image = QFileInfo(actual_image).canonicalFilePath();
+    const QString canonical_expected = QFileInfo(executable).canonicalFilePath();
+    bool ok = check(actual_package == package, "the root uses the discovered MSIX package");
+    ok &= check(!canonical_image.isEmpty() && !canonical_expected.isEmpty() &&
+            canonical_image.compare(canonical_expected, Qt::CaseInsensitive) == 0,
+        "the root runs the discovered package executable");
+    return ok;
+}
+
+int test_store_powershell_root()
+{
+    BOOL host_in_job = FALSE;
+    if (!check(IsProcessInJob(GetCurrentProcess(), nullptr, &host_in_job),
+            "the Store launch test can identify its host Job context"))
+    {
+        return 1;
+    }
+    std::cout << "Store launch host pid=" << GetCurrentProcessId()
+        << " in_any_job=" << (host_in_job ? "true" : "false") << '\n';
+    if (host_in_job) {
+        std::cout << "SKIP: Store launch regression coverage requires a host outside every Job; "
+            "launch outside terminal sessions (for example through Win32_Process.Create).\n";
+        return 77;
+    }
+
+    QString package, executable;
+    const int discovery = vnm_terminal::test_helpers::find_store_powershell(package, executable);
+    if (discovery != 0) {
+        return discovery;
+    }
+    std::cout << "Selected Store package=" << package.toUtf8().constData() << '\n'
+        << "Selected Store executable=" << executable.toUtf8().constData() << '\n';
+
+    Backend_capture capture;
+    bool observed = false, identity_ok = false;
+    term::Windows_conpty_backend backend;
+    if (!check(backend.set_cpu_observer_for_testing([
+                &observed, &identity_ok, &package, &executable
+            ](
+                const char* event, void* job, void* root,
+                const term::windows_conpty_cpu_query_for_testing_t&)
+            {
+                if (std::string_view(event) == "sample") {
+                    observed    = true;
+                    identity_ok = check_store_root_identity(job, root, package, executable);
+                }
+            }), "Store root observer is installed before native dispatch"))
+    {
+        return 1;
+    }
+    // The handshake keeps the original root alive while the observer inspects
+    // its retained handle; no PID lookup can accidentally inspect a replacement.
+    const auto result = backend.start(launch_config(executable, {
+        QStringLiteral("-NoLogo"), QStringLiteral("-NoProfile"), QStringLiteral("-NonInteractive"),
+        QStringLiteral("-Command"),
+        QStringLiteral("[Console]::WriteLine('VNM_STORE_ROOT_READY'); "
+            "if ([Console]::ReadLine() -ne 'continue') { exit 24 }; "
+            "[Console]::WriteLine('VNM_STORE_ROOT_DONE'); exit 23")}), capture.callbacks());
+    if (!check(result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "Store PowerShell starts as the ConPTY backend root"))
+    {
+        check_no_backend_errors(capture, "Store PowerShell launch diagnostics");
+        return 1;
+    }
+    if (!check(capture.wait_for_output(QByteArrayLiteral("VNM_STORE_ROOT_READY")),
+            "the Store root executes and emits its readiness marker"))
+    {
+        std::cerr << capture.output_snapshot().constData() << '\n';
+        return 1;
+    }
+    (void)backend.process_cpu_time();
+    bool ok = check(observed && identity_ok, "live Store root identity and terminal Job admission are proven");
+    ok &= check(backend.write(QByteArrayLiteral("continue\r")).code ==
+            term::Terminal_backend_result_code::ACCEPTED,
+        "the Store root receives its exit handshake");
+    ok &= check(capture.wait_for_exit(), "the Store root exits after the handshake");
+    const auto exit = capture.exit_snapshot();
+    ok &= check(exit && exit->reason == term::Terminal_exit_reason::EXITED && exit->exit_code == 23,
+        "the Store root delivers its natural exit status");
+    ok &= check(capture.exit_count_snapshot() == 1 &&
+            capture.output_precedes_exit(QByteArrayLiteral("VNM_STORE_ROOT_DONE")),
+        "Store root output precedes the sole exit notification");
+    ok &= check_no_backend_errors(capture, "Store root launch, I/O and exit report no backend errors");
+    return ok ? 0 : 1;
 }
 
 struct cpu_accounting_process_times_t
@@ -7412,6 +7538,13 @@ bool test_native_cmd_primary_resize_with_text_below_the_cursor()
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--store-powershell-root") {
+        const int result = test_store_powershell_root();
+        if (!wait_for_console_host_children_to_exit("Store PowerShell root")) {
+            return 1;
+        }
+        return result;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
         bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));
         ok &= term::Native_backend_cleanup_reservation::wait_until_idle(

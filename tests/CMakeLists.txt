@@ -2233,6 +2233,29 @@ if(WIN32)
         AUTOMOC OFF
     )
 
+    # Public CI exports this small native harness so Store-package checks can
+    # also run on a workstation without rebuilding the surface there.
+    set(conpty_test_artifact_dir "${PROJECT_BINARY_DIR}/conpty-native-check")
+    add_custom_target(vnm_terminal_windows_conpty_test_artifact
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${conpty_test_artifact_dir}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" "${conpty_test_artifact_dir}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:vnm_terminal_windows_conpty_backend> "${conpty_test_artifact_dir}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/windows_conpty_backend/run_store_powershell.ps1"
+            "${conpty_test_artifact_dir}/"
+        COMMAND "$<TARGET_FILE_DIR:Qt6::Core>/windeployqt.exe"
+            --compiler-runtime --no-translations --no-opengl-sw
+            --dir "${conpty_test_artifact_dir}"
+            "${conpty_test_artifact_dir}/$<TARGET_FILE_NAME:vnm_terminal_windows_conpty_backend>"
+        DEPENDS vnm_terminal_windows_conpty_backend
+        COMMAND_EXPAND_LISTS
+        VERBATIM
+    )
+    vnm_terminal_deploy_conpty(vnm_terminal_windows_conpty_test_artifact
+        DESTINATION "${conpty_test_artifact_dir}")
+
     get_property(vnm_terminal_conpty_package_dir GLOBAL PROPERTY vnm_terminal_conpty_package_dir)
     add_test(NAME vnm_terminal_conpty_runtime_package
         COMMAND "${CMAKE_COMMAND}"
@@ -2265,6 +2288,20 @@ if(WIN32)
     )
     set_tests_properties(vnm_terminal_windows_conpty_process_snapshot PROPERTIES
         LABELS "conformance;windows;conpty;process-snapshot"
+        TIMEOUT 120
+    )
+
+    add_test(
+        NAME vnm_terminal_windows_conpty_store_powershell
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>"
+            --store-powershell-root
+    )
+    set_tests_properties(vnm_terminal_windows_conpty_store_powershell PROPERTIES
+        LABELS "conformance;windows;conpty;store-powershell"
+        SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
 

@@ -1167,6 +1167,11 @@ public:
         // every child that does not opt out. The terminal runs the user's own
         // program, which must behave as it would in any other console, missing
         // DLL dialog included.
+        //
+        // Suspended create -> AssignProcessToJobObject -> ResumeThread keeps
+        // Store PowerShell launchable. JOB_LIST admission (reverted 21187ee)
+        // rejects it with 0xC0070005 in some caller contexts. The unbounded
+        // pre-assignment host-death gap is an accepted lifecycle limit.
         DWORD creation_flags =
             EXTENDED_STARTUPINFO_PRESENT |
             CREATE_UNICODE_ENVIRONMENT |

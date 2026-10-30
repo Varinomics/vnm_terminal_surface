@@ -157,6 +157,51 @@ jobs:
             cmake --build build --config %CMAKE_BUILD_TYPE% --parallel 4
           )
 
+      - name: Export native ConPTY test runtime
+        if: env.VNM_TEST_SCOPE == 'all'
+        shell: cmd
+        run: |
+          call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          cmake --build build --config %CMAKE_BUILD_TYPE% --target vnm_terminal_windows_conpty_test_artifact --parallel 4
+
+      - name: Upload native ConPTY test runtime
+        if: env.VNM_TEST_SCOPE == 'all'
+        uses: actions/upload-artifact@v4
+        with:
+          name: conpty-native-check-windows
+          path: build/conpty-native-check
+          if-no-files-found: error
+
+      - name: Try installing published PowerShell MSIX
+        if: env.VNM_TEST_SCOPE == 'all'
+        shell: powershell
+        run: |
+          ./.github/scripts/prepare_store_powershell.ps1 -EvidenceDirectory "$env:RUNNER_TEMP/store-powershell-evidence"
+
+      - name: Check Store PowerShell root outside runner Job
+        if: env.VNM_TEST_SCOPE == 'all'
+        shell: pwsh
+        run: |
+          & ./build/conpty-native-check/run_store_powershell.ps1 `
+            -EvidenceDirectory "$env:RUNNER_TEMP/store-powershell-evidence/root-check"
+          $result = $LASTEXITCODE
+          if ($result -eq 77) {
+            'Store PowerShell native root coverage: **unavailable (skipped)**; see evidence logs.' >> $env:GITHUB_STEP_SUMMARY
+            Write-Warning 'Store PowerShell root test skipped; this is not a native compatibility pass.'
+            exit 0
+          }
+          if ($result -ne 0) { throw "Store PowerShell root test failed: $result" }
+          'Store PowerShell native root coverage: **passed**, outside every Job.' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Store PowerShell evidence
+        if: always() && env.VNM_TEST_SCOPE == 'all'
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-powershell-evidence-windows
+          path: ${{ runner.temp }}/store-powershell-evidence
+          if-no-files-found: warn
+
       - name: Run tests
         working-directory: build
         env:
@@ -168,7 +213,7 @@ jobs:
           if /I "%VNM_TEST_SCOPE%"=="atlas-report-d3d11" (
             ctest --output-on-failure --no-tests=error -C %CMAKE_BUILD_TYPE% -R "^vnm_terminal_qsg_atlas_report_d3d11$"
           ) else (
-            ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -E "^vnm_terminal_compat_smoke$"
+            ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -E "^(vnm_terminal_compat_smoke|vnm_terminal_windows_conpty_store_powershell)$"
           )
 
       # The package fixture builds a real LCD-only provider and a separate

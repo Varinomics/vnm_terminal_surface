@@ -80,6 +80,45 @@ launch config requests `Terminal_process_group_policy::CREATE_NEW_SESSION`, the
 backend adds `CREATE_NEW_PROCESS_GROUP` to the creation flags; this is the
 Windows mapping of the new-session request.
 
+The root is created with `CREATE_SUSPENDED`, assigned to the backend's
+kill-on-close Job with `AssignProcessToJobObject`, and resumed only after
+assignment succeeds. This sequence preserves Store PowerShell compatibility:
+creation-time `PROC_THREAD_ATTRIBUTE_JOB_LIST` admission can reject that MSIX
+executable with `0xC0070005`, depending on the caller's context (the change in
+commit `21187ee` was reverted).
+
+The creation-to-assignment gap is an accepted containment limit. Between
+`CreateProcessW` returning and `AssignProcessToJobObject`, the launching thread
+can be preempted or suspended; native-resource adoption also takes `m_mutex`.
+The interval has no fixed bound. If the host dies in it, the root can survive
+as a suspended process that has run no code. Removing the gap completely would
+require a different creation path; the backend deliberately keeps the single
+Store-compatible path.
+
+The conditional native check is CTest's
+`vnm_terminal_windows_conpty_store_powershell` entry, or the backend test
+executable's `--store-powershell-root` mode. It discovers the current user's
+registered `Microsoft.PowerShell` package rather than resolving `pwsh` on PATH,
+then checks the live root's package identity, image path and membership in the
+terminal Job through the backend's retained process handle. Output and a natural
+exit are also required. Absence of a registered package returns skip code 77;
+an installed package that fails to start or lacks the expected identity fails.
+
+Run this check outside terminal sessions and outside every Job. The check
+returns 77 when the test host is already in a Job, because that context can mask
+the creation-time admission regression. Windows CI tries Microsoft's published
+PowerShell MSIX and reports unavailable coverage separately from a pass. It
+exports `conpty-native-check-windows`, containing the test executable and its Qt,
+MSVC and ConPTY runtime. After extracting the artifact, run:
+
+```powershell
+./run_store_powershell.ps1 -EvidenceDirectory C:/temp/store-root-check
+```
+
+The script uses `Win32_Process.Create` to launch outside the invoking terminal's
+Job and records the test's own context check and outcome in a fresh evidence
+directory. No local build or package installation is performed by this script.
+
 ### Early-child setup-failure cleanup
 
 The selected process owner reports whether a child was born and whether the
@@ -278,6 +317,12 @@ callback reports the root's state; it does not establish transitive termination
 of every process that the terminal workload may have created. A supplied owner
 documents any stronger cleanup scope it provides.
 
+On Windows, MSIX-packaged descendants can escape the terminal Job into a
+Windows-managed Job. Closing the pseudoconsole can end an escaped process that
+is still attached to it, but an escaped process with its own console can survive
+both pseudoconsole and terminal Job closure. The terminal Job's cleanup scope
+does not include those escaped processes.
+
 ## Exit-Reason Resolution
 
 Exit is reported exactly once. Both backends gate exit reporting on an
@@ -387,8 +432,11 @@ teardown and a root-exit callback do not extend its scope.
 `VNM_TerminalSurface::process_cpu_time()` returns an optional cumulative sample.
 The default POSIX owner reports CPU accounting unavailable. A supplied owner
 can provide a sample with an explicit coverage scope. The Windows native backend
-reports workload-family CPU through its process Job accounting, including CPU
-credited to exited descendants.
+reports `WORKLOAD_FAMILY` through its process Job accounting: the root and
+descendants admitted to that Job, including CPU credited to exited members.
+This is a Job-membership scope, not a guarantee that every process descended
+from the root is included. MSIX-packaged descendants can escape into a separate
+Windows-managed Job; their CPU is absent from the terminal Job's sample.
 
 `OBSERVED_FAMILY` identifies best-effort root and descendant observations and
 can miss short-lived or detached children and work outside the observation
