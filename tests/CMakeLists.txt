@@ -2223,6 +2223,7 @@ if(WIN32)
         windows_conpty_backend/windows_conpty_backend_tests.cpp
         windows_conpty_backend/store_powershell_fixture.cpp
         windows_conpty_backend/packaged_descendant_tests.cpp
+        windows_conpty_backend/descendant_scope_tests.cpp
     )
 
     # Kept out of vnm_terminal_test_process_targets: that setup replaces the
@@ -2238,6 +2239,7 @@ if(WIN32)
 
     target_link_libraries(vnm_terminal_windows_conpty_backend PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
+        shell32
     )
 
     set_target_properties(vnm_terminal_windows_conpty_backend PROPERTIES
@@ -2294,6 +2296,12 @@ if(WIN32)
             "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" --packaged-descendants)
     set_tests_properties(vnm_terminal_windows_conpty_packaged_descendants PROPERTIES
         LABELS "conformance;windows;conpty;containment" SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+    add_test(NAME vnm_terminal_windows_conpty_descendant_scope
+        COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" --descendant-scan-scope)
+    set_tests_properties(vnm_terminal_windows_conpty_descendant_scope PROPERTIES
+        LABELS "conformance;windows;conpty;containment" TIMEOUT 180)
 
     add_test(
         NAME vnm_terminal_windows_conpty_process_snapshot

@@ -341,9 +341,11 @@ public:
     using Process = Unique_handle;
     using Candidates = Windows_descendant_candidates<Process>;
 
-    explicit Descendant_job_family(HANDLE root_job)
+    Descendant_job_family(HANDLE root_job,
+        std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> scan_control)
     :
-        m_root_job(duplicate_handle(root_job))
+        m_root_job(duplicate_handle(root_job)),
+        m_scan_control_for_testing(std::move(scan_control))
     {
         if (!m_root_job) {
             throw std::system_error((int)GetLastError(), std::system_category(), "DuplicateHandle Job");
@@ -353,6 +355,16 @@ public:
     void enable() { m_enabled.store(true, std::memory_order_release); }
     bool enabled() const { return m_enabled.load(std::memory_order_acquire); }
 
+    void prepare_collection_for_testing() const
+    {
+        if (m_scan_control_for_testing && m_scan_control_for_testing->fault.load() ==
+            Windows_conpty_descendant_scan_fault_for_testing::ACTIVE_FAMILY_ALLOCATION)
+        {
+            ++m_scan_control_for_testing->injected_failures;
+            throw std::bad_alloc();
+        }
+    }
+
     std::optional<std::set<std::uint32_t>> begin_scan()
     {
         const std::lock_guard lock(m_mutex);
@@ -360,7 +372,11 @@ public:
             return std::nullopt;
         }
         retire_empty_jobs();
-        return member_pids();
+        auto members = member_pids();
+        if (!members) {
+            m_observed_escape = true;
+        }
+        return members;
     }
 
     Candidates prepare_scan(const std::set<std::uint32_t>& members, const Windows_process_parents& first)
@@ -383,7 +399,9 @@ public:
     void scan_failed()
     {
         const std::lock_guard lock(m_mutex);
-        m_observed_escape = true;
+        if (enabled()) {
+            m_observed_escape = true;
+        }
     }
 
     void terminate() noexcept
@@ -446,6 +464,12 @@ public:
     // The following source methods run only inside a scan phase's ownership lock.
     std::optional<std::set<std::uint32_t>> member_pids() const
     {
+        if (m_scan_control_for_testing && m_scan_control_for_testing->fault.load() ==
+            Windows_conpty_descendant_scan_fault_for_testing::MEMBER_QUERY)
+        {
+            ++m_scan_control_for_testing->injected_failures;
+            return std::nullopt;
+        }
         std::set<std::uint32_t> members;
         const auto append = [&](HANDLE job) {
             const auto pids = job_member_pids(job);
@@ -462,6 +486,9 @@ public:
             if (!append(job.get())) {
                 return std::nullopt;
             }
+        }
+        if (m_scan_control_for_testing) {
+            ++m_scan_control_for_testing->successful_member_queries;
         }
         return members;
     }
@@ -578,6 +605,7 @@ private:
     std::uint64_t m_retired_cpu_ticks = 0;
     std::atomic_bool m_enabled{false};
     bool m_observed_escape = false;
+    std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> m_scan_control_for_testing;
 };
 
 class Descendant_scanner
@@ -628,11 +656,19 @@ private:
                 std::erase_if(m_families, [](const auto& entry) { return entry.expired(); });
                 for (const auto& entry : m_families) {
                     if (auto family = entry.lock(); family && family->enabled()) {
+                        family->prepare_collection_for_testing();
                         active.push_back(std::move(family));
                     }
                 }
             }
             catch (const std::bad_alloc&) {
+                // Collection may fail before a family reaches active. Visit
+                // the registry without allocating so none lose the failure.
+                for (const auto& entry : m_families) {
+                    if (auto family = entry.lock()) {
+                        family->scan_failed();
+                    }
+                }
                 m_changed.wait_for(lock, std::chrono::milliseconds(100));
                 continue;
             }
@@ -1334,6 +1370,17 @@ public:
         return true;
     }
 
+    bool set_descendant_scan_control_for_testing(
+        std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> control)
+    {
+        const std::lock_guard lock(m_mutex);
+        if (m_start_attempted || m_start_in_progress) {
+            return false;
+        }
+        m_descendant_scan_control_for_testing = std::move(control);
+        return true;
+    }
+
     void set_cleanup_observation_blocked_for_testing(bool blocked)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1555,7 +1602,8 @@ public:
         Unique_handle process_job = std::move(process_job_result.handle);
         std::shared_ptr<Descendant_job_family> descendants;
         try {
-            descendants = std::make_shared<Descendant_job_family>(process_job.get());
+            descendants = std::make_shared<Descendant_job_family>(
+                process_job.get(), m_descendant_scan_control_for_testing);
             Descendant_scanner::instance().reserve(descendants);
         }
         catch (const std::exception& error) {
@@ -3060,6 +3108,7 @@ private:
     Windows_conpty_start_fault_for_testing m_start_fault_for_testing =
         Windows_conpty_start_fault_for_testing::NONE;
     Windows_conpty_cpu_observer_for_testing m_cpu_observer_for_testing;
+    std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> m_descendant_scan_control_for_testing;
     bool m_cleanup_observation_blocked_for_testing = false;
     std::shared_ptr<std::atomic_bool> m_cleanup_observation_gate_for_testing;
     std::shared_ptr<Windows_conpty_close_control_for_testing> m_close_control_for_testing;
@@ -3191,6 +3240,12 @@ bool Windows_conpty_backend::set_start_fault_for_testing(Windows_conpty_start_fa
 bool Windows_conpty_backend::set_cpu_observer_for_testing(Windows_conpty_cpu_observer_for_testing observer)
 {
     return m_impl->set_cpu_observer_for_testing(std::move(observer));
+}
+
+bool Windows_conpty_backend::set_descendant_scan_control_for_testing(
+    std::shared_ptr<Windows_conpty_descendant_scan_control_for_testing> control)
+{
+    return m_impl->set_descendant_scan_control_for_testing(std::move(control));
 }
 
 void Windows_conpty_backend::set_cleanup_observation_blocked_for_testing(bool blocked)

@@ -114,6 +114,9 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
     }
     const auto first = snapshots.snapshot();
     if (!first) {
+        for (const auto& scan : scans) {
+            scan.m_family->scan_failed();
+        }
         return;
     }
     bool has_candidates = false;
@@ -126,6 +129,11 @@ void scan_windows_descendant_families(const Families& families, Snapshots& snaps
     }
     const auto second = snapshots.snapshot();
     if (!second) {
+        for (const auto& scan : scans) {
+            if (!scan.m_candidates.empty()) {
+                scan.m_family->scan_failed();
+            }
+        }
         return;
     }
     for (const auto& scan : scans) {

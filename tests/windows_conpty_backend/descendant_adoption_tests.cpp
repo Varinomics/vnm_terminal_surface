@@ -82,13 +82,22 @@ public:
         }
     }
 
+    void scan_failed()
+    {
+        if (enabled) {
+            ++scan_failures;
+        }
+    }
+
     std::optional<term::Windows_process_parents> snapshot()
     {
         ++snapshots;
         if (snapshots % 2 == 0 && during_second_snapshot) {
             during_second_snapshot();
         }
-        if (fail_second_snapshot && snapshots % 2 == 0) {
+        if ((fail_first_snapshot  && snapshots % 2 == 1) ||
+            (fail_second_snapshot && snapshots % 2 == 0))
+        {
             return std::nullopt;
         }
         return parents;
@@ -131,6 +140,8 @@ public:
     std::function<void()> during_second_snapshot;
     std::function<void()> after_adoption;
     int snapshots = 0;
+    int scan_failures = 0;
+    bool fail_first_snapshot = false;
     bool fail_second_snapshot = false;
     bool fail_members = false;
     bool enabled = true;
@@ -268,6 +279,41 @@ bool test_stop_between_shared_snapshots()
         "stop prevents post-S2 admission and other families still validate their retained instances");
 }
 
+bool test_failed_shared_snapshot_reports_affected_families()
+{
+    // CPU accounting documents observed-family scope once discovery fails.
+    // Failure notification must reach each affected family even without adoption.
+    bool ok = true;
+    for (const bool fail_first : {true, false}) {
+        Injected_source first;
+        Injected_source second(300);
+        Injected_source candidate_free(500);
+        Injected_source disabled(700);
+        candidate_free.processes[600]->owned = true;
+        disabled.enabled = false;
+        first.parents.insert(second.parents.begin(), second.parents.end());
+        first.parents.insert(candidate_free.parents.begin(), candidate_free.parents.end());
+        first.parents.insert(disabled.parents.begin(), disabled.parents.end());
+        first.fail_first_snapshot  =  fail_first;
+        first.fail_second_snapshot = !fail_first;
+        const std::vector<Injected_source*> families{&first, &second, &candidate_free, &disabled};
+
+        term::scan_windows_descendant_families<Injected_source>(families, first);
+
+        ok &= check(first.scan_failures == 1 && second.scan_failures == 1,
+            fail_first ? "failed S1 marks every active family with unknown descendants"
+                       : "failed S2 marks every family awaiting candidate validation");
+        ok &= check(candidate_free.scan_failures == (fail_first ? 1 : 0),
+            "a family without candidates needs S1 but does not depend on S2");
+        ok &= check(disabled.scan_failures == 0, "disabled families are not discovery failures");
+        ok &= check(first.adopted.empty() && second.adopted.empty(),
+            "a failed shared snapshot cannot authorize adoption");
+        ok &= check(first.snapshots == (fail_first ? 1 : 2),
+            "failure reporting does not add snapshots or retry a failed pass");
+    }
+    return ok;
+}
+
 }
 
 int main()
@@ -282,5 +328,6 @@ int main()
     ok &= test_membership_changes_during_scan();
     ok &= test_shared_snapshots();
     ok &= test_stop_between_shared_snapshots();
+    ok &= test_failed_shared_snapshot_reports_affected_families();
     return ok ? 0 : 1;
 }

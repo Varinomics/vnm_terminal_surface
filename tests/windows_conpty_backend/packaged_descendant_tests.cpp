@@ -12,6 +12,7 @@
 #include <QTemporaryDir>
 #include <windows.h>
 #include <appmodel.h>
+#include <shellapi.h>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -159,7 +160,9 @@ std::optional<std::uint64_t> process_cpu(HANDLE process)
 
 bool test_lifecycle(const QString& self, const QString& shell, const QString& package, std::string_view mode)
 {
-    QTemporaryDir temporary;
+    // Every fixture relaunch must preserve paths outside the active ANSI code page.
+    QTemporaryDir temporary(QDir::temp().filePath(
+        QStringLiteral("vnm-packaged-\u03a9\u6f22\u5b57\U0001f680-XXXXXX")));
     if (!check(temporary.isValid(), "packaged descendant directory is available")) {
         return false;
     }
@@ -292,14 +295,33 @@ bool test_lifecycle(const QString& self, const QString& shell, const QString& pa
 
 std::optional<int> run_packaged_descendant_tests(int argc, char** argv)
 {
-    if (argc == 4 && std::string_view(argv[1]) == "--packaged-descendant-parent") {
-        return run_parent(QString::fromLocal8Bit(argv[2]), QDir(QString::fromLocal8Bit(argv[3])));
+    if (argc < 2) {
+        return std::nullopt;
     }
-    if (argc == 4 && std::string_view(argv[1]) == "--packaged-descendant-root") {
-        return run_root(QString::fromLocal8Bit(argv[0]), QString::fromLocal8Bit(argv[2]),
-            QDir(QString::fromLocal8Bit(argv[3])));
+    const std::string_view mode(argv[1]);
+    if (mode != "--packaged-descendant-parent" &&
+        mode != "--packaged-descendant-root"   &&
+        mode != "--packaged-descendants")
+    {
+        return std::nullopt;
     }
-    if (argc != 2 || std::string_view(argv[1]) != "--packaged-descendants") {
+
+    // This dispatcher runs before a QCoreApplication exists. Narrow CRT argv
+    // has already lost characters that the native command line still retains.
+    int argument_count = 0;
+    wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    if (!check(arguments != nullptr, "packaged fixture native arguments are available")) {
+        return 1;
+    }
+    const auto release_arguments = qScopeGuard([&] { LocalFree(arguments); });
+    if (argument_count == 4 && mode == "--packaged-descendant-parent") {
+        return run_parent(QString::fromWCharArray(arguments[2]), QDir(QString::fromWCharArray(arguments[3])));
+    }
+    if (argument_count == 4 && mode == "--packaged-descendant-root") {
+        return run_root(QString::fromWCharArray(arguments[0]), QString::fromWCharArray(arguments[2]),
+            QDir(QString::fromWCharArray(arguments[3])));
+    }
+    if (argument_count != 2 || mode != "--packaged-descendants") {
         return std::nullopt;
     }
     QString package;
@@ -310,7 +332,7 @@ std::optional<int> run_packaged_descendant_tests(int argc, char** argv)
     }
     bool ok = true;
     for (const auto mode : {"natural", "terminate", "destroy", "exited-child"}) {
-        ok &= test_lifecycle(QString::fromLocal8Bit(argv[0]), executable, package, mode);
+        ok &= test_lifecycle(QString::fromWCharArray(arguments[0]), executable, package, mode);
     }
     return ok ? 0 : 1;
 }
