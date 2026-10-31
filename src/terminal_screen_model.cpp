@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
