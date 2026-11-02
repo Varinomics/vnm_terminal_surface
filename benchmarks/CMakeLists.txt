@@ -1,3 +1,8 @@
+add_subdirectory(terminal_canvas_idle)
+if(NOT VNM_TERMINAL_SURFACE_BUILD_FULL)
+    return()
+endif()
+
 add_subdirectory(embedded_terminal)
 add_subdirectory(input_echo_catchup)
 add_subdirectory(public_scroll)
