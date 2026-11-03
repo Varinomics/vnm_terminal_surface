@@ -150,7 +150,7 @@ bool append_c0_control_action(unsigned char byte, std::vector<Parser_action>& ac
     }
 }
 
-std::optional<QByteArray> osc_command_body(QByteArrayView payload, QByteArrayView command)
+std::optional<QByteArrayView> osc_command_body(QByteArrayView payload, QByteArrayView command)
 {
     if (payload.size() < command.size() + 1 || !payload.startsWith(command)) {
         return std::nullopt;
@@ -162,13 +162,10 @@ std::optional<QByteArray> osc_command_body(QByteArrayView payload, QByteArrayVie
         return std::nullopt;
     }
 
-    return
-        QByteArray(
-            payload.data() + static_cast<qsizetype>(command.size()) + 1,
-            payload.size() - static_cast<qsizetype>(command.size()) - 1);
+    return payload.sliced(command.size() + 1);
 }
 
-std::optional<QByteArray> parse_osc8_id_parameter(QByteArrayView parameters)
+std::optional<QByteArrayView> parse_osc8_id_parameter(QByteArrayView parameters)
 {
     const QByteArray key    = QByteArrayLiteral("id=");
     qsizetype        offset = 0;
@@ -179,8 +176,7 @@ std::optional<QByteArray> parse_osc8_id_parameter(QByteArrayView parameters)
             : parameters.sliced(offset, end - offset);
 
         if (part.startsWith(key)) {
-            const QByteArrayView value = part.sliced(key.size());
-            return QByteArray(value.data(), value.size());
+            return part.sliced(key.size());
         }
 
         if (end < 0) {
@@ -238,7 +234,7 @@ Parser_action make_icon_name_notification_action(QString icon_name)
 }
 
 std::optional<QString> parse_osc_title_text(
-    const QByteArray&              text_bytes,
+    QByteArrayView                  text_bytes,
     QString                        source_sequence,
     std::vector<Parser_action>&    actions)
 {
@@ -1991,7 +1987,7 @@ void Terminal_byte_stream_parser::handle_osc_payload(
     QByteArray                     payload,
     std::vector<Parser_action>&    actions)
 {
-    if (const std::optional<QByteArray> title =
+    if (const std::optional<QByteArrayView> title =
         osc_command_body(payload, QByteArrayLiteral("0"));
         title.has_value())
     {
@@ -2006,7 +2002,7 @@ void Terminal_byte_stream_parser::handle_osc_payload(
         return;
     }
 
-    if (const std::optional<QByteArray> icon_name =
+    if (const std::optional<QByteArrayView> icon_name =
         osc_command_body(payload, QByteArrayLiteral("1"));
         icon_name.has_value())
     {
@@ -2022,7 +2018,7 @@ void Terminal_byte_stream_parser::handle_osc_payload(
         return;
     }
 
-    if (const std::optional<QByteArray> title = osc_command_body(payload, QByteArrayLiteral("2"));
+    if (const std::optional<QByteArrayView> title = osc_command_body(payload, QByteArrayLiteral("2"));
         title.has_value())
     {
         const std::optional<QString> title_text =
@@ -2035,7 +2031,7 @@ void Terminal_byte_stream_parser::handle_osc_payload(
         return;
     }
 
-    if (const std::optional<QByteArray> hyperlink =
+    if (const std::optional<QByteArrayView> hyperlink =
         osc_command_body(payload, QByteArrayLiteral("8"));
         hyperlink.has_value())
     {
@@ -2062,17 +2058,15 @@ void Terminal_byte_stream_parser::handle_osc_payload(
             return;
         }
 
-        const QByteArrayView parameters(hyperlink->constData(), separator);
-        const QByteArrayView uri(
-            hyperlink->constData() + separator + 1,
-            hyperlink->size() - separator - 1);
+        const QByteArrayView parameters = hyperlink->first(separator);
+        const QByteArrayView uri        = hyperlink->sliced(separator + 1);
 
         if (uri.isEmpty()) {
             actions.push_back(make_hyperlink_action({}));
             return;
         }
 
-        const std::optional<QByteArray> id = parse_osc8_id_parameter(parameters);
+        const std::optional<QByteArrayView> id = parse_osc8_id_parameter(parameters);
 
         // The identity key joins the id to the URI with 0x1f, and everything
         // that reads a target back out of it takes the first one. An id
@@ -2089,16 +2083,17 @@ void Terminal_byte_stream_parser::handle_osc_payload(
             return;
         }
 
-        QByteArray identity_key = QByteArrayLiteral("uri:");
+        QByteArray identity_key;
+        identity_key.reserve(4 + uri.size() + (id.has_value() ? id->size() : 0));
         if (id.has_value()) {
-            identity_key = QByteArrayLiteral("id:");
-            identity_key.append(*id);
+            identity_key.append("id:");
+            identity_key.append(id->data(), id->size());
             identity_key.append('\x1f');
-            identity_key.append(uri.data(), uri.size());
         }
         else {
-            identity_key.append(uri.data(), uri.size());
+            identity_key.append("uri:");
         }
+        identity_key.append(uri.data(), uri.size());
 
         actions.push_back(make_hyperlink_action(std::move(identity_key)));
         return;
@@ -2129,7 +2124,7 @@ void Terminal_byte_stream_parser::handle_osc_payload(
     }
 
     if (payload.startsWith("4;") && payload.endsWith(";?")) {
-        const QByteArray         index_bytes   = payload.mid(2, payload.size() - 4);
+        const QByteArrayView     index_bytes   = QByteArrayView(payload).mid(2, payload.size() - 4);
         const std::optional<int> palette_index = parse_ascii_palette_index(index_bytes);
         if (!palette_index.has_value()) {
             actions.push_back(make_unsupported_sequence_diagnostic(
@@ -2149,8 +2144,8 @@ void Terminal_byte_stream_parser::handle_osc_payload(
     }
 
     if (payload.startsWith("52;")) {
-        const QByteArray body      = payload.mid(3);
-        const qsizetype  separator = body.indexOf(';');
+        const QByteArrayView body      = QByteArrayView(payload).sliced(3);
+        const qsizetype      separator = body.indexOf(';');
         if (separator < 0) {
             actions.push_back(make_clipboard_diagnostic(
                 Parser_diagnostic_code::CLIPBOARD_WRITE_DENIED,
@@ -2159,8 +2154,8 @@ void Terminal_byte_stream_parser::handle_osc_payload(
             return;
         }
 
-        const QByteArray target_selection_bytes = body.left(separator);
-        const QByteArray data_bytes             = body.mid(separator + 1);
+        const QByteArrayView target_selection_bytes = body.first(separator);
+        const QByteArrayView data_bytes             = body.sliced(separator + 1);
         if (data_bytes == QByteArrayLiteral("?")) {
             actions.push_back(make_clipboard_diagnostic(
                 Parser_diagnostic_code::CLIPBOARD_READ_DENIED,
@@ -2169,8 +2164,9 @@ void Terminal_byte_stream_parser::handle_osc_payload(
             return;
         }
 
+        const QByteArray encoded_payload = QByteArray::fromRawData(data_bytes.data(), data_bytes.size());
         const QByteArray::FromBase64Result decoded_payload = QByteArray::fromBase64Encoding(
-            data_bytes,
+            encoded_payload,
             QByteArray::AbortOnBase64DecodingErrors);
         if (decoded_payload.decodingStatus != QByteArray::Base64DecodingStatus::Ok) {
             actions.push_back(make_clipboard_diagnostic(
