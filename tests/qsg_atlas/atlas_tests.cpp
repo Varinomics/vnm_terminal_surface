@@ -10220,6 +10220,61 @@ bool test_text_renderer_report_names()
     return ok;
 }
 
+bool test_cache_copy_on_write_prepare()
+{
+    const term::Glyph_rgba_tile first_tile = test_rgba_tile(
+        QSize(2, 2), 8,
+        {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    const term::Glyph_rgba_tile second_tile = test_rgba_tile(
+        QSize(2, 2), 8,
+        {17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32});
+    const auto first_key = term::qsg_atlas_cache_key(
+        70U, QStringLiteral("face"), 13.0, 0);
+    const auto second_key = term::qsg_atlas_cache_key(
+        71U, QStringLiteral("face"), 13.0, 0);
+
+    term::Glyph_atlas_cache committed(QSize(16, 16));
+    committed.set_epoch(1U);
+    const term::Glyph_atlas_slot first = committed.insert_or_get(
+        first_key, first_tile);
+    const QByteArray original_page = committed.page_bytes(first.page);
+    const auto original_stats = committed.stats();
+
+    term::Glyph_atlas_cache preparing = committed;
+    bool ok = true;
+    ok &= check(preparing.find(first_key) != nullptr &&
+            preparing.page_bytes(first.page) == original_page,
+        "warm prepare reuses the committed glyph slots and page pixels");
+    const auto committed_stats_before = committed.stats();
+    ok &= check(committed_stats_before.lookups == original_stats.lookups,
+        "working-cache hits never update committed lookup statistics");
+
+    const term::Glyph_atlas_slot second = preparing.insert_or_get(
+        second_key, second_tile);
+    ok &= check(second.is_valid() && preparing.find(second_key) != nullptr &&
+            committed.find(second_key) == nullptr,
+        "first glyph insertion detaches the working cache's structural state");
+    ok &= check(committed.page_bytes(first.page) == original_page,
+        "working bitmap writes do not change the committed atlas");
+    preparing.reset(); // Simulates failed resource preparation.
+    ok &= check(committed.find(first_key) != nullptr &&
+            committed.page_bytes(first.page) == original_page,
+        "discarded preparation retains the last committed glyphs and pixels");
+
+    preparing = committed;
+    preparing.set_epoch(2U);
+    ok &= check(preparing.find(first_key) == nullptr &&
+            committed.find(first_key) != nullptr,
+        "font epoch invalidation only discards the preparing cache");
+    preparing = committed;
+    ok &= check(preparing.configure(QSize(32, 32), 2) &&
+            preparing.find(first_key) == nullptr &&
+            committed.find(first_key) != nullptr &&
+            committed.page_bytes(first.page) == original_page,
+        "page configuration changes do not mutate shared committed state");
+    return ok;
+}
+
 bool test_atlas_budget_stats()
 {
     const term::Glyph_rgba_tile tile = test_rgba_tile(
@@ -23203,6 +23258,7 @@ bool run_unit_tests()
     ok &= test_atlas_recorder_accumulates_elapsed_counters();
     ok &= test_atlas_snapshot_publication_identity();
     ok &= test_atlas_budget_stats();
+    ok &= test_cache_copy_on_write_prepare();
     ok &= test_atlas_warm_set_table_and_shaping();
     ok &= test_atlas_warm_set_representative_family_coverage();
     return ok;
