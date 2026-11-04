@@ -422,6 +422,7 @@ struct Msdf_terminal_atlas_build
 {
     Msdf_terminal_baked_atlas_key key;
     std::atomic<bool>            complete = false;
+    std::atomic<bool>            started = false;
     msdf_text::build_result_t    result;
     std::mutex                  completion_mutex;
     std::condition_variable     completion_cv;
@@ -1340,6 +1341,12 @@ void complete_msdf_shared_bake(
     int                                                baked_pixel_height,
     const msdf_text::options_t&                        options)
 {
+    // An availability worker can claim a render request still queued in the
+    // same QThreadPool. The queued task then exits, avoiding single-worker
+    // pool deadlock without ever baking the same key twice.
+    if (build->started.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
     try {
         build->result = msdf_text::build_font_atlas(
             reinterpret_cast<const std::uint8_t*>(font_data.constData()),
@@ -1384,25 +1391,32 @@ std::shared_ptr<Msdf_terminal_atlas_build> request_msdf_shared_bake(
 {
     const auto pool = atlas_msdf_bake_pool();
     std::shared_ptr<Msdf_terminal_atlas_build> build;
+    bool newly_created = false;
     {
         const std::lock_guard<std::mutex> lock(pool->mutex);
         for (const auto& existing : pool->entries) {
             if (msdf_baked_atlas_key_equal(existing->key, key)) {
+                build = existing;
                 if (existing->complete.load(std::memory_order_acquire)) {
                     ++pool->completed_reuses;
                 }
                 else {
                     ++pool->inflight_reuses;
                 }
-                return existing;
+                break;
             }
         }
-        build = std::make_shared<Msdf_terminal_atlas_build>();
-        build->key = key;
-        pool->entries.push_back(build);
-        ++pool->build_calls;
+        if (!build) {
+            build = std::make_shared<Msdf_terminal_atlas_build>();
+            build->key = key;
+            pool->entries.push_back(build);
+            ++pool->build_calls;
+            newly_created = true;
+        }
     }
-
+    if (!newly_created && !bake_on_caller_thread) {
+        return build;
+    }
     const auto work = [
             build,
             pool,
@@ -1414,10 +1428,9 @@ std::shared_ptr<Msdf_terminal_atlas_build> request_msdf_shared_bake(
         complete_msdf_shared_bake(
             build, pool, font_data, codepoints, baked_pixel_height, options);
     };
-
     if (bake_on_caller_thread) {
-        // The availability caller is already a worker. Do not enqueue onto
-        // the same possibly single-thread Qt pool and then wait on ourselves.
+        // Availability is itself a pool worker. Claiming a queued bake here
+        // avoids waiting for that same worker to run a queued render job.
         work();
     }
     else {
