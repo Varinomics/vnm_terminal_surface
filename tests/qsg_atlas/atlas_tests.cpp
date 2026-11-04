@@ -12851,6 +12851,13 @@ bool test_async_msdf_atlas_case(
 {
     std::cerr << "async atlas case policy=" << (int)policy
         << " destroy=" << destroy_pending_owner << '\n';
+    // This test deliberately blocks new worker jobs. A previous case's
+    // completed process-shared bake would defeat its pending-work premise.
+    if (!check(term::qsg_atlas_clear_msdf_shared_bakes_for_testing(),
+            "async atlas case starts with an empty shared CPU bake registry"))
+    {
+        return false;
+    }
     QQuickWindow window;
     window.resize(640, 240);
     const QString family = term::vnm_terminal_default_monospace_font_family();
