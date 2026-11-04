@@ -1241,6 +1241,218 @@ const std::vector<char32_t>& atlas_msdf_text_codepoints()
     return codepoints;
 }
 
+
+const QByteArray& atlas_msdf_codepoint_inventory_hash()
+{
+    static const QByteArray hash = [] {
+        const auto& codepoints = atlas_msdf_text_codepoints();
+        return QCryptographicHash::hash(
+            QByteArray(
+                reinterpret_cast<const char*>(codepoints.data()),
+                static_cast<qsizetype>(codepoints.size() * sizeof(char32_t))),
+            QCryptographicHash::Sha256);
+    }();
+    return hash;
+}
+
+Msdf_terminal_baked_atlas_key atlas_msdf_shared_bake_key(
+    const QByteArray&         font_fingerprint,
+    int                       baked_pixel_height,
+    const msdf_text::options_t& options)
+{
+    Msdf_terminal_baked_atlas_key key;
+    key.font_fingerprint         = font_fingerprint;
+    key.codepoint_inventory_hash = atlas_msdf_codepoint_inventory_hash();
+    key.baked_pixel_height       = baked_pixel_height;
+    key.atlas_size               = options.atlas_size;
+    key.min_atlas_font_size      = options.min_atlas_font_size;
+    key.atlas_px_range           = options.atlas_px_range;
+    key.atlas_gutter_px          = options.atlas_gutter_px;
+    key.build_kerning_table      = options.build_kerning_table;
+    key.auto_atlas_size          = options.auto_atlas_size;
+    key.sharpness_bias           = options.sharpness_bias;
+    key.missing_glyph_policy     = static_cast<int>(options.missing_glyph_policy);
+    key.valid                    = true;
+    return key;
+}
+
+// Only CPU products are shared. Renderer QRhi textures and their upload
+// generations remain owned by the render thread that created them.
+struct Msdf_shared_bake_pool
+{
+    std::mutex mutex;
+    std::vector<std::shared_ptr<Msdf_terminal_atlas_build>> entries;
+    std::uint64_t build_calls = 0U;
+    std::uint64_t inflight_reuses = 0U;
+    std::uint64_t completed_reuses = 0U;
+};
+
+std::shared_ptr<Msdf_shared_bake_pool> atlas_msdf_bake_pool()
+{
+    // A worker may finish while the application is shutting down; retaining
+    // the pool in its capture avoids static-destruction ordering hazards.
+    static const auto pool = std::make_shared<Msdf_shared_bake_pool>();
+    return pool;
+}
+
+constexpr std::size_t k_atlas_msdf_shared_completed_limit = 2U;
+constexpr std::size_t k_atlas_msdf_shared_byte_limit = 32U * 1024U * 1024U;
+
+void prune_completed_msdf_bakes(Msdf_shared_bake_pool& pool)
+{
+    const auto finished = [](const auto& build) {
+        return build->complete.load(std::memory_order_acquire);
+    };
+    // Do not make transient failures sticky. Existing waiters still own their
+    // result even after the registry releases it.
+    std::erase_if(pool.entries, [&](const auto& build) {
+        return finished(build) &&
+            build->result.status == msdf_text::Build_status::FAILURE;
+    });
+
+    std::size_t completed = 0U;
+    std::size_t bytes = 0U;
+    for (const auto& build : pool.entries) {
+        if (finished(build)) {
+            ++completed;
+            bytes += build->result.atlas.rgba.size();
+        }
+    }
+    while (completed > k_atlas_msdf_shared_completed_limit ||
+           bytes > k_atlas_msdf_shared_byte_limit)
+    {
+        const auto oldest = std::find_if(
+            pool.entries.begin(), pool.entries.end(), finished);
+        if (oldest == pool.entries.end()) {
+            break;
+        }
+        bytes -= (*oldest)->result.atlas.rgba.size();
+        --completed;
+        pool.entries.erase(oldest);
+    }
+}
+
+void complete_msdf_shared_bake(
+    const std::shared_ptr<Msdf_terminal_atlas_build>& build,
+    const std::shared_ptr<Msdf_shared_bake_pool>&     pool,
+    const QByteArray&                                 font_data,
+    const std::vector<char32_t>&                      codepoints,
+    int                                                baked_pixel_height,
+    const msdf_text::options_t&                        options)
+{
+    try {
+        build->result = msdf_text::build_font_atlas(
+            reinterpret_cast<const std::uint8_t*>(font_data.constData()),
+            static_cast<std::size_t>(font_data.size()),
+            baked_pixel_height,
+            std::span<const char32_t>(codepoints.data(), codepoints.size()),
+            options);
+    }
+    catch (const std::exception& error) {
+        build->result.status = msdf_text::Build_status::FAILURE;
+        build->result.message = error.what();
+    }
+    catch (...) {
+        build->result.status = msdf_text::Build_status::FAILURE;
+        build->result.message = "unknown MSDF atlas bake exception";
+    }
+
+    std::vector<std::weak_ptr<Msdf_atlas_completion>> completions;
+    {
+        const std::lock_guard<std::mutex> lock(build->completion_mutex);
+        build->complete.store(true, std::memory_order_release);
+        completions = std::move(build->completions);
+    }
+    build->completion_cv.notify_all();
+    for (const auto& completion_ref : completions) {
+        if (const auto completion = completion_ref.lock()) {
+            emit completion->atlas_ready();
+        }
+    }
+    {
+        const std::lock_guard<std::mutex> lock(pool->mutex);
+        prune_completed_msdf_bakes(*pool);
+    }
+}
+
+std::shared_ptr<Msdf_terminal_atlas_build> request_msdf_shared_bake(
+    const Msdf_terminal_baked_atlas_key& key,
+    const QByteArray&                     font_data,
+    int                                   baked_pixel_height,
+    const msdf_text::options_t&           options,
+    bool                                  bake_on_caller_thread)
+{
+    const auto pool = atlas_msdf_bake_pool();
+    std::shared_ptr<Msdf_terminal_atlas_build> build;
+    {
+        const std::lock_guard<std::mutex> lock(pool->mutex);
+        for (const auto& existing : pool->entries) {
+            if (msdf_baked_atlas_key_equal(existing->key, key)) {
+                if (existing->complete.load(std::memory_order_acquire)) {
+                    ++pool->completed_reuses;
+                }
+                else {
+                    ++pool->inflight_reuses;
+                }
+                return existing;
+            }
+        }
+        build = std::make_shared<Msdf_terminal_atlas_build>();
+        build->key = key;
+        pool->entries.push_back(build);
+        ++pool->build_calls;
+    }
+
+    const auto work = [
+            build,
+            pool,
+            font_data,
+            codepoints = atlas_msdf_text_codepoints(),
+            options,
+            baked_pixel_height
+        ] {
+        complete_msdf_shared_bake(
+            build, pool, font_data, codepoints, baked_pixel_height, options);
+    };
+
+    if (bake_on_caller_thread) {
+        // The availability caller is already a worker. Do not enqueue onto
+        // the same possibly single-thread Qt pool and then wait on ourselves.
+        work();
+    }
+    else {
+        QThreadPool::globalInstance()->start(work);
+    }
+    return build;
+}
+
+void subscribe_msdf_shared_bake(
+    const std::shared_ptr<Msdf_terminal_atlas_build>& build,
+    const std::shared_ptr<Msdf_atlas_completion>&      completion)
+{
+    bool already_complete = false;
+    {
+        const std::lock_guard<std::mutex> lock(build->completion_mutex);
+        already_complete = build->complete.load(std::memory_order_acquire);
+        if (!already_complete) {
+            build->completions.push_back(completion);
+        }
+    }
+    if (already_complete) {
+        emit completion->atlas_ready();
+    }
+}
+
+void await_msdf_shared_bake(
+    const std::shared_ptr<Msdf_terminal_atlas_build>& build)
+{
+    std::unique_lock<std::mutex> lock(build->completion_mutex);
+    build->completion_cv.wait(lock, [&] {
+        return build->complete.load(std::memory_order_acquire);
+    });
+}
+
+
 bool atlas_msdf_text_codepoint_is_supported(char32_t codepoint)
 {
     const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
