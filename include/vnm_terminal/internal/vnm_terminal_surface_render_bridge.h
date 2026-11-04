@@ -16,6 +16,8 @@
 #include <memory>
 #include <optional>
 
+class QFont;
+class QTimer;
 class VNM_TerminalSurface;
 
 namespace vnm_terminal {
@@ -193,6 +195,14 @@ public:
     static void set_before_search_completion_dispatch_handler_for_testing(
         VNM_TerminalSurface& surface,
         std::function<void()> handler);
+
+    // Set before selecting a font; the probe runs on its availability worker.
+    static void set_msdf_availability_probe_for_testing(
+        VNM_TerminalSurface&              surface,
+        std::function<bool(const QFont&)> probe);
+
+    static QTimer& msdf_availability_deadline_timer_for_testing(
+        VNM_TerminalSurface& surface);
 
     static void set_pending_published_mouse_report_block_count_for_testing(
         VNM_TerminalSurface&       surface,
