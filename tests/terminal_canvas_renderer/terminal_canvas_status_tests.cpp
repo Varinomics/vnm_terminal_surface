@@ -34,7 +34,7 @@ std::shared_ptr<vnm_terminal::Terminal_canvas_frame> make_frame(std::uint64_t se
     frame->content_height         = 40.0;
     frame->sequence               = sequence;
     frame->publication_generation = sequence;
-    frame->styles.push_back({0xffffffffU, 0xff101010U, 0U});
+    frame->styles.push_back({frame->default_foreground_rgba, frame->default_background_rgba, 0U});
     frame->cells.push_back({0, 0, 1, 0U, QStringLiteral("A")});
     return frame;
 }
