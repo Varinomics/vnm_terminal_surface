@@ -19,6 +19,7 @@
 #include <QString>
 #include <QtGlobal>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -1033,6 +1034,19 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 // resolve and a ready atlas bakes). Thread-safe; used to gate the MSDF option in
 // the UI so it is never offered for a font MSDF cannot render.
 bool qsg_atlas_msdf_text_available_for_font(const QFont& font);
+
+// CPU-only process-local bake sharing diagnostics. These count actual jobs,
+// reuse (in-flight versus completed), and the bounded completed-result pool.
+struct Qsg_atlas_msdf_shared_bake_stats
+{
+    std::uint64_t build_calls       = 0U;
+    std::uint64_t inflight_reuses   = 0U;
+    std::uint64_t completed_reuses  = 0U;
+    std::size_t   completed_atlases = 0U;
+    std::size_t   completed_bytes   = 0U;
+};
+Qsg_atlas_msdf_shared_bake_stats qsg_atlas_msdf_shared_bake_stats();
+bool qsg_atlas_clear_msdf_shared_bakes_for_testing();
 
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
 
