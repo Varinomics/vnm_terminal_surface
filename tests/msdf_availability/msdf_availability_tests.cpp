@@ -580,6 +580,58 @@ bool test_reentrant_font_selection_finishes_checking(QGuiApplication& app)
     return ok;
 }
 
+
+bool test_msdf_shared_cpu_bake_reuse()
+{
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+    bool ok = true;
+    QThreadPool::globalInstance()->waitForDone();
+    ok &= check(term::qsg_atlas_clear_msdf_shared_bakes_for_testing(),
+        "MSDF shared-bake test starts without in-flight work");
+
+    const QFont font = QGuiApplication::font();
+    const bool first_available =
+        term::qsg_atlas_msdf_text_available_for_font(font);
+    const auto initial = term::qsg_atlas_msdf_shared_bake_stats();
+    if (!first_available || initial.completed_atlases == 0U) {
+        // Minimal CI images do not all expose a font with readable sfnt data.
+        // The ordinary availability contract already exercises this fallback.
+        return ok;
+    }
+
+    const bool second_available =
+        term::qsg_atlas_msdf_text_available_for_font(font);
+    const auto repeated = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(second_available && repeated.build_calls == 1U &&
+            repeated.completed_reuses >= 1U &&
+            repeated.completed_atlases == 1U &&
+            repeated.completed_bytes <= 32U * 1024U * 1024U,
+        "matching availability checks reuse one CPU bake and bounded pixels");
+
+    ok &= check(term::qsg_atlas_clear_msdf_shared_bakes_for_testing(),
+        "completed MSDF CPU results can be released for the concurrency test");
+    std::promise<void> start;
+    const std::shared_future<void> gate = start.get_future().share();
+    const auto check_font = [font, gate] {
+        gate.wait();
+        return term::qsg_atlas_msdf_text_available_for_font(font);
+    };
+    auto first = std::async(std::launch::async, check_font);
+    auto second = std::async(std::launch::async, check_font);
+    start.set_value();
+    const bool concurrent_first = first.get();
+    const bool concurrent_second = second.get();
+    const auto concurrent = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(concurrent_first && concurrent_second &&
+            concurrent.build_calls == 1U &&
+            concurrent.inflight_reuses + concurrent.completed_reuses >= 1U,
+        "simultaneous availability requests share one actual bake");
+    return ok;
+#else
+    return true;
+#endif
+}
+
 bool test_dispatch_rejection_clears_checking_and_allows_retry(QGuiApplication& app)
 {
     bool ok = true;
@@ -668,5 +720,6 @@ int main(int argc, char** argv)
     ok &= test_surface_destruction_with_pending_completion(app, true);
     ok &= test_reentrant_font_selection_finishes_checking(app);
     ok &= test_dispatch_rejection_clears_checking_and_allows_retry(app);
+    ok &= test_msdf_shared_cpu_bake_reuse();
     return ok ? 0 : 1;
 }
