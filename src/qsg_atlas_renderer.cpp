@@ -5898,10 +5898,6 @@ private:
         return false;
     }
 
-        result.msdf_text_build_pending = true;
-        return false;
-    }
-
     void record_msdf_supported_text_miss(
         const Terminal_render_text_run& run,
         Atlas_prepare_result&           result,
