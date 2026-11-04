@@ -60,7 +60,8 @@ using Posix_pty_wake_write_error_hook_for_testing = int (*)(
 
 // Zero delegates to the native write; a nonzero errno injects a failed attempt.
 // The descriptor is the real nonblocking write endpoint, allowing full-pipe
-// tests without fabricated readiness. The hook must not re-enter the backend.
+// tests without fabricated readiness. The hook runs under the backend mutex
+// and must not re-enter the backend.
 void set_posix_pty_wake_write_error_hook_for_testing(
     Posix_pty_wake_write_error_hook_for_testing hook);
 

@@ -2579,7 +2579,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             vnm_terminal_surface::vnm_terminal_surface)
         target_include_directories(vnm_terminal_posix_pty_readiness PRIVATE "${PROJECT_SOURCE_DIR}/src")
         set_target_properties(vnm_terminal_posix_pty_readiness PROPERTIES AUTOMOC OFF)
-        foreach(scenario IN ITEMS quiet capacity)
+        foreach(scenario IN ITEMS
+            quiet capacity wake_eintr wake_full
+            callback_revoke callback_terminate callback_root_exit callback_destroy drain_deadline)
             add_test(NAME vnm_terminal_posix_pty_readiness_${scenario}
                 COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
                     "$<TARGET_FILE:vnm_terminal_posix_pty_readiness>" "${scenario}")

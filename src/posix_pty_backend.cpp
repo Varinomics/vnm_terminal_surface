@@ -106,16 +106,14 @@ ssize_t write_pty_wake_for_testing(
 #endif
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
-// Upper bound on how long an I/O thread blocks in a single poll() before it
-// re-checks its stop flags. poll() on a PTY master is unreliable on macOS once
-// the child has exited while a descendant still holds the slave open (the
-// master is neither readable/writable nor hung up, and the wake-pipe write may
-// not interrupt the poll), so the I/O threads must not wait on it indefinitely
-// or teardown deadlocks joining them. The reader bounds its master POLLIN poll
-// with this; the writer never polls the master at all and instead waits on its
-// wake pipe with this bound (see wait_for_write_capacity). The cost is one idle
-// wake-up per interval per thread when the terminal is silent.
-constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
+#if defined(__APPLE__)
+// On macOS, a PTY master poll can fail to wake after root exit while a
+// descendant retains the slave, even when the wake pipe is signalled. Bound
+// reader waits so teardown can still join it. A macOS POLLOUT wait can also
+// wedge despite its timeout, so the writer waits only on its ordinary wake
+// pipe before retrying a nonblocking write. Linux uses native PTY readiness.
+constexpr std::chrono::milliseconds k_macos_master_poll_interval(100);
+#endif
 
 QString posix_error_message(QStringView context, int code)
 {
@@ -421,8 +419,7 @@ int poll_timeout_until(std::optional<std::chrono::steady_clock::time_point> dead
         return 0;
     }
 
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now);
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now);
     return static_cast<int>(std::min<std::int64_t>(
         remaining.count(),
         std::numeric_limits<int>::max()));
@@ -688,7 +685,6 @@ public:
             m_reader_finished                    = false;
             m_writer_failed                      = false;
             m_startup_aborted                    = false;
-            m_child_exit_observed                = false;
             m_child_exit_confirmed               = false;
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
@@ -696,6 +692,7 @@ public:
                 derive_native_backend_output_delivery_limits(
                     effective_config.output_delivery_limits);
             m_exit_reason_override.reset();
+            m_exit_output_drain_deadline.reset();
             m_queued_write_bytes = 0U;
             m_write_queue.clear();
         }
@@ -973,6 +970,9 @@ public:
             m_queued_write_bytes = 0U;
         }
 
+        m_output_cv.notify_all();
+        m_write_cv.notify_all();
+        wake_io_threads();
         if (!paused_output.isEmpty()) {
             deliver_native_backend_output_with_snapshot(
                 m_mutex,
@@ -980,9 +980,6 @@ public:
                 std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
-        m_output_cv.notify_all();
-        m_write_cv.notify_all();
-        wake_io_threads();
         std::string error;
         if (!m_owner->stop(policy.graceful_interval, policy.kill_interval, &error)) {
             return backend_stop_error(QString::fromStdString(error));
@@ -1079,6 +1076,7 @@ public:
         }
         m_output_cv.notify_all();
         m_write_cv.notify_all();
+        wake_io_threads();
         m_callback_gate->revoke_and_drain();
     }
 
@@ -1223,12 +1221,10 @@ private:
             });
     }
 
-    // Block until the exit-drain window (reap_time + k_exit_output_drain_timeout)
-    // elapses, returning early if shutdown begins. Uses m_output_cv, which
-    // shutdown notifies after setting m_stopping, so teardown is never delayed.
-    void wait_out_exit_drain_window(std::chrono::steady_clock::time_point reap_time)
+    // Use the same absolute admission deadline as the reader even if EOF ends
+    // it early. Shutdown wakes this wait through m_output_cv and m_stopping.
+    void wait_out_exit_drain_window(std::chrono::steady_clock::time_point deadline)
     {
-        const auto deadline = reap_time + k_exit_output_drain_timeout;
         std::unique_lock<std::mutex> lock(m_mutex);
         m_output_cv.wait_until(lock, deadline, [&] {
             return m_stopping;
@@ -1237,35 +1233,39 @@ private:
 
     void wake_io_threads()
     {
-        int read_wake_write = -1;
-        int write_wake_write = -1;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            read_wake_write = m_read_wake_write.get();
-            write_wake_write = m_write_wake_write.get();
-        }
-
+        // Keep each endpoint owned through its nonblocking write: cleanup may
+        // close the pipes concurrently after joining workers from a failed start.
+        const std::lock_guard lock(m_mutex);
         const unsigned char byte = 1U;
-        if (read_wake_write >= 0) {
+        for (Unique_fd* wake_write : std::array{&m_read_wake_write, &m_write_wake_write}) {
+            if (!*wake_write) {
+                continue;
+            }
+            for (;;) {
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
-            const ssize_t result = write_pty_wake_for_testing(
-                Posix_pty_io_worker_for_testing::READER,
-                read_wake_write, &byte, sizeof(byte));
+                const auto worker = wake_write == &m_read_wake_write
+                    ? Posix_pty_io_worker_for_testing::READER
+                    : Posix_pty_io_worker_for_testing::WRITER;
+                const ssize_t result = write_pty_wake_for_testing(
+                    worker, wake_write->get(), &byte, sizeof(byte));
 #else
-            const ssize_t result = ::write(read_wake_write, &byte, sizeof(byte));
+                const ssize_t result = ::write(wake_write->get(), &byte, sizeof(byte));
 #endif
-            (void)result;
-        }
+                if (result > 0 ||
+                    (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+                {
+                    // A full pipe already holds a durable notification.
+                    break;
+                }
+                if (result < 0 && errno == EINTR) {
+                    continue;
+                }
 
-        if (write_wake_write >= 0) {
-#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
-            const ssize_t result = write_pty_wake_for_testing(
-                Posix_pty_io_worker_for_testing::WRITER,
-                write_wake_write, &byte, sizeof(byte));
-#else
-            const ssize_t result = ::write(write_wake_write, &byte, sizeof(byte));
-#endif
-            (void)result;
+                // Retire only the failed writer. Its reader stays owned until
+                // join and observes HUP instead of waiting for a lost wake.
+                wake_write->reset();
+                break;
+            }
         }
     }
 
@@ -1300,13 +1300,17 @@ private:
 #if defined(__APPLE__)
         std::size_t remaining_output = 0;
 #endif
-        const auto report_drain_error = [&](QStringView operation) {
-            const int error = errno;
-            if (!is_native_backend_stopping(m_mutex, m_stopping)) {
-                report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
-                    Terminal_backend_error_code::READ_FAILED, posix_error_message(operation, error));
-            }
-        };
+        const auto report_read_error = [
+                this
+            ](
+                QStringView operation,
+                int error)
+            {
+                if (!is_native_backend_stopping(m_mutex, m_stopping)) {
+                    report_native_backend_error_with_snapshot(m_mutex, m_callbacks,
+                        Terminal_backend_error_code::READ_FAILED, posix_error_message(operation, error));
+                }
+            };
 
         for (;;) {
             int         master        = -1;
@@ -1337,10 +1341,7 @@ private:
                     break;
                 }
 
-                if (m_child_exit_observed && !final_drain_deadline.has_value()) {
-                    final_drain_deadline =
-                        std::chrono::steady_clock::now() + k_exit_output_drain_timeout;
-                }
+                final_drain_deadline = m_exit_output_drain_deadline;
 
                 master = m_master.get();
                 wake_read = m_read_wake_read.get();
@@ -1372,7 +1373,7 @@ private:
                 // Stop new writes, then let read/poll flush that buffer before
                 // using their no-input result as the end of the finite drain.
                 if (::tcflow(m_drain_peer.get(), TCOOFF) != 0) {
-                    report_drain_error(u"freeze PTY output");
+                    report_read_error(u"freeze PTY output", errno);
                     break;
                 }
 #else
@@ -1381,7 +1382,7 @@ private:
                 // producer must not extend the drain by continually refilling it.
                 int queued = 0;
                 if (::ioctl(master, TIOCSTART) != 0 || ::ioctl(master, TIOCOUTQ, &queued) != 0) {
-                    report_drain_error(u"snapshot PTY output");
+                    report_read_error(u"snapshot PTY output", errno);
                     break;
                 }
                 remaining_output = static_cast<std::size_t>(queued);
@@ -1400,14 +1401,15 @@ private:
             }
 #endif
 
-            // Bound the wait: when a drain deadline is armed it caps the poll;
-            // otherwise fall back to the heartbeat so the reader re-checks its
-            // stop flags rather than trusting the wake pipe to interrupt a poll
-            // on the PTY master (unreliable on macOS). A heartbeat tick with no
-            // deadline just means no master/wake activity yet -- keep waiting.
-            const int poll_timeout = output_admission_closed ? 0 : final_drain_deadline.has_value()
-                ? poll_timeout_until(final_drain_deadline)
-                : static_cast<int>(k_native_master_poll_interval.count());
+            // Linux silence needs no timeout: state changes wake the pipe.
+            // After the deadline, drain only the already accepted FIFO prefix.
+            int poll_timeout = output_admission_closed ? 0 : poll_timeout_until(final_drain_deadline);
+#if defined(__APPLE__)
+            const int fallback_timeout = static_cast<int>(k_macos_master_poll_interval.count());
+            if (poll_timeout < 0 || poll_timeout > fallback_timeout) {
+                poll_timeout = fallback_timeout;
+            }
+#endif
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
             const int poll_result = poll_pty_io_for_testing(
                 Posix_pty_io_worker_for_testing::READER, fds, 2, poll_timeout);
@@ -1428,21 +1430,33 @@ private:
                     continue;
                 }
 
-                if (!is_native_backend_stopping(m_mutex, m_stopping)) {
-                    report_native_backend_error_with_snapshot(
-                        m_mutex,
-                        m_callbacks,
-                        Terminal_backend_error_code::READ_FAILED,
-                        posix_error_message(QStringLiteral("poll PTY output"), errno));
-                }
+                report_read_error(u"poll PTY output", errno);
+                break;
+            }
+
+            if ((fds[0].revents & POLLNVAL) != 0) {
+                report_read_error(u"poll PTY output", EBADF);
+                break;
+            }
+            if ((fds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                report_read_error(u"PTY output wake",
+                    (fds[1].revents & POLLNVAL) != 0 ? EBADF : EIO);
                 break;
             }
 
             if ((fds[1].revents & POLLIN) != 0) {
                 drain_wake_pipe(wake_read);
-                if (is_native_backend_stopping(m_mutex, m_stopping)) {
-                    break;
-                }
+                // Recheck pause, stop and the published deadline before reading.
+                // Simultaneous master readiness remains pending for the next poll.
+                continue;
+            }
+
+            // Readiness can arrive as the deadline expires. Close admission
+            // before another output callback can delay the reader again.
+            if (!output_admission_closed && final_drain_deadline.has_value() &&
+                std::chrono::steady_clock::now() >= *final_drain_deadline)
+            {
+                continue;
             }
 
             if ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
@@ -1450,14 +1464,14 @@ private:
                 if (output_admission_closed) {
                     int queued = 0;
                     if (::ioctl(master, TIOCOUTQ, &queued) != 0) {
-                        report_drain_error(u"inspect PTY output");
+                        report_read_error(u"inspect PTY output", errno);
                         break;
                     }
                     if (queued == 0) {
                         break;
                     }
                     if (::ioctl(master, TIOCSTART) != 0) {
-                        report_drain_error(u"resume PTY output");
+                        report_read_error(u"resume PTY output", errno);
                         break;
                     }
                     // A concurrent flow stop must not turn this into a busy
@@ -1465,9 +1479,9 @@ private:
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
                     (void)poll_pty_io_for_testing(
                         Posix_pty_io_worker_for_testing::READER,
-                        fds + 1, 1, static_cast<int>(k_native_master_poll_interval.count()));
+                        fds + 1, 1, static_cast<int>(k_macos_master_poll_interval.count()));
 #else
-                    (void)::poll(fds + 1, 1, static_cast<int>(k_native_master_poll_interval.count()));
+                    (void)::poll(fds + 1, 1, static_cast<int>(k_macos_master_poll_interval.count()));
 #endif
                 }
 #endif
@@ -1483,6 +1497,9 @@ private:
                     continue;
                 }
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if ((fds[0].revents & (POLLHUP | POLLERR)) != 0) {
+                        break;
+                    }
 #if defined(__linux__)
                     if (output_admission_closed) {
                         break;
@@ -1491,12 +1508,8 @@ private:
                     continue;
                 }
 
-                if (errno != EIO && !is_native_backend_stopping(m_mutex, m_stopping)) {
-                    report_native_backend_error_with_snapshot(
-                        m_mutex,
-                        m_callbacks,
-                        Terminal_backend_error_code::READ_FAILED,
-                        posix_error_message(QStringLiteral("PTY output read"), errno));
+                if (errno != EIO) {
+                    report_read_error(u"PTY output read", errno);
                 }
                 break;
             }
@@ -1557,48 +1570,61 @@ private:
         }
     }
 
-    // Wait, bounded by a heartbeat, before retrying a write that returned
-    // EAGAIN. This deliberately polls ONLY the wake pipe (an ordinary pipe) and
-    // never the PTY master: poll() on a PTY master is unreliable on macOS -- a
-    // POLLOUT poll there could be wedged neither by the wake-pipe write nor by a
-    // finite timeout once the child has exited while a descendant still holds
-    // the slave open, deadlocking the writer thread and teardown. The retried
-    // non-blocking write() is itself the authoritative writability test, so we
-    // only need a bounded, reliably-interruptible wait here. Returns false when
-    // the writer should stop.
-    bool wait_for_write_capacity(int wake_read)
+    // Linux waits for actual capacity and explicit cancellation. Darwin keeps
+    // the wake-only retry bound because its master POLLOUT wait can wedge after
+    // root exit with a retained slave (see k_macos_master_poll_interval).
+    bool wait_for_write_capacity([[maybe_unused]] int master, int wake_read)
     {
-        pollfd fds[1] = {
+        pollfd fds[] = {
             { wake_read, POLLIN, 0 },
+#if defined(__linux__)
+            { master, POLLOUT | POLLHUP | POLLERR, 0 },
+#endif
         };
+        constexpr nfds_t descriptor_count = sizeof(fds) / sizeof(fds[0]);
+#if defined(__linux__)
+        constexpr int poll_timeout = -1;
+#else
+        constexpr int poll_timeout = static_cast<int>(k_macos_master_poll_interval.count());
+#endif
 
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
         const int poll_result = poll_pty_io_for_testing(
-            Posix_pty_io_worker_for_testing::WRITER,
-            fds,
-            1,
-            static_cast<int>(k_native_master_poll_interval.count()));
+            Posix_pty_io_worker_for_testing::WRITER, fds, descriptor_count, poll_timeout);
 #else
-        const int poll_result = ::poll(
-            fds,
-            1,
-            static_cast<int>(k_native_master_poll_interval.count()));
+        const int poll_result = ::poll(fds, descriptor_count, poll_timeout);
 #endif
-        if (poll_result < 0) {
-            if (errno == EINTR) {
-                return !write_stopping();
+        int error = poll_result < 0 ? errno : 0;
+        if (error == EINTR) {
+            return !write_stopping();
+        }
+        if (poll_result >= 0) {
+            if ((fds[0].revents & (POLLHUP | POLLERR)) != 0) {
+                error = EIO;
             }
-
+            for (const pollfd& descriptor : fds) {
+                if ((descriptor.revents & POLLNVAL) != 0) {
+                    error = EBADF;
+                    break;
+                }
+            }
+        }
+        if (error != 0) {
             if (!write_stopping()) {
                 report_native_backend_error_with_snapshot(
                     m_mutex,
                     m_callbacks,
                     Terminal_backend_error_code::WRITE_FAILED,
-                    posix_error_message(QStringLiteral("poll PTY write wake"), errno));
+                    posix_error_message(QStringLiteral("poll PTY input"), error));
             }
             return false;
         }
 
+#if defined(__linux__)
+        if ((fds[1].revents & (POLLHUP | POLLERR)) != 0) {
+            return false;
+        }
+#endif
         if ((fds[0].revents & POLLIN) != 0) {
             drain_wake_pipe(wake_read);
         }
@@ -1622,11 +1648,8 @@ private:
                 wake_read = m_write_wake_read.get();
             }
 
-            // Write first: the PTY master is non-blocking, so write() is itself
-            // the writability test. Only wait when it reports EAGAIN, and wait
-            // on the wake pipe rather than polling the master for POLLOUT (see
-            // wait_for_write_capacity). This keeps the writer off the unreliable
-            // macOS PTY-master POLLOUT path entirely.
+            // The nonblocking write is authoritative; enter the platform's
+            // capacity wait only after the PTY actually applies backpressure.
             const qsizetype remaining = bytes.size() - offset;
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
             observe_pty_io_for_testing(Posix_pty_io_point_for_testing::WRITE, master);
@@ -1645,7 +1668,7 @@ private:
             }
 
             if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!wait_for_write_capacity(wake_read)) {
+                if (!wait_for_write_capacity(master, wake_read)) {
                     return false;
                 }
                 continue;
@@ -1687,15 +1710,16 @@ private:
         }
 
         const auto root_exit = m_owner->wait_root();
+        const auto final_drain_deadline =
+            std::chrono::steady_clock::now() + k_exit_output_drain_timeout;
         const int wait_error = root_exit ? 0 : ECHILD;
-        const auto reap_time = std::chrono::steady_clock::now();
         if (wait_error != 0) {
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 // Wait ownership loss is not proof of native settlement.
-                m_child_exit_observed = true;
+                m_exit_output_drain_deadline = final_drain_deadline;
                 m_process_stopping = true;
                 m_output_paused = false;
                 m_write_queue.clear();
@@ -1705,6 +1729,9 @@ private:
                         take_paused_output_for_delivery_locked(paused_output);
                 }
             }
+            m_output_cv.notify_all();
+            m_write_cv.notify_all();
+            wake_io_threads();
             if (!paused_output.isEmpty()) {
                 deliver_native_backend_output_with_snapshot(
                     m_mutex,
@@ -1712,9 +1739,6 @@ private:
                     std::move(paused_output));
             }
             finish_paused_output_delivery(paused_output_delivery_started);
-            m_output_cv.notify_all();
-            m_write_cv.notify_all();
-            wake_io_threads();
             wait_for_native_backend_reader_finished(
                 m_mutex,
                 m_reader_cv,
@@ -1732,7 +1756,7 @@ private:
         bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_child_exit_observed = true;
+            m_exit_output_drain_deadline = final_drain_deadline;
             m_child_exit_confirmed = true;
             m_process_stopping = true;
             m_output_paused    = false;
@@ -1746,6 +1770,11 @@ private:
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
         observe_pty_io_for_testing(Posix_pty_io_point_for_testing::ROOT_EXIT, m_master.get());
 #endif
+        // Publish the deadline and cancellation before a replay callback can
+        // block. Its in-progress flag still prevents the reader overtaking it.
+        m_output_cv.notify_all();
+        m_write_cv.notify_all();
+        wake_io_threads();
         if (!paused_output.isEmpty()) {
             deliver_native_backend_output_with_snapshot(
                 m_mutex,
@@ -1753,9 +1782,6 @@ private:
                 std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
-        m_output_cv.notify_all();
-        m_write_cv.notify_all();
-        wake_io_threads();
         wait_for_native_backend_reader_finished(
             m_mutex,
             m_reader_cv,
@@ -1763,7 +1789,7 @@ private:
         // Honor the exit-drain window even if PTY EOF ends the reader early.
         // Shutdown can interrupt this output drain; native cleanup belongs to
         // the owner independently of callback delivery.
-        wait_out_exit_drain_window(reap_time);
+        wait_out_exit_drain_window(final_drain_deadline);
         drain_paused_output_before_exit_report();
         // Root observation does not discharge cleanup. The selected owner
         // retains the sole consuming wait and its remaining native obligations.
@@ -1795,9 +1821,8 @@ private:
     std::shared_ptr<Posix_process_group_custody> m_child_group_custody =
         std::make_shared<Posix_process_group_custody>(-1);
 #endif
-    bool m_child_exit_observed = false;
-    // Set only once the wait has observed the child's exit, unlike
-    // m_child_exit_observed, which a lost observation sets as well.
+    std::optional<std::chrono::steady_clock::time_point> m_exit_output_drain_deadline;
+    // Lost observation also arms the drain, but does not confirm child exit.
     bool m_child_exit_confirmed = false;
     std::mutex                          m_mutex;
     std::condition_variable             m_output_cv;
