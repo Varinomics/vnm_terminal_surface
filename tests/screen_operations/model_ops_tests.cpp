@@ -6924,6 +6924,56 @@ bool test_dec_selective_rectangle_preserves_protected_soft_wrap()
     return ok;
 }
 
+
+bool test_retained_lookup_invalidation_skips_unchanged_buffers()
+{
+    term::Terminal_screen_model model = make_model(4, 16);
+    model.ingest(QByteArrayLiteral("initial"));
+    model.set_selection_reconciliation_counters_enabled(true);
+
+    bool ok = true;
+    const auto visits = [&]() {
+        return model.selection_reconciliation_counters()
+            .retained_lookup_active_grid_entries_visited;
+    };
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("\x1b[2;2H"));
+    ok &= check(visits() == 0U,
+        "cursor-only ingest skips unchanged active-grid lookups");
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("X"));
+    ok &= check(visits() > 0U && visits() <= 16U,
+        "primary text mutation refreshes only the primary lookup");
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    ok &= check(visits() > 0U && visits() <= 16U,
+        "alternate switch refreshes only the newly cleared alternate lookup");
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("\x1b[3;4H"));
+    ok &= check(visits() == 0U,
+        "alternate cursor movement skips unchanged lookup indexes");
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("\x1b[?2026hY"));
+    ok &= check(visits() > 0U && visits() <= 16U,
+        "synchronized output refreshes hidden alternate row mutations");
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("\x1b[?2026l\x1b[?1049l"));
+    ok &= check(visits() <= 16U,
+        "returning to primary does not traverse its unchanged grid");
+
+    model.reset_selection_reconciliation_counters();
+    model.resize({6, 12});
+    ok &= check(visits() > 0U,
+        "resize invalidates structurally changed active-grid lookups");
+    return ok;
+}
+
 bool test_rectangular_attribute_styled_blank_selection()
 {
     bool ok = true;
@@ -7025,6 +7075,7 @@ int main()
     ok &= test_recovery_disabled_chunk_split_invariance_for_non_scroll_sources();
     ok &= test_recovery_disabled_scrollback_limit_changes_do_not_grow_retained_history();
     ok &= test_retained_line_content_generation_mutations();
+    ok &= test_retained_lookup_invalidation_skips_unchanged_buffers();
     ok &= test_replies_and_cursor_save_restore();
     ok &= test_text_area_resize_policy_gates_the_request();
     ok &= test_pixel_size_reports_follow_cell_pixel_size();
