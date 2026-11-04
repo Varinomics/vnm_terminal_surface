@@ -38,6 +38,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -379,6 +380,8 @@ struct Msdf_terminal_baked_atlas_key
     float         atlas_px_range       = 0.0f;
     int           atlas_gutter_px      = 0;
     bool          build_kerning_table  = false;
+    bool          auto_atlas_size      = false;
+    float         sharpness_bias       = 0.0f;
     int           missing_glyph_policy = 0;
     bool          valid                = false;
 };
@@ -395,6 +398,8 @@ bool msdf_baked_atlas_key_equal(
         left.atlas_px_range       == right.atlas_px_range &&
         left.atlas_gutter_px      == right.atlas_gutter_px &&
         left.build_kerning_table  == right.build_kerning_table &&
+        left.auto_atlas_size      == right.auto_atlas_size &&
+        left.sharpness_bias       == right.sharpness_bias &&
         left.missing_glyph_policy == right.missing_glyph_policy &&
         left.font_fingerprint         == right.font_fingerprint &&
         left.codepoint_inventory_hash == right.codepoint_inventory_hash;
@@ -409,7 +414,8 @@ struct Msdf_terminal_text_cache
     bool          atlas_built = false;
     bool          ready       = false;
     QString       message;
-    msdf_text_atlas_t atlas;
+    // An alias to the process-shared bake result; no bitmap copy per surface.
+    std::shared_ptr<const msdf_text_atlas_t> atlas;
 };
 
 struct Msdf_terminal_atlas_build
@@ -417,6 +423,9 @@ struct Msdf_terminal_atlas_build
     Msdf_terminal_baked_atlas_key key;
     std::atomic<bool>            complete = false;
     msdf_text::build_result_t    result;
+    std::mutex                  completion_mutex;
+    std::condition_variable     completion_cv;
+    std::vector<std::weak_ptr<Msdf_atlas_completion>> completions;
 };
 
 // Draw-size layout derived from one baked atlas for the current terminal size.
