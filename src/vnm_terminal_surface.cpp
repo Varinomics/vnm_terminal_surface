@@ -37,6 +37,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFont>
+#include <QFutureWatcher>
 #include <QGuiApplication>
 #include <QHoverEvent>
 #include <QInputMethodEvent>
@@ -46,6 +47,7 @@
 #include <QMouseEvent>
 #include <QObject>
 #include <QPointer>
+#include <QPromise>
 #include <QProcessEnvironment>
 #include <QThreadPool>
 #include <QQuickWindow>
@@ -280,7 +282,6 @@ Terminal_process_start_result rejected_terminal_start()
 constexpr std::size_t k_surface_notification_trace_limit         = 0U;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
-constexpr int         k_msdf_availability_completion_poll_ms     = 10;
 constexpr int         k_msdf_availability_completion_timeout_ms  = 30000;
 constexpr std::size_t k_surface_output_queue_hard_limit_bytes    = 2U * 1024U * 1024U;
 constexpr std::size_t k_bytes_per_mib                             = 1024U * 1024U;
@@ -310,6 +311,7 @@ struct Msdf_availability_completion
 
     unsigned long long generation = 0;
     std::atomic<int>   dispatch_result{k_dispatch_pending};
+    QPromise<void>     dispatch_finished;
 };
 
 class Search_completion_dispatch final : public QObject
@@ -3248,13 +3250,14 @@ struct VNM_TerminalSurface::Private
     QTimer                                                 synchronized_output_recovery_timer;
     QTimer                                                 text_area_resize_arbitration_timer;
     QTimer                                                 row_timestamp_tooltip_timer;
-    QTimer                                                 msdf_availability_completion_timer;
+    QTimer                                                 msdf_availability_deadline_timer;
+    QFutureWatcher<void>                                   msdf_availability_completion_watcher;
     std::shared_ptr<Msdf_availability_completion>          msdf_availability_completion;
 
     std::shared_ptr<term::Msdf_availability_work>
                                                            msdf_availability_work;
 
-    int                                                    msdf_availability_completion_polls_remaining = 0;
+    std::function<bool(const QFont&)>                      msdf_availability_probe_for_testing;
     std::optional<QPointF>                                 row_timestamp_tooltip_pointer_position;
     bool                                                   row_timestamp_tooltip_request_active  = false;
     bool                                                   selection_drag_active                 = false;
@@ -3428,14 +3431,23 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
         [this] {
             handle_row_timestamp_tooltip_timeout();
         });
-    m_private->msdf_availability_completion_timer.setInterval(
-        k_msdf_availability_completion_poll_ms);
+    m_private->msdf_availability_deadline_timer.setSingleShot(true);
+    m_private->msdf_availability_deadline_timer.setTimerType(Qt::PreciseTimer);
+    m_private->msdf_availability_deadline_timer.setInterval(
+        k_msdf_availability_completion_timeout_ms);
     QObject::connect(
-        &m_private->msdf_availability_completion_timer,
+        &m_private->msdf_availability_deadline_timer,
         &QTimer::timeout,
         this,
         [this] {
-            handle_msdf_availability_completion_timeout();
+            handle_msdf_availability_completion(true);
+        });
+    QObject::connect(
+        &m_private->msdf_availability_completion_watcher,
+        &QFutureWatcher<void>::finished,
+        this,
+        [this] {
+            handle_msdf_availability_completion(false);
         });
     QObject::connect(
         qGuiApp,
@@ -3601,23 +3613,36 @@ void VNM_TerminalSurface::start_msdf_availability_check()
 
     auto completion = std::make_shared<Msdf_availability_completion>();
     completion->generation = generation;
+    completion->dispatch_finished.start();
     m_private->msdf_availability_completion = completion;
-    m_private->msdf_availability_completion_polls_remaining =
-        k_msdf_availability_completion_timeout_ms /
-        k_msdf_availability_completion_poll_ms;
-    m_private->msdf_availability_completion_timer.start();
+    // Qt owns watcher notification independently of the application result
+    // post, so rejected admission can settle checking without another post.
+    m_private->msdf_availability_completion_watcher.setFuture(
+        completion->dispatch_finished.future());
+    m_private->msdf_availability_deadline_timer.start();
 
     if (m_private->msdf_availability_work == nullptr) {
         m_private->msdf_availability_work = std::make_shared<term::Msdf_availability_work>();
     }
     QPointer<VNM_TerminalSurface> self = this;
+    // QCoreApplication drains the global pool before destroying its QObject
+    // receiver. Capture it here rather than reading the singleton on a worker
+    // while application shutdown changes it.
+    QObject* const completion_context = qApp;
     const bool start_worker = m_private->msdf_availability_work->submit([
-            self, font, generation, completion
+            self,
+            font,
+            generation,
+            completion,
+            completion_context,
+            probe = m_private->msdf_availability_probe_for_testing
         ]()
         {
-            const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
+            const bool available = probe
+                ? probe(font)
+                : term::qsg_atlas_msdf_text_available_for_font(font);
             const auto post_result = vnm::qt::post(
-                qApp,
+                completion_context,
                 [self, available, generation]() {
                     if (self) {
                         self->apply_msdf_availability_result(available, generation);
@@ -3626,6 +3651,13 @@ void VNM_TerminalSurface::start_msdf_availability_check()
             completion->dispatch_result.store(
                 static_cast<int>(post_result),
                 std::memory_order_release);
+            try {
+                completion->dispatch_finished.finish();
+            }
+            catch (...) {
+                // Qt notification can also fail to allocate/queue. The armed
+                // deadline still observes the published dispatch result.
+            }
         });
     if (start_worker) {
         QThreadPool::globalInstance()->start([
@@ -3637,14 +3669,14 @@ void VNM_TerminalSurface::start_msdf_availability_check()
     }
 }
 
-void VNM_TerminalSurface::handle_msdf_availability_completion_timeout()
+void VNM_TerminalSurface::handle_msdf_availability_completion(bool deadline_expired)
 {
     const std::shared_ptr<Msdf_availability_completion> completion =
         m_private->msdf_availability_completion;
     if (completion == nullptr ||
         completion->generation != m_msdf_availability_generation)
     {
-        m_private->msdf_availability_completion_timer.stop();
+        m_private->msdf_availability_deadline_timer.stop();
         m_private->msdf_availability_completion.reset();
         return;
     }
@@ -3654,13 +3686,11 @@ void VNM_TerminalSurface::handle_msdf_availability_completion_timeout()
     const bool dispatch_rejected =
         dispatch_result != Msdf_availability_completion::k_dispatch_pending &&
         dispatch_result != static_cast<int>(vnm::qt::Post_result::QUEUED);
-    const bool completion_timed_out =
-        --m_private->msdf_availability_completion_polls_remaining <= 0;
-    if (!dispatch_rejected && !completion_timed_out) {
+    if (!dispatch_rejected && !deadline_expired) {
         return;
     }
 
-    m_private->msdf_availability_completion_timer.stop();
+    m_private->msdf_availability_deadline_timer.stop();
     m_private->msdf_availability_completion.reset();
     if (m_msdf_text_checking) {
         m_msdf_text_checking = false;
@@ -3690,11 +3720,17 @@ void VNM_TerminalSurface::apply_msdf_availability_result(
         return; // superseded by a newer font change
     }
 
-    m_private->msdf_availability_completion_timer.stop();
+    // A same-generation result remains useful after the deadline. Completion
+    // state only tracks checking; the generation decides result freshness.
+    m_private->msdf_availability_deadline_timer.stop();
     m_private->msdf_availability_completion.reset();
     if (m_msdf_text_checking) {
+        const QPointer<VNM_TerminalSurface> self(this);
         m_msdf_text_checking = false;
         emit msdf_text_checking_changed();
+        if (self == nullptr || generation != m_msdf_availability_generation) {
+            return;
+        }
     }
     if (m_msdf_text_available != available) {
         m_msdf_text_available = available;
@@ -10005,6 +10041,21 @@ set_before_search_completion_dispatch_handler_for_testing(
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->before_search_completion_dispatch_handler_for_testing =
         std::move(handler);
+}
+
+void term::VNM_TerminalSurface_render_bridge::set_msdf_availability_probe_for_testing(
+    VNM_TerminalSurface&              surface,
+    std::function<bool(const QFont&)> probe)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->msdf_availability_probe_for_testing = std::move(probe);
+}
+
+QTimer& term::VNM_TerminalSurface_render_bridge::msdf_availability_deadline_timer_for_testing(
+    VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->msdf_availability_deadline_timer;
 }
 
 void term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
