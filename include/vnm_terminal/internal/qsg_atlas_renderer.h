@@ -821,16 +821,29 @@ private:
         Glyph_atlas_slot slot;
     };
 
+    // Only preparation-time insertion mutates this state. A warm prepare
+    // shares the committed packer, slots, and page buffers without copying
+    // the glyph map; the first insertion detaches the transaction.
+    struct Storage
+    {
+        explicit Storage(QSize page_size, int page_budget = 4)
+            : packer(page_size, 1, page_budget) {}
+
+        Glyph_atlas_packer                     packer;
+        std::map<Glyph_atlas_cache_key, Entry> entries;
+        std::vector<QByteArray>                pages;
+    };
+
+    void detach_storage_for_write();
     void ensure_page_count(int page_count);
     void copy_tile_to_slot(
         int                        page,
         const QRect&               rect,
         const Glyph_rgba_tile&      tile);
 
-    Glyph_atlas_packer                     m_packer;
-    std::map<Glyph_atlas_cache_key, Entry> m_entries;
-    std::vector<QByteArray>                m_pages;
-    Glyph_atlas_cache_stats                m_stats;
+    std::shared_ptr<Storage> m_storage;
+    // Lookup/hit counters are per prepare, never part of shared storage.
+    Glyph_atlas_cache_stats m_stats;
 };
 
 struct Captured_atlas_frame
