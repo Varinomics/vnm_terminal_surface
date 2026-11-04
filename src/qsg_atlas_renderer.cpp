@@ -8279,7 +8279,7 @@ const Glyph_atlas_slot* Glyph_atlas_cache::find(
 
 void Glyph_atlas_cache::detach_storage_for_write()
 {
-    if (!m_storage.unique()) {
+    if (m_storage.use_count() > 1) {
         // QByteArray pages retain their own copy-on-write bitmap storage;
         // only a subsequently modified page needs a pixel-buffer detach.
         m_storage = std::make_shared<Storage>(*m_storage);
