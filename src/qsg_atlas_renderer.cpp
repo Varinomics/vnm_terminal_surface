@@ -8914,6 +8914,45 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font)
     return layout_font;
 }
 
+Qsg_atlas_msdf_shared_bake_stats qsg_atlas_msdf_shared_bake_stats()
+{
+    Qsg_atlas_msdf_shared_bake_stats stats;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+    const auto pool = atlas_msdf_bake_pool();
+    const std::lock_guard<std::mutex> lock(pool->mutex);
+    stats.build_calls      = pool->build_calls;
+    stats.inflight_reuses  = pool->inflight_reuses;
+    stats.completed_reuses = pool->completed_reuses;
+    for (const auto& build : pool->entries) {
+        if (build->complete.load(std::memory_order_acquire)) {
+            ++stats.completed_atlases;
+            stats.completed_bytes += build->result.atlas.rgba.size();
+        }
+    }
+#endif
+    return stats;
+}
+
+bool qsg_atlas_clear_msdf_shared_bakes_for_testing()
+{
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+    const auto pool = atlas_msdf_bake_pool();
+    const std::lock_guard<std::mutex> lock(pool->mutex);
+    // Never discard in-progress registrations: another availability request
+    // or renderer may be waiting for their result.
+    for (const auto& build : pool->entries) {
+        if (!build->complete.load(std::memory_order_acquire)) {
+            return false;
+        }
+    }
+    pool->entries.clear();
+    pool->build_calls = 0U;
+    pool->inflight_reuses = 0U;
+    pool->completed_reuses = 0U;
+#endif
+    return true;
+}
+
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 // Whether the MSDF text renderer can actually render `font`: its sfnt bytes
 // resolve and msdfgen bakes a ready atlas covering the printable-ASCII core.
