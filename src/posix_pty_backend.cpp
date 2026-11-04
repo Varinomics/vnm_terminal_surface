@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -48,13 +49,59 @@ namespace vnm_terminal::internal {
 namespace {
 
 #ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
-std::atomic<Posix_pty_io_hook_for_testing> s_pty_io_hook{nullptr};
+std::atomic<Posix_pty_io_hook_for_testing>   s_pty_io_hook{nullptr};
+std::atomic<Posix_pty_poll_hook_for_testing> s_pty_poll_hook{nullptr};
+
+std::atomic<Posix_pty_wake_write_error_hook_for_testing> s_pty_wake_write_error_hook{nullptr};
 
 void observe_pty_io_for_testing(Posix_pty_io_point_for_testing point, int descriptor)
 {
     if (const auto hook = s_pty_io_hook.load(std::memory_order_acquire)) {
         hook(point, descriptor);
     }
+}
+
+void observe_pty_poll_for_testing(const posix_pty_poll_observation_t& observation)
+{
+    if (const auto hook = s_pty_poll_hook.load(std::memory_order_acquire)) {
+        const int saved_error = errno;
+        hook(observation);
+        errno = saved_error;
+    }
+}
+
+int poll_pty_io_for_testing(
+    Posix_pty_io_worker_for_testing worker,
+    pollfd*                        descriptors,
+    nfds_t                         descriptor_count,
+    int                            timeout_ms)
+{
+    observe_pty_poll_for_testing({
+        worker, Posix_pty_poll_phase_for_testing::BEFORE_WAIT,
+        descriptors, descriptor_count, timeout_ms, 0, 0});
+    const int result = ::poll(descriptors, descriptor_count, timeout_ms);
+    observe_pty_poll_for_testing({
+        worker, Posix_pty_poll_phase_for_testing::AFTER_WAIT,
+        descriptors, descriptor_count, timeout_ms, result, result < 0 ? errno : 0});
+    return result;
+}
+
+ssize_t write_pty_wake_for_testing(
+    Posix_pty_io_worker_for_testing worker,
+    int                            descriptor,
+    const void*                    bytes,
+    std::size_t                    count)
+{
+    if (const auto hook = s_pty_wake_write_error_hook.load(std::memory_order_acquire)) {
+        const int saved_error    = errno;
+        const int injected_error = hook(worker, descriptor);
+        if (injected_error != 0) {
+            errno = injected_error;
+            return -1;
+        }
+        errno = saved_error;
+    }
+    return ::write(descriptor, bytes, count);
 }
 #endif
 
@@ -388,6 +435,17 @@ int poll_timeout_until(std::optional<std::chrono::steady_clock::time_point> dead
 void set_posix_pty_io_hook_for_testing(Posix_pty_io_hook_for_testing hook)
 {
     s_pty_io_hook.store(hook, std::memory_order_release);
+}
+
+void set_posix_pty_poll_hook_for_testing(Posix_pty_poll_hook_for_testing hook)
+{
+    s_pty_poll_hook.store(hook, std::memory_order_release);
+}
+
+void set_posix_pty_wake_write_error_hook_for_testing(
+    Posix_pty_wake_write_error_hook_for_testing hook)
+{
+    s_pty_wake_write_error_hook.store(hook, std::memory_order_release);
 }
 #endif
 
@@ -1189,12 +1247,24 @@ private:
 
         const unsigned char byte = 1U;
         if (read_wake_write >= 0) {
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+            const ssize_t result = write_pty_wake_for_testing(
+                Posix_pty_io_worker_for_testing::READER,
+                read_wake_write, &byte, sizeof(byte));
+#else
             const ssize_t result = ::write(read_wake_write, &byte, sizeof(byte));
+#endif
             (void)result;
         }
 
         if (write_wake_write >= 0) {
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+            const ssize_t result = write_pty_wake_for_testing(
+                Posix_pty_io_worker_for_testing::WRITER,
+                write_wake_write, &byte, sizeof(byte));
+#else
             const ssize_t result = ::write(write_wake_write, &byte, sizeof(byte));
+#endif
             (void)result;
         }
     }
@@ -1338,7 +1408,12 @@ private:
             const int poll_timeout = output_admission_closed ? 0 : final_drain_deadline.has_value()
                 ? poll_timeout_until(final_drain_deadline)
                 : static_cast<int>(k_native_master_poll_interval.count());
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+            const int poll_result = poll_pty_io_for_testing(
+                Posix_pty_io_worker_for_testing::READER, fds, 2, poll_timeout);
+#else
             const int poll_result = ::poll(fds, 2, poll_timeout);
+#endif
             if (poll_result == 0) {
                 if (!output_admission_closed) {
                     continue;
@@ -1387,7 +1462,13 @@ private:
                     }
                     // A concurrent flow stop must not turn this into a busy
                     // loop. Reset still interrupts through the wake descriptor.
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+                    (void)poll_pty_io_for_testing(
+                        Posix_pty_io_worker_for_testing::READER,
+                        fds + 1, 1, static_cast<int>(k_native_master_poll_interval.count()));
+#else
                     (void)::poll(fds + 1, 1, static_cast<int>(k_native_master_poll_interval.count()));
+#endif
                 }
 #endif
                 continue;
@@ -1491,10 +1572,18 @@ private:
             { wake_read, POLLIN, 0 },
         };
 
+#ifdef VNM_TERMINAL_CAPTURE_TEST_HOOKS
+        const int poll_result = poll_pty_io_for_testing(
+            Posix_pty_io_worker_for_testing::WRITER,
+            fds,
+            1,
+            static_cast<int>(k_native_master_poll_interval.count()));
+#else
         const int poll_result = ::poll(
             fds,
             1,
             static_cast<int>(k_native_master_poll_interval.count()));
+#endif
         if (poll_result < 0) {
             if (errno == EINTR) {
                 return !write_stopping();
