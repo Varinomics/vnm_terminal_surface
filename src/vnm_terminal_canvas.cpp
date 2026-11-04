@@ -491,7 +491,6 @@ struct VNM_TerminalCanvas::Private
     std::shared_ptr<term::Hierarchical_profiler> render_profiler;
 
     QTimer*                                                     cursor_blink_timer   = nullptr;
-    QTimer*                                                     render_status_timer  = nullptr;
     QString                                                     render_error;
     bool                                                        cursor_blink_visible = true;
     bool                                                        render_ready         = false;
@@ -592,14 +591,12 @@ VNM_TerminalCanvas::VNM_TerminalCanvas(QQuickItem* parent)
         &QTimer::timeout,
         this,
         &VNM_TerminalCanvas::toggle_cursor_blink_phase);
-    m_private->render_status_timer = new QTimer(this);
-    m_private->render_status_timer->setInterval(100);
     connect(
-        m_private->render_status_timer,
-        &QTimer::timeout,
+        m_private->recorder.get(),
+        &term::Qsg_atlas_recorder::render_status_changed,
         this,
-        &VNM_TerminalCanvas::refresh_render_status);
-    m_private->render_status_timer->start();
+        &VNM_TerminalCanvas::refresh_render_status,
+        Qt::QueuedConnection);
     refresh_render_state();
 }
 
@@ -1186,7 +1183,7 @@ void VNM_TerminalCanvas::refresh_render_state()
 
 void VNM_TerminalCanvas::refresh_render_status()
 {
-    const term::Qsg_atlas_frame_report report = m_private->recorder->snapshot();
+    const term::Qsg_atlas_frame_report report = m_private->recorder->take_render_status();
     const bool prepared_current_ownership =
         report.prepared_ownership_generation ==
             m_private->ownership_generation;
