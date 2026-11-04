@@ -7991,10 +7991,10 @@ std::optional<Glyph_atlas_slot> Glyph_atlas_packer::pack_in_page(
 
 Glyph_atlas_cache::Glyph_atlas_cache(QSize page_size)
 :
-    m_packer(page_size)
+    m_storage(std::make_shared<Storage>(page_size))
 {
     m_stats.page_size    = page_size;
-    m_stats.page_budget  = m_packer.max_pages();
+    m_stats.page_budget  = m_storage->packer.max_pages();
     m_stats.page_bytes   = qsg_atlas_rgba_tile_byte_count(page_size);
     m_stats.budget_bytes =
         m_stats.page_bytes * static_cast<std::uint64_t>(m_stats.page_budget);
@@ -8006,17 +8006,17 @@ bool Glyph_atlas_cache::configure(QSize page_size, int page_budget)
         return false;
     }
     if (m_stats.page_size == page_size &&
-        m_packer.max_pages() == page_budget)
+        m_storage->packer.max_pages() == page_budget)
     {
         return true;
     }
 
-    if (!m_entries.empty() || !m_pages.empty()) {
+    if (!m_storage->entries.empty() || !m_storage->pages.empty()) {
         ++m_stats.invalidations;
     }
-    m_entries.clear();
-    m_pages.clear();
-    m_packer = Glyph_atlas_packer(page_size, 1, page_budget);
+    // Discard only this transaction's reference; a previous committed cache
+    // may still use these slots and bitmap pages after a failed prepare.
+    m_storage = std::make_shared<Storage>(page_size, page_budget);
     m_stats.page_size       = page_size;
     m_stats.page_budget     = page_budget;
     m_stats.page_bytes      = qsg_atlas_rgba_tile_byte_count(page_size);
@@ -8034,13 +8034,12 @@ void Glyph_atlas_cache::set_epoch(std::uint64_t epoch)
         return;
     }
 
-    if (m_stats.epoch != 0U || !m_entries.empty()) {
+    if (m_stats.epoch != 0U || !m_storage->entries.empty()) {
         ++m_stats.invalidations;
     }
     m_stats.epoch = epoch;
-    m_entries.clear();
-    m_pages.clear();
-    m_packer.reset();
+    m_storage = std::make_shared<Storage>(
+        m_stats.page_size, m_stats.page_budget);
     m_stats.page_count      = 0;
     m_stats.allocated_bytes = 0U;
     m_stats.used_bytes      = 0U;
@@ -8054,9 +8053,7 @@ void Glyph_atlas_cache::reset()
     const int           page_budget   = m_stats.page_budget;
     const std::uint64_t page_bytes    = m_stats.page_bytes;
     const std::uint64_t budget_bytes  = m_stats.budget_bytes;
-    m_entries.clear();
-    m_pages.clear();
-    m_packer.reset();
+    m_storage = std::make_shared<Storage>(page_size, page_budget);
     m_stats               = {};
     m_stats.epoch         = epoch;
     m_stats.invalidations = invalidations;
@@ -8070,8 +8067,8 @@ const Glyph_atlas_slot* Glyph_atlas_cache::find(
     const Glyph_atlas_cache_key& key)
 {
     ++m_stats.lookups;
-    const auto found = m_entries.find(key);
-    if (found == m_entries.end()) {
+    const auto found = m_storage->entries.find(key);
+    if (found == m_storage->entries.end()) {
         return nullptr;
     }
 
@@ -8079,31 +8076,41 @@ const Glyph_atlas_slot* Glyph_atlas_cache::find(
     return &found->second.slot;
 }
 
+void Glyph_atlas_cache::detach_storage_for_write()
+{
+    if (!m_storage.unique()) {
+        // QByteArray pages retain their own copy-on-write bitmap storage;
+        // only a subsequently modified page needs a pixel-buffer detach.
+        m_storage = std::make_shared<Storage>(*m_storage);
+    }
+}
+
 Glyph_atlas_slot Glyph_atlas_cache::insert_or_get(
     const Glyph_atlas_cache_key& key,
     const Glyph_rgba_tile&       tile,
     QPoint                       physical_offset)
 {
-    const auto found = m_entries.find(key);
-    if (found != m_entries.end()) {
+    const auto found = m_storage->entries.find(key);
+    if (found != m_storage->entries.end()) {
         return found->second.slot;
     }
 
-    const std::optional<Glyph_atlas_slot> slot = m_packer.pack(tile.size);
+    detach_storage_for_write();
+    const std::optional<Glyph_atlas_slot> slot = m_storage->packer.pack(tile.size);
     if (!slot.has_value()) {
         ++m_stats.failed_inserts;
         return {};
     }
 
-    ensure_page_count(m_packer.page_count());
+    ensure_page_count(m_storage->packer.page_count());
     Glyph_atlas_slot stored_slot = *slot;
     stored_slot.physical_offset  = physical_offset;
     stored_slot.coverage_kind    = tile.coverage_kind;
     stored_slot.lcd_order        = tile.lcd_order;
     copy_tile_to_slot(stored_slot.page, stored_slot.rect, tile);
-    m_entries.emplace(key, Entry{stored_slot});
+    m_storage->entries.emplace(key, Entry{stored_slot});
     ++m_stats.inserts;
-    m_stats.page_count      = m_packer.page_count();
+    m_stats.page_count      = m_storage->packer.page_count();
     m_stats.allocated_bytes = m_stats.page_bytes *
         static_cast<std::uint64_t>(m_stats.page_count);
     m_stats.used_bytes += qsg_atlas_rgba_tile_byte_count(tile.size);
@@ -8113,8 +8120,8 @@ Glyph_atlas_slot Glyph_atlas_cache::insert_or_get(
 Glyph_atlas_cache_stats Glyph_atlas_cache::stats() const
 {
     Glyph_atlas_cache_stats stats = m_stats;
-    stats.page_count      = m_packer.page_count();
-    stats.page_budget     = m_packer.max_pages();
+    stats.page_count      = m_storage->packer.page_count();
+    stats.page_budget     = m_storage->packer.max_pages();
     stats.page_bytes      = qsg_atlas_rgba_tile_byte_count(stats.page_size);
     stats.allocated_bytes = stats.page_bytes *
         static_cast<std::uint64_t>(stats.page_count);
@@ -8125,13 +8132,13 @@ Glyph_atlas_cache_stats Glyph_atlas_cache::stats() const
 
 const QByteArray& Glyph_atlas_cache::page_bytes(int page) const
 {
-    return m_pages[static_cast<std::size_t>(page)];
+    return m_storage->pages[static_cast<std::size_t>(page)];
 }
 
 void Glyph_atlas_cache::ensure_page_count(int page_count)
 {
-    while (static_cast<int>(m_pages.size()) < page_count) {
-        m_pages.push_back(
+    while (static_cast<int>(m_storage->pages.size()) < page_count) {
+        m_storage->pages.push_back(
             QByteArray(
                 static_cast<int>(qsg_atlas_rgba_tile_byte_count(m_stats.page_size)),
                 '\0'));
@@ -8143,7 +8150,7 @@ void Glyph_atlas_cache::copy_tile_to_slot(
     const QRect&               rect,
     const Glyph_rgba_tile&      tile)
 {
-    QByteArray& page_bytes = m_pages[static_cast<std::size_t>(page)];
+    QByteArray& page_bytes = m_storage->pages[static_cast<std::size_t>(page)];
     const int page_stride  = m_stats.page_size.width() * 4;
     for (int y = 0; y < tile.size.height(); ++y) {
         const char* const source = tile.bytes.constData() + y * tile.bytes_per_line;
