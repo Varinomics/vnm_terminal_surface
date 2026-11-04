@@ -5,6 +5,7 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
+#include <QAbstractEventDispatcher>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -25,6 +26,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -166,6 +168,36 @@ private:
     };
 
     std::shared_ptr<Counts> m_counts = std::make_shared<Counts>();
+};
+
+class Application_dispatch_rejection
+{
+public:
+    explicit Application_dispatch_rejection(QGuiApplication& app)
+    :
+        m_app(app),
+        m_application_thread(app.thread()),
+        m_dispatcher(QAbstractEventDispatcher::instance(app.thread())),
+        m_dispatcher_parent(m_dispatcher->parent())
+    {
+        // Qt parents the dispatcher to the application. Moving that child
+        // would also move the queue drained by the Unix event pump, so detach
+        // it while rejecting only the application receiver's admission.
+        m_dispatcher->setParent(nullptr);
+        m_app.moveToThread(nullptr);
+    }
+
+    ~Application_dispatch_rejection()
+    {
+        m_app.moveToThread(m_application_thread);
+        m_dispatcher->setParent(m_dispatcher_parent);
+    }
+
+private:
+    QGuiApplication&                m_app;
+    QThread* const                  m_application_thread;
+    QAbstractEventDispatcher* const m_dispatcher;
+    QObject* const                  m_dispatcher_parent;
 };
 
 bool pump_until(
@@ -420,15 +452,16 @@ bool test_superseded_completion_and_deadline(QGuiApplication& app, bool reject_d
     }
     surface.set_font_family(final_family);
 
-    QThread* const application_thread = app.thread();
+    std::optional<Application_dispatch_rejection> dispatch_rejection;
     if (reject_dispatch) {
-        app.moveToThread(nullptr);
+        dispatch_rejection.emplace(app);
+        ok &= check(app.thread() == nullptr &&
+                QAbstractEventDispatcher::instance()->thread() == QThread::currentThread(),
+            "application dispatch rejection preserves the GUI event dispatcher's affinity");
     }
     first_probe.release();
     ok &= check(final_probe.wait_until_started(), "only the latest pending check starts next");
-    if (reject_dispatch) {
-        app.moveToThread(application_thread);
-    }
+    dispatch_rejection.reset();
     app.processEvents();
     QTimerEvent stale_deadline(stale_timer_id);
     QCoreApplication::sendEvent(&deadline, &stale_deadline);
@@ -564,25 +597,29 @@ bool test_dispatch_rejection_clears_checking_and_allows_retry(QGuiApplication& a
     const QString rejected_family =
         retry_family + QStringLiteral(" forced dispatch rejection");
     QThread* const application_thread = app.thread();
-    app.moveToThread(nullptr);
-    ok &= check(
-        app.thread() == nullptr,
-        "MSDF availability test removes the application dispatch affinity");
+    auto* const dispatcher = QAbstractEventDispatcher::instance();
+    QObject* const dispatcher_parent = dispatcher->parent();
+    {
+        Application_dispatch_rejection dispatch_rejection(app);
+        ok &= check(app.thread() == nullptr &&
+                dispatcher->thread() == application_thread,
+            "rejected application dispatch retains a working GUI event dispatcher");
 
-    surface.set_font_family(rejected_family);
-    ok &= check(
-        surface.msdf_text_checking(),
-        "MSDF availability check enters checking state before worker dispatch");
-    ok &= check(
-        pump_until(app, [&surface] {
-            return !surface.msdf_text_checking();
-        }, 5000),
-        "MSDF availability dispatch rejection clears the checking state");
+        surface.set_font_family(rejected_family);
+        ok &= check(
+            surface.msdf_text_checking(),
+            "MSDF availability check enters checking state before worker dispatch");
+        ok &= finish_workers();
+        ok &= check(
+            pump_until(app, [&surface] {
+                return !surface.msdf_text_checking();
+            }, 5000),
+            "MSDF availability dispatch rejection clears the checking state");
+    }
 
-    app.moveToThread(application_thread);
-    ok &= check(
-        app.thread() == application_thread,
-        "MSDF availability test restores the application dispatch affinity");
+    ok &= check(app.thread() == application_thread &&
+            dispatcher->thread() == application_thread && dispatcher->parent() == dispatcher_parent,
+        "dispatch rejection restores application affinity and dispatcher ownership");
     ok &= check(surface.msdf_text_available() == initial_available &&
             counts.available_changes == 0 && !deadline.isActive(),
         "rejected dispatch clears checking without applying the computed availability");
