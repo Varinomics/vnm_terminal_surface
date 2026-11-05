@@ -86,7 +86,7 @@ jobs:
 
       # Offscreen CTest deliberately skips native renderer/readback cases.
       # Exercise their scenegraph lifecycle with the already-built executable.
-      - name: Run native canvas renderer with Mesa OpenGL
+      - name: Run native renderer validation with Mesa OpenGL
         env:
           QT_QPA_PLATFORM: xcb
           QSG_RHI_BACKEND: opengl
@@ -102,6 +102,8 @@ jobs:
         run: |
           timeout 60s xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
             ./build/tests/vnm_terminal_canvas_renderer
+          timeout 90s xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
+            ./build/tests/vnm_terminal_qsg_atlas --shared-msdf-atlas --backend opengl
 
       - name: Run tests
         working-directory: build

@@ -20,6 +20,7 @@
 #include <QString>
 #include <QtGlobal>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -200,7 +201,6 @@ public:
         int   max_pages = 4);
 
     std::optional<Glyph_atlas_slot> pack(QSize tile_size);
-    void reset();
 
     QSize page_size() const { return m_page_size; }
     int max_pages() const { return m_max_pages; }
@@ -821,16 +821,29 @@ private:
         Glyph_atlas_slot slot;
     };
 
+    // Only preparation-time insertion mutates this state. A warm prepare
+    // shares the committed packer, slots, and page buffers without copying
+    // the glyph map; the first insertion detaches the transaction.
+    struct Storage
+    {
+        explicit Storage(QSize page_size, int page_budget = 4)
+            : packer(page_size, 1, page_budget) {}
+
+        Glyph_atlas_packer                     packer;
+        std::map<Glyph_atlas_cache_key, Entry> entries;
+        std::vector<QByteArray>                pages;
+    };
+
+    void detach_storage_for_write();
     void ensure_page_count(int page_count);
     void copy_tile_to_slot(
         int                        page,
         const QRect&               rect,
         const Glyph_rgba_tile&      tile);
 
-    Glyph_atlas_packer                     m_packer;
-    std::map<Glyph_atlas_cache_key, Entry> m_entries;
-    std::vector<QByteArray>                m_pages;
-    Glyph_atlas_cache_stats                m_stats;
+    std::shared_ptr<Storage> m_storage;
+    // Lookup/hit counters are per prepare, never part of shared storage.
+    Glyph_atlas_cache_stats m_stats;
 };
 
 struct Captured_atlas_frame
@@ -1030,6 +1043,19 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 // resolve and a ready atlas bakes). Thread-safe; used to gate the MSDF option in
 // the UI so it is never offered for a font MSDF cannot render.
 bool qsg_atlas_msdf_text_available_for_font(const QFont& font);
+
+// CPU-only process-local bake sharing diagnostics. These count producer calls,
+// reuse (in-flight versus completed), and the bounded completed-result pool.
+struct Qsg_atlas_msdf_shared_bake_stats
+{
+    std::uint64_t build_calls       = 0U;
+    std::uint64_t inflight_reuses   = 0U;
+    std::uint64_t completed_reuses  = 0U;
+    std::size_t   completed_atlases = 0U;
+    std::size_t   completed_bytes   = 0U;
+};
+Qsg_atlas_msdf_shared_bake_stats qsg_atlas_msdf_shared_bake_stats();
+bool qsg_atlas_clear_msdf_shared_bakes_for_testing();
 
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
 
