@@ -4339,7 +4339,8 @@ Terminal_screen_model::Alternate_active_grid::active_grid_state() const
 void Terminal_screen_model::restore_buffer_state(const screen_buffer_state_t& state)
 {
     const bool previous_origin_mode = m_origin_mode;
-    active_grid_rows()  = state.rows;
+    // The selected buffer already owns these rows. Restore only the working
+    // cursor/mode metadata so an unchanged grid keeps its lookup index clean.
     m_saved_cursor      = state.saved_cursor;
     m_cursor            = state.cursor;
     m_scroll_top        = state.scroll_top;

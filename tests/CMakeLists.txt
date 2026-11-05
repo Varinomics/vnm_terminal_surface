@@ -660,6 +660,27 @@ set_tests_properties(vnm_terminal_canvas_contract PROPERTIES
     TIMEOUT 30
 )
 
+add_executable(vnm_terminal_canvas_status
+    terminal_canvas_renderer/terminal_canvas_status_tests.cpp
+)
+target_link_libraries(vnm_terminal_canvas_status PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface_renderer
+    Threads::Threads
+)
+set_target_properties(vnm_terminal_canvas_status PROPERTIES AUTOMOC OFF)
+add_test(
+    NAME vnm_terminal_canvas_status
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_canvas_status>"
+)
+set_tests_properties(vnm_terminal_canvas_status PROPERTIES
+    LABELS "renderer;canvas;contract"
+    TIMEOUT 30
+)
+
 find_package(Qt6 6.12 REQUIRED COMPONENTS Test)
 add_executable(vnm_terminal_canvas_renderer
     terminal_canvas_renderer/terminal_canvas_renderer_tests.cpp
@@ -2619,6 +2640,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_diagnostics_text_layout
     vnm_terminal_diagnostics_schema_sync
     vnm_terminal_canvas_contract
+    vnm_terminal_canvas_status
     vnm_terminal_canvas_renderer
     vnm_terminal_renderer_surface_format
     vnm_terminal_qsg_atlas

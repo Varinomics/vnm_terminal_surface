@@ -21144,9 +21144,27 @@ bool test_flat_ring_direct_retained_lookup_index_and_validation()
             large_history_refresh.retained_lookup_history_rows_visited == 0U &&
             small_history_refresh.retained_lookup_active_grid_entries_visited ==
                 large_history_refresh.retained_lookup_active_grid_entries_visited &&
-            large_history_refresh.retained_lookup_active_grid_entries_visited ==
-                static_cast<std::uint64_t>(config.grid_size.rows * 4),
-        "active-grid refresh visits only grid-bounded entries independent of history size");
+            large_history_refresh.retained_lookup_active_grid_entries_visited == 0U,
+        "empty ingest skips unchanged active-grid indexes independent of history size");
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayLiteral("\rZ"));
+    const term::terminal_selection_reconciliation_counters_t small_history_edit =
+        model.selection_reconciliation_counters();
+    large_history_model.reset_selection_reconciliation_counters();
+    large_history_model.ingest(QByteArrayLiteral("\rZ"));
+    const term::terminal_selection_reconciliation_counters_t large_history_edit =
+        large_history_model.selection_reconciliation_counters();
+    ok &= check(small_history_edit.retained_lookup_cache_rebuilds == 0U &&
+            small_history_edit.retained_lookup_history_rows_visited == 0U &&
+            large_history_edit.retained_lookup_cache_rebuilds == 0U &&
+            large_history_edit.retained_lookup_history_rows_visited == 0U &&
+            small_history_edit.retained_lookup_active_grid_entries_visited ==
+                large_history_edit.retained_lookup_active_grid_entries_visited &&
+            large_history_edit.retained_lookup_active_grid_entries_visited > 0U &&
+            large_history_edit.retained_lookup_active_grid_entries_visited <=
+                static_cast<std::uint64_t>(config.grid_size.rows * 2),
+        "text edits refresh only the changed grid independent of history size");
 
     term::Terminal_screen_model duplicate_model(config);
     duplicate_model.ingest(numbered_scroll_lines(8));
