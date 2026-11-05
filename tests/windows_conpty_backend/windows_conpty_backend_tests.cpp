@@ -73,7 +73,6 @@ constexpr std::chrono::milliseconds k_wait_timeout(20000);
 // costs nothing on a healthy run and stays inside the 120 second CTest budget
 // even if several fixtures genuinely fail.
 constexpr std::chrono::milliseconds k_file_marker_wait_timeout(20000);
-constexpr std::chrono::milliseconds k_console_host_exit_timeout(1000);
 constexpr std::uint64_t k_cpu_accounting_work_usec = 100'000U;
 constexpr int k_cpu_accounting_failure_resample_count = 20;
 constexpr std::chrono::milliseconds k_cpu_accounting_failure_resample_interval(10);
@@ -162,87 +161,70 @@ bool write_gate_file(const QString& path)
     return file.write(QByteArrayLiteral("go\n")) == 3;
 }
 
-std::vector<DWORD> current_process_console_host_children()
+struct Console_host_children
 {
     std::vector<DWORD> pids;
+    DWORD             error = ERROR_SUCCESS;
+};
+
+Console_host_children current_process_console_host_children()
+{
+    Console_host_children children;
     const DWORD        current_pid = GetCurrentProcessId();
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
-        return pids;
+        children.error = GetLastError();
+        return children;
     }
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     if (!Process32FirstW(snapshot, &entry)) {
+        children.error = GetLastError();
         CloseHandle(snapshot);
-        return pids;
+        return children;
     }
 
     do {
         if (entry.th32ParentProcessID == current_pid &&
             std::wcscmp(entry.szExeFile, L"OpenConsole.exe") == 0)
         {
-            pids.push_back(entry.th32ProcessID);
+            children.pids.push_back(entry.th32ProcessID);
         }
     }
     while (Process32NextW(snapshot, &entry));
-
+    const DWORD enumeration_error = GetLastError();
+    if (enumeration_error != ERROR_NO_MORE_FILES) {
+        children.error = enumeration_error;
+    }
     CloseHandle(snapshot);
-    return pids;
+    return children;
 }
 
-bool wait_for_console_host_children_to_exit(std::string_view test_name)
+void report_console_host_process_state(
+    HANDLE                    process,
+    DWORD                     pid,
+    std::string_view          phase,
+    std::chrono::milliseconds elapsed)
 {
-    const auto deadline = std::chrono::steady_clock::now() + k_console_host_exit_timeout;
-    std::vector<DWORD> pids;
-    do {
-        pids = current_process_console_host_children();
-        if (pids.empty()) {
-            return true;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    while (std::chrono::steady_clock::now() < deadline);
-
-    std::cerr << "ConPTY test left OpenConsole.exe child processes after "
-        << test_name << ':';
-    for (const DWORD pid : pids) {
-        std::cerr << ' ' << pid;
-    }
-    std::cerr << '\n';
-    // Preserve the original failure before retaining any diagnostic handles.
-    // A process-table entry alone does not say whether OpenConsole is still
-    // executing or an exited process object remains observable.
-    for (const DWORD pid : pids) {
-        const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-        if (!process) {
-            std::cerr << "ConPTY leftover pid=" << pid << " open_error=" << GetLastError() << '\n';
-            continue;
-        }
-        const DWORD state = WaitForSingleObject(process, 0);
-        const DWORD wait_error = state == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
-        DWORD exit_code = 0;
-        const BOOL exit_known = GetExitCodeProcess(process, &exit_code);
-        const DWORD exit_error = exit_known ? ERROR_SUCCESS : GetLastError();
-        FILETIME created{}, exited{}, kernel{}, user{};
-        const BOOL times_known = GetProcessTimes(process, &created, &exited, &kernel, &user);
-        const DWORD times_error = times_known ? ERROR_SUCCESS : GetLastError();
-        const auto ticks = [](FILETIME time) {
-            return (std::uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime;
-        };
-        std::cerr << "ConPTY leftover pid=" << pid << " signal=" << state
-            << " wait_error=" << wait_error << " exit_code=" << exit_code
-            << " exit_error=" << exit_error << " times_error=" << times_error
-            << " creation_ticks=" << ticks(created)
-            << " exit_ticks=" << (state == WAIT_OBJECT_0 ? ticks(exited) : 0)
-            << " kernel_ticks=" << ticks(kernel) << " user_ticks=" << ticks(user) << '\n';
-        CloseHandle(process);
-    }
-    std::cerr << "ConPTY cleanup registry retained="
-        << term::Native_backend_cleanup_reservation::retained_tasks()
-        << " unconfirmed=" << term::Native_backend_cleanup_reservation::unconfirmed_tasks() << '\n';
-    return check(false, "ConPTY backend releases console host child processes");
+    const DWORD state      = WaitForSingleObject(process, 0);
+    const DWORD wait_error = state == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+    DWORD exit_code = 0;
+    const BOOL exit_known  = GetExitCodeProcess(process, &exit_code);
+    const DWORD exit_error = exit_known ? ERROR_SUCCESS : GetLastError();
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const BOOL times_known  = GetProcessTimes(process, &created, &exited, &kernel, &user);
+    const DWORD times_error = times_known ? ERROR_SUCCESS : GetLastError();
+    const auto ticks = [](FILETIME time) {
+        return (std::uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    };
+    std::cerr << "ConPTY leftover pid=" << pid << " phase=" << phase
+        << " elapsed_ms=" << elapsed.count() << " signal=" << state
+        << " wait_error=" << wait_error << " exit_code=" << exit_code
+        << " exit_error=" << exit_error << " times_error=" << times_error
+        << " creation_ticks=" << ticks(created)
+        << " exit_ticks=" << (state == WAIT_OBJECT_0 ? ticks(exited) : 0)
+        << " kernel_ticks=" << ticks(kernel) << " user_ticks=" << ticks(user) << '\n';
 }
 
 std::optional<DWORD> parse_pid_after_prefix(
@@ -363,6 +345,66 @@ public:
 private:
     HANDLE m_handle = nullptr;
 };
+
+bool wait_for_console_host_children_to_exit(
+    std::string_view test_name,
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + k_wait_timeout)
+{
+    const auto started = std::chrono::steady_clock::now();
+    const auto children = current_process_console_host_children();
+    if (children.error != ERROR_SUCCESS) {
+        std::cerr << "ConPTY host enumeration after " << test_name
+            << " error=" << children.error << '\n';
+        return check(false, "ConPTY console host exit remains observable");
+    }
+
+    struct Console_host
+    {
+        DWORD                pid;
+        Win32_process_handle process;
+    };
+    std::vector<Console_host> hosts;
+    bool ok = true;
+    for (const DWORD pid : children.pids) {
+        const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+        if (process == nullptr) {
+            const DWORD error = GetLastError();
+            // The process can exit between enumeration and opening its handle.
+            if (error == ERROR_INVALID_PARAMETER) {
+                continue;
+            }
+            std::cerr << "ConPTY host pid=" << pid << " after " << test_name
+                << " open_error=" << error << '\n';
+            ok &= check(false, "ConPTY console host exit remains observable");
+            continue;
+        }
+        hosts.push_back({pid, Win32_process_handle(process)});
+    }
+    for (const auto& host : hosts) {
+        // Packaged ConPTY can finish its asynchronous startup after close. Wait
+        // for actual exit; retained, signaled process objects are already done.
+        const auto remaining = std::max(std::chrono::milliseconds::zero(),
+            std::chrono::ceil<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()));
+        const DWORD state = WaitForSingleObject(host.process.get(), (DWORD)remaining.count());
+        if (state == WAIT_FAILED) {
+            std::cerr << "ConPTY host pid=" << host.pid << " after " << test_name
+                << " wait_error=" << GetLastError() << '\n';
+        }
+        report_console_host_process_state(host.process.get(), host.pid,
+            state == WAIT_OBJECT_0 ? "exited" : "unsettled",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started));
+        ok &= check(state == WAIT_OBJECT_0, "ConPTY backend releases console host child processes");
+    }
+    if (!ok) {
+        std::cerr << "ConPTY cleanup registry retained="
+            << term::Native_backend_cleanup_reservation::retained_tasks()
+            << " unconfirmed=" << term::Native_backend_cleanup_reservation::unconfirmed_tasks() << '\n';
+    }
+    return ok;
+}
 
 Win32_process_handle open_process_handle(DWORD pid)
 {
@@ -620,6 +662,14 @@ public:
         return wait_until([&] {
             return m_output.contains(needle);
         });
+    }
+
+    bool wait_for_output_until(
+        const QByteArray& needle,
+        std::chrono::steady_clock::time_point deadline)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_until(lock, deadline, [&] { return m_output.contains(needle); });
     }
 
     bool wait_for_output_within(
@@ -6683,7 +6733,17 @@ bool test_post_birth_failure_keeps_native_custody(const QString& fixture_path)
     return ok;
 }
 
-bool test_failed_start_retires_cpu_job(const QString& fixture_path)
+enum class Failed_start_handshake
+{
+    UNGATED,
+    UNANSWERED,
+    ANSWERED,
+};
+
+bool test_failed_start_retires_cpu_job(
+    const QString& fixture_path,
+    std::chrono::steady_clock::time_point deadline,
+    Failed_start_handshake handshake = Failed_start_handshake::UNGATED)
 {
     // This runs in its own process so Job admission cannot affect other fixtures.
     Win32_process_handle host_job(CreateJobObjectW(nullptr, nullptr));
@@ -6692,10 +6752,9 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
     {
         return false;
     }
-    const auto burn_deadline = std::chrono::steady_clock::now() + k_wait_timeout;
     auto host_cpu = process_cpu_time_usec(GetCurrentProcess());
     std::atomic_uint work{0};
-    while (host_cpu && *host_cpu == 0 && std::chrono::steady_clock::now() < burn_deadline) {
+    while (host_cpu && *host_cpu == 0 && std::chrono::steady_clock::now() < deadline) {
         for (unsigned int index = 0; index < 4096; ++index) {
             work.fetch_add(index, std::memory_order_relaxed);
         }
@@ -6749,19 +6808,82 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
         return false;
     }
     backend.set_cleanup_observation_blocked_for_testing(true);
+    auto callbacks = capture.callbacks();
+    bool da1_observed = false;
+    bool answer_accepted = false;
+    bool fixture_ready = false;
+    std::atomic<DWORD> output_thread_id{0};
+    if (handshake != Failed_start_handshake::UNGATED) {
+        callbacks.output_received = [
+                record_output = std::move(callbacks.output_received),
+                &output_thread_id
+            ](QByteArray bytes)
+            {
+                output_thread_id.store(GetCurrentThreadId());
+                record_output(std::move(bytes));
+            };
+        callbacks.error_reported = [
+                record_error = std::move(callbacks.error_reported),
+                &capture,
+                &backend,
+                &da1_observed,
+                &answer_accepted,
+                &fixture_ready,
+                &output_thread_id,
+                handshake,
+                deadline,
+                diagnostic_start
+            ](term::Terminal_backend_error error)
+            {
+                const auto code = error.code;
+                record_error(std::move(error));
+                if (code != term::Terminal_backend_error_code::START_FAILED) {
+                    return;
+                }
+                // The error callback precedes deferred cleanup; the independent
+                // reader can observe ConPTY's query while this start call waits.
+                da1_observed = capture.wait_for_output_until(QByteArrayLiteral("\x1b[c"), deadline);
+                const auto da1_observed_at = std::chrono::steady_clock::now();
+                if (da1_observed && handshake == Failed_start_handshake::ANSWERED) {
+                    const QByteArray answer = scripted_csi_report(fixture_record_payload(
+                        term::Terminal_canvas_fixture_record_kind::EXPECT_INPUT,
+                        "reply-handling"), 'c');
+                    answer_accepted = !answer.isEmpty() && backend.write(answer).code ==
+                        term::Terminal_backend_result_code::ACCEPTED;
+                    fixture_ready = answer_accepted &&
+                        capture.wait_for_output_until(QByteArrayLiteral("hold-open"), deadline);
+                }
+                std::cerr << "FAILED_START_HANDSHAKE answer="
+                    << (handshake == Failed_start_handshake::ANSWERED)
+                    << " da1_observed=" << da1_observed << " answer_accepted=" << answer_accepted
+                    << " fixture_ready=" << fixture_ready << " error_tid=" << GetCurrentThreadId()
+                    << " output_tid=" << output_thread_id.load()
+                    << " da1_elapsed_usec=" << std::chrono::duration_cast<std::chrono::microseconds>(
+                        da1_observed_at - diagnostic_start).count()
+                    << " elapsed_usec=" << std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - diagnostic_start).count() << '\n';
+            };
+    }
     const auto result = backend.start(
-        launch_config(fixture_path, {QStringLiteral("--hold-open")}), capture.callbacks());
+        launch_config(fixture_path, {QStringLiteral("--hold-open")}), std::move(callbacks));
     record_cleanup_state("start-rejected");
     bool ok = check(result.code == term::Terminal_backend_result_code::REJECTED &&
             result.native_dispatch_occurred && !result.start_outcome_determinate,
         "worker startup failure rejects start while deferred cleanup retains the native child");
+    if (handshake != Failed_start_handshake::UNGATED) {
+        ok &= check(da1_observed && output_thread_id.load() != GetCurrentThreadId(),
+            "failed-start ordering observes DA1 on the independent reader before cleanup");
+        if (handshake == Failed_start_handshake::ANSWERED) {
+            ok &= check(answer_accepted && fixture_ready,
+                "the DA1 reply control completes native startup before the same cleanup");
+        }
+    }
     const auto admitted = backend.write_state_for_testing();
     ok &= check(admitted.process_handle_retained && admitted.process_assigned_to_job &&
             !admitted.native_cleanup_settled && backend.process_cpu_time().has_value(),
         "failed start keeps CPU accounting tied to its admitted child until native settlement");
 
     backend.set_cleanup_observation_blocked_for_testing(false);
-    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
     auto cleaned = backend.write_state_for_testing();
     while (cleaned.process_handle_retained && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -6786,10 +6908,19 @@ bool test_failed_start_retires_cpu_job(const QString& fixture_path)
     return ok;
 }
 
-bool test_failed_start_cpu_in_isolated_process(const QString& executable_path, const QString& fixture_path)
+bool test_failed_start_cpu_in_isolated_process(
+    const QString& executable_path,
+    const QString& fixture_path,
+    Failed_start_handshake handshake = Failed_start_handshake::UNGATED)
 {
     QProcess child;
-    child.start(executable_path, {QStringLiteral("--failed-start-cpu-child"), fixture_path});
+    QString child_mode = QStringLiteral("--failed-start-cpu-child");
+    if (handshake != Failed_start_handshake::UNGATED) {
+        child_mode = handshake == Failed_start_handshake::ANSWERED
+            ? QStringLiteral("--failed-start-da1-answered-child")
+            : QStringLiteral("--failed-start-da1-unanswered-child");
+    }
+    child.start(executable_path, {child_mode, fixture_path});
     if (!check(child.waitForStarted(k_wait_timeout.count()),
             "failed-start CPU subprocess starts"))
     {
@@ -6801,6 +6932,10 @@ bool test_failed_start_cpu_in_isolated_process(const QString& executable_path, c
         child.waitForFinished();
     }
     std::cerr << child.readAllStandardError().constData();
+    if (handshake != Failed_start_handshake::UNGATED) {
+        std::cerr << "FAILED_START_CASE mode=" << child_mode.toLocal8Bit().constData()
+            << " finished=" << finished << " exit_code=" << child.exitCode() << '\n';
+    }
     return check(finished && child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0,
         "failed-start CPU subprocess preserves Job ownership through deferred cleanup");
 }
@@ -7643,12 +7778,34 @@ int main(int argc, char** argv)
         }
         return *result;
     }
-    if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu-child") {
-        bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]));
+    if (argc == 3 &&
+        (std::string_view(argv[1]) == "--failed-start-cpu-child" ||
+         std::string_view(argv[1]) == "--failed-start-da1-unanswered-child" ||
+         std::string_view(argv[1]) == "--failed-start-da1-answered-child"))
+    {
+        auto handshake = Failed_start_handshake::UNGATED;
+        if (std::string_view(argv[1]) == "--failed-start-da1-unanswered-child") {
+            handshake = Failed_start_handshake::UNANSWERED;
+        }
+        if (std::string_view(argv[1]) == "--failed-start-da1-answered-child") {
+            handshake = Failed_start_handshake::ANSWERED;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+        bool ok = test_failed_start_retires_cpu_job(QString::fromLocal8Bit(argv[2]), deadline, handshake);
         ok &= term::Native_backend_cleanup_reservation::wait_until_idle(
-            std::chrono::steady_clock::now() + k_wait_timeout);
-        ok &= wait_for_console_host_children_to_exit("failed-start CPU");
+            deadline);
+        ok &= wait_for_console_host_children_to_exit("failed-start CPU", deadline);
         return ok ? 0 : 1;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--failed-start-da1") {
+        // Exercise close during both unanswered and completed native startup.
+        const QString executable_path = QString::fromLocal8Bit(argv[0]);
+        const QString fixture_path = QString::fromLocal8Bit(argv[2]);
+        const bool unanswered = test_failed_start_cpu_in_isolated_process(
+            executable_path, fixture_path, Failed_start_handshake::UNANSWERED);
+        const bool answered = test_failed_start_cpu_in_isolated_process(
+            executable_path, fixture_path, Failed_start_handshake::ANSWERED);
+        return unanswered && answered ? 0 : 1;
     }
     if (argc == 3 && std::string_view(argv[1]) == "--failed-start-cpu") {
         return test_failed_start_cpu_in_isolated_process(

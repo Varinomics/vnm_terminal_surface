@@ -2315,6 +2315,13 @@ if(WIN32)
     set_tests_properties(vnm_terminal_windows_conpty_native_lifecycle PROPERTIES
         LABELS "conformance;windows;conpty;lifecycle" TIMEOUT 180)
 
+    add_test(NAME vnm_terminal_windows_conpty_failed_start_handshake
+        COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_windows_conpty_backend>" --failed-start-da1
+            "$<TARGET_FILE:vnm_terminal_canvas_fixture>")
+    set_tests_properties(vnm_terminal_windows_conpty_failed_start_handshake PROPERTIES
+        LABELS "conformance;windows;conpty;start-failure" TIMEOUT 120)
+
     add_test(
         NAME vnm_terminal_windows_conpty_process_snapshot
         COMMAND

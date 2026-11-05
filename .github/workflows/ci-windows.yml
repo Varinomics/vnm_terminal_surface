@@ -14,6 +14,8 @@ on:
         options:
           - all
           - atlas-report-d3d11
+          - conpty-asan
+          - conpty-startup-handshake-asan
 
 defaults:
   run:
@@ -30,6 +32,9 @@ env:
 
 jobs:
   build-and-test:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      (inputs.test_scope != 'conpty-asan' && inputs.test_scope != 'conpty-startup-handshake-asan')
     name: Qt Quick Terminal Surface (Windows)
     runs-on: windows-2025-vs2026
 
@@ -302,7 +307,11 @@ jobs:
           key: ${{ steps.restore_compiler_cache.outputs.cache-primary-key }}
 
   conpty-asan:
-    if: github.event_name != 'workflow_dispatch' || inputs.test_scope == 'all'
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.test_scope == 'all' ||
+      inputs.test_scope == 'conpty-asan' ||
+      inputs.test_scope == 'conpty-startup-handshake-asan'
     name: Qt Quick Terminal Surface ConPTY ASan (Windows)
     runs-on: windows-2025-vs2026
 
@@ -447,6 +456,7 @@ jobs:
           cmake --build build-asan --config %CMAKE_BUILD_TYPE% --target vnm_terminal_windows_conpty_backend --parallel 4
 
       - name: Run ConPTY backend ASan test
+        if: env.VNM_TEST_SCOPE != 'conpty-startup-handshake-asan'
         working-directory: build-asan
         env:
           QT_QPA_PLATFORM: offscreen
@@ -455,6 +465,25 @@ jobs:
           call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
           if errorlevel 1 exit /b %ERRORLEVEL%
           ctest --output-on-failure -C %CMAKE_BUILD_TYPE% -R "^vnm_terminal_windows_conpty_(backend|native_lifecycle)$"
+
+      - name: Run failed-start startup handshake regression
+        if: env.VNM_TEST_SCOPE == 'conpty-startup-handshake-asan'
+        working-directory: build-asan
+        env:
+          QT_QPA_PLATFORM: offscreen
+        shell: cmd
+        run: |
+          call "%VNM_VCVARSALL_PATH%" x64 -vcvars_ver=14.51
+          if errorlevel 1 exit /b %ERRORLEVEL%
+          ctest --verbose -C %CMAKE_BUILD_TYPE% -R "^vnm_terminal_windows_conpty_failed_start_handshake$"
+
+      - name: Upload startup-handshake test evidence
+        if: always() && env.VNM_TEST_SCOPE == 'conpty-startup-handshake-asan' && steps.conpty_asan_build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: conpty-startup-handshake-asan-evidence
+          path: build-asan/Testing/Temporary/LastTest.log
+          if-no-files-found: error
 
       - name: Export native ConPTY ASan runtime
         id: conpty_asan_export
