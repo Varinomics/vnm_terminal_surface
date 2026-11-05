@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/msdf_availability_work.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/diagnostics/diagnostic_sink.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
@@ -581,7 +582,7 @@ bool test_reentrant_font_selection_finishes_checking(QGuiApplication& app)
 }
 
 
-bool test_msdf_shared_cpu_bake_reuse()
+bool test_msdf_shared_cpu_bake_reuse(QGuiApplication& app)
 {
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     bool ok = true;
@@ -589,14 +590,21 @@ bool test_msdf_shared_cpu_bake_reuse()
     ok &= check(term::qsg_atlas_clear_msdf_shared_bakes_for_testing(),
         "MSDF shared-bake test starts without in-flight work");
 
-    const QFont font = QGuiApplication::font();
+    if (!check(term::vnm_terminal_default_monospace_font_loaded(),
+            "shared-bake validation loads the bundled font fixture"))
+    {
+        return false;
+    }
+    const QFont font = term::vnm_terminal_font(
+        term::vnm_terminal_default_monospace_font_family(), 18.0);
     const bool first_available =
         term::qsg_atlas_msdf_text_available_for_font(font);
     const auto initial = term::qsg_atlas_msdf_shared_bake_stats();
-    if (!first_available || initial.completed_atlases == 0U) {
-        // Minimal CI images do not all expose a font with readable sfnt data.
-        // The ordinary availability contract already exercises this fallback.
-        return ok;
+    if (!check(first_available && initial.completed_atlases == 1U &&
+            initial.completed_bytes > 0U,
+            "the bundled fixture produces an available nonempty CPU atlas"))
+    {
+        return false;
     }
 
     const bool second_available =
@@ -626,8 +634,31 @@ bool test_msdf_shared_cpu_bake_reuse()
             concurrent.build_calls == 1U &&
             concurrent.inflight_reuses + concurrent.completed_reuses >= 1U,
         "simultaneous availability requests share one actual bake");
+
+    ok &= check(term::qsg_atlas_clear_msdf_shared_bakes_for_testing(),
+        "completed CPU results can be released before real surface requests");
+    VNM_TerminalSurface first_surface;
+    VNM_TerminalSurface second_surface;
+    // An empty family selects the same bundled bytes, while changing the
+    // constructor's explicit family starts each surface's real async check.
+    first_surface.set_font_family(QString());
+    second_surface.set_font_family(QString());
+    ok &= check(first_surface.msdf_text_checking() && second_surface.msdf_text_checking(),
+        "two live surfaces start independent availability checks");
+    ok &= check(pump_until(app, [&] {
+            return !first_surface.msdf_text_checking() &&
+                !second_surface.msdf_text_checking();
+        }),
+        "both real surface availability checks complete");
+    ok &= finish_workers();
+    const auto surfaces = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(first_surface.msdf_text_available() && second_surface.msdf_text_available() &&
+            surfaces.build_calls == 1U &&
+            surfaces.inflight_reuses + surfaces.completed_reuses >= 1U,
+        "two live surfaces publish availability from one shared CPU bake");
     return ok;
 #else
+    (void)app;
     return true;
 #endif
 }
@@ -720,6 +751,6 @@ int main(int argc, char** argv)
     ok &= test_surface_destruction_with_pending_completion(app, true);
     ok &= test_reentrant_font_selection_finishes_checking(app);
     ok &= test_dispatch_rejection_clears_checking_and_allows_retry(app);
-    ok &= test_msdf_shared_cpu_bake_reuse();
+    ok &= test_msdf_shared_cpu_bake_reuse(app);
     return ok ? 0 : 1;
 }

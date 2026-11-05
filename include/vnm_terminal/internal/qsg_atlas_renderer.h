@@ -201,7 +201,6 @@ public:
         int   max_pages = 4);
 
     std::optional<Glyph_atlas_slot> pack(QSize tile_size);
-    void reset();
 
     QSize page_size() const { return m_page_size; }
     int max_pages() const { return m_max_pages; }
@@ -1045,7 +1044,7 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 // the UI so it is never offered for a font MSDF cannot render.
 bool qsg_atlas_msdf_text_available_for_font(const QFont& font);
 
-// CPU-only process-local bake sharing diagnostics. These count actual jobs,
+// CPU-only process-local bake sharing diagnostics. These count producer calls,
 // reuse (in-flight versus completed), and the bounded completed-result pool.
 struct Qsg_atlas_msdf_shared_bake_stats
 {

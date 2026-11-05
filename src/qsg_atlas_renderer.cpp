@@ -1347,6 +1347,10 @@ void complete_msdf_shared_bake(
     if (build->started.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    {
+        const std::lock_guard<std::mutex> lock(pool->mutex);
+        ++pool->build_calls;
+    }
     try {
         build->result = msdf_text::build_font_atlas(
             reinterpret_cast<const std::uint8_t*>(font_data.constData()),
@@ -1410,7 +1414,6 @@ std::shared_ptr<Msdf_terminal_atlas_build> request_msdf_shared_bake(
             build = std::make_shared<Msdf_terminal_atlas_build>();
             build->key = key;
             pool->entries.push_back(build);
-            ++pool->build_calls;
             newly_created = true;
         }
     }
@@ -8135,11 +8138,6 @@ std::optional<Glyph_atlas_slot> Glyph_atlas_packer::pack(QSize tile_size)
         static_cast<int>(m_pages.size() - 1U),
         padded_size,
         tile_size);
-}
-
-void Glyph_atlas_packer::reset()
-{
-    m_pages.clear();
 }
 
 int Glyph_atlas_packer::page_count() const

@@ -84,9 +84,29 @@ jobs:
       - name: Build
         run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel 4
 
+      - name: Compare native active-grid ingest against the integration base
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        env:
+          LOOKUP_BASELINE_REF: ${{ github.event.pull_request.base.sha }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          git fetch --no-tags --depth=1 origin "${LOOKUP_BASELINE_REF}"
+          python3 tests/history_row_record_codec/compare_active_grid_ingest.py \
+            --source . --build build --baseline "${LOOKUP_BASELINE_REF}" \
+            --output "${RUNNER_TEMP}/active-grid-ingest.json"
+
+      - name: Preserve native active-grid measurements
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-grid-ingest-comparison
+          path: ${{ runner.temp }}/active-grid-ingest.json
+          if-no-files-found: ignore
+
       # Offscreen CTest deliberately skips native renderer/readback cases.
       # Exercise their scenegraph lifecycle with the already-built executable.
-      - name: Run native canvas renderer with Mesa OpenGL
+      - name: Run native renderer validation with Mesa OpenGL
         env:
           QT_QPA_PLATFORM: xcb
           QSG_RHI_BACKEND: opengl
@@ -102,6 +122,8 @@ jobs:
         run: |
           timeout 60s xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
             ./build/tests/vnm_terminal_canvas_renderer
+          timeout 90s xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
+            ./build/tests/vnm_terminal_qsg_atlas --shared-msdf-atlas --backend opengl
 
       - name: Run tests
         working-directory: build

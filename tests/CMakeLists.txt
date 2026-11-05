@@ -1663,6 +1663,10 @@ target_link_libraries(vnm_terminal_msdf_availability PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
 )
 
+target_compile_definitions(vnm_terminal_msdf_availability PRIVATE
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER}>
+)
+
 set_target_properties(vnm_terminal_msdf_availability PROPERTIES
     AUTOMOC OFF
 )

@@ -83,9 +83,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
@@ -10238,13 +10240,15 @@ bool test_cache_copy_on_write_prepare()
     const term::Glyph_atlas_slot first = committed.insert_or_get(
         first_key, first_tile);
     const QByteArray original_page = committed.page_bytes(first.page);
+    const term::Glyph_atlas_slot* const original_slot = committed.find(first_key);
     const auto original_stats = committed.stats();
 
     term::Glyph_atlas_cache preparing = committed;
     bool ok = true;
-    ok &= check(preparing.find(first_key) != nullptr &&
-            preparing.page_bytes(first.page) == original_page,
-        "warm prepare reuses the committed glyph slots and page pixels");
+    ok &= check(original_slot != nullptr && preparing.find(first_key) == original_slot &&
+            preparing.page_bytes(first.page).constData() ==
+                committed.page_bytes(first.page).constData(),
+        "warm prepare shares the committed map entry and page storage without copying");
     const auto committed_stats_before = committed.stats();
     ok &= check(committed_stats_before.lookups == original_stats.lookups,
         "working-cache hits never update committed lookup statistics");
@@ -10252,9 +10256,12 @@ bool test_cache_copy_on_write_prepare()
     const term::Glyph_atlas_slot second = preparing.insert_or_get(
         second_key, second_tile);
     ok &= check(second.is_valid() && preparing.find(second_key) != nullptr &&
-            committed.find(second_key) == nullptr,
+            committed.find(second_key) == nullptr &&
+            preparing.find(first_key) != original_slot,
         "first glyph insertion detaches the working cache's structural state");
-    ok &= check(committed.page_bytes(first.page) == original_page,
+    ok &= check(committed.page_bytes(first.page) == original_page &&
+            preparing.page_bytes(first.page).constData() !=
+                committed.page_bytes(first.page).constData(),
         "working bitmap writes do not change the committed atlas");
     preparing.reset(); // Simulates failed resource preparation.
     ok &= check(committed.find(first_key) != nullptr &&
@@ -12843,6 +12850,211 @@ private:
     QSemaphore   m_finished;
     bool         m_released = false;
 };
+
+int test_shared_msdf_atlas(QGuiApplication& app, const char* backend)
+{
+    // Forced MSDF is a supported policy even on adapters where AUTO selects
+    // glyph text. Validate its real uploads/readback without changing AUTO's
+    // hardware gate or the existing async test's skip policy.
+    const int backend_status = verify_requested_backend(app, backend, "shared MSDF atlas");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+    if (!term::k_qsg_atlas_msdf_text_renderer_compiled) {
+        std::cerr << "SKIP: shared MSDF atlas renderer is not compiled\n";
+        return k_unsupported_backend_skip_return_code;
+    }
+    if (!check(term::vnm_terminal_default_monospace_font_loaded(),
+            "shared MSDF renderer test loads the bundled font") ||
+        !check(QThreadPool::globalInstance()->waitForDone(30000),
+            "shared MSDF renderer test starts after prior workers finish") ||
+        !check(term::qsg_atlas_clear_msdf_shared_bakes_for_testing(),
+            "shared MSDF renderer test starts with an empty bake registry"))
+    {
+        return 1;
+    }
+
+    QQuickWindow window;
+    window.resize(640, 360);
+    window.setColor(Qt::black);
+    const QString family = term::vnm_terminal_default_monospace_font_family();
+    const QFont font = term::vnm_terminal_font(family, 18.0);
+    Direct_atlas_item first(pixel_metrics(1.0, 18.0, family), font, QSizeF(600.0, 160.0));
+    Direct_atlas_item second(pixel_metrics(1.0, 18.0, family), font, QSizeF(600.0, 160.0));
+    first.setParentItem(window.contentItem());
+    second.setParentItem(window.contentItem());
+    second.setY(180.0);
+    auto content = make_text_snapshot(19911U, QStringLiteral("A"));
+    content.cursor.visible = false;
+    content.color_state.default_background_rgba = 0xff000000U;
+    content.color_state.default_foreground_rgba = 0xffffffffU;
+    const auto snapshot = std::make_shared<const term::Terminal_render_snapshot>(std::move(content));
+    term::Terminal_render_options options;
+    options.text_renderer_policy = term::Terminal_text_renderer_policy::GLYPH;
+    first.set_frame(snapshot, options);
+    second.set_frame(snapshot, options);
+    window.show();
+
+    term::Qsg_atlas_frame_report first_report;
+    term::Qsg_atlas_frame_report second_report;
+    if (!check(pump_direct_atlas_until(
+            app, window, first, atlas_report_render_state_ready, first_report) &&
+            pump_direct_atlas_until(
+                app, window, second, atlas_report_render_state_ready, second_report),
+            "both shared-atlas consumers reach their glyph baseline"))
+    {
+        return 1;
+    }
+
+    Atlas_worker_barrier barrier;
+    if (!check(barrier.started(), "shared MSDF test holds the sole global-pool worker")) {
+        return 1;
+    }
+    options.text_renderer_policy = term::Terminal_text_renderer_policy::MSDF;
+    first.set_frame(snapshot, options);
+    second.set_frame(snapshot, options);
+    const auto pending = [](const term::Qsg_atlas_frame_report& report) {
+        return report.capture_sequence == 2U &&
+            report.render.msdf_text_atlas_build_attempts_total == 1U;
+    };
+    if (!check(pump_direct_atlas_until(app, window, first, pending, first_report) &&
+            pump_direct_atlas_until(app, window, second, pending, second_report),
+            "two render consumers request the same CPU bake while its worker is queued"))
+    {
+        return 1;
+    }
+    bool ok = true;
+    const auto queued = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(queued.build_calls == 0U && queued.inflight_reuses == 1U &&
+            queued.completed_atlases == 0U,
+        "two pending render consumers share queued work without running the CPU producer");
+
+    using availability_result_t = std::pair<bool, std::int64_t>;
+    const auto availability = std::make_shared<std::promise<availability_result_t>>();
+    auto availability_result = availability->get_future();
+    // Availability has higher priority than the already queued render bake.
+    // On the one-worker pool it must claim that bake itself, without waiting
+    // for the lower-priority task which cannot run until this call returns.
+    QThreadPool::globalInstance()->start([font, availability]() {
+        const auto started = std::chrono::steady_clock::now();
+        const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started);
+        availability->set_value({available, elapsed.count()});
+    }, 1);
+    barrier.release();
+
+    const auto ready = [](const term::Qsg_atlas_frame_report& report) {
+        return atlas_report_render_state_ready(report) &&
+            report.prepared_generation_committed &&
+            report.render.msdf_text_renderer_active &&
+            report.render.msdf_text_texture_ready &&
+            report.render.msdf_text_glyph_instances == 1;
+    };
+    if (!check(pump_direct_atlas_until(app, window, first, ready, first_report, 600) &&
+            pump_direct_atlas_until(app, window, second, ready, second_report, 600),
+            "both render consumers adopt and draw the shared CPU result"))
+    {
+        return 1;
+    }
+    std::int64_t availability_elapsed_ns = 0;
+    const bool availability_finished =
+        availability_result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    ok &= check(availability_finished,
+        "availability completes ahead of the queued bake on a one-worker pool");
+    if (availability_finished) {
+        const auto result = availability_result.get();
+        ok &= check(result.first, "the renderer's shared CPU result also answers availability");
+        availability_elapsed_ns = result.second;
+    }
+    ok &= check(QThreadPool::globalInstance()->waitForDone(30000),
+        "the claimed bake's queued task finishes without producing a duplicate");
+    const auto shared = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(shared.build_calls == 1U && shared.inflight_reuses == 2U &&
+            shared.completed_atlases == 1U && shared.completed_bytes > 0U,
+        "availability and both render consumers use exactly one CPU atlas");
+    ok &= check(first_report.render.msdf_text_atlas_texture_uploads_total == 1U &&
+            second_report.render.msdf_text_atlas_texture_uploads_total == 1U &&
+            first_report.render.msdf_text_baked_pixel_height == 48 &&
+            second_report.render.msdf_text_baked_pixel_height == 48,
+        "shared CPU pixels feed independent renderer-owned texture uploads");
+    const QImage shared_image = window.grabWindow();
+    const qreal dpr = pixel_window_device_pixel_ratio(window);
+    const QRectF first_region(0.0, 0.0, 80.0, 80.0);
+    ok &= check(!shared_image.isNull() &&
+            measure_image_ink(shared_image, Qt::black, first_region, dpr).has_ink() &&
+            measure_image_ink(shared_image, Qt::black, QRectF(0.0, 180.0, 80.0, 80.0), dpr).has_ink(),
+        "both renderer-owned textures produce visible text in native readback");
+    const QImage first_pixels = shared_image.copy(logical_rect_to_pixels(first_region, dpr));
+    std::cout << "shared_msdf_consumers build_calls=" << shared.build_calls
+        << " inflight_reuses=" << shared.inflight_reuses
+        << " retained_bytes=" << shared.completed_bytes
+        << " renderer_texture_uploads="
+        << first_report.render.msdf_text_atlas_texture_uploads_total << ','
+        << second_report.render.msdf_text_atlas_texture_uploads_total
+        << " availability_bake_elapsed_ns=" << availability_elapsed_ns << '\n';
+
+    int previous_bake_height = second_report.render.msdf_text_baked_pixel_height;
+    int retained_bake_height = 0;
+    for (const qreal pixel_size : {72.0, 96.0}) {
+        second.set_font(pixel_metrics(1.0, pixel_size, family),
+            term::vnm_terminal_font(family, pixel_size));
+        second.set_frame(snapshot, options);
+        if (!check(pump_direct_atlas_until(app, window, second,
+                [&](const term::Qsg_atlas_frame_report& report) {
+                    return ready(report) &&
+                        report.render.msdf_text_baked_pixel_height > previous_bake_height;
+                }, second_report, 600),
+                "a different bake-height key produces its own ready atlas"))
+        {
+            return 1;
+        }
+        retained_bake_height = previous_bake_height;
+        previous_bake_height = second_report.render.msdf_text_baked_pixel_height;
+    }
+    ok &= check(QThreadPool::globalInstance()->waitForDone(30000),
+        "all pressure-test bakes finish before retention is measured");
+    const auto pressure = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(pressure.build_calls == 3U && pressure.completed_atlases == 2U &&
+            pressure.completed_bytes <= 32U * 1024U * 1024U,
+        "three different keys retain at most two CPU atlases and thirty-two MiB");
+    ok &= check(pump_direct_atlas_until(app, window, first, ready, first_report) &&
+            first_report.render.msdf_text_baked_pixel_height == 48 &&
+            first_report.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "evicting a shared-pool entry preserves the first renderer's live atlas");
+    const QImage pressure_image = window.grabWindow();
+    ok &= check(!pressure_image.isNull() &&
+            pressure_image.copy(logical_rect_to_pixels(first_region, dpr)) == first_pixels,
+        "retention pressure leaves the first consumer's committed pixels unchanged");
+    first.set_font(pixel_metrics(1.0, 22.0, family), term::vnm_terminal_font(family, 22.0));
+    const auto resized_capture = first.set_frame(snapshot, options);
+    ok &= check(pump_direct_atlas_until(app, window, first,
+            [&](const term::Qsg_atlas_frame_report& report) {
+                return ready(report) && report.capture_sequence == resized_capture;
+            }, first_report) &&
+            first_report.render.msdf_text_baked_atlas_reused &&
+            first_report.render.msdf_text_baked_pixel_height == 48 &&
+            first_report.render.msdf_text_atlas_texture_uploads_total == 1U &&
+            term::qsg_atlas_msdf_shared_bake_stats().build_calls == 3U,
+        "the first renderer can rebuild draw layout from its pinned CPU atlas after pool eviction");
+
+    second.set_font(pixel_metrics(1.0, 72.0, family), term::vnm_terminal_font(family, 72.0));
+    second.set_frame(snapshot, options);
+    ok &= check(pump_direct_atlas_until(app, window, second,
+            [&](const term::Qsg_atlas_frame_report& report) {
+                return ready(report) &&
+                    report.render.msdf_text_baked_pixel_height == retained_bake_height;
+            }, second_report, 600),
+        "a retained different-key result can be adopted again");
+    const auto reused = term::qsg_atlas_msdf_shared_bake_stats();
+    ok &= check(reused.build_calls == 3U && reused.completed_reuses >= 1U,
+        "returning to a retained bake key does not run another CPU producer");
+    std::cout << "shared_msdf_pressure build_calls=" << reused.build_calls
+        << " completed_reuses=" << reused.completed_reuses
+        << " retained_atlases=" << reused.completed_atlases
+        << " retained_bytes=" << reused.completed_bytes << '\n';
+    return ok ? 0 : 1;
+}
 
 bool test_async_msdf_atlas_case(
     QGuiApplication& app,
@@ -23295,6 +23507,7 @@ int main(int argc, char** argv)
     const bool dynamic_buffer = has_argument(argc, argv, "--dynamic-buffer");
     const bool idle_recovery = has_argument(argc, argv, "--idle-recovery");
     const bool async_msdf_atlas = has_argument(argc, argv, "--async-msdf-atlas");
+    const bool shared_msdf_atlas = has_argument(argc, argv, "--shared-msdf-atlas");
     const bool arc_row_provenance =
         has_argument(argc, argv, "--arc-row-provenance");
     const bool warm_lazy_smoke = has_argument(argc, argv, "--warm-lazy-smoke");
@@ -23310,7 +23523,8 @@ int main(int argc, char** argv)
         render_smoke || dense_grid_smoke || primitive_parity ||
         forced_glyph_parity || forced_msdf_parity || auto_text_renderer ||
         layout_contract || text_renderer_fallback ||
-        atlas_report || dynamic_buffer || idle_recovery || async_msdf_atlas || arc_row_provenance || warm_lazy_smoke ||
+        atlas_report || dynamic_buffer || idle_recovery || async_msdf_atlas || shared_msdf_atlas ||
+        arc_row_provenance || warm_lazy_smoke ||
         lcd_capability_probe || host_state_smoke || cursor_descender_smoke ||
         msdf_orientation_discriminator;
     if (graphics_mode) {
@@ -23354,6 +23568,9 @@ int main(int argc, char** argv)
     }
     if (async_msdf_atlas) {
         return test_async_msdf_atlas(app, backend);
+    }
+    if (shared_msdf_atlas) {
+        return test_shared_msdf_atlas(app, backend);
     }
     if (arc_row_provenance) {
         return test_atlas_arc_row_provenance(app, backend);
