@@ -11,6 +11,7 @@
 #include <QColor>
 #include <QFont>
 #include <QImage>
+#include <QObject>
 #include <QPoint>
 #include <QRawFont>
 #include <QRect>
@@ -30,7 +31,6 @@
 #include <vector>
 
 struct QRhiDriverInfo;
-class QObject;
 class QSGNode;
 
 namespace vnm_terminal::internal {
@@ -934,8 +934,10 @@ struct Qsg_atlas_frame_report
                   warm_lazy;
 };
 
-class Qsg_atlas_recorder final
+class Qsg_atlas_recorder final : public QObject
 {
+    Q_OBJECT
+
 public:
     void reset();
 
@@ -967,9 +969,17 @@ public:
 
     Qsg_atlas_frame_report snapshot() const;
 
+    // One queued status consumer rearms notification with its snapshot. Other
+    // diagnostic readers must not consume that consumer's pending wake.
+    Qsg_atlas_frame_report take_render_status();
+
+signals:
+    void render_status_changed();
+
 private:
     mutable std::mutex            m_mutex;
     Qsg_atlas_frame_report m_report;
+    bool m_status_notification_pending = false;
 };
 
 Glyph_coverage_tile qsg_atlas_coverage_tile_from_image(const QImage& image);

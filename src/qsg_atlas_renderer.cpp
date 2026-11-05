@@ -8156,6 +8156,45 @@ void Glyph_atlas_cache::copy_tile_to_slot(
     }
 }
 
+namespace {
+
+auto canvas_render_status_key(const Qsg_atlas_frame_report& report)
+{
+    // Compare the inputs to the canvas's status projection, excluding timing,
+    // cache-hit, upload and other diagnostic counters that change every draw.
+    const auto& build = report.frame_build;
+    const bool failed = report.prepare_count > 0U && (
+        build.glyph_missed_instances > 0 ||
+        build.glyph_coverage_failures > 0 ||
+        build.glyph_atlas_insert_failures > 0 ||
+        (report.command_buffer_non_null && report.render_target_non_null &&
+            report.rhi_non_null && !report.prepared_generation_committed));
+    const auto cause = failed && build.glyph_missed_instances > 0
+        ? build.first_glyph_miss.cause : Qsg_atlas_glyph_miss_cause::NONE;
+    const bool atlas_failed = cause == Qsg_atlas_glyph_miss_cause::ATLAS_INSERT_FAILED;
+    const bool rendered =
+        report.prepared_generation_committed &&
+        report.render_count > 0U &&
+        report.render_capture_sequence == report.prepared_capture_sequence &&
+        report.render_ownership_generation == report.prepared_ownership_generation &&
+        report.render_canvas_frame_generation == report.prepared_canvas_frame_generation;
+    return std::tuple(
+        report.prepared_ownership_generation,
+        report.prepared_canvas_frame_generation,
+        report.prepared_snapshot_sequence,
+        report.prepared_publication_generation,
+        rendered,
+        failed,
+        failed ? build.glyph_missed_instances : 0,
+        cause,
+        atlas_failed ? report.cache.page_size : QSize{},
+        atlas_failed ? report.cache.page_count : 0,
+        atlas_failed ? report.cache.page_budget : 0,
+        atlas_failed ? report.cache.budget_bytes : 0U);
+}
+
+} // namespace
+
 void Qsg_atlas_recorder::reset()
 {
     const std::lock_guard<std::mutex> lock(m_mutex);
@@ -8208,7 +8247,8 @@ void Qsg_atlas_recorder::record_prepare(
     const Qsg_atlas_warm_lazy_summary&   warm_lazy_summary,
     bool                                 prepared_generation_committed)
 {
-    const std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
+    const auto previous_status = canvas_render_status_key(m_report);
     ++m_report.prepare_count;
     m_report.prepare_elapsed_ns            += prepare_elapsed_ns;
     m_report.image_texture_creations_total +=
@@ -8238,6 +8278,13 @@ void Qsg_atlas_recorder::record_prepare(
     m_report.render                        = render_summary;
     m_report.producer                      = producer_summary;
     m_report.warm_lazy                     = warm_lazy_summary;
+    const bool notify = !m_status_notification_pending &&
+        previous_status != canvas_render_status_key(m_report);
+    m_status_notification_pending |= notify;
+    lock.unlock();
+    if (notify) {
+        emit render_status_changed();
+    }
 }
 
 void Qsg_atlas_recorder::record_render(
@@ -8246,7 +8293,8 @@ void Qsg_atlas_recorder::record_render(
     QRect                       viewport_rect,
     bool                        drew)
 {
-    const std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
+    const auto previous_status = canvas_render_status_key(m_report);
     ++m_report.render_count;
     m_report.render_elapsed_ns             += render_elapsed_ns;
     m_report.render_capture_sequence        = frame.capture_sequence;
@@ -8287,11 +8335,27 @@ void Qsg_atlas_recorder::record_render(
         m_report.first_render_font_epoch        = frame.font_epoch;
         m_report.first_render_light_options     = captured_options_are_light(frame);
     }
+    const bool notify = !m_status_notification_pending &&
+        previous_status != canvas_render_status_key(m_report);
+    m_status_notification_pending |= notify;
+    lock.unlock();
+    if (notify) {
+        emit render_status_changed();
+    }
 }
 
 Qsg_atlas_frame_report Qsg_atlas_recorder::snapshot() const
 {
     const std::lock_guard<std::mutex> lock(m_mutex);
+    return m_report;
+}
+
+Qsg_atlas_frame_report Qsg_atlas_recorder::take_render_status()
+{
+    const std::lock_guard<std::mutex> lock(m_mutex);
+    // Updates before this lock are included; updates after it can queue the
+    // next wake even while the GUI is still applying this snapshot.
+    m_status_notification_pending = false;
     return m_report;
 }
 
