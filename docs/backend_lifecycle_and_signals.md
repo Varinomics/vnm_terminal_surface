@@ -214,11 +214,13 @@ observed and the POSIX wait's loss of its exit observation.
 
 The writer drains queued entries in order. The POSIX writer issues a
 non-blocking `write()` to the master and treats the write itself as the
-writability test; on `EAGAIN` it waits on its wake pipe (never polling the
-master for `POLLOUT`) and retries. The ConPTY writer issues `WriteFile` against
-the input pipe and loops until the chunk is fully written. A write that fails
-while the backend is not stopping reports `WRITE_FAILED` and marks the writer
-failed, which closes the write side.
+writability test. On `EAGAIN`, Linux waits for master `POLLOUT` or an explicit
+wake-pipe notification without a periodic timeout. macOS retains a 100 ms
+wake-pipe-only retry interval because master `POLLOUT` waits can wedge after
+root exit while a descendant retains the slave. The ConPTY writer issues
+`WriteFile` against the input pipe and loops until the chunk is fully written.
+A write that fails while the backend is not stopping reports `WRITE_FAILED`
+and marks the writer failed, which closes the write side.
 
 ## Terminal Size And Cell Pixels
 
