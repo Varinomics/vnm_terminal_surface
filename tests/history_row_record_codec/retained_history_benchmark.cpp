@@ -7,51 +7,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <new>
 #include <optional>
 #include <span>
 #include <string>
 #include <utility>
 #include <vector>
-
-namespace {
-thread_local bool count_ingest_allocations = false;
-thread_local std::uint64_t ingest_allocation_calls = 0U;
-thread_local std::uint64_t ingest_allocation_bytes = 0U;
-}
-
-// Count ordinary C++ new/new[] on the ingest thread, including map/vector
-// allocations. Qt's internal malloc/realloc calls are outside this boundary.
-// Keep the malloc-backed replacement opaque to optimized callers, as in the
-// native cleanup-owner allocation fixture.
-#if defined(_MSC_VER)
-#define BENCHMARK_ALLOCATION_BOUNDARY __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-#define BENCHMARK_ALLOCATION_BOUNDARY __attribute__((noinline))
-#else
-#define BENCHMARK_ALLOCATION_BOUNDARY
-#endif
-BENCHMARK_ALLOCATION_BOUNDARY void* operator new(std::size_t size)
-{
-    if (count_ingest_allocations) {
-        ++ingest_allocation_calls;
-        ingest_allocation_bytes += size;
-    }
-    if (void* allocation = std::malloc(size == 0U ? 1U : size)) {
-        return allocation;
-    }
-    throw std::bad_alloc();
-}
-BENCHMARK_ALLOCATION_BOUNDARY void* operator new[](std::size_t size) { return ::operator new(size); }
-BENCHMARK_ALLOCATION_BOUNDARY void operator delete(void* value) noexcept { std::free(value); }
-BENCHMARK_ALLOCATION_BOUNDARY void operator delete(void* value, std::size_t) noexcept { std::free(value); }
-BENCHMARK_ALLOCATION_BOUNDARY void operator delete[](void* value) noexcept { ::operator delete(value); }
-BENCHMARK_ALLOCATION_BOUNDARY void operator delete[](void* value, std::size_t) noexcept { ::operator delete(value); }
-#undef BENCHMARK_ALLOCATION_BOUNDARY
 
 namespace term = vnm_terminal::internal;
 
@@ -441,135 +404,6 @@ bool result_has_diagnostic(const term::Terminal_screen_model_result& result)
     }
 
     return false;
-}
-
-int benchmark_active_grid_ingest()
-{
-    constexpr int chunk_bytes    = 4096;
-    constexpr int warmup_ingests = 32;
-    constexpr int ingests        = 256;
-    constexpr int grid_rows      = 60;
-    constexpr int grid_columns   = 160;
-
-    const auto repaint_payload = [](char character) {
-        QByteArray payload;
-        for (int row = 1; row <= 32; ++row) {
-            payload += QByteArrayLiteral("\x1b[") + QByteArray::number(row) +
-                QByteArrayLiteral(";1H") + QByteArray(120, character);
-        }
-        // Complete the 4 KiB input slice with ignored NULs, without splitting
-        // an escape sequence or adding an unrelated scrolling operation.
-        payload += QByteArray(chunk_bytes - payload.size(), '\0');
-        return payload;
-    };
-    const QByteArray repaint_a = repaint_payload('a');
-    const QByteArray repaint_b = repaint_payload('b');
-    const QByteArray cursors =
-        QByteArrayLiteral("\x1b[10;20H\x1b[20;30H").repeated(chunk_bytes / 16);
-    const QByteArray scrolling =
-        (QByteArray(62, 's') + QByteArrayLiteral("\r\n")).repeated(chunk_bytes / 64);
-
-    struct Workload
-    {
-        const char* name;
-        bool        alternate;
-        QByteArray  first;
-        QByteArray  second;
-    };
-    const std::vector<Workload> workloads = {
-        {"primary_text_4k",   false, repaint_a, repaint_b},
-        {"alternate_text_4k", true,  repaint_a, repaint_b},
-        {"cursor_only_4k",    false, cursors,   cursors},
-        {"primary_scroll_4k", false, scrolling, scrolling},
-    };
-
-    for (const Workload& workload : workloads) {
-        term::Terminal_screen_model_config config;
-        config.grid_size        = {grid_rows, grid_columns};
-        config.scrollback_limit = 1024;
-
-        config.retained_history_capacity_bytes = k_retained_history_ring_capacity_bytes;
-        term::Terminal_screen_model model(config);
-        if (workload.alternate) {
-            model.ingest(QByteArrayLiteral("\x1b[?1049h"));
-        }
-
-        model.set_selection_reconciliation_counters_enabled(true);
-        std::uint64_t elapsed_ns     = 0U;
-        std::uint64_t consumed_bytes = 0U;
-        for (int iteration = 0; iteration < warmup_ingests + ingests; ++iteration) {
-            if (iteration == warmup_ingests) {
-                model.reset_selection_reconciliation_counters();
-                ingest_allocation_calls = 0U;
-                ingest_allocation_bytes = 0U;
-            }
-            const QByteArray& payload = iteration % 2 == 0
-                ? workload.first : workload.second;
-            const bool measured = iteration >= warmup_ingests;
-            count_ingest_allocations = measured;
-            const auto begin = std::chrono::steady_clock::now();
-            const term::Terminal_screen_model_result result = model.ingest(payload);
-            const auto end = std::chrono::steady_clock::now();
-            count_ingest_allocations = false;
-            if (payload.size() != chunk_bytes || result.consumed_bytes != chunk_bytes ||
-                result.parser_work_pending || result_has_diagnostic(result))
-            {
-                report_failure("active-grid benchmark did not ingest one complete 4 KiB slice");
-                return 1;
-            }
-            if (measured) {
-                elapsed_ns += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
-                consumed_bytes += static_cast<std::uint64_t>(result.consumed_bytes);
-            }
-        }
-
-        const auto counters = model.selection_reconciliation_counters();
-        std::uint64_t checksum = checksum_mix_text(0U, model.visible_text());
-        for (term::Terminal_buffer_id buffer : {
-            term::Terminal_buffer_id::PRIMARY, term::Terminal_buffer_id::ALTERNATE})
-        {
-            const int first_row = buffer == term::Terminal_buffer_id::PRIMARY
-                ? model.scrollback_size() : 0;
-            for (int row = 0; row < grid_rows; ++row) {
-                const int logical_row = first_row + row;
-                const auto handle = model.retained_history_handle_at_logical_row(
-                    buffer, logical_row);
-                if (!handle.has_value()) {
-                    report_failure("active-grid benchmark lost a live row handle");
-                    return 1;
-                }
-                const auto lookup = model.retained_line_lookup(buffer, *handle);
-                if (!lookup.exact_match || lookup.exact_logical_row != logical_row ||
-                    lookup.retained_line_id_match_count != 1)
-                {
-                    report_failure("active-grid benchmark live lookup did not match its row");
-                    return 1;
-                }
-                checksum = checksum_mix_u64(checksum, handle->row_sequence);
-                checksum = checksum_mix_u64(checksum, handle->content_generation);
-            }
-        }
-        const auto cursor = model.cursor_position();
-        checksum = checksum_mix_u64(checksum, cursor.row);
-        checksum = checksum_mix_u64(checksum, cursor.column);
-
-        std::cout << "{\"workload\":\"" << workload.name
-                  << "\",\"rows\":" << grid_rows
-                  << ",\"columns\":" << grid_columns
-                  << ",\"warmup_ingests\":" << warmup_ingests
-                  << ",\"ingests\":" << ingests
-                  << ",\"chunk_bytes\":" << chunk_bytes
-                  << ",\"consumed_bytes\":" << consumed_bytes
-                  << ",\"ingest_ns\":" << elapsed_ns
-                  << ",\"cpp_new_calls\":" << ingest_allocation_calls
-                  << ",\"cpp_new_bytes\":" << ingest_allocation_bytes
-                  << ",\"lookup_entries_visited\":"
-                  << counters.retained_lookup_active_grid_entries_visited
-                  << ",\"history_rows\":" << model.scrollback_size()
-                  << ",\"checksum\":" << checksum << "}\n";
-    }
-    return 0;
 }
 
 benchmark_measurement_t benchmark_append()
@@ -963,10 +797,6 @@ void print_summary(
 
 int main(int argc, char** argv)
 {
-    if (argc == 2 && std::string(argv[1]) == "--active-grid-ingest") {
-        return benchmark_active_grid_ingest();
-    }
-
     term::Terminal_history_ring limits_ring({
         k_retained_history_ring_capacity_bytes,
         0U,

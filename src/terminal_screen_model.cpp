@@ -3323,27 +3323,9 @@ Terminal_screen_model::selection_reconciliation_counters() const
     return m_selection_reconciliation_counters;
 }
 
-void Terminal_screen_model::invalidate_active_grid_retained_lookup_index(
-    Terminal_buffer_id buffer_id)
-{
-    if (buffer_id == Terminal_buffer_id::PRIMARY) {
-        m_primary_active_grid_lookup_dirty = true;
-    }
-    else {
-        m_alternate_active_grid_lookup_dirty = true;
-    }
-}
-
 void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
     Terminal_buffer_id buffer_id)
 {
-    bool& dirty = buffer_id == Terminal_buffer_id::PRIMARY
-        ? m_primary_active_grid_lookup_dirty
-        : m_alternate_active_grid_lookup_dirty;
-    if (!dirty) {
-        return;
-    }
-
     retained_lookup_index_t& index = mutable_retained_lookup_index(buffer_id);
     const std::vector<Terminal_screen_row>& rows = buffer_id == Terminal_buffer_id::PRIMARY
         ? primary_active_grid_rows()
@@ -3377,7 +3359,6 @@ void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
             m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited += visited;
         }
         if (same_identity_layout) {
-            dirty = false;
             return;
         }
     }
@@ -3416,7 +3397,6 @@ void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
             ++entry.row_sequence_match_count;
         }
     }
-    dirty = false;
 }
 
 void Terminal_screen_model::refresh_active_grid_retained_lookup_indexes()
@@ -3646,7 +3626,6 @@ void Terminal_screen_model::set_active_grid_retained_line_provenance_for_testing
     Terminal_screen_row& row = rows[static_cast<std::size_t>(active_grid_row)];
     row.retained_line_provenance = provenance;
     row.content_origin_spans.clear();
-    invalidate_active_grid_retained_lookup_index(buffer_id);
     refresh_active_grid_retained_lookup_index(buffer_id);
 }
 
@@ -4339,8 +4318,7 @@ Terminal_screen_model::Alternate_active_grid::active_grid_state() const
 void Terminal_screen_model::restore_buffer_state(const screen_buffer_state_t& state)
 {
     const bool previous_origin_mode = m_origin_mode;
-    // The selected buffer already owns these rows. Restore only the working
-    // cursor/mode metadata so an unchanged grid keeps its lookup index clean.
+    active_grid_rows()  = state.rows;
     m_saved_cursor      = state.saved_cursor;
     m_cursor            = state.cursor;
     m_scroll_top        = state.scroll_top;
@@ -4388,9 +4366,6 @@ Terminal_screen_model::active_buffer_state() const
 std::vector<Terminal_screen_model::Terminal_screen_row>&
 Terminal_screen_model::active_grid_rows()
 {
-    // Mutable views cover text, scrolling, erases, recovery, and synchronized
-    // output, even when their rows have not yet been published to a snapshot.
-    invalidate_active_grid_retained_lookup_index(m_active_buffer_id);
     return active_buffer_state().rows;
 }
 
@@ -4871,7 +4846,6 @@ void Terminal_screen_model::resize_deferred_primary()
 // ConhostInternalGetSet::ResizeWindow, screenInfo.cpp _handleDeferredResize).
 void Terminal_screen_model::resize_primary_state(terminal_grid_size_t grid_size)
 {
-    invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::PRIMARY);
     screen_buffer_state_t&     primary      = m_primary_backing.active_grid_state();
     const terminal_grid_size_t primary_size = primary_grid_size();
     if (m_config.backend_owns_screen_buffers   &&
@@ -5264,8 +5238,6 @@ void Terminal_screen_model::reset_grid()
     cancel_primary_repaint_recovery_resize_guard();
     m_primary_backing.active_grid_state()     = make_empty_buffer_state();
     m_alternate_grid.active_grid_state()      = make_empty_buffer_state();
-    invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::PRIMARY);
-    invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::ALTERNATE);
     m_active_buffer_id              = Terminal_buffer_id::PRIMARY;
     m_active_alternate_mode         = 0;
     m_dec_1049_saved_primary_cursor = false;
@@ -5301,7 +5273,6 @@ bool Terminal_screen_model::apply_grid_resize(
     {
         resize_primary_state(grid_size);
     }
-    invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::ALTERNATE);
     resize_buffer_state(m_alternate_grid.active_grid_state(), grid_size, false);
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
@@ -7400,7 +7371,6 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
         const Terminal_buffer_id active_buffer_before = m_active_buffer_id;
         save_active_buffer_state();
         if (clear_alternate) {
-            invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::ALTERNATE);
             m_alternate_grid.active_grid_state() = make_entered_alternate_state(
                 entry_cursor,
                 m_alternate_grid.active_grid_state().saved_cursor);
@@ -7413,7 +7383,6 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
     else
     if (clear_alternate) {
         resize_deferred_primary();
-        invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::ALTERNATE);
         m_alternate_grid.active_grid_state() =
             make_entered_alternate_state(entry_cursor, m_saved_cursor);
         mark_terminal_content_changed();
@@ -7441,7 +7410,6 @@ bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
     if (clear_alternate) {
         const saved_cursor_state_t alternate_saved_cursor =
             m_alternate_grid.active_grid_state().saved_cursor;
-        invalidate_active_grid_retained_lookup_index(Terminal_buffer_id::ALTERNATE);
         m_alternate_grid.active_grid_state() = make_empty_buffer_state();
         // A backend that owns its screens keeps the alternate screen's saved
         // cursor apart from its rows (adaptDispatch.hpp _savedCursorState).

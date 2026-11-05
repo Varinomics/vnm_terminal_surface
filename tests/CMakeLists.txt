@@ -2598,6 +2598,22 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     )
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(vnm_terminal_posix_pty_readiness
+            posix_pty_backend/readiness_tests.cpp)
+        target_link_libraries(vnm_terminal_posix_pty_readiness PRIVATE
+            vnm_terminal_surface::vnm_terminal_surface)
+        target_include_directories(vnm_terminal_posix_pty_readiness PRIVATE "${PROJECT_SOURCE_DIR}/src")
+        set_target_properties(vnm_terminal_posix_pty_readiness PROPERTIES AUTOMOC OFF)
+        foreach(scenario IN ITEMS
+            quiet capacity wake_eintr wake_full
+            callback_revoke callback_terminate callback_root_exit callback_destroy drain_deadline)
+            add_test(NAME vnm_terminal_posix_pty_readiness_${scenario}
+                COMMAND "${CMAKE_COMMAND}" -E env "${vnm_terminal_qt_runtime_path}"
+                    "$<TARGET_FILE:vnm_terminal_posix_pty_readiness>" "${scenario}")
+            set_tests_properties(vnm_terminal_posix_pty_readiness_${scenario} PROPERTIES
+                LABELS "conformance;posix;pty;readiness" TIMEOUT 45)
+        endforeach()
+
         add_executable(vnm_terminal_posix_pty_foreground_pipeline
             posix_pty_backend/foreground_pipeline_tests.cpp)
         target_link_libraries(vnm_terminal_posix_pty_foreground_pipeline PRIVATE
@@ -2691,6 +2707,12 @@ endif()
 if(TARGET vnm_terminal_posix_pty_foreground_pipeline)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_posix_pty_foreground_pipeline
+    )
+endif()
+
+if(TARGET vnm_terminal_posix_pty_readiness)
+    list(APPEND vnm_terminal_test_process_targets
+        vnm_terminal_posix_pty_readiness
     )
 endif()
 

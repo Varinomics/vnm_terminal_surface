@@ -1778,8 +1778,6 @@ private:
         terminal_selection_line_lease_t descriptor,
         int&                           logical_row) const;
 
-    void invalidate_active_grid_retained_lookup_index(
-        Terminal_buffer_id             buffer_id);
     void refresh_active_grid_retained_lookup_index(
         Terminal_buffer_id             buffer_id);
     void refresh_active_grid_retained_lookup_indexes();
@@ -1889,9 +1887,6 @@ private:
     std::uint64_t                   m_next_retained_line_id = 1U;
     retained_lookup_index_t         m_primary_retained_lookup_index;
     retained_lookup_index_t         m_alternate_retained_lookup_index;
-    // Invalidate on mutable row access, including hidden synchronized updates.
-    bool                            m_primary_active_grid_lookup_dirty = true;
-    bool                            m_alternate_active_grid_lookup_dirty = true;
     std::optional<terminal_selection_continuity_capability_t>
                                     m_selection_continuity;
     bool                            m_selection_continuity_published = false;
