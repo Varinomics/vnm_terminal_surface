@@ -267,6 +267,24 @@ bool recorder_distinguishes_failed_candidate(
 bool scenegraph_recreation_preserves_render_status(
     QGuiApplication& application, QQuickWindow& window, VNM_TerminalCanvas& canvas)
 {
+    // A Windows launcher can suppress the first show via STARTUPINFO, while
+    // unexposed grabWindow() readbacks use temporary scenegraphs. Re-show this
+    // fixture before requiring a populated native graph for retirement.
+    window.hide();
+    window.show();
+    if (!check(QTest::qWaitForWindowExposed(&window),
+            "scenegraph lifecycle starts from an exposed native window"))
+    {
+        return false;
+    }
+    QImage baseline;
+    if (!check(pump_until_rendered(application, window, canvas, baseline) &&
+            window.isSceneGraphInitialized(),
+            "scenegraph lifecycle starts from a populated native scenegraph"))
+    {
+        return false;
+    }
+
     std::atomic_uint invalidations = 0U;
     const auto connection = QObject::connect(
         &window, &QQuickWindow::sceneGraphInvalidated, &window,
