@@ -34,7 +34,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${LINUX_SYSTEM_DEPS}
+          sudo apt-get install -y ${LINUX_SYSTEM_DEPS} \
+            xvfb xauth libgl1-mesa-dri libxcb-cursor0 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
 
       - name: Identify compiler cache
         id: compiler_cache
@@ -81,6 +83,25 @@ jobs:
 
       - name: Build
         run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel 4
+
+      # Offscreen CTest deliberately skips native renderer/readback cases.
+      # Exercise their scenegraph lifecycle with the already-built executable.
+      - name: Run native canvas renderer with Mesa OpenGL
+        env:
+          QT_QPA_PLATFORM: xcb
+          QSG_RHI_BACKEND: opengl
+          QSG_RENDER_LOOP: threaded
+          QSG_INFO: '1'
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          GALLIUM_DRIVER: llvmpipe
+          QT_SCALE_FACTOR: '1'
+          QT_SCREEN_SCALE_FACTORS: ''
+          QT_AUTO_SCREEN_SCALE_FACTOR: '0'
+          QT_DEVICE_PIXEL_RATIO: ''
+          QT_SCALE_FACTOR_ROUNDING_POLICY: PassThrough
+        run: |
+          timeout 60s xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
+            ./build/tests/vnm_terminal_canvas_renderer
 
       - name: Run tests
         working-directory: build

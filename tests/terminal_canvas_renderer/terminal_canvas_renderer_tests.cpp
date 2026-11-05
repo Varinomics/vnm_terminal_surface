@@ -5,6 +5,7 @@
 #include "vnm_terminal/vnm_terminal_canvas.h"
 
 #include <QColor>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFont>
 #include <QFontMetricsF>
@@ -19,6 +20,7 @@
 #include <QTouchEvent>
 #include <QtMath>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -259,6 +261,72 @@ bool recorder_distinguishes_failed_candidate(
         recovered.render_publication_generation == recovered.prepared_publication_generation &&
         recovered.render_canvas_frame_generation == canvas.frame_generation(),
         "recorder advances to the recovered committed frame");
+    return ok;
+}
+
+bool scenegraph_recreation_preserves_render_status(
+    QGuiApplication& application, QQuickWindow& window, VNM_TerminalCanvas& canvas)
+{
+    // A Windows launcher can suppress the first show via STARTUPINFO, while
+    // unexposed grabWindow() readbacks use temporary scenegraphs. Re-show this
+    // fixture before requiring a populated native graph for retirement.
+    window.hide();
+    window.show();
+    if (!check(QTest::qWaitForWindowExposed(&window),
+            "scenegraph lifecycle starts from an exposed native window"))
+    {
+        return false;
+    }
+    QImage baseline;
+    if (!check(pump_until_rendered(application, window, canvas, baseline) &&
+            window.isSceneGraphInitialized(),
+            "scenegraph lifecycle starts from a populated native scenegraph"))
+    {
+        return false;
+    }
+
+    std::atomic_uint invalidations = 0U;
+    const auto connection = QObject::connect(
+        &window, &QQuickWindow::sceneGraphInvalidated, &window,
+        [&] { ++invalidations; }, Qt::DirectConnection);
+    const bool persistent_scenegraph = window.isPersistentSceneGraph();
+    const bool persistent_graphics = window.isPersistentGraphics();
+    const auto restore = qScopeGuard([&] {
+        QObject::disconnect(connection);
+        window.setPersistentSceneGraph(persistent_scenegraph);
+        window.setPersistentGraphics(persistent_graphics);
+    });
+
+    window.setPersistentSceneGraph(false);
+    window.setPersistentGraphics(false);
+    window.hide();
+    window.releaseResources();
+    QElapsedTimer deadline;
+    deadline.start();
+    while (invalidations == 0U && deadline.elapsed() < 2000) {
+        application.processEvents(QEventLoop::AllEvents, 20);
+        QThread::msleep(10);
+    }
+    bool ok = check(invalidations > 0U,
+        "native window invalidates the previous canvas scenegraph");
+
+    ok &= check(canvas.set_canvas_frame({}), "scenegraph retirement clears canvas ownership");
+    auto replacement = make_frame(901U);
+    replacement->publication_generation = 4U;
+    ok &= check(canvas.set_canvas_frame(replacement),
+        "hidden canvas accepts a replacement after scenegraph retirement");
+    application.processEvents(QEventLoop::AllEvents, 50);
+    ok &= check(!canvas.render_ready() && canvas.rendered_frame_generation() == 0U &&
+        canvas.render_error().isEmpty(),
+        "retired scenegraph notifications cannot restore cleared render status");
+
+    window.show();
+    QImage rendered;
+    ok &= check(pump_until_rendered(application, window, canvas, rendered),
+        "recreated scenegraph renders replacement canvas pixels");
+    ok &= check(canvas.render_ready() && canvas.rendered_frame_sequence() == 901U &&
+        canvas.rendered_publication_generation() == 4U && canvas.render_error().isEmpty(),
+        "recreated scenegraph publishes readiness for the replacement identity");
     return ok;
 }
 
@@ -672,6 +740,7 @@ int main(int argc, char** argv)
         ok &= authoritative_grid_glyph_positions(application, window, canvas);
         ok &= row_images_follow_pixels_placement_and_lifecycle(application, window, canvas);
         ok &= rendered_presentation_handle_contract(application, window, canvas);
+        ok &= scenegraph_recreation_preserves_render_status(application, window, canvas);
     }
 
     ok &= check(canvas.set_canvas_frame({}), "null frame clears the canvas");
