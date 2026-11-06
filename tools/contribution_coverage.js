@@ -1,301 +1,15 @@
 #!/usr/bin/env node
 "use strict";
 
-const crypto = require("node:crypto");
-const fs     = require("node:fs");
-const path   = require("node:path");
-
+const fs   = require("node:fs");
+const path = require("node:path");
+const assent = require("./contribution_assent.js");
+const { AGREEMENT_PATHS, require_value, sha256, text_digest, email_digest, valid_id,
+    status_contexts, validate_registry, empty_registry, require_retained_records } = assent;
 const RECORDS_BRANCH = "contribution-records";
 const RECORDS_PATH   = "coverage.json";
-const CLA_STATUS     = "cla/coverage";
-const MATERIAL_STATUS = "contributions/material-review";
-const SIGNATURE_GROUPS = [
-    "individuals", "corporations", "corporate_authorizations", "exceptions", "material_reviews"
-];
-const AGREEMENT_PATHS = {
-    "individual-v1.0": "docs/contributions/individual-cla-v1.0.md",
-    "corporate-v1.0":  "docs/contributions/corporate-cla-v1.0.md"
-};
-const SOURCE_ROOT = path.resolve(__dirname, "..");
-
-function require_value(condition, message)
-{
-    if (!condition) {
-        throw new Error(message);
-    }
-}
-
-function sha256(value)
-{
-    return crypto.createHash("sha256").update(value).digest("hex");
-}
-
-function text_digest(text)
-{
-    return sha256(text.replace(/\r\n/g, "\n"));
-}
-
-function email_digest(email)
-{
-    require_value(typeof email === "string" && email.trim().includes("@"),
-        "An author has no usable commit email; verified identity evidence is required.");
-    return sha256(email.trim().toLowerCase());
-}
-
-function valid_id(value)
-{
-    return Number.isSafeInteger(value) && value > 0;
-}
-
-function status_contexts(generation)
-{
-    require_value(Number.isSafeInteger(generation) && generation >= 0,
-        "The coverage registry needs a nonnegative generation.");
-    return [CLA_STATUS, MATERIAL_STATUS].map(prefix => `${prefix} (records ${generation})`);
-}
-
-function valid_hash(value)
-{
-    return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-}
-
-function timestamp(value, label)
-{
-    require_value(typeof value === "string" &&
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
-        Number.isFinite(Date.parse(value)), `${label} must be a UTC timestamp.`);
-    return Date.parse(value);
-}
-
-function record_id(value)
-{
-    return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$/.test(value);
-}
-
-function validate_evidence(record, prefix = "evidence")
-{
-    require_value(record_id(record[`${prefix}_id`]) && valid_hash(record[`${prefix}_sha256`]),
-        `${record.id}: an archived ${prefix} receipt and its SHA256 are required.`);
-}
-
-function validate_verification(record, registry)
-{
-    require_value(record_id(record.id), "Every record needs a unique durable ID.");
-    require_value(registry.custodians.includes(record.verified_by),
-        `${record.id}: verified_by must identify a recorded custodian.`);
-    timestamp(record.verified_at, `${record.id}.verified_at`);
-    if (record.withdrawn_at !== null) {
-        timestamp(record.withdrawn_at, `${record.id}.withdrawn_at`);
-    }
-}
-
-function validate_subject(record)
-{
-    require_value(valid_id(record.github_id), `${record.id}: github_id must be a numeric account ID.`);
-    require_value(Array.isArray(record.email_sha256) && record.email_sha256.every(valid_hash),
-        `${record.id}: email_sha256 must contain verified commit-email hashes.`);
-}
-
-function validate_signature(record, registry, agreement_prefix)
-{
-    validate_verification(record, registry);
-    validate_evidence(record);
-    const agreement = registry.agreements.find(item => item.id === record.agreement_id);
-    require_value(agreement && agreement.id.startsWith(agreement_prefix) &&
-        agreement.sha256 === record.agreement_sha256,
-        `${record.id}: the signature must identify the exact applicable agreement digest.`);
-    require_value(timestamp(record.signed_at, `${record.id}.signed_at`) <=
-        timestamp(record.verified_at, `${record.id}.verified_at`),
-        `${record.id}: a signature cannot be verified before execution.`);
-}
-
-function validate_registry(registry, repository_id, agreement_text)
-{
-    status_contexts(registry.generation);
-    require_value(registry.schema_version === 1 && valid_id(registry.repository_id) &&
-        registry.repository_id === repository_id,
-        "The coverage registry schema or repository identity does not match.");
-    require_value(Array.isArray(registry.custodians) && registry.custodians.length > 0 &&
-        registry.custodians.every(valid_id), "The registry needs identified record custodians.");
-    require_value(Array.isArray(registry.agreements) && registry.agreements.length > 0,
-        "The registry needs versioned agreements.");
-    const ids = new Set();
-    for (const agreement of registry.agreements) {
-        require_value(record_id(agreement.id) && !ids.has(agreement.id),
-            "Agreement IDs must be unique.");
-        ids.add(agreement.id);
-        require_value(AGREEMENT_PATHS[agreement.id] === agreement.path &&
-            typeof agreement_text[agreement.id] === "string" &&
-            agreement.sha256 === text_digest(agreement_text[agreement.id]),
-            `${agreement.id}: agreement text/version SHA256 does not match the published source.`);
-    }
-    for (const group of SIGNATURE_GROUPS) {
-        require_value(Array.isArray(registry[group]), `The registry needs a ${group} array.`);
-        for (const record of registry[group]) {
-            require_value(record_id(record.id) && !ids.has(record.id), "Record IDs must be unique.");
-            ids.add(record.id);
-        }
-    }
-    const aliases = new Map();
-    for (const record of registry.individuals) {
-        validate_signature(record, registry, "individual-");
-        validate_subject(record);
-        for (const alias of record.withdrawn_at === null ? record.email_sha256 : []) {
-            require_value(!aliases.has(alias) || aliases.get(alias) === record.github_id,
-                "A verified commit alias cannot identify two different contributors.");
-            aliases.set(alias, record.github_id);
-        }
-    }
-    for (const record of registry.corporations) {
-        validate_signature(record, registry, "corporate-");
-        require_value(record_id(record.entity_id), `${record.id}: a corporate entity ID is required.`);
-        validate_evidence(record, "authority_evidence");
-    }
-    for (const record of registry.corporate_authorizations) {
-        validate_verification(record, registry);
-        validate_subject(record);
-        validate_evidence(record);
-        require_value(registry.corporations.some(item => item.id === record.corporation_id),
-            `${record.id}: the corporate signature record is missing.`);
-        timestamp(record.valid_from, `${record.id}.valid_from`);
-        if (record.valid_until !== null) {
-            require_value(timestamp(record.valid_until, `${record.id}.valid_until`) >
-                timestamp(record.valid_from, `${record.id}.valid_from`),
-                `${record.id}: the authorisation interval is empty.`);
-        }
-        if (record.ending !== undefined) {
-            validate_verification(record.ending, registry);
-            validate_evidence(record.ending);
-            require_value(record.valid_until !== null &&
-                timestamp(record.valid_until, `${record.id}.valid_until`) >=
-                timestamp(record.ending.verified_at, `${record.id}.ending.verified_at`),
-                `${record.id}: a prospective ending must preserve previously reviewed grants.`);
-        }
-        require_value(typeof record.work_scope === "string" && record.work_scope.trim().length > 0,
-            `${record.id}: the verified corporate work scope is required.`);
-    }
-    for (const record of registry.exceptions) {
-        validate_verification(record, registry);
-        validate_evidence(record);
-        require_value(valid_id(record.pull_request) && /^[a-f0-9]{40}$/.test(record.head_sha) &&
-            (valid_id(record.github_id) !== valid_hash(record.email_sha256)),
-            `${record.id}: an exception must name one exact PR/head and one exact author identity.`);
-        require_value(["varinomics-owned", "separately-licensed", "mechanical-bot"].includes(record.basis) &&
-            typeof record.reason === "string" && record.reason.trim().length > 0,
-            `${record.id}: an exception needs its verified rights basis and reason.`);
-        require_value(record.rights_irrevocable === true && !("valid_until" in record),
-            `${record.id}: exceptions require durable rights; time-limited acceptance is unsupported.`);
-    }
-    for (const review of registry.material_reviews) {
-        validate_verification(review, registry);
-        require_value(valid_id(review.pull_request) && /^[a-f0-9]{40}$/.test(review.head_sha) &&
-            valid_hash(review.disclosure_sha256) && review.rights_confirmed === true,
-            `${review.id}: a review must affirm rights for an exact PR/head and disclosure.`);
-        require_value(["original", "imports-approved"].includes(review.disposition) &&
-            Array.isArray(review.provenance_paths) && review.provenance_paths.every(item =>
-                typeof item === "string" && item.length > 0 && !item.startsWith("/") &&
-                !item.split(/[\\/]/).includes("..")),
-            `${review.id}: reviewed material needs a valid disposition and provenance paths.`);
-        require_value(review.disposition !== "imports-approved" || review.provenance_paths.length > 0,
-            `${review.id}: approved imports require tracked origin/licence records.`);
-        require_value(Array.isArray(review.individual_github_ids) &&
-            review.individual_github_ids.every(valid_id) &&
-            Array.isArray(review.corporate_authorization_ids) &&
-            review.corporate_authorization_ids.every(id =>
-                registry.corporate_authorizations.some(item => item.id === id)),
-            `${review.id}: ownership capacity must be explicitly reviewed.`);
-    }
-    return registry;
-}
-
-function is_active(record, now)
-{
-    // Withdrawal invalidates evidence now; corporate valid_until separately ends future authority.
-    return Date.parse(record.verified_at) <= now && record.withdrawn_at === null;
-}
-
-function verified_actor_id(actor, registry)
-{
-    if (valid_id(actor.github_id)) {
-        return actor.github_id;
-    }
-    const hash = email_digest(actor.email);
-    const matches = registry.individuals.filter(record =>
-        record.withdrawn_at === null && record.email_sha256.includes(hash));
-    require_value(matches.length > 0,
-        "An unlinked author needs a verified commit-email mapping in the coverage registry.");
-    return matches[0].github_id;
-}
-
-function evaluate_coverage(pr, actors, registry, now)
-{
-    const review = registry.material_reviews.findLast(item =>
-        item.pull_request === pr.number && item.head_sha === pr.head.sha &&
-        item.disclosure_sha256 === text_digest(pr.body || "") && is_active(item, now));
-    const missing = [];
-    const contribution_time = review ? Date.parse(review.verified_at) : now;
-    const declared_corporate = (review?.corporate_authorization_ids || []).map(id =>
-        registry.corporate_authorizations.find(item => item.id === id));
-    const declared = [
-        ...actors,
-        ...(review?.individual_github_ids || []).map(github_id => ({ github_id })),
-        ...declared_corporate.map(record => ({ github_id: record.github_id }))
-    ];
-    for (const actor of declared) {
-        const exception = registry.exceptions.find(item =>
-            item.pull_request === pr.number && item.head_sha === pr.head.sha &&
-            item.rights_irrevocable === true && is_active(item, now) &&
-            (valid_id(actor.github_id)
-                ? item.github_id === actor.github_id
-                : item.email_sha256 === email_digest(actor.email)));
-        if (exception) {
-            continue;
-        }
-        let id;
-        try {
-            id = verified_actor_id(actor, registry);
-        }
-        catch (error) {
-            missing.push(error.message);
-            continue;
-        }
-        const individual = registry.individuals.find(item =>
-            item.github_id === id && Date.parse(item.signed_at) <= contribution_time && is_active(item, now));
-        if (!individual) {
-            missing.push(`GitHub account ${id} has no active verified individual CLA.`);
-            continue;
-        }
-        if (!review) {
-            missing.push(`GitHub account ${id} needs a maintainer's ownership-capacity review.`);
-            continue;
-        }
-        const corporate = declared_corporate.filter(item => item.github_id === id);
-        if (!review.individual_github_ids.includes(id) && corporate.length === 0) {
-            missing.push(`GitHub account ${id} needs a maintainer's ownership-capacity review.`);
-        }
-        // Mixed ownership needs every declared grant; a personal grant cannot replace employer rights.
-        for (const authorization of corporate) {
-            if (!(Date.parse(authorization.valid_from) <= contribution_time &&
-                (authorization.valid_until === null || contribution_time < Date.parse(authorization.valid_until)) &&
-                is_active(authorization, now) &&
-                (authorization.ending === undefined || is_active(authorization.ending, now)) &&
-                registry.corporations.some(signature =>
-                    signature.id === authorization.corporation_id &&
-                    Date.parse(signature.signed_at) <= contribution_time && is_active(signature, now))))
-            {
-                missing.push(`GitHub account ${id} has an inactive required corporate authorisation.`);
-            }
-        }
-    }
-    const declarations = [...(pr.body || "").matchAll(
-        /^Material origin:[ \t]*(original|imported-or-adapted)[ \t]*$/gmi)];
-    const material_ok = Boolean(review) && declarations.length === 1 &&
-        ((declarations[0][1].toLowerCase() === "original" && review.disposition === "original") ||
-         (declarations[0][1].toLowerCase() === "imported-or-adapted" &&
-            review.disposition === "imports-approved"));
-    return { coverage_ok: missing.length === 0, material_ok, missing: [...new Set(missing)], review };
-}
-
+const RECEIPTS_PATH  = "assents/v1.1";
+const SOURCE_ROOT   = path.resolve(__dirname, "..");
 class GitHub_api
 {
     constructor(token)
@@ -318,7 +32,11 @@ class GitHub_api
             body: body === undefined ? undefined : JSON.stringify(body),
             signal: AbortSignal.timeout(30000)
         });
-        require_value(response.ok, `GitHub API ${method} ${route.split("?")[0]} failed (${response.status}).`);
+        if (!response.ok) {
+            const error = new Error(`GitHub API ${method} ${route.split("?")[0]} failed (${response.status}).`);
+            error.status = response.status;
+            throw error;
+        }
         return response.status === 204 ? null : response.json();
     }
 
@@ -441,206 +159,6 @@ async function collect_actors(api, repository, pr)
     return actors;
 }
 
-function agreement_texts()
-{
-    return Object.fromEntries(Object.entries(AGREEMENT_PATHS).map(([id, file]) =>
-        [id, fs.readFileSync(path.join(SOURCE_ROOT, file), "utf8")]));
-}
-
-async function registry_snapshot(api, repository)
-{
-    const ref = await api.request("GET", `/repos/${repository}/git/ref/heads/${RECORDS_BRANCH}`);
-    const file = await api.request("GET",
-        `/repos/${repository}/contents/${RECORDS_PATH}?ref=${ref.object.sha}`);
-    require_value(file.type === "file" && file.encoding === "base64" && typeof file.content === "string",
-        "The coverage registry could not be read completely.");
-    return { sha: ref.object.sha,
-        registry: JSON.parse(Buffer.from(file.content, "base64").toString("utf8")), file_sha: file.sha };
-}
-
-async function post_status(api, repository, head_sha, context, state, description, target_url)
-{
-    await api.request("POST", `/repos/${repository}/statuses/${head_sha}`,
-        { context, state, description, target_url });
-}
-
-async function invalidate_heads(api, repository, pulls, target_url, contexts)
-{
-    for (const head of new Set(pulls.map(pr => pr.head.sha))) {
-        for (const context of contexts) {
-            await post_status(api, repository, head, context, "pending",
-                "Checking contribution rights and material review.", target_url);
-        }
-    }
-}
-
-async function check_repository(api, repository, requested_number, target_url, now = Date.now())
-{
-    const repo = await api.request("GET", `/repos/${repository}`);
-    const open = await api.list(`/repos/${repository}/pulls?state=open`);
-    let pulls = open;
-    if (requested_number !== null) {
-        const requested = open.find(pr => pr.number === requested_number);
-        require_value(requested, "The requested pull request is not open.");
-        pulls = open.filter(pr => pr.head.sha === requested.head.sha);
-    }
-    if (pulls.length === 0) {
-        process.stdout.write("No open pull requests need contribution checks.\n");
-        return true;
-    }
-    const outcomes = new Map();
-    let contexts = [];
-    try {
-        const snapshot = await registry_snapshot(api, repository);
-        contexts = status_contexts(snapshot.registry.generation);
-        await invalidate_heads(api, repository, pulls, target_url, contexts);
-        const registry = validate_registry(snapshot.registry, repo.id, agreement_texts());
-        for (const listed of pulls) {
-            const pr = await api.request("GET", `/repos/${repository}/pulls/${listed.number}`);
-            require_value(pr.state === "open" && pr.head.sha === listed.head.sha,
-                "An open PR changed while the contribution check was starting; recheck it.");
-            const actors = await collect_actors(api, repository, pr);
-            const outcome = evaluate_coverage(pr, actors, registry, now);
-            if (outcome.material_ok && outcome.review.disposition === "imports-approved") {
-                for (const file of outcome.review.provenance_paths) {
-                    const encoded = file.split("/").map(encodeURIComponent).join("/");
-                    const provenance = await api.request("GET",
-                        `/repos/${repository}/contents/${encoded}?ref=${pr.head.sha}`);
-                    require_value(provenance.type === "file" && provenance.sha,
-                        "Reviewed import provenance must be a tracked file in this PR head.");
-                }
-            }
-            const current = await api.request("GET", `/repos/${repository}/pulls/${pr.number}`);
-            require_value(current.state === "open" && current.head.sha === pr.head.sha &&
-                text_digest(current.body || "") === text_digest(pr.body || ""),
-                "The PR head or disclosure changed during the check; recheck it.");
-            const head_outcome = outcomes.get(pr.head.sha) || { coverage_ok: true, material_ok: true };
-            head_outcome.coverage_ok &&= outcome.coverage_ok;
-            head_outcome.material_ok &&= outcome.material_ok;
-            outcomes.set(pr.head.sha, head_outcome);
-            process.stdout.write(`PR #${pr.number}: CLA ${outcome.coverage_ok ? "covered" : "not covered"}; ` +
-                `material review ${outcome.material_ok ? "approved" : "required"}.\n`);
-            for (const failure of outcome.missing) {
-                process.stdout.write(`  ${failure}\n`);
-            }
-        }
-        const current_ref = await api.request("GET",
-            `/repos/${repository}/git/ref/heads/${RECORDS_BRANCH}`);
-        require_value(current_ref.object.sha === snapshot.sha,
-            "Contribution records changed during the check; recheck open PRs.");
-        for (const [head, outcome] of outcomes) {
-            await post_status(api, repository, head, contexts[0],
-                outcome.coverage_ok ? "success" : "failure",
-                outcome.coverage_ok ? "All declared authors have verified rights coverage." :
-                    "Verified author coverage or ownership-capacity review is required.", target_url);
-            await post_status(api, repository, head, contexts[1],
-                outcome.material_ok ? "success" : "failure",
-                outcome.material_ok ? "The exact contribution and disclosed origins were reviewed." :
-                    "A matching maintainer material/licence review is required.", target_url);
-        }
-        return [...outcomes.values()].every(outcome => outcome.coverage_ok && outcome.material_ok);
-    }
-    catch (error) {
-        for (const head of new Set(pulls.map(pr => pr.head.sha))) {
-            let failed_contexts = contexts;
-            if (failed_contexts.length === 0) {
-                const prior = await api.list(`/repos/${repository}/commits/${head}/statuses`);
-                failed_contexts = [...new Set(prior.map(item => item.context).filter(context =>
-                    /^(cla\/coverage|contributions\/material-review) \(records \d+\)$/.test(context)))];
-            }
-            for (const context of failed_contexts) {
-                await post_status(api, repository, head, context, "failure",
-                    "Contribution evidence could not be verified; see the workflow log.", target_url);
-            }
-        }
-        throw error;
-    }
-}
-
-function empty_registry(repository_id, custodians, texts)
-{
-    return {
-        schema_version: 1,
-        generation: 0,
-        repository_id,
-        custodians,
-        agreements: Object.entries(AGREEMENT_PATHS).map(([id, file]) =>
-            ({ id, path: file, sha256: text_digest(texts[id]) })),
-        individuals: [], corporations: [], corporate_authorizations: [], exceptions: [], material_reviews: []
-    };
-}
-
-function require_retained_records(previous, proposed)
-{
-    require_value(previous.repository_id === proposed.repository_id,
-        "An update cannot change the repository identity.");
-    for (const id of previous.custodians) {
-        require_value(proposed.custodians.includes(id), "Retain the identities of historical record verifiers.");
-    }
-    for (const group of ["agreements", ...SIGNATURE_GROUPS]) {
-        for (const record of previous[group]) {
-            const replacement = proposed[group].find(item => item.id === record.id);
-            require_value(replacement, `${record.id}: retained records cannot be deleted.`);
-            const retained = { ...replacement };
-            if (record.withdrawn_at === null && retained.withdrawn_at !== null) {
-                retained.withdrawn_at = null;
-            }
-            if (group === "corporate_authorizations" && record.valid_until !== retained.valid_until)
-            {
-                require_value(retained.valid_until !== null &&
-                    (record.valid_until === null ||
-                        Date.parse(retained.valid_until) < Date.parse(record.valid_until)) &&
-                    retained.ending && retained.ending.id !== record.ending?.id,
-                    `${record.id}: authority may only be shortened with a new archived ending attestation.`);
-                if (record.ending) {
-                    require_value(Date.parse(retained.ending.verified_at) >= Date.parse(record.ending.verified_at),
-                        `${record.id}: retain the chronology of authority-ending notices.`);
-                }
-                retained.valid_until = record.valid_until;
-                if (record.ending === undefined) {
-                    delete retained.ending;
-                }
-                else {
-                    retained.ending = record.ending;
-                }
-            }
-            require_value(canonical_json(record) === canonical_json(retained),
-                `${record.id}: retained evidence is immutable; append a correction and withdraw the old record.`);
-        }
-    }
-}
-
-function canonical_json(value)
-{
-    if (Array.isArray(value)) {
-        return `[${value.map(canonical_json).join(",")}]`;
-    }
-    if (value !== null && typeof value === "object") {
-        return `{${Object.keys(value).sort().map(key =>
-            `${JSON.stringify(key)}:${canonical_json(value[key])}`).join(",")}}`;
-    }
-    return JSON.stringify(value);
-}
-
-async function bootstrap_records(api, repository, custodian)
-{
-    const repo = await api.request("GET", `/repos/${repository}`);
-    const registry = empty_registry(repo.id, [custodian], agreement_texts());
-    validate_registry(registry, repo.id, agreement_texts());
-    const workflow = fs.readFileSync(path.join(SOURCE_ROOT, ".github/workflows/contribution-coverage.yml"), "utf8");
-    const tree = await api.request("POST", `/repos/${repository}/git/trees`, { tree: [
-        { path: RECORDS_PATH, mode: "100644", type: "blob", content: JSON.stringify(registry, null, 2) + "\n" },
-        { path: ".github/workflows/contribution-coverage.yml", mode: "100644", type: "blob", content: workflow }
-    ] });
-    const commit = await api.request("POST", `/repos/${repository}/git/commits`, {
-        message: "Create the contribution evidence registry\n\nKeep verified signing evidence separate from product PRs so coverage can be administered without bypassing product merge requirements.",
-        tree: tree.sha, parents: []
-    });
-    await api.request("POST", `/repos/${repository}/git/refs`,
-        { ref: `refs/heads/${RECORDS_BRANCH}`, sha: commit.sha });
-    process.stdout.write(`Created ${RECORDS_BRANCH} with empty coverage; no signatures were assumed.\n`);
-}
-
 async function advance_required_generation(api, repository, ruleset_id, current_generation, default_branch)
 {
     const route = `/repos/${repository}/rulesets/${ruleset_id}`;
@@ -679,6 +197,246 @@ async function advance_required_generation(api, repository, ruleset_id, current_
     });
 }
 
+function agreement_texts()
+{
+    return Object.fromEntries(Object.entries(AGREEMENT_PATHS).map(([id, file]) =>
+        [id, fs.readFileSync(path.join(SOURCE_ROOT, file), "utf8")]));
+}
+
+function decode_file(file)
+{
+    require_value(file.encoding === "base64" && typeof file.content === "string",
+        "The complete signing evidence could not be read.");
+    return JSON.parse(Buffer.from(file.content, "base64").toString("utf8"));
+}
+
+async function registry_snapshot(api, repository)
+{
+    const ref = await api.request("GET", `/repos/${repository}/git/ref/heads/${RECORDS_BRANCH}`);
+    const file = await api.request("GET", `/repos/${repository}/contents/${RECORDS_PATH}?ref=${ref.object.sha}`);
+    return { sha: ref.object.sha, registry: decode_file(file), file_sha: file.sha };
+}
+
+async function read_receipts(api, repository, snapshot, texts)
+{
+    const tree = await api.request("GET", `/repos/${repository}/git/trees/${snapshot.sha}?recursive=1`);
+    require_value(Array.isArray(tree.tree) && tree.truncated === false,
+        "The complete signing-receipt inventory could not be read.");
+    const receipts = [];
+    for (const entry of tree.tree) {
+        if (entry.path.startsWith(`${RECEIPTS_PATH}/`) && entry.type === "blob") {
+            require_value(new RegExp(`^${RECEIPTS_PATH}/\\d+\\.json$`).test(entry.path),
+                "The signing evidence contains an unexpected receipt path.");
+            const file = await api.request("GET", `/repos/${repository}/git/blobs/${entry.sha}`);
+            const receipt = assent.validate_receipt(decode_file(file), snapshot.registry, texts);
+            require_value(entry.path === `${RECEIPTS_PATH}/${receipt.comment_id}.json`,
+                "The signing-receipt identity does not match its immutable path.");
+            receipts.push(receipt);
+        }
+    }
+    return receipts;
+}
+
+async function append_receipt(api, repository, receipt)
+{
+    const route = `/repos/${repository}/contents/${RECEIPTS_PATH}/${receipt.comment_id}.json`;
+    for (let attempt = 0; attempt < 5; ++attempt) {
+        try {
+            const existing = await api.request("GET", `${route}?ref=${RECORDS_BRANCH}`);
+            const retained = decode_file(existing);
+            require_value(retained.github_id === receipt.github_id && retained.assent_text === receipt.assent_text &&
+                retained.created_at === receipt.created_at && retained.agreement_sha256 === receipt.agreement_sha256 &&
+                retained.head_sha === receipt.head_sha,
+                "An independently retained creation receipt cannot be rewritten.");
+            return false;
+        }
+        catch (error) {
+            if (error.status !== 404) {
+                throw error;
+            }
+        }
+        try {
+            await api.request("PUT", route, {
+                branch: RECORDS_BRANCH,
+                message: `Retain authenticated contribution assent ${receipt.comment_id}`,
+                content: Buffer.from(JSON.stringify(receipt, null, 2) + "\n").toString("base64")
+            });
+            return true;
+        }
+        catch (error) {
+            if (error.status !== 409 || attempt === 4) {
+                throw error;
+            }
+            await new Promise(resolve => setTimeout(resolve, 100 * 2 ** attempt));
+        }
+    }
+}
+
+async function ingest_comment(api, repository, event, context)
+{
+    try {
+        const snapshot = await registry_snapshot(api, repository);
+        const texts = agreement_texts();
+        validate_registry(snapshot.registry, event.repository?.id, texts);
+        const receipt = await assent.capture_receipt(api, repository, event, context, snapshot.registry, texts);
+        await append_receipt(api, repository, receipt);
+        process.stdout.write(`Retained authenticated ${receipt.kind} creation receipt.\n`);
+    }
+    catch (error) {
+        if (event.issue?.pull_request && /^\/cla /.test(event.comment?.body || "")) {
+            await api.request("POST", `/repos/${repository}/issues/${event.issue.number}/comments`, {
+                body: `The CLA command was not recorded. ${error.message}`
+            });
+        }
+        throw error;
+    }
+}
+
+async function additional_actors(api, body)
+{
+    const lines = [...body.matchAll(/^Additional authors:[ \t]*(.*)$/gmi)];
+    require_value(lines.length <= 1, "Use one Additional authors line.");
+    if (lines.length === 0 || /^(none)?$/i.test(lines[0][1].trim())) {
+        return [];
+    }
+    const handles = lines[0][1].split(",").map(item => item.trim().replace(/^@/, ""));
+    require_value(handles.every(item => /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(item)),
+        "Additional authors use comma-separated GitHub handles, such as @alice, @bob.");
+    const actors = [];
+    for (const handle of handles) {
+        const user = await api.request("GET", `/users/${handle}`);
+        require_value(valid_id(user.id), "An additional author could not be identified.");
+        actors.push({ github_id: user.id, login: user.login });
+    }
+    return actors;
+}
+
+async function update_prompt(api, repository, pr, body)
+{
+    const comments = await api.list(`/repos/${repository}/issues/${pr.number}/comments`);
+    const marker = "<!-- varinomics-contribution-check -->";
+    const existing = comments.find(comment => comment.user?.login === "github-actions[bot]" &&
+        comment.user.type === "Bot" && comment.body.startsWith(marker));
+    if (existing?.body === body) {
+        return;
+    }
+    if (existing) {
+        await api.request("PATCH", `/repos/${repository}/issues/comments/${existing.id}`, { body });
+    }
+    else {
+        await api.request("POST", `/repos/${repository}/issues/${pr.number}/comments`, { body });
+    }
+}
+
+async function post_status(api, repository, head_sha, context, state, description, target_url)
+{
+    await api.request("POST", `/repos/${repository}/statuses/${head_sha}`,
+        { context, state, description, target_url });
+}
+
+async function check_repository(api, repository, requested_number, target_url)
+{
+    const repo = await api.request("GET", `/repos/${repository}`);
+    const open = await api.list(`/repos/${repository}/pulls?state=open`);
+    let pulls = open;
+    if (requested_number !== null) {
+        const requested = open.find(pr => pr.number === requested_number);
+        require_value(requested, "The requested PR is not open.");
+        pulls = open.filter(pr => pr.head.sha === requested.head.sha);
+    }
+    if (pulls.length === 0) {
+        process.stdout.write("No open PRs need contribution checks.\n");
+        return true;
+    }
+    let contexts = [];
+    try {
+        const snapshot = await registry_snapshot(api, repository);
+        contexts = status_contexts(snapshot.registry.generation);
+        for (const head of new Set(pulls.map(pr => pr.head.sha))) {
+            for (const context of contexts) {
+                await post_status(api, repository, head, context, "pending", "Checking contribution rights.", target_url);
+            }
+        }
+        const texts = agreement_texts();
+        const registry = validate_registry(snapshot.registry, repo.id, texts);
+        const receipts = await read_receipts(api, repository, snapshot, texts);
+        const outcomes = new Map();
+        for (const listed of pulls) {
+            let pull = listed;
+            let coverage = { coverage_ok: false, missing: [] };
+            let material_ok = false;
+            try {
+                pull = await api.request("GET", `/repos/${repository}/pulls/${listed.number}`);
+                require_value(pull.state === "open" && pull.head.sha === listed.head.sha,
+                    "The PR head changed before checking; its next event will recheck the new head.");
+                const results = await Promise.allSettled([
+                    (async () => {
+                        const actors = [...await collect_actors(api, repository, pull),
+                            ...await additional_actors(api, pull.body || "")];
+                        return assent.evaluate_coverage(pull, actors, registry, receipts);
+                    })(),
+                    assent.review_material(api, repository, pull, registry, receipts)
+                ]);
+                if (results[0].status === "fulfilled") {
+                    coverage = results[0].value;
+                }
+                if (results[1].status === "fulfilled") {
+                    material_ok = results[1].value;
+                }
+                for (const result of results) {
+                    if (result.status === "rejected") {
+                        coverage.problem = true;
+                        process.stderr.write(`PR #${pull.number}: ${result.reason.message}\n`);
+                    }
+                }
+                const current = await api.request("GET", `/repos/${repository}/pulls/${pull.number}`);
+                require_value(current.state === "open" && current.head.sha === pull.head.sha &&
+                    text_digest(current.body || "") === text_digest(pull.body || ""),
+                    "The PR head or disclosure changed during checking; the next event will recheck it.");
+                await update_prompt(api, repository, pull, assent.signing_prompt(pull, coverage, material_ok));
+            }
+            catch (error) {
+                coverage.coverage_ok = false;
+                material_ok = false;
+                process.stderr.write(`PR #${listed.number}: ${error.message}\n`);
+            }
+            const combined = outcomes.get(listed.head.sha) || { coverage_ok: true, material_ok: true };
+            combined.coverage_ok &&= coverage.coverage_ok;
+            combined.material_ok &&= material_ok;
+            outcomes.set(listed.head.sha, combined);
+            process.stdout.write(`PR #${listed.number}: CLA ${coverage.coverage_ok ? "covered" : "assent needed"}; ` +
+                `origins ${material_ok ? "checked" : "review needed"}.\n`);
+        }
+        const latest = await registry_snapshot(api, repository);
+        require_value(assent.canonical_json(latest.registry) === assent.canonical_json(snapshot.registry),
+            "Administrative rights evidence changed during checking; recheck under its new generation.");
+        for (const [head, outcome] of outcomes) {
+            await post_status(api, repository, head, contexts[0], outcome.coverage_ok ? "success" : "failure",
+                outcome.coverage_ok ? "All declared authors have contribution rights coverage." :
+                    "CLA assent is needed; follow the copyable PR comment.", target_url);
+            await post_status(api, repository, head, contexts[1], outcome.material_ok ? "success" : "failure",
+                outcome.material_ok ? "The material-origin and licence-review requirements are met." :
+                    "Disclose origins and obtain current-head import review.", target_url);
+        }
+        return [...outcomes.values()].every(item => item.coverage_ok && item.material_ok);
+    }
+    catch (error) {
+        for (const head of new Set(pulls.map(pr => pr.head.sha))) {
+            let failed_contexts = contexts;
+            if (failed_contexts.length === 0) {
+                const prior = await api.list(`/repos/${repository}/commits/${head}/statuses`);
+                failed_contexts = [...new Set(prior.map(item => item.context).filter(context =>
+                    /^(cla\/coverage|contributions\/material-review) \(records \d+\)$/.test(context)))];
+            }
+            for (const context of failed_contexts) {
+                await post_status(api, repository, head, context, "failure",
+                    "Contribution evidence could not be verified; see the workflow log.", target_url);
+            }
+        }
+        throw error;
+    }
+}
+
 async function publish_records(api, repository, filename, ruleset_id)
 {
     const repo = await api.request("GET", `/repos/${repository}`);
@@ -688,18 +446,32 @@ async function publish_records(api, repository, filename, ruleset_id)
         "Edit a fresh copy of the current registry before publishing.");
     validate_registry(proposed, repo.id, agreement_texts());
     require_retained_records(snapshot.registry, proposed);
-    require_value(valid_id(ruleset_id), "--ruleset must name the installed contribution ruleset ID.");
-    await advance_required_generation(api, repository, ruleset_id, snapshot.registry.generation,
-        repo.default_branch);
+    require_value(valid_id(ruleset_id), "--ruleset must identify the installed contribution ruleset.");
+    await advance_required_generation(api, repository, ruleset_id, snapshot.registry.generation, repo.default_branch);
     proposed.generation += 1;
     await api.request("PUT", `/repos/${repository}/contents/${RECORDS_PATH}`, {
-        branch: RECORDS_BRANCH,
-        sha: snapshot.file_sha,
+        branch: RECORDS_BRANCH, sha: snapshot.file_sha,
         content: Buffer.from(JSON.stringify(proposed, null, 2) + "\n").toString("base64"),
-        message: "Update verified contribution evidence\n\nRetain executed agreement references, authorisation and material-review decisions for the required contribution checks."
+        message: "Update controlled contribution rights evidence\n\nKeep corrections separate from additive online assent and advance the required merge generation before changing existing rights decisions."
     });
-    process.stdout.write(`Published records generation ${proposed.generation}; ` +
-        "the CLA-only workflow will recheck open PRs.\n");
+    process.stdout.write(`Published administrative records generation ${proposed.generation}.\n`);
+}
+
+async function bootstrap_records(api, repository, custodian)
+{
+    const repo = await api.request("GET", `/repos/${repository}`);
+    const registry = empty_registry(repo.id, [custodian], agreement_texts());
+    validate_registry(registry, repo.id, agreement_texts());
+    const workflow = fs.readFileSync(path.join(SOURCE_ROOT, ".github/workflows/contribution-coverage.yml"), "utf8");
+    const tree = await api.request("POST", `/repos/${repository}/git/trees`, { tree: [
+        { path: RECORDS_PATH, mode: "100644", type: "blob", content: JSON.stringify(registry, null, 2) + "\n" },
+        { path: ".github/workflows/contribution-coverage.yml", mode: "100644", type: "blob", content: workflow }
+    ] });
+    const commit = await api.request("POST", `/repos/${repository}/git/commits`, {
+        message: "Create empty versioned online contribution records", tree: tree.sha, parents: []
+    });
+    await api.request("POST", `/repos/${repository}/git/refs`,
+        { ref: `refs/heads/${RECORDS_BRANCH}`, sha: commit.sha });
 }
 
 function parse_options(args)
@@ -723,14 +495,16 @@ async function main(args)
         process.stdout.write(email_digest(options.email) + "\n");
         return;
     }
-    if (command === "disclosure-hash") {
-        process.stdout.write(text_digest(fs.readFileSync(options.file, "utf8")) + "\n");
+    if (command === "upgrade-empty-registry") {
+        const previous = JSON.parse(fs.readFileSync(options.file, "utf8"));
+        const upgraded = assent.upgrade_empty_registry(previous, agreement_texts());
+        fs.writeFileSync(options.output, JSON.stringify(upgraded, null, 2) + "\n", "utf8");
         return;
     }
     if (command === "validate-records") {
         const registry = JSON.parse(fs.readFileSync(options.file, "utf8"));
         validate_registry(registry, registry.repository_id, agreement_texts());
-        process.stdout.write("Contribution records are structurally valid and match published agreements.\n");
+        process.stdout.write("Online signing controls match the published agreement versions.\n");
         return;
     }
     const repository = options.repository || process.env.GITHUB_REPOSITORY;
@@ -738,32 +512,35 @@ async function main(args)
         "Use --repository owner/name.");
     const api = new GitHub_api(process.env.GH_TOKEN || process.env.GITHUB_TOKEN);
     if (command === "bootstrap") {
-        const custodian = Number(options.custodian);
-        require_value(valid_id(custodian), "--custodian must be a verified GitHub numeric account ID.");
-        await bootstrap_records(api, repository, custodian);
+        require_value(valid_id(Number(options.custodian)), "--custodian must be a verified GitHub account ID.");
+        await bootstrap_records(api, repository, Number(options.custodian));
         return;
     }
     if (command === "publish-records") {
         await publish_records(api, repository, options.file, Number(options.ruleset));
         return;
     }
-    require_value(command === "check", "Use check, bootstrap, publish-records, validate-records, email-hash or disclosure-hash.");
+    if (command === "ingest") {
+        const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+        await ingest_comment(api, repository, event, { event_name: process.env.GITHUB_EVENT_NAME,
+            run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            workflow_ref: process.env.GITHUB_WORKFLOW_REF });
+        return;
+    }
+    require_value(command === "check", "Use check, ingest, bootstrap, publish-records, validate-records or upgrade-empty-registry.");
     const target_url = process.env.GITHUB_RUN_ID
         ? `https://github.com/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}`
         : `https://github.com/${repository}/actions/workflows/contribution-coverage.yml`;
     const number = options["pull-request"] ? Number(options["pull-request"]) : null;
-    require_value(number === null || valid_id(number), "--pull-request must be a positive PR number.");
+    require_value(number === null || valid_id(number), "--pull-request must identify an open PR.");
     if (!await check_repository(api, repository, number, target_url)) {
         process.exitCode = 1;
     }
 }
 
-module.exports = {
-    AGREEMENT_PATHS, CLA_STATUS, MATERIAL_STATUS, GitHub_api,
-    sha256, text_digest, email_digest, validate_registry, empty_registry,
-    evaluate_coverage, collect_actors, check_repository, require_retained_records,
-    status_contexts, advance_required_generation, publish_records, main
-};
+module.exports = { ...assent, GitHub_api, collect_actors, agreement_texts, registry_snapshot,
+    read_receipts, append_receipt, ingest_comment, additional_actors, check_repository,
+    advance_required_generation, publish_records, main };
 
 if (require.main === module) {
     main(process.argv.slice(2)).catch(error => {

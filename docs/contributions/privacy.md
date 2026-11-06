@@ -4,75 +4,78 @@ Published: **2026-11-06**.
 
 **Varinomics Ltd**, HE 434980, Agiou Athanasiou 59, 4102 Limassol, Cyprus,
 is the controller for the contribution-agreement records it administers.
-This notice covers that administration, including contributions made through
-GitHub, and supplements the [website privacy policy](https://varinomics.com/legal/privacy/).
-Questions and rights requests concerning these records may be sent to
-**info@varinomics.com**.
+This notice covers GitHub contribution administration and supplements the
+[website privacy policy](https://varinomics.com/legal/privacy/). Rights
+requests concerning these records may be sent to **info@varinomics.com**;
+email is not required to accept the CLA.
 
 ## Data and purposes
 
-We process the signer's legal name, contact email, GitHub identity, verified
-commit email identities, agreement version and text, signature or electronic
-acceptance evidence, dates, and the contributions covered. Corporate records
-also contain the Entity's identity, signatory name and role, authority
-evidence, designated-contributor roster, work scope and authorisation changes.
-We retain associated verification, exception, correction and material-review
-records and the origin/licence information needed to substantiate rights.
+The online workflow records your authenticated GitHub numeric account ID and
+login, commit attribution, exact acceptance comment, source comment/event
+identity, repository and pull request, acceptance time, agreement identifier,
+version, digest and accepted text. Corporate acceptance records the Entity
+you name, stated role or signing authority, and express representation that
+you may bind it. An online
+authorisation covering other contributors identifies their accounts and
+covered work. We also retain necessary provenance, review, correction,
+authority-change and exception decisions.
 
-We use those records to enter into and administer contribution agreements
-and to establish the rights relied upon for acceptance, distribution and
-downstream licensing. Article 6(1)(b) GDPR applies where the processing is
-necessary for our agreement with the individual. Article 6(1)(f) applies to
-our legitimate interests in verifying corporate authority, maintaining
-licensing provenance, administering contributions and substantiating or
-defending legal rights. Where a specific legal retention obligation applies,
-Article 6(1)(c) applies to the necessary records. Signing is not consent to
-unrelated marketing or product telemetry.
+Routine acceptance does not ask for a residential address, identity document,
+uploaded signature or emailed form. Additional identity or authority evidence
+is collected privately only where an actual ambiguity, dispute, separate
+permission or legal matter needs it. Do not put unnecessary personal or
+confidential information in a public comment.
 
-## Public and private records
+We use the records to administer contribution agreements, verify the stated
+capacity and establish the rights relied on for acceptance, distribution and
+downstream licensing. Article 6(1)(b) GDPR applies where necessary for our
+agreement with the individual. Article 6(1)(f) applies to legitimate interests
+in corporate authority, contribution and licensing provenance, and legal
+rights and claims. Article 6(1)(c) applies where a specific legal retention
+obligation requires records. Acceptance is not consent to unrelated marketing
+or product telemetry.
 
-GitHub submissions, commit metadata, pull-request disclosures and repository
-licence/provenance files are public for public repositories. Public check
-records use GitHub numeric identities, hashes of verified commit emails,
-agreement identifiers and digests, dates, limited scope and decisions,
-reviewer identities, and opaque references/digests for private evidence.
-Hashes and opaque references reduce disclosure but are not a promise of
-anonymity; an email hash can be correlated with an already known email.
+## Visibility and service providers
 
-Signed originals, private legal names/contact details supplied only for
-execution, signatures and corporate authority evidence are held in restricted
-company records. Do not submit those documents in public issues or pull
-requests. Access is limited to agreement administrators and persons who need
-the evidence for a necessary legal matter. We may disclose necessary evidence
-to professional advisers, a successor relying on the grants, or competent
-authorities where lawful and necessary, with appropriate safeguards.
+Comments and retained acceptance receipts in public repositories are public,
+including the company name if you choose corporate acceptance. Private
+repository records follow that repository's access permissions; they are
+not automatically published elsewhere. Commit metadata and public
+origin/licence records keep their ordinary repository visibility. Recorded
+assent and agreement snapshots remain even if their original comment is
+edited or deleted.
 
-GitHub processes repository, account and check data under its
+Private evidence supplied for a particular authority or rights issue is
+limited to agreement administrators and persons who need it for that matter.
+Necessary evidence may be disclosed lawfully to advisers, a successor relying
+on the grants or competent authorities with appropriate safeguards.
+
+GitHub hosts the collaboration, comment events, Actions checks and retained
+repository records under its
 [privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-privacy-statement/).
-Our email provider processes agreement correspondence as described in the
-website privacy policy. Provider services and lawful access may involve
-international transfers; the provider information and applicable safeguards
-are described in that policy. The automated check reads the minimal registry,
-not the private signed documents.
+No separate CLA-provider account is needed. GitHub services and lawful access
+may involve international transfers; the website privacy policy describes
+provider information and applicable safeguards. Its email-provider information
+applies only when correspondence actually takes place.
 
 ## Retention and rights
 
-We retain executed agreements, the accepted versions and necessary identity,
-authority and decision evidence for as long as we rely on the granted rights,
-including continuing distribution and sublicensing, and longer only where
-necessary for applicable legal obligations or the establishment, exercise or
-defence of legal claims. We review necessity at least annually and remove
-unnecessary ancillary material. Unaccepted drafts and ordinary administrative
-correspondence are normally deleted within 24 months after the last
-substantive reply unless a continuing matter or legal requirement justifies
-longer retention. Public repository history is not erased automatically by
-deleting an administrative record.
+We retain accepted agreement versions, recorded assent and necessary
+authority, identity and decision evidence for as long as we rely on the
+granted rights, including continuing distribution and sublicensing, and longer
+only for applicable legal obligations or necessary legal claims. We review
+necessity at least annually and remove unnecessary ancillary data. Ordinary
+unaccepted drafts and administrative correspondence are normally deleted
+within 24 months after the last substantive reply unless a continuing matter
+or legal requirement justifies longer retention. Public repository history
+does not disappear automatically with an administrative deletion.
 
 You may request access, correction, erasure, restriction or portability where
-applicable, and object to processing based on legitimate interests. These
-rights have the limits provided by GDPR; an erasure request does not revoke
-licences already validly granted or require removal of necessary legal-claim
-evidence. You may complain to the Office of the Commissioner for Personal
-Data Protection in Cyprus or another competent supervisory authority.
-The [official GDPR text](https://eur-lex.europa.eu/eli/reg/2016/679/oj/eng)
-sets out those rights and the applicable retention principles.
+applicable, and object to legitimate-interest processing. GDPR provides
+limits to these rights: erasure does not revoke a valid licence or require
+removal of necessary legal-claim evidence. You may complain to the Office of
+the Commissioner for Personal Data Protection in Cyprus or another competent
+supervisory authority. The
+[official GDPR text](https://eur-lex.europa.eu/eli/reg/2016/679/oj/eng)
+sets out the relevant rights and retention principles.

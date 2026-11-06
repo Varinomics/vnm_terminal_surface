@@ -75,8 +75,10 @@ Retain public origin and licence facts in the repository. Keep confidential
 negotiated permissions in the restricted agreement archive and use an opaque
 evidence reference in the public record. Update `THIRD_PARTY_NOTICES.md`,
 `NOTICE`, distributed licence texts and release source/access material where
-the accepted licence requires it. An approved import record must be named
-in the protected branch's material review before merge.
+the accepted licence requires it. The maintainer must inspect the actual
+licence and provenance before approving the import in normal pull-request
+review. A successful CLA check does not represent that import decision, and
+ordinary original changes need no separate protected-branch material ledger.
 
 Existing third-party notices and licence records remain the starting
 inventory for older material. Adding this process does not certify their

@@ -11,17 +11,23 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
   statuses: write
 
 jobs:
-  check:
-    name: Verify CLA coverage and material review
+  retain-assent:
+    name: Retain authenticated CLA comment
+    if: >-
+      github.event_name == 'issue_comment' && github.event.action == 'created' &&
+      github.event.issue.pull_request && startsWith(github.event.comment.body, '/cla ')
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      # The privileged job consumes only trusted automation and API metadata.
-      - name: Read shared contribution checker
+      # Every creation event is retained independently; a pending-job queue could discard assent.
+      - name: Read trusted shared CLA collector
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: Varinomics/vnm_terminal_surface
@@ -29,9 +35,40 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             tools/contribution_coverage.js
+            tools/contribution_assent.js
             docs/contributions
           sparse-checkout-cone-mode: false
+      - name: Retain the original created comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node tools/contribution_coverage.js ingest
 
+  check:
+    name: Verify authors and imported material
+    needs: retain-assent
+    if: always()
+    concurrency:
+      group: contribution-check-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      # Only this all-PR check is serialized; newer checks include every independently retained assent.
+      - name: Read trusted shared contribution checker
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: Varinomics/vnm_terminal_surface
+          ref: master
+          persist-credentials: false
+          sparse-checkout: |
+            tools/contribution_coverage.js
+            tools/contribution_assent.js
+            docs/contributions
+          sparse-checkout-cone-mode: false
       - name: Check contribution rights
         env:
           GITHUB_TOKEN: ${{ github.token }}
