@@ -163,9 +163,13 @@ async function advance_required_generation(api, repository, ruleset_id, current_
 {
     const route = `/repos/${repository}/rulesets/${ruleset_id}`;
     const ruleset = await api.request("GET", route);
+    const bypass_actors = ruleset.bypass_actors || [];
+    const owner_bypass = bypass_actors.length === 1 &&
+        bypass_actors[0].actor_type === "User" && bypass_actors[0].actor_id === 20025756 &&
+        bypass_actors[0].bypass_mode === "always";
     require_value(ruleset.target === "branch" && ruleset.enforcement === "active" &&
-        (ruleset.bypass_actors || []).length === 0,
-        "The contribution ruleset must be active without bypass actors.");
+        (bypass_actors.length === 0 || owner_bypass),
+        "The contribution ruleset must be active with no bypass or only the recorded owner's direct-push bypass.");
     const refs = ruleset.conditions?.ref_name;
     require_value(refs && Array.isArray(refs.include) && refs.exclude?.length === 0 &&
         (refs.include.includes("~DEFAULT_BRANCH") || refs.include.includes(`refs/heads/${default_branch}`)),

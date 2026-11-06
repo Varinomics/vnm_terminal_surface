@@ -332,3 +332,38 @@ test("an old in-flight green cannot satisfy a corrected records generation, and 
     await checker.advance_required_generation(api, REPOSITORY, 9001, 0, "master");
     assert.equal(rule_writes, 1);
 });
+
+test("generation publication accepts only the explicit owner bypass and preserves it unchanged", async () => {
+    const owner = { actor_id: 20025756, actor_type: "User", bypass_mode: "always" };
+    for (const actors of [[], [owner],
+        [{ ...owner, actor_id: AUTHOR_B }],
+        [{ ...owner, actor_type: "Team" }],
+        [{ ...owner, actor_type: "RepositoryRole" }],
+        [{ ...owner, actor_type: "Integration" }],
+        [{ ...owner, bypass_mode: "pull_request" }],
+        [owner, { actor_id: AUTHOR_B, actor_type: "User", bypass_mode: "always" }]])
+    {
+        const ruleset = { name: "Contribution rights", target: "branch", enforcement: "active",
+            bypass_actors: actors,
+            conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+            rules: [{ type: "required_status_checks", parameters: { required_status_checks:
+                checker.status_contexts(1).map(context => ({ context, integration_id: 15368 })) } }] };
+        let written;
+        const api = { request: async (method, route, body) => {
+            assert.equal(route, `/repos/${REPOSITORY}/rulesets/9001`);
+            if (method === "PUT") { written = structuredClone(body); }
+            return structuredClone(ruleset);
+        } };
+        const publication = checker.advance_required_generation(api, REPOSITORY, 9001, 1, "master");
+        if (actors.length === 0 || actors.length === 1 && actors[0] === owner) {
+            await publication;
+            assert.equal(JSON.stringify(written.bypass_actors), JSON.stringify(actors));
+            assert.deepEqual(written.rules[0].parameters.required_status_checks.map(item => item.context),
+                checker.status_contexts(2));
+        }
+        else {
+            await assert.rejects(publication, /only the recorded owner's direct-push bypass/);
+            assert.equal(written, undefined);
+        }
+    }
+});

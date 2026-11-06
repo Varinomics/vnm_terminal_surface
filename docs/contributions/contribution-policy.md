@@ -9,6 +9,13 @@ alternative terms, including proprietary terms and downstream sublicensing.
 The policy does not change a repository's published GPL licence or rights
 already granted to its recipients.
 
+CLA acceptance is reused per repository and agreement version; it is not
+required for every push. The repository owner, **imakris**, may make ordinary
+direct maintenance pushes without signing a CLA. That access creates no
+acceptance receipt and supplies no rights in another person's material.
+Contributor pull requests still use the automated coverage checks, and
+external authorship and imported-material obligations remain applicable.
+
 ## Accept online when the CLA bot asks
 
 Open your pull request normally. If the relevant agreement is not already

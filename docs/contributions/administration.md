@@ -45,10 +45,18 @@ separate actor allowlist enforced by a record-branch update ruleset.
 configured correction custodian. Correction records must name a configured
 custodian as verifier; tooling validates that declared verifier. Those roles
 confer no personal CLA coverage or ownership exemption. Retain the record
-branch's no-force-push and no-deletion
-history rules, and the product branch's required CLA and pull-request gates
-without a product-branch bypass. Proposing check or record changes in a
-product pull request does not grant that contribution coverage.
+branch's no-force-push and no-deletion history rules. Proposing check or record
+changes in a product pull request does not grant that contribution coverage.
+
+The product branch's pull-request and required-check rules give only
+**imakris**, numeric account ID **20025756**, an owner bypass for ordinary
+direct maintenance pushes. Those pushes require no CLA acceptance and create
+no assent record. GitHub's always-bypass permission also allows that owner
+to override a pull request explicitly; it is not limited to direct pushes.
+Ordinary contributor pull requests retain their automated coverage checks.
+Keep a separate default-branch no-force-push and no-deletion guard without a
+bypass. Owner access does not grant third-party rights or waive the policy's
+external-author coverage and import-review obligations.
 
 Retain a recoverable copy of the accepted agreement snapshots and records.
 Verify recovery when maintaining that storage. Additional private documents
@@ -98,9 +106,10 @@ conclusive proof of authority.
 The check assesses all relevant authors against the recorded individual or
 corporate rights. Preserve authorship through cherry-picks and squashes and
 resolve genuinely unlinked identities rather than silently excluding them.
-Do not exempt owners, maintainers, organisation members or bot accounts
-merely because of their role. Identify the actual rights basis for automated
-or imported work.
+The automated contributor-PR check does not treat an owner, maintainer,
+organisation member or bot role as a CLA grant. The owner's direct-push or
+explicit override permission does not fabricate coverage. Identify the
+actual rights basis for external, automated or imported work.
 
 Review imported or adapted material using the
 [third-party procedure](third-party-materials.md), inspect its actual licence
@@ -164,9 +173,9 @@ permission is not a substitute for the required continuing rights, and an
 exception cannot approve third-party material or waive its obligations.
 
 The custodian's correction tools must make stale coverage unavailable for
-the affected acceptance and request fresh checks. Do not bypass merge rules
-to force a green result. Use the repository's administration tooling for the
-rare correction or exception; contributors do not need to run it for online
+the affected acceptance and request fresh checks. An owner override is not
+evidence that a missing grant was supplied. Use the repository's administration
+tooling for the rare correction or exception; contributors do not need to run it for online
 signing or ordinary pull requests.
 
 ## Agreement versions and historic work
