@@ -1,0 +1,44 @@
+name: Check contribution rights
+
+on:
+  workflow_call:
+    inputs:
+      pull_request:
+        description: Optional open PR number; blank checks every open PR
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  check:
+    name: Verify CLA coverage and material review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # The privileged job consumes only trusted automation and API metadata.
+      - name: Read shared contribution checker
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: Varinomics/vnm_terminal_surface
+          ref: master
+          persist-credentials: false
+          sparse-checkout: |
+            tools/contribution_coverage.js
+            docs/contributions
+          sparse-checkout-cone-mode: false
+
+      - name: Check contribution rights
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CONTRIBUTION_PR: ${{ inputs.pull_request }}
+        run: |
+          if [ -n "$CONTRIBUTION_PR" ]; then
+            node tools/contribution_coverage.js check --pull-request "$CONTRIBUTION_PR"
+          else
+            node tools/contribution_coverage.js check
+          fi
