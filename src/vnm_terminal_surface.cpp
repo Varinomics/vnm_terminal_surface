@@ -4167,6 +4167,17 @@ void VNM_TerminalSurface::set_backend_output_capture_config(
     m_backend_output_capture_config = std::move(config);
 }
 
+bool VNM_TerminalSurface::stop_backend_output_capture(QString* error)
+{
+    if (m_private->session != nullptr) {
+        return m_private->session->stop_backend_output_capture(error);
+    }
+    if (error != nullptr) {
+        error->clear();
+    }
+    return true;
+}
+
 QString VNM_TerminalSurface::transcript_capture_path() const
 {
     return m_transcript_capture_path;

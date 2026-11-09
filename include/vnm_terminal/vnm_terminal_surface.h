@@ -510,6 +510,12 @@ public:
     void set_backend_output_capture_config(
         std::optional<vnm_terminal::Backend_output_capture_config> config);
 
+    // Finalizes the current session's capture and prevents further raw writes.
+    // Returns after pending capture writes have flushed; the process, model and
+    // configuration for future sessions remain unchanged. Repeated calls return
+    // the first finalization result. No active session is a successful no-op.
+    bool stop_backend_output_capture(QString* error = nullptr);
+
     QString transcript_capture_path() const;
     void set_transcript_capture_path(const QString& path);
 

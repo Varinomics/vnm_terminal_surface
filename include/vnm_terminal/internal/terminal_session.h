@@ -338,6 +338,9 @@ public:
         text_area_resize_arbitration_events() const;
     std::vector<Terminal_resize_transaction> resize_transactions() const;
     std::vector<QByteArray> output_chunks() const;
+    // Serializes finalization with raw callback ingress without draining the
+    // session or stopping the process. Later callbacks no longer write capture.
+    bool stop_backend_output_capture(QString* error = nullptr);
     std::optional<Terminal_render_snapshot> latest_render_snapshot() const;
     std::shared_ptr<const Terminal_render_snapshot> latest_render_snapshot_handle() const;
     std::optional<Terminal_render_snapshot> latest_content_render_snapshot_for_testing() const;
@@ -1181,7 +1184,10 @@ private:
     // the one request whose standing text-area resize notification has to stay
     // silent because the host has already moved its window for it.
     bool                                                   m_replaying_arbitrated_text_area_resize = false;
+    std::mutex                                             m_backend_output_capture_mutex;
     std::unique_ptr<Backend_output_capture_writer>          m_backend_output_capture_writer;
+    bool                                                   m_backend_output_capture_stopped = false;
+    QString                                                m_backend_output_capture_stop_error;
     std::atomic<bool>                                      m_backend_output_capture_failure_recorded{false};
     std::optional<Terminal_screen_model>                   m_screen_model;
     // Last color state requested via set_color_state, remembered so it can be

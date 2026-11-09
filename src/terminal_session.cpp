@@ -4548,6 +4548,28 @@ std::vector<QByteArray> Terminal_session::output_chunks() const
     return m_output_chunks;
 }
 
+bool Terminal_session::stop_backend_output_capture(QString* error)
+{
+    std::lock_guard<std::mutex> lock(m_backend_output_capture_mutex);
+    if (!m_backend_output_capture_stopped) {
+        // Latch before finalization, including failure: no later callback may
+        // append once the caller has requested the capture boundary.
+        m_backend_output_capture_stopped = true;
+        if (m_backend_output_capture_writer) {
+            const auto result = m_backend_output_capture_writer->finalize();
+            if (!result.accepted) {
+                m_backend_output_capture_stop_error = result.error.isEmpty()
+                    ? QStringLiteral("backend output capture finalization failed")
+                    : result.error;
+            }
+        }
+    }
+    if (error != nullptr) {
+        *error = m_backend_output_capture_stop_error;
+    }
+    return m_backend_output_capture_stop_error.isEmpty();
+}
+
 std::optional<Terminal_render_snapshot> Terminal_session::latest_render_snapshot() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -7747,20 +7769,17 @@ void Terminal_session::apply_backend_exit(const Terminal_session_command& comman
     m_backend_ready  = false;
     m_backend_geometry_in_sync = false;
     m_stop_requested = false;
-    if (m_backend_output_capture_writer) {
-        const Backend_output_capture_writer_result capture_result =
-            m_backend_output_capture_writer->finalize();
-        if (!capture_result.accepted &&
-            !m_backend_output_capture_failure_recorded.exchange(
-                true,
-                std::memory_order_acq_rel))
-        {
-            record_backend_error(
-                command.sequence,
-                make_backend_error(
-                    Terminal_backend_error_code::WRITE_FAILED,
-                    capture_result.error));
-        }
+    QString capture_error;
+    if (!stop_backend_output_capture(&capture_error) &&
+        !m_backend_output_capture_failure_recorded.exchange(
+            true,
+            std::memory_order_acq_rel))
+    {
+        record_backend_error(
+            command.sequence,
+            make_backend_error(
+                Terminal_backend_error_code::WRITE_FAILED,
+                capture_error));
     }
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
@@ -8269,8 +8288,14 @@ void Terminal_session::record_backend_output_capture_chunk(QByteArrayView bytes)
         return;
     }
 
-    const Backend_output_capture_writer_result result =
-        m_backend_output_capture_writer->append(bytes);
+    Backend_output_capture_writer_result result;
+    {
+        std::lock_guard<std::mutex> lock(m_backend_output_capture_mutex);
+        if (m_backend_output_capture_stopped) {
+            return;
+        }
+        result = m_backend_output_capture_writer->append(bytes);
+    }
     if (!result.accepted &&
         !m_backend_output_capture_failure_recorded.exchange(
             true,
