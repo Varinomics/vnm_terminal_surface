@@ -813,6 +813,113 @@ bool test_writer_is_poisoned_after_write_or_flush_failure()
     return ok;
 }
 
+bool test_session_stop_capture_is_idempotent_and_suppresses_later_output()
+{
+    bool ok = true;
+    QTemporaryDir temp_dir;
+    ok &= check(temp_dir.isValid(), "stop capture temp dir is valid");
+    const Backend_output_capture_config capture{
+        canonical_temp_file_path(temp_dir, QStringLiteral("startup")), 64U};
+    term::Terminal_session_config config;
+    config.backend_output_capture_config = capture;
+    config.trace_output_chunk_limit = 4U;
+    auto backend = std::make_unique<Output_backend>();
+    Output_backend* producer = backend.get();
+    term::Terminal_session session(std::move(backend), config);
+    ok &= check(session.start(valid_launch_config()).code == term::Terminal_session_result_code::ACCEPTED,
+        "startup capture session starts");
+    ok &= check(producer->emit_output(QByteArrayLiteral("startup")), "startup output is accepted");
+    QString error;
+    ok &= check(session.stop_backend_output_capture(&error) && error.isEmpty(), "capture stops successfully");
+    auto recovery = vnm_terminal::recover_backend_output_capture(capture);
+    ok &= check(recovery.status == Backend_output_capture_status::FINALIZED,
+        "explicit stop finalizes startup capture");
+    ok &= check(recovered_bytes(recovery) == QByteArrayLiteral("startup"), "stop preserves startup bytes");
+    // Removing the artifacts after acknowledged stop is the host's success policy.
+    // Neither another stop nor later terminal exit may recreate them.
+    const auto artifacts = QDir(temp_dir.path()).entryInfoList(QDir::Files | QDir::Hidden);
+    for (const auto& artifact : artifacts) {
+        ok &= check(QFile::remove(artifact.absoluteFilePath()), "stopped capture releases every artifact");
+    }
+    ok &= check(session.stop_backend_output_capture(&error), "repeated capture stop succeeds");
+    ok &= check(producer->emit_output(QByteArrayLiteral("conversation")), "terminal still accepts conversation output");
+    ok &= check(session.process_state() == term::Terminal_process_state::RUNNING,
+        "stopping capture preserves the running native terminal");
+    ok &= check(session.output_chunks() == std::vector<QByteArray>{
+        QByteArrayLiteral("startup"), QByteArrayLiteral("conversation")},
+        "stopping capture preserves ordinary terminal output");
+    ok &= check(producer->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
+        "terminal exits after capture stopped");
+    ok &= check(QDir(temp_dir.path()).entryList(QDir::Files | QDir::Hidden).isEmpty(),
+        "later output and exit do not recreate removed capture artifacts");
+    return ok;
+}
+
+bool test_session_stop_before_output_suppresses_later_capture()
+{
+    bool ok = true;
+    QTemporaryDir temp_dir;
+    ok &= check(temp_dir.isValid(), "empty stop capture temp dir is valid");
+    term::Terminal_session_config config;
+    const Backend_output_capture_config capture{
+        canonical_temp_file_path(temp_dir, QStringLiteral("empty-startup")), 64U};
+    config.backend_output_capture_config = capture;
+    auto backend = std::make_unique<Output_backend>();
+    Output_backend* producer = backend.get();
+    term::Terminal_session session(std::move(backend), config);
+    ok &= check(session.start(valid_launch_config()).code == term::Terminal_session_result_code::ACCEPTED,
+        "empty startup capture session starts");
+    ok &= check(session.stop_backend_output_capture(), "capture stops before its first output callback");
+    const auto recovery = vnm_terminal::recover_backend_output_capture(capture);
+    ok &= check(recovery.status == Backend_output_capture_status::FINALIZED && recovery.retained_bytes == 0U,
+        "stop finalizes an empty startup capture");
+    for (const auto& artifact : QDir(temp_dir.path()).entryInfoList(QDir::Files | QDir::Hidden)) {
+        ok &= check(QFile::remove(artifact.absoluteFilePath()), "empty stopped capture releases every artifact");
+    }
+    ok &= check(producer->emit_output(QByteArrayLiteral("conversation")), "output after empty stop is accepted");
+    ok &= check(producer->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
+        "empty capture terminal exits normally");
+    ok &= check(QDir(temp_dir.path()).entryList(QDir::Files | QDir::Hidden).isEmpty(),
+        "later callbacks and exit do not recreate the empty stopped capture");
+    return ok;
+}
+
+bool test_failed_capture_stop_latches_before_finalization()
+{
+    bool ok = true;
+    QTemporaryDir temp_dir;
+    ok &= check(temp_dir.isValid(), "failed stop capture temp dir is valid");
+    const Backend_output_capture_config capture{
+        canonical_temp_file_path(temp_dir, QStringLiteral("failed-stop")), 64U};
+    term::Terminal_session_config config;
+    config.backend_output_capture_config = capture;
+    auto backend = std::make_unique<Output_backend>();
+    Output_backend* producer = backend.get();
+    term::Terminal_session session(std::move(backend), config);
+    ok &= check(session.start(valid_launch_config()).code == term::Terminal_session_result_code::ACCEPTED,
+        "failed stop session starts");
+    ok &= check(producer->emit_output(QByteArrayLiteral("startup")), "failed stop captures startup bytes");
+    const QString blocked_manifest = capture.base_path + QStringLiteral(".vnm-complete");
+    ok &= check(QDir().mkdir(blocked_manifest), "completion manifest collision is created");
+    QString stop_error;
+    ok &= check(!session.stop_backend_output_capture(&stop_error) && !stop_error.isEmpty(),
+        "failed finalization reports its error");
+    ok &= check(QDir().rmdir(blocked_manifest), "completion collision is removed");
+    QString repeated_error;
+    ok &= check(!session.stop_backend_output_capture(&repeated_error) && repeated_error == stop_error,
+        "repeated stop preserves the original failure without retrying finalization");
+    ok &= check(producer->emit_output(QByteArrayLiteral("conversation")),
+        "terminal accepts ordinary output after failed finalization");
+    ok &= check(producer->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
+        "terminal exits after failed capture finalization");
+    const auto recovery = vnm_terminal::recover_backend_output_capture(capture);
+    ok &= check(recovery.status == Backend_output_capture_status::INCOMPLETE,
+        "failed stop releases the writer and never fabricates completion at exit");
+    ok &= check(recovered_bytes(recovery) == QByteArrayLiteral("startup"),
+        "failed finalization still suppresses all later captured output");
+    return ok;
+}
+
 bool test_capture_error_is_reported_without_failing_backend_output()
 {
     bool ok = true;
@@ -1183,6 +1290,9 @@ int main(int argc, char** argv)
 
     bool ok = true;
     ok &= test_capture_is_disabled_by_default();
+    ok &= test_session_stop_capture_is_idempotent_and_suppresses_later_output();
+    ok &= test_session_stop_before_output_suppresses_later_capture();
+    ok &= test_failed_capture_stop_latches_before_finalization();
     ok &= test_capture_location_validation_rejects_unsafe_inputs();
     ok &= test_rollover_retains_exact_bounded_suffix();
     ok &= test_oversized_chunk_and_one_byte_bound();

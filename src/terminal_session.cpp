@@ -4562,6 +4562,9 @@ bool Terminal_session::stop_backend_output_capture(QString* error)
                     ? QStringLiteral("backend output capture finalization failed")
                     : result.error;
             }
+            // The host may recover and remove the artifact as soon as stop is
+            // acknowledged; release its writer lock even if finalization failed.
+            m_backend_output_capture_writer.reset();
         }
     }
     if (error != nullptr) {
@@ -8284,7 +8287,7 @@ void Terminal_session::record_resize_transaction(Terminal_resize_transaction res
 
 void Terminal_session::record_backend_output_capture_chunk(QByteArrayView bytes)
 {
-    if (!m_backend_output_capture_writer) {
+    if (!m_config.backend_output_capture_config.has_value()) {
         return;
     }
 
