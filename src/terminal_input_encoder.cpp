@@ -909,7 +909,10 @@ Encoded_key_event encode_terminal_key_event_bytes(
             return {special_bytes,
                 Windows_native_input_operation::WINDOWS_OP_VT_SEQUENCE};
         }
-        if ((event.modifiers() & Qt::AltModifier) != Qt::NoModifier) {
+        if ((event.modifiers() & Qt::AltModifier) != Qt::NoModifier ||
+            ((event.key() == Qt::Key_Return || event.key() == Qt::Key_Enter) &&
+             (event.modifiers() & Qt::ControlModifier) != Qt::NoModifier))
+        {
             return {special_bytes,
                 Windows_native_input_operation::WINDOWS_OP_NATIVE_KEY_STROKES};
         }

@@ -3537,6 +3537,40 @@ bool test_escape_transport_after_native_shift_return(const QString& executable_p
         Escape_input_delivery::PACED,
         0U);
 
+    for (const int key : {Qt::Key_Return, Qt::Key_Enter}) {
+        for (const bool shift : {false, true}) {
+            const bool keypad = key == Qt::Key_Enter;
+            const Qt::KeyboardModifiers modifiers = Qt::ControlModifier |
+                (shift ? Qt::ShiftModifier : Qt::NoModifier) |
+                (keypad ? Qt::KeypadModifier : Qt::NoModifier);
+            const int state = LEFT_CTRL_PRESSED |
+                (shift ? SHIFT_PRESSED : 0) | (keypad ? ENHANCED_KEY : 0);
+            ok &= run_case(
+                QStringLiteral("--escape-input-reader"),
+                "Control-bearing Return and keypad Enter reach the classic reader unchanged",
+                {{{encoded_key_event(key, modifiers, QStringLiteral("\r"))},
+                    native_key_stroke_records(VK_RETURN, return_scan, '\r', state)}},
+                Escape_input_delivery::PACED,
+                0U);
+        }
+    }
+    ok &= run_case(
+        QStringLiteral("--escape-input-reader"),
+        "forwarded right-Control Return chords retain their native modifier and keypad bits",
+        {
+            {{encoded_native_key_event(
+                Qt::Key_Return, Qt::ControlModifier,
+                0x1cU, VK_RETURN, 0x00000020U, QStringLiteral("\r"))},
+                native_key_stroke_records(VK_RETURN, return_scan, '\r', RIGHT_CTRL_PRESSED)},
+            {{encoded_native_key_event(
+                Qt::Key_Enter, Qt::ControlModifier | Qt::ShiftModifier | Qt::KeypadModifier,
+                0xe01cU, VK_RETURN, 0x01000030U, QStringLiteral("\r"))},
+                native_key_stroke_records(
+                    VK_RETURN, return_scan, '\r', RIGHT_CTRL_PRESSED | SHIFT_PRESSED | ENHANCED_KEY)},
+        },
+        Escape_input_delivery::PACED,
+        0U);
+
     // Closure gates for the non-text Right-Alt paths. These deliberately use
     // real native Qt metadata and the public encoder, not hand-built packets.
     // Native console records lose the selected Alt distinction in ConPTY, so

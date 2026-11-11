@@ -491,6 +491,48 @@ bool test_cursor_and_navigation_modes()
     return ok;
 }
 
+bool test_control_return_modifiers()
+{
+    bool ok = true;
+    for (const int key : {Qt::Key_Return, Qt::Key_Enter}) {
+        for (const bool shift : {false, true}) {
+            const Qt::KeyboardModifiers modifiers = Qt::ControlModifier |
+                (shift ? Qt::ShiftModifier : Qt::NoModifier) |
+                (key == Qt::Key_Enter ? Qt::KeypadModifier : Qt::NoModifier);
+#if defined(Q_OS_WIN)
+            const int state = LEFT_CTRL_PRESSED |
+                (shift ? SHIFT_PRESSED : 0) |
+                (key == Qt::Key_Enter ? ENHANCED_KEY : 0);
+            const QByteArray expected = win32_key_stroke(VK_RETURN, 0x1c, '\r', state);
+#else
+            const QByteArray expected(1, '\r');
+#endif
+            ok &= check_bytes_equal(encode(key, modifiers), expected,
+                "Control-bearing Return and keypad Enter retain their terminal operation");
+            ok &= check_bytes_equal(encode(key, modifiers, QStringLiteral("\r")), expected,
+                "Control-bearing Return preserves an explicit carriage-return character");
+        }
+    }
+#if defined(Q_OS_WIN)
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Return, Qt::ControlModifier,
+            0x1cU, VK_RETURN, 0x00000002U, QStringLiteral("\r")),
+        win32_key_stroke(VK_RETURN, 0x1c, '\r', LEFT_CTRL_PRESSED),
+        "forwarded Ctrl+Return preserves left Control metadata");
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Return, Qt::ControlModifier | Qt::ShiftModifier,
+            0x1cU, VK_RETURN, 0x00000030U, QStringLiteral("\r")),
+        win32_key_stroke(VK_RETURN, 0x1c, '\r', RIGHT_CTRL_PRESSED | SHIFT_PRESSED),
+        "forwarded Ctrl+Shift+Return preserves right Control metadata");
+    ok &= check_bytes_equal(
+        encode_native(Qt::Key_Enter, Qt::ControlModifier | Qt::KeypadModifier,
+            0xe01cU, VK_RETURN, 0x01000020U, QStringLiteral("\n")),
+        win32_key_stroke(VK_RETURN, 0x1c, '\n', RIGHT_CTRL_PRESSED | ENHANCED_KEY),
+        "forwarded Ctrl+keypad Enter preserves enhanced identity and supplied text");
+#endif
+    return ok;
+}
+
 bool test_windows_native_scan_identity()
 {
 #if defined(Q_OS_WIN)
@@ -1625,6 +1667,7 @@ int main(int argc, char** argv)
     bool ok = true;
     ok &= test_control_and_altgr();
     ok &= test_cursor_and_navigation_modes();
+    ok &= test_control_return_modifiers();
     ok &= test_windows_native_scan_identity();
     ok &= test_windows_balanced_input_semantics();
     ok &= test_keypad_policy();
