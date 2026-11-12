@@ -802,6 +802,17 @@ QByteArray application_keypad_bytes(const QKeyEvent& event)
     }
 }
 
+// C0 controls and DEL are control chords, not layout text.
+bool starts_with_printable_character(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+
+    const ushort first_character = text.front().unicode();
+    return first_character > k_c0_control_max && first_character != k_del_control;
+}
+
 QByteArray printable_text_bytes(const QKeyEvent& event)
 {
     const QString text = event.text();
@@ -825,16 +836,27 @@ QByteArray ctrl_alt_printable_text_bytes(const QKeyEvent& event)
     }
 
     const QString text = event.text();
-    if (text.isEmpty()) {
-        return {};
-    }
-
-    const QChar first_character = text.front();
-    if (first_character.unicode() < 0x20U || first_character.unicode() == 0x7fU) {
+    if (!starts_with_printable_character(text)) {
         return {};
     }
 
     return text.toUtf8();
+}
+
+// macOS reports Option as AltModifier, but Option selects characters from the
+// keyboard layout instead of acting as Meta: the event text is the character
+// the layout produced with it, such as @ for German Option+L. The event carries
+// no Meta intent to tell the two apart, so printable Option text is committed
+// text, as AltGr text is elsewhere.
+bool macos_option_selects_layout_text(const QKeyEvent& event)
+{
+#if defined(Q_OS_MACOS)
+    return (event.modifiers() & Qt::AltModifier) != Qt::NoModifier &&
+        starts_with_printable_character(event.text());
+#else
+    static_cast<void>(event);
+    return false;
+#endif
 }
 
 Encoded_key_event encode_terminal_key_event_bytes(
@@ -983,10 +1005,11 @@ Encoded_key_event encode_terminal_key_event_bytes(
             || windows_virtual_key(event) == VK_PACKET
 #endif
         );
-    if (group_switch) {
+    if (group_switch || macos_option_selects_layout_text(event)) {
         // AltGr/GroupSwitch text is committed text, even when Qt also reports
         // AltModifier or native AltRight. Do not turn it into ESC-prefixed Alt
-        // text while it passes through ConPTY's VT-input parser.
+        // text while it passes through ConPTY's VT-input parser. macOS Option
+        // text is committed text in the same way.
         return {
             event.text().toUtf8(),
             Windows_native_input_operation::WINDOWS_OP_COMMITTED_TEXT,

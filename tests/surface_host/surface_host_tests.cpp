@@ -5889,10 +5889,17 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         fixture.surface, *backend_ptr, Qt::Key_8, Qt::ControlModifier,
         {}, bytes_from_hex("7f"),
         "Ctrl+8 writes DEL");
+#if defined(Q_OS_MACOS)
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_L, Qt::AltModifier,
+        QStringLiteral("@"), bytes_from_hex("40"),
+        "Option layout text reaches the terminal without an ESC prefix");
+#else
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_X, Qt::AltModifier,
         QStringLiteral("x"), bytes_from_hex("1b78"),
         "Alt+x prefixes printable text with ESC");
+#endif
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_C,
         Qt::ControlModifier | Qt::AltModifier,

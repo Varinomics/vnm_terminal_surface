@@ -289,6 +289,83 @@ bool test_control_and_altgr()
     return ok;
 }
 
+bool test_macos_option_layout_text()
+{
+#if defined(Q_OS_MACOS)
+    // Qt reports Option as AltModifier, takes the key from the character the
+    // key produces without Option, and takes the text from the character the
+    // keyboard layout produced with it. Terminal.app and iTerm2 send that
+    // text as typed unless Option is configured to act as Meta.
+    struct option_text_case_t
+    {
+        int                   key;
+        Qt::KeyboardModifiers modifiers;
+        const char*           text_utf8;
+        const char*           label;
+    };
+    const option_text_case_t k_cases[] = {
+        {Qt::Key_L,     Qt::AltModifier,                     "@",            "German Option+L"      },
+        {Qt::Key_5,     Qt::AltModifier,                     "[",            "German Option+5"      },
+        {Qt::Key_6,     Qt::AltModifier,                     "]",            "German Option+6"      },
+        {Qt::Key_7,     Qt::AltModifier,                     "|",            "German Option+7"      },
+        {Qt::Key_8,     Qt::AltModifier,                     "{",            "German Option+8"      },
+        {Qt::Key_9,     Qt::AltModifier,                     "}",            "German Option+9"      },
+        {Qt::Key_Slash, Qt::AltModifier | Qt::ShiftModifier, "\\",           "German Option+Shift+7"},
+        {Qt::Key_B,     Qt::AltModifier,                     "\xe2\x88\xab", "US Option+B"          },
+        {Qt::Key_F,     Qt::AltModifier,                     "\xc6\x92",     "US Option+F"          },
+    };
+
+    bool ok = true;
+    for (const option_text_case_t& option_case : k_cases) {
+        ok &= check_bytes_equal(
+            encode(option_case.key, option_case.modifiers, QString::fromUtf8(option_case.text_utf8)),
+            QByteArray(option_case.text_utf8),
+            std::string(option_case.label) + " sends its layout text without an ESC prefix");
+    }
+
+    // A native event carries NSEvent's modifier flags (Option plus the left or
+    // right device bit) and key code (kVK_ANSI_L), and a host forwarding the
+    // event to a surface in another process carries the same fields. Neither
+    // Option key is singled out.
+    struct native_option_case_t
+    {
+        quint32     native_modifiers;
+        const char* label;
+    };
+    const native_option_case_t k_native_cases[] = {
+        {0x00080020U, "native German Option+L with the left Option key" },
+        {0x00080040U, "native German Option+L with the right Option key"},
+    };
+    for (const native_option_case_t& native_case : k_native_cases) {
+        const QKeyEvent native_event(
+            QEvent::KeyPress,
+            Qt::Key_L,
+            Qt::AltModifier,
+            0U,
+            0x25U,
+            native_case.native_modifiers,
+            QStringLiteral("@"));
+        ok &= check_bytes_equal(
+            term::encode_terminal_key_event(native_event, {}),
+            QByteArrayLiteral("@"),
+            std::string(native_case.label) + " sends @ without an ESC prefix");
+    }
+
+    // With Qt's default Command/Control swap a physical Control key arrives as
+    // MetaModifier, so its control character reaches the text path. It keeps
+    // the encoding test_control_and_altgr() pins for the same chord with
+    // Control reported as Control.
+    ok &= check_bytes_equal(
+        encode(Qt::Key_C, Qt::MetaModifier | Qt::AltModifier, QString(QChar(0x0003))),
+        bytes_from_hex("1b03"),
+        "Control+Option control text keeps its ESC-prefixed control byte");
+
+    return ok;
+#else
+    return true;
+#endif
+}
+
 bool test_cursor_and_navigation_modes()
 {
     bool ok = true;
@@ -474,6 +551,9 @@ bool test_cursor_and_navigation_modes()
             '[',
             LEFT_ALT_PRESSED),
         "Alt+[ uses a native Win32 key event on Windows");
+#elif defined(Q_OS_MACOS)
+        bytes_from_hex("5b"),
+        "Option text [ is committed without an ESC prefix on macOS");
 #else
         bytes_from_hex("1b5b"),
         "Alt+[ uses the terminal Alt-prefix convention");
@@ -1003,6 +1083,9 @@ bool test_keypad_policy()
 #if defined(Q_OS_WIN)
         bytes_from_hex("1b5b3130373b37383b34333b313b323b315f"),
         "modified keypad operator uses a native Win32 key event on Windows");
+#elif defined(Q_OS_MACOS)
+        bytes_from_hex("2b"),
+        "Option keypad operator text is committed without an ESC prefix on macOS");
 #else
         bytes_from_hex("1b2b"),
         "modified keypad operator preserves Alt printable behavior");
@@ -1666,6 +1749,7 @@ int main(int argc, char** argv)
 
     bool ok = true;
     ok &= test_control_and_altgr();
+    ok &= test_macos_option_layout_text();
     ok &= test_cursor_and_navigation_modes();
     ok &= test_control_return_modifiers();
     ok &= test_windows_native_scan_identity();
