@@ -325,8 +325,8 @@ bool test_macos_option_layout_text()
 
     // A native event carries NSEvent's modifier flags (Option plus the left or
     // right device bit) and key code (kVK_ANSI_L), and a host forwarding the
-    // event to a surface in another process carries the same fields. Neither
-    // Option key is singled out.
+    // event to a surface in another process carries the same fields. The
+    // encoding decision does not read these native fields.
     struct native_option_case_t
     {
         quint32     native_modifiers;
