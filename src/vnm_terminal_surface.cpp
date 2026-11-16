@@ -3095,6 +3095,27 @@ struct VNM_TerminalSurface::Private
         return report.rendered_snapshot ? report.rendered_touch_cell_metrics : cell_metrics;
     }
 
+    static bool selection_frame_follows_scrolling_tail(
+        const term::Terminal_render_snapshot& shown,
+        const term::Terminal_render_snapshot& current)
+    {
+        const auto& before = shown.viewport;
+        const auto& after = current.viewport;
+        return before.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            after.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            before.follow_tail && after.follow_tail &&
+            before.offset_from_tail == 0 && after.offset_from_tail == 0 &&
+            before.visible_rows == after.visible_rows &&
+            shown.metadata.row_origin_generation == current.metadata.row_origin_generation &&
+            before.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
+            after.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
+            before.presentation.clear_page_start_row == after.presentation.clear_page_start_row &&
+            after.scrollback_rows > before.scrollback_rows &&
+            static_cast<long long>(after.presentation.content_end_row_exclusive) -
+                before.presentation.content_end_row_exclusive ==
+                    static_cast<long long>(after.scrollback_rows) - before.scrollback_rows;
+    }
+
     std::shared_ptr<const term::Terminal_render_snapshot> input_snapshot(
         bool retained_selection = false) const
     {
@@ -3106,7 +3127,8 @@ struct VNM_TerminalSurface::Private
         const bool retained_source_matches = retained_selection &&
             display_input_snapshot && display_input_snapshot->touch_selection &&
             render_snapshot && render_snapshot->touch_selection &&
-            display_input_snapshot->touch_selection->source == render_snapshot->touch_selection->source;
+            display_input_snapshot->touch_selection->source == render_snapshot->touch_selection->source &&
+            displayed_source && selection_frame_follows_scrolling_tail(*displayed_source, *render_snapshot);
         if (!displayed_source || !render_snapshot ||
             (!retained_source_matches &&
                 !term::snapshots_share_row_identity_space(*displayed_source, *render_snapshot)) ||
