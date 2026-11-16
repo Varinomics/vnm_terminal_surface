@@ -3095,15 +3095,21 @@ struct VNM_TerminalSurface::Private
         return report.rendered_snapshot ? report.rendered_touch_cell_metrics : cell_metrics;
     }
 
-    std::shared_ptr<const term::Terminal_render_snapshot> input_snapshot() const
+    std::shared_ptr<const term::Terminal_render_snapshot> input_snapshot(
+        bool retained_selection = false) const
     {
         if (!display_input_projected) {
             return render_snapshot;
         }
         const auto* displayed_source = display_input_snapshot && display_input_snapshot->display_source
             ? display_input_snapshot->display_source.get() : display_input_snapshot.get();
+        const bool retained_source_matches = retained_selection &&
+            display_input_snapshot && display_input_snapshot->touch_selection &&
+            render_snapshot && render_snapshot->touch_selection &&
+            display_input_snapshot->touch_selection->source == render_snapshot->touch_selection->source;
         if (!displayed_source || !render_snapshot ||
-            !term::snapshots_share_row_identity_space(*displayed_source, *render_snapshot) ||
+            (!retained_source_matches &&
+                !term::snapshots_share_row_identity_space(*displayed_source, *render_snapshot)) ||
             (display_input_snapshot->touch_selection && render_snapshot->touch_selection &&
                 display_input_snapshot->touch_selection->source != render_snapshot->touch_selection->source))
         {
@@ -3112,12 +3118,20 @@ struct VNM_TerminalSurface::Private
         return display_input_snapshot;
     }
 
+    std::shared_ptr<const term::Terminal_render_snapshot> selection_input_snapshot() const
+    {
+        // Scrolling output can move a displayed row while preserving its
+        // retained identity. Local selection verifies that row's content below;
+        // application mouse reports still require the unchanged native mapping.
+        return input_snapshot(true);
+    }
+
     bool input_row_is_current(int display_row) const
     {
         if (!display_input_projected) {
             return true;
         }
-        const auto shown = input_snapshot();
+        const auto shown = selection_input_snapshot();
         if (!shown || display_row < 0 || display_row >= static_cast<int>(shown->visible_line_provenance.size())) {
             return false;
         }
@@ -3147,7 +3161,7 @@ struct VNM_TerminalSurface::Private
         if (!display_input_projected) {
             return true;
         }
-        const auto shown = input_snapshot();
+        const auto shown = selection_input_snapshot();
         if (!shown) {
             return false;
         }
@@ -6429,13 +6443,24 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         return;
     }
 
+    const auto selection_snapshot = m_private->selection_input_snapshot();
+    if (!published_snapshot && !force_local_selection &&
+        m_mouse_reporting_policy != Mouse_reporting_policy::DISABLED &&
+        snapshot_has_terminal_mouse_tracking(selection_snapshot))
+    {
+        trace_decision(QStringLiteral("out-of-grid"));
+        return;
+    }
+    published_snapshot = selection_snapshot;
+    position = grid_position_for_local_point(
+        published_snapshot, m_private->input_metrics(), event->position());
     if (!position.has_value() || !m_private->input_row_is_current(position->row)) {
         trace_decision(QStringLiteral("out-of-grid"));
         return;
     }
 
     logical_position = logical_grid_position_for_viewport_cell(
-        m_private->input_snapshot(),
+        published_snapshot,
         *position);
     if (!logical_position.has_value()) {
         trace_decision(QStringLiteral("viewport-mapping"));
@@ -6444,8 +6469,8 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 
     const std::optional<term::terminal_selection_source_identity_t> source =
         m_private->session->published_selection_source_identity();
-    if (!source.has_value() || m_private->input_snapshot() == nullptr ||
-        !selection_source_matches_snapshot(*source, *m_private->input_snapshot()))
+    if (!source.has_value() || !published_snapshot ||
+        !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             term::write_selection_trace(m_selection_trace_enabled,
@@ -6671,7 +6696,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     }
 
     position = grid_position_for_local_point(
-        m_private->input_snapshot(),
+        m_private->selection_input_snapshot(),
         m_private->input_metrics(),
         event->position());
     viewport_position = position;
@@ -6696,11 +6721,11 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 .arg(selection_trace_source_identity(
                     m_private->selection_drag_press_provenance->source))
                 .arg(selection_trace_source_identity(source))
-                .arg(selection_trace_snapshot_identity(m_private->input_snapshot())));
+                .arg(selection_trace_snapshot_identity(m_private->selection_input_snapshot())));
     }
     if (!source.has_value() ||
-        m_private->input_snapshot() == nullptr ||
-        !selection_source_matches_snapshot(*source, *m_private->input_snapshot()))
+        m_private->selection_input_snapshot() == nullptr ||
+        !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             term::write_selection_trace(m_selection_trace_enabled,
@@ -6729,7 +6754,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     viewport_position = position.has_value()
         ? position
         : clamped_grid_position_for_local_point(
-            m_private->input_snapshot(),
+            m_private->selection_input_snapshot(),
             m_private->input_metrics(),
             event->position());
     if (!viewport_position.has_value() || !m_private->input_row_is_current(viewport_position->row)) {
@@ -6738,7 +6763,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     }
 
     logical_position = logical_grid_position_for_viewport_cell(
-        m_private->input_snapshot(),
+        m_private->selection_input_snapshot(),
         *viewport_position);
     if (!logical_position.has_value()) {
         trace_decision(QStringLiteral("viewport-mapping"));
@@ -6940,8 +6965,8 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                     .arg(selection_trace_snapshot_identity(m_private->input_snapshot())));
         }
         if (!source.has_value() ||
-            m_private->input_snapshot() == nullptr ||
-            !selection_source_matches_snapshot(*source, *m_private->input_snapshot()))
+            m_private->selection_input_snapshot() == nullptr ||
+            !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
         {
             if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                 term::write_selection_trace(m_selection_trace_enabled,
@@ -6968,18 +6993,18 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         }
 
         viewport_position = grid_position_for_local_point(
-            m_private->input_snapshot(),
+            m_private->selection_input_snapshot(),
             m_private->input_metrics(),
             event->position());
         viewport_position = viewport_position.has_value()
             ? viewport_position
             : clamped_grid_position_for_local_point(
-                m_private->input_snapshot(),
+                m_private->selection_input_snapshot(),
                 m_private->input_metrics(),
                 event->position());
         if (viewport_position.has_value() && m_private->input_row_is_current(viewport_position->row)) {
             logical_position = logical_grid_position_for_viewport_cell(
-                m_private->input_snapshot(),
+                m_private->selection_input_snapshot(),
                 *viewport_position);
         }
         QString decision_reason = QStringLiteral("out-of-grid");

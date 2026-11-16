@@ -2560,6 +2560,56 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
     return ok;
 }
 
+bool test_committed_selection_after_streaming_input_drain(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+#if defined(Q_OS_WIN)
+    fixture.window.hide();
+    fixture.window.show();
+#endif
+    fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
+    fixture.surface.set_cursor_blink_enabled(false);
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(40)};
+    bool started = false;
+    auto* backend_ptr = start_surface_with_backend(fixture.surface, std::move(backend),
+        {QStringLiteral("scripted-terminal")}, &started);
+    if (!check(started, "the committed streaming selection fixture starts")) return false;
+    const bool drawn = window_render_matches(app, fixture.window, fixture.surface, [&] {
+        const auto current = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const auto report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+        return current && report.drew && report.rendered_snapshot &&
+            report.rendered_snapshot->metadata.sequence == current->metadata.sequence;
+    });
+    if (!check(drawn, "the streaming selection fixture commits its real displayed frame")) return false;
+    const auto committed = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(
+        fixture.surface).rendered_snapshot;
+    constexpr int anchor_row = 2;
+    const QString expected = snapshot_row_text(*committed, anchor_row).left(5);
+    const QPointF from = point_in_display_cell(fixture.surface, anchor_row, 0);
+    const QPointF to = point_in_display_cell(fixture.surface, anchor_row, 4);
+    // No event-loop pumping: this output is drained by the press, after the
+    // already committed frame and its input coordinates have been retained.
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("new streaming line\r\n"));
+    backend_ptr->join_worker();
+    bool ok = send_mouse_event(fixture.surface, QEvent::MouseButtonPress, from,
+        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
+        "a press leases its unchanged displayed row after draining a scrolling append");
+    const auto current = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(current && current->viewport.scrollback_rows > committed->viewport.scrollback_rows &&
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot == committed,
+        "the press crosses a new scrolling publication while the original draw remains committed");
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, to,
+        Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
+        "the drag extends on the same unchanged committed row");
+    ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, to,
+        Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
+        "the release preserves the committed row lease");
+    ok &= check(!expected.isEmpty() && fixture.surface.selected_text() == expected,
+        "streaming selection copies the displayed retained text rather than its new viewport occupant");
+    return ok;
+}
+
 // One primary presentation drives IME, links, selection, search, mouse reports
 // and the stale-input guard, including when the mapping becomes the identity.
 bool test_presentation_render_and_input(QGuiApplication& app)
@@ -23385,7 +23435,9 @@ int main(int argc, char** argv)
         return test_pointer_uses_physical_modifiers(app, qt_swaps_control_and_meta) ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--content-tail-presentation"))) {
-        return test_presentation_render_and_input(app) ? 0 : 1;
+        bool ok = test_committed_selection_after_streaming_input_drain(app);
+        ok &= test_presentation_render_and_input(app);
+        return ok ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--resize-frontier-only"))) {
         bool ok = test_hidden_surface_retries_latest_geometry_after_frontier_refusal(app, false);
