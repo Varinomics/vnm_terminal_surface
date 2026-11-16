@@ -3144,8 +3144,17 @@ struct VNM_TerminalSurface::Private
             current = current->row_coverage_snapshot.get();
             index = static_cast<int>(row.logical_row) - term::render_snapshot_first_visible_logical_row(*current);
         }
-        if (row.retained_line_id == 0U || index < 0 || index >= static_cast<int>(current->visible_line_provenance.size())) {
+        if (row.retained_line_id == 0U) {
             return false;
+        }
+        if (index < 0 || index >= static_cast<int>(current->visible_line_provenance.size())) {
+            // Output may have archived the displayed row since its last draw.
+            // Its retained handle must still name exactly the same content.
+            return session && session->retained_selection_row_is_current(
+                render_snapshot->viewport.active_buffer,
+                static_cast<int>(row.logical_row),
+                term::terminal_history_handle_from_retained_identity(
+                    row.retained_line_id, row.content_generation));
         }
         const auto& latest = current->visible_line_provenance[static_cast<std::size_t>(index)];
         return row.retained_line_id == latest.retained_line_id && row.content_generation == latest.content_generation;

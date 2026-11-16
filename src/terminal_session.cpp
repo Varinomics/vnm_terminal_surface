@@ -4102,6 +4102,19 @@ Terminal_session::published_selection_source_identity() const
     return published_selection_source_identity_unlocked();
 }
 
+bool Terminal_session::retained_selection_row_is_current(
+    Terminal_buffer_id        buffer_id,
+    int                       logical_row,
+    terminal_history_handle_t handle) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_screen_model || m_screen_model->active_buffer_id() != buffer_id) {
+        return false;
+    }
+    const auto lookup = m_screen_model->retained_line_lookup(buffer_id, handle);
+    return lookup.exact_match && lookup.exact_logical_row == logical_row;
+}
+
 std::optional<terminal_selection_drag_press_provenance_t>
 Terminal_session::begin_selection_drag_provenance(
     terminal_grid_position_t             original_position,

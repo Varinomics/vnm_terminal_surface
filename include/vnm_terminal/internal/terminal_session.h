@@ -300,6 +300,10 @@ public:
     std::optional<Terminal_selection_attachment_resolution_status>
         last_selection_attachment_resolution_status() const;
     std::optional<terminal_selection_source_identity_t> published_selection_source_identity() const;
+    bool retained_selection_row_is_current(
+        Terminal_buffer_id        buffer_id,
+        int                       logical_row,
+        terminal_history_handle_t handle) const;
     std::optional<terminal_selection_drag_press_provenance_t>
         begin_selection_drag_provenance(
             terminal_grid_position_t               original_position,

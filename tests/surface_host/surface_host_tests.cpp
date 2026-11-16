@@ -2560,7 +2560,8 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
     return ok;
 }
 
-bool test_committed_selection_after_streaming_input_drain(QGuiApplication& app)
+bool test_committed_selection_after_streaming_input_drain(
+    QGuiApplication& app, bool scroll_past_frame, bool overwrite_anchor = false)
 {
     Surface_fixture fixture;
 #if defined(Q_OS_WIN)
@@ -2590,15 +2591,26 @@ bool test_committed_selection_after_streaming_input_drain(QGuiApplication& app)
     const QPointF to = point_in_display_cell(fixture.surface, anchor_row, 4);
     // No event-loop pumping: this output is drained by the press, after the
     // already committed frame and its input coordinates have been retained.
-    backend_ptr->emit_output_from_worker(QByteArrayLiteral("new streaming line\r\n"));
+    QByteArray output = numbered_scroll_lines(scroll_past_frame ? committed->grid_size.rows + 1 : 1);
+    if (overwrite_anchor) {
+        output.prepend(QByteArrayLiteral("\x1b[3;1HREPLACED") +
+            QStringLiteral("\x1b[%1;1H").arg(committed->grid_size.rows).toUtf8());
+    }
+    backend_ptr->emit_output_from_worker(std::move(output));
     backend_ptr->join_worker();
     bool ok = send_mouse_event(fixture.surface, QEvent::MouseButtonPress, from,
-        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, true,
-        "a press leases its unchanged displayed row after draining a scrolling append");
+        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, !overwrite_anchor,
+        overwrite_anchor
+            ? "a press rejects displayed text overwritten before it was archived"
+            : "a press leases its unchanged displayed row after draining a scrolling append");
     const auto current = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(current && current->viewport.scrollback_rows > committed->viewport.scrollback_rows &&
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot == committed,
         "the press crosses a new scrolling publication while the original draw remains committed");
+    if (overwrite_anchor) {
+        return check(fixture.surface.selected_text().isEmpty(),
+            "an archived replacement cannot be selected through its prior displayed content") && ok;
+    }
     ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, to,
         Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
         "the drag extends on the same unchanged committed row");
@@ -23435,7 +23447,9 @@ int main(int argc, char** argv)
         return test_pointer_uses_physical_modifiers(app, qt_swaps_control_and_meta) ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--content-tail-presentation"))) {
-        bool ok = test_committed_selection_after_streaming_input_drain(app);
+        bool ok = test_committed_selection_after_streaming_input_drain(app, false);
+        ok &= test_committed_selection_after_streaming_input_drain(app, true);
+        ok &= test_committed_selection_after_streaming_input_drain(app, true, true);
         ok &= test_presentation_render_and_input(app);
         return ok ? 0 : 1;
     }
