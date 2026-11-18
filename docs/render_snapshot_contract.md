@@ -87,8 +87,11 @@ Dirty rows from consecutive snapshots may be merged with
 physical row-identity space, decided by `snapshots_share_row_identity_space`:
 same grid size, same `metadata.row_origin_generation`, and the same viewport
 mapping (`active_buffer`, `visible_rows`, `scrollback_rows`,
-`offset_from_tail`). `row_origin_generation` advances when scrollback
-eviction shifts which logical line each physical row index names, so
+`offset_from_tail`). `row_origin_generation` advances by the number of
+discarded prefix rows. Local selection uses the difference between committed
+and current generations to translate logical positions, then verifies the
+retained row identities and content generations. Each eviction shifts which
+logical line each physical row index names, so
 coalescing across it would attribute a dirty row to the wrong line; the
 helper instead falls back to a full-viewport repaint range. The fallback is
 purely conservative: it can only add repaint work, never skip a changed row.

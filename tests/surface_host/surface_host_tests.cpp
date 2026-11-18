@@ -2560,8 +2560,18 @@ bool test_surface_pressure_bypasses_active_after_frame_owner(
     return ok;
 }
 
+enum class Streaming_selection_change
+{
+    APPEND,
+    ARCHIVE,
+    OVERWRITE_ANCHOR,
+    EVICT_PREFIX,
+    EVICT_ANCHOR,
+    OVERWRITE_MIDDLE_AND_EVICT_PREFIX,
+};
+
 bool test_committed_selection_after_streaming_input_drain(
-    QGuiApplication& app, bool scroll_past_frame, bool overwrite_anchor = false)
+    QGuiApplication& app, Streaming_selection_change change)
 {
     Surface_fixture fixture;
 #if defined(Q_OS_WIN)
@@ -2570,6 +2580,12 @@ bool test_committed_selection_after_streaming_input_drain(
 #endif
     fixture.surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
     fixture.surface.set_cursor_blink_enabled(false);
+    const bool capped = change == Streaming_selection_change::EVICT_PREFIX ||
+        change == Streaming_selection_change::EVICT_ANCHOR ||
+        change == Streaming_selection_change::OVERWRITE_MIDDLE_AND_EVICT_PREFIX;
+    if (capped) {
+        fixture.surface.set_scrollback_limit(8);
+    }
     auto backend = std::make_unique<Scripted_backend>();
     backend->outputs_during_start = {numbered_scroll_lines(40)};
     bool started = false;
@@ -2585,40 +2601,69 @@ bool test_committed_selection_after_streaming_input_drain(
     if (!check(drawn, "the streaming selection fixture commits its real displayed frame")) return false;
     const auto committed = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(
         fixture.surface).rendered_snapshot;
-    constexpr int anchor_row = 2;
-    const QString expected = snapshot_row_text(*committed, anchor_row).left(5);
-    const QPointF from = point_in_display_cell(fixture.surface, anchor_row, 0);
-    const QPointF to = point_in_display_cell(fixture.surface, anchor_row, 4);
-    // No event-loop pumping: this output is drained by the press, after the
-    // already committed frame and its input coordinates have been retained.
-    QByteArray output = numbered_scroll_lines(scroll_past_frame ? committed->grid_size.rows + 1 : 1);
-    if (overwrite_anchor) {
-        output.prepend(QByteArrayLiteral("\x1b[3;1HREPLACED") +
-            QStringLiteral("\x1b[%1;1H").arg(committed->grid_size.rows).toUtf8());
+    const int anchor_row = capped ? 4 : 2;
+    const int anchor_column = capped ? 14 : 0;
+    const int extent_column = capped ? 0 : 14;
+    const QPointF from = point_in_display_cell(fixture.surface, anchor_row, anchor_column);
+    const QPointF to = point_in_display_cell(fixture.surface, 2, extent_column);
+    QStringList expected_rows;
+    for (int row = 2; row <= anchor_row; ++row) {
+        expected_rows.push_back(snapshot_row_text(*committed, row));
+    }
+    const bool reject_press = change == Streaming_selection_change::OVERWRITE_ANCHOR ||
+        change == Streaming_selection_change::EVICT_ANCHOR;
+    const bool reject_range = change == Streaming_selection_change::OVERWRITE_MIDDLE_AND_EVICT_PREFIX;
+
+    // Queue output without painting again. The real input frontier drains it
+    // after the displayed coordinates have been sampled for the press.
+    const int appended = change == Streaming_selection_change::APPEND ? 1 :
+        capped && !reject_press ? 5 : committed->grid_size.rows + 8;
+    QByteArray output = numbered_scroll_lines(appended);
+    if (change == Streaming_selection_change::OVERWRITE_ANCHOR || reject_range) {
+        const int rewritten = reject_range ? 3 : anchor_row;
+        output.prepend(QStringLiteral("\x1b[%1;1HREPLACED\x1b[%2;1H")
+            .arg(rewritten + 1).arg(committed->grid_size.rows).toUtf8());
     }
     backend_ptr->emit_output_from_worker(std::move(output));
     backend_ptr->join_worker();
     bool ok = send_mouse_event(fixture.surface, QEvent::MouseButtonPress, from,
-        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, !overwrite_anchor,
-        overwrite_anchor
-            ? "a press rejects displayed text overwritten before it was archived"
+        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier, !reject_press,
+        reject_press
+            ? "a press rejects changed or evicted displayed text"
             : "a press leases its unchanged displayed row after draining a scrolling append");
     const auto current = term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(current && current->viewport.scrollback_rows > committed->viewport.scrollback_rows &&
+    ok &= check(current &&
+            (capped ? current->metadata.row_origin_generation != committed->metadata.row_origin_generation &&
+                current->viewport.scrollback_rows == 8 && committed->viewport.scrollback_rows == 8
+                : current->viewport.scrollback_rows > committed->viewport.scrollback_rows) &&
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface).rendered_snapshot == committed,
-        "the press crosses a new scrolling publication while the original draw remains committed");
-    if (overwrite_anchor) {
+        "the press crosses a scrolling publication while the original draw remains committed");
+    if (reject_press) {
         return check(fixture.surface.selected_text().isEmpty(),
-            "an archived replacement cannot be selected through its prior displayed content") && ok;
+            "the logical row's new occupant cannot be selected through the prior draw") && ok;
+    }
+
+    if (capped) {
+        backend_ptr->emit_output_from_worker(numbered_scroll_lines(1));
+        backend_ptr->join_worker();
     }
     ok &= send_mouse_event(fixture.surface, QEvent::MouseMove, to,
         Qt::NoButton, Qt::LeftButton, Qt::NoModifier, true,
-        "the drag extends on the same unchanged committed row");
+        "the drag addresses the committed rows after intervening output");
+    if (capped) {
+        backend_ptr->emit_output_from_worker(numbered_scroll_lines(1));
+        backend_ptr->join_worker();
+    }
     ok &= send_mouse_event(fixture.surface, QEvent::MouseButtonRelease, to,
         Qt::LeftButton, Qt::NoButton, Qt::NoModifier, true,
-        "the release preserves the committed row lease");
-    ok &= check(!expected.isEmpty() && fixture.surface.selected_text() == expected,
-        "streaming selection copies the displayed retained text rather than its new viewport occupant");
+        "the release addresses the committed rows after intervening output");
+    if (reject_range) {
+        return check(fixture.surface.selected_text().isEmpty(),
+            "a changed middle row prevents selecting its replacement through unchanged endpoints") && ok;
+    }
+    ok &= check(expected_rows.first().startsWith(QStringLiteral("scroll-line-")) &&
+            fixture.surface.selected_text() == expected_rows.join(QLatin1Char('\n')),
+        "the selected payload contains the displayed numbered rows regardless of their new logical positions");
     return ok;
 }
 
@@ -23447,9 +23492,17 @@ int main(int argc, char** argv)
         return test_pointer_uses_physical_modifiers(app, qt_swaps_control_and_meta) ? 0 : 1;
     }
     if (app.arguments().contains(QStringLiteral("--content-tail-presentation"))) {
-        bool ok = test_committed_selection_after_streaming_input_drain(app, false);
-        ok &= test_committed_selection_after_streaming_input_drain(app, true);
-        ok &= test_committed_selection_after_streaming_input_drain(app, true, true);
+        bool ok = true;
+        for (const auto change : {
+                Streaming_selection_change::APPEND,
+                Streaming_selection_change::ARCHIVE,
+                Streaming_selection_change::OVERWRITE_ANCHOR,
+                Streaming_selection_change::EVICT_PREFIX,
+                Streaming_selection_change::EVICT_ANCHOR,
+                Streaming_selection_change::OVERWRITE_MIDDLE_AND_EVICT_PREFIX})
+        {
+            ok &= test_committed_selection_after_streaming_input_drain(app, change);
+        }
         ok &= test_presentation_render_and_input(app);
         return ok ? 0 : 1;
     }

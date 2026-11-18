@@ -929,7 +929,6 @@ std::optional<term::terminal_grid_position_t> clamped_grid_position_for_local_po
         static_cast<int>(column_index)};
 }
 
-using term::logical_grid_position_for_viewport_cell;
 using term::native_mouse_position;
 
 bool position_is_before(
@@ -3101,16 +3100,20 @@ struct VNM_TerminalSurface::Private
     {
         const auto& before = shown.viewport;
         const auto& after = current.viewport;
+        const auto evicted = current.metadata.row_origin_generation - shown.metadata.row_origin_generation;
+        if (evicted > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            return false;
+        }
+        const int removed = static_cast<int>(evicted);
         return before.active_buffer == term::Terminal_buffer_id::PRIMARY &&
             after.active_buffer == term::Terminal_buffer_id::PRIMARY &&
             before.follow_tail && after.follow_tail &&
             before.offset_from_tail == 0 && after.offset_from_tail == 0 &&
             before.visible_rows == after.visible_rows &&
-            shown.metadata.row_origin_generation == current.metadata.row_origin_generation &&
             before.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
             after.presentation.policy == term::Terminal_presentation_policy::CONTENT_TAIL &&
-            before.presentation.clear_page_start_row == after.presentation.clear_page_start_row &&
-            after.scrollback_rows > before.scrollback_rows &&
+            std::max(0, before.presentation.clear_page_start_row - removed) == after.presentation.clear_page_start_row &&
+            static_cast<long long>(after.scrollback_rows) + removed > before.scrollback_rows &&
             static_cast<long long>(after.presentation.content_end_row_exclusive) -
                 before.presentation.content_end_row_exclusive ==
                     static_cast<long long>(after.scrollback_rows) - before.scrollback_rows;
@@ -3148,23 +3151,30 @@ struct VNM_TerminalSurface::Private
         return input_snapshot(true);
     }
 
-    bool input_row_is_current(int display_row) const
+    std::int64_t current_input_logical_row(std::int64_t displayed_row) const
     {
-        if (!display_input_projected) {
-            return true;
+        const auto removed = render_snapshot->metadata.row_origin_generation -
+            display_input_snapshot->metadata.row_origin_generation;
+        if (displayed_row < 0 || removed > static_cast<std::uint64_t>(displayed_row)) {
+            return -1;
         }
-        const auto shown = selection_input_snapshot();
-        if (!shown || display_row < 0 || display_row >= static_cast<int>(shown->visible_line_provenance.size())) {
+        return displayed_row - static_cast<std::int64_t>(removed);
+    }
+
+    bool input_row_is_current(int display_row, int logical_row) const
+    {
+        const auto& shown = display_input_snapshot;
+        if (display_row < 0 || display_row >= static_cast<int>(shown->visible_line_provenance.size())) {
             return false;
         }
         // A backend overwrite can retain the same viewport and logical row.
         // Do not lease its newer text for a pointer action on the prior draw.
         const auto& row = shown->visible_line_provenance[static_cast<std::size_t>(display_row)];
         const auto* current = render_snapshot.get();
-        int index = static_cast<int>(row.logical_row) - term::render_snapshot_first_visible_logical_row(*current);
+        int index = logical_row - term::render_snapshot_first_visible_logical_row(*current);
         if ((index < 0 || index >= current->grid_size.rows) && current->row_coverage_snapshot) {
             current = current->row_coverage_snapshot.get();
-            index = static_cast<int>(row.logical_row) - term::render_snapshot_first_visible_logical_row(*current);
+            index = logical_row - term::render_snapshot_first_visible_logical_row(*current);
         }
         if (row.retained_line_id == 0U) {
             return false;
@@ -3174,12 +3184,30 @@ struct VNM_TerminalSurface::Private
             // Its retained handle must still name exactly the same content.
             return session && session->retained_selection_row_is_current(
                 render_snapshot->viewport.active_buffer,
-                static_cast<int>(row.logical_row),
+                logical_row,
                 term::terminal_history_handle_from_retained_identity(
                     row.retained_line_id, row.content_generation));
         }
         const auto& latest = current->visible_line_provenance[static_cast<std::size_t>(index)];
         return row.retained_line_id == latest.retained_line_id && row.content_generation == latest.content_generation;
+    }
+
+    std::optional<term::terminal_grid_position_t> selection_logical_position(
+        std::optional<term::terminal_grid_position_t> viewport_position) const
+    {
+        if (!viewport_position) {
+            return std::nullopt;
+        }
+        auto position = term::logical_grid_position_for_viewport_cell(selection_input_snapshot(), *viewport_position);
+        if (!position || !display_input_projected) {
+            return position;
+        }
+        const auto logical_row = current_input_logical_row(position->row);
+        if (logical_row < 0 || !input_row_is_current(viewport_position->row, static_cast<int>(logical_row))) {
+            return std::nullopt;
+        }
+        position->row = static_cast<int>(logical_row);
+        return position;
     }
 
     term::terminal_cell_metrics_t input_metrics() const
@@ -3199,8 +3227,9 @@ struct VNM_TerminalSurface::Private
         const int first = term::normalized_selection_start(range).row;
         const int last = term::normalized_selection_end(range).row;
         for (int row = 0; row < static_cast<int>(shown->visible_line_provenance.size()); ++row) {
-            const auto logical = shown->visible_line_provenance[static_cast<std::size_t>(row)].logical_row;
-            if (logical >= first && logical <= last && !input_row_is_current(row)) {
+            const auto displayed_row = shown->visible_line_provenance[static_cast<std::size_t>(row)].logical_row;
+            const auto logical = current_input_logical_row(displayed_row);
+            if (logical >= first && logical <= last && !input_row_is_current(row, static_cast<int>(logical))) {
                 return false;
             }
         }
@@ -6485,16 +6514,9 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     published_snapshot = selection_snapshot;
     position = grid_position_for_local_point(
         published_snapshot, m_private->input_metrics(), event->position());
-    if (!position.has_value() || !m_private->input_row_is_current(position->row)) {
-        trace_decision(QStringLiteral("out-of-grid"));
-        return;
-    }
-
-    logical_position = logical_grid_position_for_viewport_cell(
-        published_snapshot,
-        *position);
+    logical_position = m_private->selection_logical_position(position);
     if (!logical_position.has_value()) {
-        trace_decision(QStringLiteral("viewport-mapping"));
+        trace_decision(QStringLiteral("out-of-grid"));
         return;
     }
 
@@ -6788,16 +6810,9 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             m_private->selection_input_snapshot(),
             m_private->input_metrics(),
             event->position());
-    if (!viewport_position.has_value() || !m_private->input_row_is_current(viewport_position->row)) {
-        trace_decision(QStringLiteral("out-of-grid"));
-        return;
-    }
-
-    logical_position = logical_grid_position_for_viewport_cell(
-        m_private->selection_input_snapshot(),
-        *viewport_position);
+    logical_position = m_private->selection_logical_position(viewport_position);
     if (!logical_position.has_value()) {
-        trace_decision(QStringLiteral("viewport-mapping"));
+        trace_decision(QStringLiteral("out-of-grid"));
         return;
     }
 
@@ -7033,11 +7048,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 m_private->selection_input_snapshot(),
                 m_private->input_metrics(),
                 event->position());
-        if (viewport_position.has_value() && m_private->input_row_is_current(viewport_position->row)) {
-            logical_position = logical_grid_position_for_viewport_cell(
-                m_private->selection_input_snapshot(),
-                *viewport_position);
-        }
+        logical_position = m_private->selection_logical_position(viewport_position);
         QString decision_reason = QStringLiteral("out-of-grid");
         if (logical_position.has_value()) {
             const term::Terminal_selection_drag_resolution proof =

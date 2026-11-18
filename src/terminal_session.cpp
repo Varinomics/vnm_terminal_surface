@@ -9340,7 +9340,8 @@ void Terminal_session::advance_selection_content_basis_for_model_result(
     }
 
     if (row_origin_changed) {
-        ++m_row_origin_generation;
+        // Each eviction shifts every remaining primary logical row by one.
+        m_row_origin_generation += static_cast<std::uint64_t>(result.evicted_scrollback_rows);
     }
 
     if (!content_basis_changed      &&
