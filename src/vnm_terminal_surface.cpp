@@ -53,6 +53,7 @@
 #include <QQuickWindow>
 #include <QScreen>
 #include <QScopedValueRollback>
+#include <QSet>
 #include <QStringDecoder>
 #include <QStringList>
 #include <QThread>
@@ -2900,13 +2901,42 @@ struct VNM_TerminalSurface::Private
         return render_snapshot != nullptr && !render_snapshot->selection_spans.empty();
     }
 
-    void cancel_clipboard_paste()
+    std::uint64_t cancel_clipboard_paste()
     {
-        ++clipboard_request_generation;
-        auto cancel = std::exchange(clipboard_cancel, {});
-        if (cancel) {
-            cancel();
+        const auto generation = ++clipboard_request_generation;
+        auto read = std::exchange(clipboard_read, std::nullopt);
+        if (read && read->cancel) {
+            read->cancel();
         }
+        return generation;
+    }
+
+    bool handle_clipboard_return(QKeyEvent& event)
+    {
+        const int key = event.key();
+        if (key != Qt::Key_Return && key != Qt::Key_Enter) {
+            return false;
+        }
+        if (!event.isAutoRepeat()) {
+            const bool was_held = held_clipboard_return_keys.remove(key);
+            if (event.type() == QEvent::KeyRelease) {
+                return was_held;
+            }
+        }
+        if (event.isAutoRepeat() && held_clipboard_return_keys.contains(key)) {
+            return true;
+        }
+        if (event.modifiers() != Qt::NoModifier && event.modifiers() != Qt::KeypadModifier) {
+            return false;
+        }
+        if (event.type() != QEvent::KeyPress || !clipboard_read || ime_preedit.active) {
+            return false;
+        }
+        if (!clipboard_read->return_key) {
+            clipboard_read->return_key.reset(event.clone());
+        }
+        held_clipboard_return_keys.insert(key);
+        return true;
     }
 
     std::optional<term::Terminal_mouse_event_result> try_write_mouse_motion(
@@ -3315,7 +3345,15 @@ struct VNM_TerminalSurface::Private
     // it makes, so without this the delivery would nest once per answer.
     bool                                                   delivering_session_notifications    = false;
     Clipboard_reader                                      clipboard_text_reader;
-    Clipboard_cancel                                      clipboard_cancel;
+    struct Clipboard_read
+    {
+        std::uint64_t                   session_generation;
+        Clipboard_cancel                cancel;
+        std::unique_ptr<QKeyEvent>      return_key;
+        std::optional<QString>          ready_text;
+    };
+    std::optional<Clipboard_read>                         clipboard_read;
+    QSet<int>                                             held_clipboard_return_keys;
     std::uint64_t                                         clipboard_request_generation = 0U;
     std::chrono::steady_clock::time_point                  copy_interrupt_guard_until;
     bool                                                  selection_was_attached = false;
@@ -3618,6 +3656,11 @@ VNM_TerminalSurface::Input_frontier_scope::~Input_frontier_scope()
     if (m_surface.m_private != nullptr && --m_surface.m_private->display_input_depth == 0) {
         m_surface.m_private->display_input_snapshot.reset();
         m_surface.m_private->display_input_projected = false;
+        // A reader can complete in a host callback while this input is still
+        // being routed. Only the route knows whether it cancels the paste.
+        if (m_surface.m_private->clipboard_read && m_surface.m_private->clipboard_read->ready_text) {
+            m_surface.finish_clipboard_paste();
+        }
     }
 }
 
@@ -5419,12 +5462,19 @@ bool VNM_TerminalSurface::paste_text(QString text)
     Input_frontier_scope input_frontier(*this);
     m_private->cancel_clipboard_paste();
     m_private->dismiss_copy_intent();
+    return write_paste_within_input_event(std::move(text), std::nullopt);
+}
 
+bool VNM_TerminalSurface::write_paste_within_input_event(
+    QString                       text,
+    std::optional<std::uint64_t>  clipboard_generation)
+{
     if (m_private->session == nullptr) {
         return false;
     }
     if (!m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this) ||
-        m_private->session == nullptr)
+        m_private->session == nullptr ||
+        (clipboard_generation && *clipboard_generation != m_private->clipboard_request_generation))
     {
         return false;
     }
@@ -5562,13 +5612,15 @@ VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
 bool VNM_TerminalSurface::paste_clipboard_text()
 {
     Q_ASSERT(thread() == QThread::currentThread());
-    m_private->cancel_clipboard_paste();
+    const auto request = m_private->cancel_clipboard_paste();
     m_private->dismiss_copy_intent();
-    if (m_private->session == nullptr || m_private->shutting_down.load()) {
+    if (m_private->session == nullptr || m_private->shutting_down.load() ||
+        request != m_private->clipboard_request_generation)
+    {
         return false;
     }
-    const auto request = m_private->clipboard_request_generation;
     const auto session = m_private->session_generation;
+    m_private->clipboard_read.emplace(Private::Clipboard_read{session, {}, {}, {}});
     const QPointer<VNM_TerminalSurface> surface(this);
     Clipboard_completion completion = [surface, request, session](std::optional<QString> text) {
         if (!surface || surface->m_private->clipboard_request_generation != request ||
@@ -5577,10 +5629,18 @@ bool VNM_TerminalSurface::paste_clipboard_text()
             return;
         }
         Q_ASSERT(surface->thread() == QThread::currentThread());
-        surface->m_private->clipboard_cancel = {};
-        ++surface->m_private->clipboard_request_generation;
-        if (text) {
-            (void)surface->paste_text(std::move(*text));
+        auto& read = *surface->m_private->clipboard_read;
+        if (read.ready_text) {
+            return;
+        }
+        read.cancel = {};
+        if (!text || text->isEmpty()) {
+            surface->m_private->cancel_clipboard_paste();
+            return;
+        }
+        read.ready_text = std::move(text);
+        if (surface->m_private->display_input_depth == 0) {
+            surface->finish_clipboard_paste();
         }
     };
     if (m_private->clipboard_text_reader) {
@@ -5591,20 +5651,59 @@ bool VNM_TerminalSurface::paste_clipboard_text()
                 cancel();
             }
         }
-        else {
-            m_private->clipboard_cancel = std::move(cancel);
+        else
+        if (!m_private->clipboard_read->ready_text) {
+            m_private->clipboard_read->cancel = std::move(cancel);
         }
         return true;
     }
     // Qt clipboard access must remain on the GUI thread. Hosts that need an
     // isolated/native nonblocking read provide the reader above.
-    return vnm::qt::post(this, [surface, request, completion = std::move(completion)]() mutable {
+    const auto result = vnm::qt::post(this, [surface, request, completion = std::move(completion)]() mutable {
         if (!surface || surface->m_private->clipboard_request_generation != request) {
             return;
         }
         QClipboard* clipboard = QGuiApplication::clipboard();
         completion(clipboard ? std::optional<QString>(clipboard->text(QClipboard::Clipboard)) : std::nullopt);
-    }) == vnm::qt::Post_result::QUEUED;
+    });
+    if (result != vnm::qt::Post_result::QUEUED) {
+        m_private->cancel_clipboard_paste();
+        return false;
+    }
+    return true;
+}
+
+void VNM_TerminalSurface::finish_clipboard_paste()
+{
+    const auto request = m_private->clipboard_request_generation;
+    const auto session = m_private->clipboard_read->session_generation;
+    if (session != m_private->session_generation) {
+        m_private->cancel_clipboard_paste();
+        return;
+    }
+    const auto current = [&] {
+        return m_private->clipboard_request_generation == request &&
+            m_private->session_generation == session;
+    };
+
+    // Keep the request visible through both the frontier drain and paste
+    // publication. Either can deliver a Return or supersede the request.
+    Input_frontier_scope frontier(*this);
+    if (!current()) {
+        return;
+    }
+    const bool pasted = write_paste_within_input_event(
+        std::move(*m_private->clipboard_read->ready_text), request);
+    if (!current()) {
+        return;
+    }
+    auto read = std::exchange(m_private->clipboard_read, std::nullopt);
+    ++m_private->clipboard_request_generation;
+    if (pasted && read->return_key) {
+        const auto trace_id = term::interaction_trace_enabled()
+            ? term::next_interaction_trace_correlation_id() : 0U;
+        write_key_within_input_event(*read->return_key, trace_id);
+    }
 }
 
 bool VNM_TerminalSurface::scroll_canvas_presentation_wheel(int wheel_steps, int rows)
@@ -6000,17 +6099,17 @@ void VNM_TerminalSurface::geometryChange(
 
 void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& value)
 {
-    std::optional<Input_frontier_scope> input_frontier;
-    if (change == ItemActiveFocusHasChanged) {
-        input_frontier.emplace(*this, true, false);
-    }
-    QQuickItem::itemChange(change, value);
     if (change == ItemActiveFocusHasChanged || change == ItemSceneChange ||
         change == ItemVisibleHasChanged || change == ItemEnabledHasChanged)
     {
         m_private->cancel_clipboard_paste();
         m_private->dismiss_copy_intent();
     }
+    std::optional<Input_frontier_scope> input_frontier;
+    if (change == ItemActiveFocusHasChanged) {
+        input_frontier.emplace(*this, true, false);
+    }
+    QQuickItem::itemChange(change, value);
 
     if (change == ItemActiveFocusHasChanged && term::interaction_trace_enabled()) {
         term::record_interaction_trace(
@@ -6100,6 +6199,19 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
 
 bool VNM_TerminalSurface::event(QEvent* event)
 {
+    // A frontier drain can synchronously complete or cancel a reader. Bind
+    // Return to the read that was outstanding when the physical key arrived.
+    if ((event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) &&
+        m_private->handle_clipboard_return(*static_cast<QKeyEvent*>(event)))
+    {
+        event->accept();
+        return true;
+    }
+    if (event->type() == QEvent::KeyPress || event->type() == QEvent::InputMethod ||
+        event->type() == QEvent::FocusOut)
+    {
+        m_private->cancel_clipboard_paste();
+    }
     const bool input_event =
         event->type() == QEvent::KeyPress ||
         event->type() == QEvent::MouseButtonPress ||
@@ -6158,7 +6270,6 @@ bool VNM_TerminalSurface::event(QEvent* event)
 void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
-    m_private->cancel_clipboard_paste();
     if (!is_plain_copy_shortcut(*event) &&
         event->key() != Qt::Key_Control && event->key() != Qt::Key_Shift &&
         event->key() != Qt::Key_Alt && event->key() != Qt::Key_Meta)
@@ -6250,31 +6361,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             event->ignore();
             return;
         }
-        term::Terminal_session* const route_session = m_private->session.get();
-        const term::Terminal_key_event_result key_result =
-            route_session->write_key_event(*event, trace_id);
-        if (!key_result.handled) {
-            event->ignore();
-            term::record_interaction_trace("surface", "key-route", QStringLiteral("unhandled"), trace_id);
-            return;
-        }
-
-        event->accept();
-        if (term::interaction_trace_enabled()) {
-            term::record_interaction_trace(
-                "surface",
-                "key-route",
-                QStringLiteral("session sequence=%1 result=%2")
-                    .arg(key_result.result.sequence)
-                    .arg(static_cast<int>(key_result.result.code)),
-                trace_id);
-        }
-        sync_from_session();
-        if (!is_accepted(key_result.result.code)) {
-            report_result_failure(key_result.result);
-            return;
-        }
-        m_private->grant_cursor_input_grace(*this);
+        write_key_within_input_event(*event, trace_id);
         return;
     }
 
@@ -6300,6 +6387,33 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             QStringLiteral("no-session %1").arg(term::interaction_trace_byte_summary(bytes)),
             trace_id);
     }
+}
+
+void VNM_TerminalSurface::write_key_within_input_event(QKeyEvent& event, std::uint64_t trace_id)
+{
+    const auto key_result = m_private->session->write_key_event(event, trace_id);
+    if (!key_result.handled) {
+        event.ignore();
+        term::record_interaction_trace("surface", "key-route", QStringLiteral("unhandled"), trace_id);
+        return;
+    }
+
+    event.accept();
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "surface",
+            "key-route",
+            QStringLiteral("session sequence=%1 result=%2")
+                .arg(key_result.result.sequence)
+                .arg(static_cast<int>(key_result.result.code)),
+            trace_id);
+    }
+    sync_from_session();
+    if (!is_accepted(key_result.result.code)) {
+        report_result_failure(key_result.result);
+        return;
+    }
+    m_private->grant_cursor_input_grace(*this);
 }
 
 void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
@@ -8096,7 +8210,6 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
-    m_private->cancel_clipboard_paste();
     m_private->dismiss_copy_intent();
 
     const QString commit_text             = terminal_commit_text_from_event(*event);

@@ -16609,6 +16609,11 @@ bool test_async_clipboard_intent(QGuiApplication& app)
         ok &= check(fixture->surface.paste_clipboard_text(), "async clipboard request admitted");
         ok &= check(backend_ptr->writes.size() == writes, "clipboard admission does not inject text");
         auto late = pending;
+        if (action != 0 && action != 9 && action != 10) {
+            ok &= send_key(fixture->surface, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"),
+                "intervening input or a lifecycle change must also retire a held Return");
+            ok &= check(backend_ptr->writes.size() == writes, "pending Return does not reach the old line");
+        }
         switch (action) {
             case 0:
                 backend_ptr->emit_output(QByteArrayLiteral("ordinary output"));
@@ -16687,6 +16692,172 @@ bool test_async_clipboard_intent(QGuiApplication& app)
         }
         fixture->surface.set_clipboard_text_reader({});
     }
+    return ok;
+}
+
+bool test_clipboard_return_order(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+    bool started = false;
+    auto* backend = start_surface_with_backend(fixture.surface, std::make_unique<Scripted_backend>(),
+        {QStringLiteral("scripted-terminal")}, &started);
+    if (!check(started, "clipboard Return surface starts")) {
+        return false;
+    }
+    bool ok = true;
+    VNM_TerminalSurface::Clipboard_completion complete;
+    fixture.surface.set_clipboard_text_reader(
+        [&](QObject*, VNM_TerminalSurface::Clipboard_completion callback) {
+            complete = std::move(callback);
+            return VNM_TerminalSurface::Clipboard_cancel{};
+        });
+    const auto press_return = [&] {
+        return send_key(fixture.surface, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"),
+            "surface accepts plain Return");
+    };
+    const auto repeat_return = [&] {
+        QKeyEvent repeat(QEvent::KeyPress, Qt::Key_Return, Qt::ShiftModifier, QStringLiteral("\r"), true);
+        repeat.ignore();
+        QCoreApplication::sendEvent(&fixture.surface, &repeat);
+        return check(repeat.isAccepted(), "held Return repeat remains consumed when modifiers change");
+    };
+    for (const bool bracketed : {false, true}) {
+        fixture.surface.set_bracketed_paste_policy(bracketed
+            ? VNM_TerminalSurface::Bracketed_paste_policy::ENABLED
+            : VNM_TerminalSurface::Bracketed_paste_policy::DISABLED);
+        const auto writes = backend->writes.size();
+        ok &= check(fixture.surface.paste_clipboard_text(), "reader with no cancellation handle admitted");
+        ok &= press_return();
+        ok &= press_return();
+        ok &= repeat_return();
+        ok &= check(backend->writes.size() == writes, "outstanding read holds every Return");
+        complete(QStringLiteral("one\x1b\r\ntwo"));
+        complete(QStringLiteral("duplicate"));
+        ok &= repeat_return();
+        const QByteArray body = QByteArrayLiteral("one\rtwo");
+        const QByteArray expected = (bracketed ? framed_paste(body) : body) + '\r';
+        ok &= check(joined_writes_since(backend->writes, writes) == expected,
+            "one ordinary Return follows all filtered paste bytes and closing frame");
+        QKeyEvent release(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier);
+        QCoreApplication::sendEvent(&fixture.surface, &release);
+        ok &= press_return();
+        ok &= check(joined_writes_since(backend->writes, writes) == expected + '\r',
+            "a fresh Return after release reaches the terminal normally");
+    }
+    for (const auto& text : std::vector<std::optional<QString>>{
+        std::nullopt, QString{}, QStringLiteral("\x1b\x07")})
+    {
+        const auto writes = backend->writes.size();
+        ok &= check(fixture.surface.paste_clipboard_text(), "unusable clipboard read admitted");
+        ok &= press_return();
+        complete(text);
+        complete(QStringLiteral("late"));
+        ok &= repeat_return();
+        ok &= check(backend->writes.size() == writes, "failed, empty or filtered paste consumes Return");
+    }
+    backend->reject_writes = true;
+    const auto rejected = backend->writes.size();
+    ok &= check(fixture.surface.paste_clipboard_text(), "clipboard read before rejected write admitted");
+    ok &= press_return();
+    complete(QStringLiteral("rejected"));
+    ok &= check(joined_writes_since(backend->writes, rejected) == framed_paste(QByteArrayLiteral("rejected")),
+        "a backend that refuses the payload receives no Return");
+    backend->reject_writes = false;
+
+    for (const auto modifiers : {Qt::ShiftModifier, Qt::ControlModifier, Qt::AltModifier, Qt::MetaModifier}) {
+        const QKeyEvent key(QEvent::KeyPress, Qt::Key_Return, modifiers, QStringLiteral("\r"));
+        const QByteArray expected = term::encode_terminal_key_event(key, {});
+        const auto writes = backend->writes.size();
+        ok &= check(fixture.surface.paste_clipboard_text(), "clipboard read before modified Return admitted");
+        ok &= press_return();
+        QKeyEvent modified(QEvent::KeyPress, Qt::Key_Return, modifiers, QStringLiteral("\r"));
+        QCoreApplication::sendEvent(&fixture.surface, &modified);
+        complete(QStringLiteral("stale"));
+        ok &= check(joined_writes_since(backend->writes, writes) == expected,
+            "fresh modified Return keeps its ordinary encoding and invalidates the paste");
+    }
+    backend->emit_output(QByteArrayLiteral("\x1b="));
+    ok &= send_key(fixture.surface, Qt::Key_Enter, Qt::KeypadModifier, QStringLiteral("\r"),
+        "ordinary application keypad Enter accepted");
+    const QByteArray keypad_enter = backend->writes.back();
+    const auto keypad = backend->writes.size();
+    ok &= check(fixture.surface.paste_clipboard_text(), "clipboard read before keypad Enter admitted");
+    ok &= send_key(fixture.surface, Qt::Key_Enter, Qt::KeypadModifier, QStringLiteral("\r"),
+        "pending read captures keypad Enter");
+    complete(QStringLiteral("keypad"));
+    ok &= check(joined_writes_since(backend->writes, keypad) ==
+        framed_paste(QByteArrayLiteral("keypad")) + keypad_enter,
+        "deferred keypad Enter matches ordinary application keypad encoding");
+
+    const auto replaced = backend->writes.size();
+    ok &= check(fixture.surface.paste_clipboard_text(), "read admitted before reentrant reader replacement");
+    ok &= press_return();
+    backend->on_write = [&] { fixture.surface.set_clipboard_text_reader({}); };
+    complete(QStringLiteral("last"));
+    backend->on_write = {};
+    ok &= check(joined_writes_since(backend->writes, replaced) == framed_paste(QByteArrayLiteral("last")),
+        "reader replacement during paste delivery discards the held Return");
+    return ok;
+}
+
+bool test_reentrant_clipboard_return(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+    bool started = false;
+    auto* backend = start_surface_with_backend(fixture.surface, std::make_unique<Scripted_backend>(),
+        {QStringLiteral("scripted-terminal")}, &started);
+    if (!check(started, "reentrant clipboard Return surface starts")) {
+        return false;
+    }
+    bool ok = true;
+    VNM_TerminalSurface::Clipboard_completion complete;
+    fixture.surface.set_clipboard_text_reader(
+        [&](QObject*, VNM_TerminalSurface::Clipboard_completion callback) {
+            complete = std::move(callback);
+            return VNM_TerminalSurface::Clipboard_cancel{};
+        });
+    const auto press_return = [&] {
+        return send_key(fixture.surface, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"),
+            "reentrant clipboard Return accepted");
+    };
+    int notifications = 0;
+    QObject::connect(&fixture.surface, &VNM_TerminalSurface::terminal_title_changed, &fixture.surface, [&] {
+        ++notifications;
+        if (fixture.surface.terminal_title() == QStringLiteral("key")) {
+            ok &= press_return();
+        }
+        else {
+            complete(QStringLiteral("stale"));
+        }
+    });
+    const auto writes = backend->writes.size();
+    ok &= check(fixture.surface.paste_clipboard_text(), "read admitted before paste frontier");
+    backend->emit_output(QByteArrayLiteral("\x1b]0;key\a"));
+    complete(QStringLiteral("paste"));
+    ok &= check(joined_writes_since(backend->writes, writes) == QByteArrayLiteral("paste\r"),
+        "Return delivered inside the paste frontier follows the text");
+
+    for (const bool ime : {false, true}) {
+        const auto before_input = backend->writes.size();
+        ok &= check(fixture.surface.paste_clipboard_text(), "read admitted before newer input frontier");
+        ok &= press_return();
+        backend->emit_output(ime ? QByteArrayLiteral("\x1b]0;ime\a") : QByteArrayLiteral("\x1b]0;typed\a"));
+        if (ime) {
+            ok &= send_ime_preedit(fixture.surface, QStringLiteral("new"), 3, "IME preedit supersedes held Return");
+            ok &= check(backend->writes.size() == before_input, "stale paste cannot submit during IME preedit");
+        }
+        else {
+            ok &= send_key(fixture.surface, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"),
+                "ordinary key supersedes held Return");
+            const QKeyEvent key(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"));
+            ok &= check(joined_writes_since(backend->writes, before_input) == term::encode_terminal_key_event(key, {}),
+                "typing survives a stale reader completion during the input frontier");
+        }
+    }
+    ok &= check(notifications == 3, "all clipboard frontier cases exercised synchronous host reentry");
+    fixture.surface.set_clipboard_text_reader({});
     return ok;
 }
 
@@ -23553,6 +23724,8 @@ int main(int argc, char** argv)
     if (app.arguments().contains(QStringLiteral("--clipboard-selection-only"))) {
         bool ok = test_selection_copy_intent_after_output(app);
         ok &= test_async_clipboard_intent(app);
+        ok &= test_clipboard_return_order(app);
+        ok &= test_reentrant_clipboard_return(app);
         ok &= test_async_clipboard_report_chronology(app);
         ok &= test_copy_shortcut_policy(app);
         ok &= test_selection_drag_composes_synchronized_press_successors(app);
@@ -23716,6 +23889,8 @@ int main(int argc, char** argv)
         ok &= test_selection_visual_detach_after_row_mutation(app);
         ok &= test_selection_copy_intent_after_output(app);
         ok &= test_async_clipboard_intent(app);
+        ok &= test_clipboard_return_order(app);
+        ok &= test_reentrant_clipboard_return(app);
         ok &= test_async_clipboard_report_chronology(app);
         ok &= test_selection_drag_remaps_live_scrollback_viewport_spans(app);
         ok &= test_selection_drag_survives_unrelated_row_backend_output(app);

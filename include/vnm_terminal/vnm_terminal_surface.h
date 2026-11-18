@@ -764,7 +764,9 @@ public:
     vnm_terminal::Terminal_message_submission_result submit_utf8_message(
         QByteArray message_utf8);
     // Returns whether the request was admitted, not whether text was pasted.
-    // Intervening input, focus/session changes, or another paste cancel it.
+    // A plain Return or keypad Enter during the read follows a successful
+    // nonempty paste once. Other input, focus/session changes or a newer
+    // paste invalidate the request and its pending Return.
     Q_INVOKABLE bool    paste_clipboard_text();
     /**
      * Re-derives the terminal grid from the current item geometry, resizing the
@@ -972,6 +974,9 @@ private:
     void releaseResources() override;
     bool event(QEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
+    void finish_clipboard_paste();
+    void write_key_within_input_event(QKeyEvent& event, std::uint64_t trace_id);
+    bool write_paste_within_input_event(QString text, std::optional<std::uint64_t> clipboard_generation);
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;

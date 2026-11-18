@@ -588,8 +588,14 @@ There are three clipboard paths:
   GUI thread after returning: empty `QString` is successful empty text, and
   `std::nullopt` is failure. Cancellation or context destruction suppresses
   completion. `paste_clipboard_text()` reports request admission, not completed
-  delivery. Intervening input, focus/session changes, reader replacement, and a
-  newer paste invalidate the request. Ordinary child output does not. The Qt
+  delivery. A plain Return or keypad Enter pressed while the read is outstanding
+  follows the accepted paste using its ordinary terminal encoding, outside any
+  bracketed-paste frame. Additional Returns during the read coalesce. A held
+  key's auto-repeat stays suppressed until release. An empty, fully filtered,
+  failed or rejected paste consumes the pending Return. Other intervening input
+  (including modified Return and IME input), focus/session changes, reader
+  replacement, and a newer paste invalidate the request and its pending Return.
+  Ordinary child output does not. The Qt
   fallback is deferred to the event loop but its native read remains on the GUI
   thread; use an isolated reader when the platform clipboard can block.
 - OSC 52 clipboard writes are mediated by the host. The parser decodes the
