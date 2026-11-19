@@ -2505,6 +2505,9 @@ public:
         m_pending_frame = std::move(frame);
         m_frame    = m_pending_frame;
         m_recorder = std::move(recorder);
+        // A retained layer only redraws on scene graph changes. The node
+        // survives snapshot, cursor and atlas updates, so notify its renderer.
+        markDirty(QSGNode::DirtyMaterial);
         if (m_recorder != nullptr) {
             m_recorder->record_capture(m_pending_frame);
         }
