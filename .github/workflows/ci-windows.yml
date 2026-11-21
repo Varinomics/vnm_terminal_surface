@@ -42,29 +42,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Locate Visual Studio 2026 and verify MSVC 14.51
+      - name: Provision and verify Visual Studio 2026 MSVC 14.51
         shell: pwsh
         run: |
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $installation = & $vswhere -latest -products * -version '[18.0,19.0)' `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $installation) {
-            throw "Visual Studio 2026 with x64 C++ tools was not found."
-          }
-          $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvarsall.bat'
-          $probe = & cmd /d /c "call `"$vcvars`" x64 -vcvars_ver=14.51 && where cl"
-          if ($LASTEXITCODE -ne 0) {
-            throw "The MSVC 14.51 developer environment could not be initialized."
-          }
-          $compiler = @($probe | Where-Object { $_ -match '\\cl\.exe$' })
-          $expected = Join-Path $installation 'VC\Tools\MSVC\14.51.'
-          if ($compiler.Count -eq 0 -or
-              -not $compiler[0].StartsWith($expected, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "The developer environment did not select the Visual Studio 2026 MSVC 14.51 compiler."
-          }
-          $compiler[0]
-          "VNM_VCVARSALL_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "MSVC_COMPILER_DIR=$(Split-Path -Parent $compiler[0])" >> $env:GITHUB_ENV
+          $msvc = & './.github/scripts/initialize_msvc_145.ps1'
+          "VNM_VCVARSALL_PATH=$($msvc.VcVarsAll)" >> $env:GITHUB_ENV
+          "MSVC_COMPILER_DIR=$($msvc.CompilerDirectory)" >> $env:GITHUB_ENV
 
       - name: Install and identify compiler cache
         id: compiler_cache
@@ -319,29 +302,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Locate Visual Studio 2026 and verify MSVC 14.51
+      - name: Provision and verify Visual Studio 2026 MSVC 14.51
         shell: pwsh
         run: |
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $installation = & $vswhere -latest -products * -version '[18.0,19.0)' `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $installation) {
-            throw "Visual Studio 2026 with x64 C++ tools was not found."
-          }
-          $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvarsall.bat'
-          $probe = & cmd /d /c "call `"$vcvars`" x64 -vcvars_ver=14.51 && where cl"
-          if ($LASTEXITCODE -ne 0) {
-            throw "The MSVC 14.51 developer environment could not be initialized."
-          }
-          $compiler = @($probe | Where-Object { $_ -match '\\cl\.exe$' })
-          $expected = Join-Path $installation 'VC\Tools\MSVC\14.51.'
-          if ($compiler.Count -eq 0 -or
-              -not $compiler[0].StartsWith($expected, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "The developer environment did not select the Visual Studio 2026 MSVC 14.51 compiler."
-          }
-          $compiler[0]
-          "VNM_VCVARSALL_PATH=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "MSVC_COMPILER_DIR=$(Split-Path -Parent $compiler[0])" >> $env:GITHUB_ENV
+          $msvc = & './.github/scripts/initialize_msvc_145.ps1'
+          "VNM_VCVARSALL_PATH=$($msvc.VcVarsAll)" >> $env:GITHUB_ENV
+          "MSVC_COMPILER_DIR=$($msvc.CompilerDirectory)" >> $env:GITHUB_ENV
 
       - name: Install and identify compiler cache
         id: compiler_cache

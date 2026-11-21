@@ -1,3 +1,10 @@
+# v145 alone selects the latest MSVC minor, which may differ from OpenConsole's.
+set(VCPKG_PLATFORM_TOOLSET_VERSION "$ENV{VNM_CONPTY_MSVC_VERSION}")
+if(NOT VCPKG_PLATFORM_TOOLSET_VERSION MATCHES "^14[.]51[.][0-9]+$")
+    message(FATAL_ERROR "ConPTY triplets require the selected MSVC 14.51 toolset version.")
+endif()
+list(APPEND VCPKG_ENV_PASSTHROUGH VNM_CONPTY_MSVC_VERSION)
+
 # vcpkg's Windows toolchain otherwise adds /Z7 and /DEBUG even to Release.
 list(APPEND VCPKG_HASH_ADDITIONAL_FILES "${CMAKE_CURRENT_LIST_FILE}")
 set(VCPKG_CMAKE_CONFIGURE_OPTIONS

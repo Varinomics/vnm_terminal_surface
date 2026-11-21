@@ -58,6 +58,7 @@ $env:VCPKG_MAX_CONCURRENCY = "$Slots"
 $env:VCPKG_VISUAL_STUDIO_PATH = $VisualStudioDirectory
 $env:VCPKG_BINARY_SOURCES = 'clear'
 $env:VCPKG_ROOT = $vcpkgRoot
+$env:VNM_CONPTY_MSVC_VERSION = $VCToolsVersion
 $env:CL_MPCount = '1'
 $env:VCPKG_KEEP_ENV_VARS = 'VCPKG_MAX_CONCURRENCY'
 $buildEvidence = Join-Path $SourceDirectory 'obj/vnm-conpty-release'
