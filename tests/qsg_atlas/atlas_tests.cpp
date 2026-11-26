@@ -7530,7 +7530,7 @@ bool test_source_posture()
     const qsizetype render_pos = atlas_source.indexOf(
         QByteArrayLiteral("void render(const RenderState* state) override"));
     const QByteArray prepare_atlas_instances_call =
-        QByteArrayLiteral("prepare_atlas_instances(rhi)");
+        QByteArrayLiteral("= prepare_atlas_instances(");
     const qsizetype prepare_instances_call_pos = atlas_source.indexOf(
         prepare_atlas_instances_call,
         prepare_pos);
