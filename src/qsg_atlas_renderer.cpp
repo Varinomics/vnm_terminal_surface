@@ -507,7 +507,7 @@ Glyph_atlas_runtime_configuration glyph_atlas_runtime_configuration(
 
     const qreal normalized_device_pixel_ratio =
         std::isfinite(device_pixel_ratio) && device_pixel_ratio > 0.0
-            ? std::max<qreal>(1.0, device_pixel_ratio)
+            ? device_pixel_ratio
             : 1.0;
     const qreal physical_pixel_size = qsg_atlas_physical_pixel_size(
         font,
@@ -1832,7 +1832,7 @@ QByteArray prepared_text_cache_font_key(
     const qreal normalized_device_pixel_ratio =
         (!std::isfinite(device_pixel_ratio) || device_pixel_ratio <= 0.0)
             ? 1.0
-            : std::max<qreal>(1.0, device_pixel_ratio);
+            : device_pixel_ratio;
     append_key_qreal(key, normalized_device_pixel_ratio);
     return key;
 }
@@ -2002,7 +2002,7 @@ qreal atlas_normalized_device_pixel_ratio(qreal device_pixel_ratio)
         return 1.0;
     }
 
-    return std::max<qreal>(1.0, device_pixel_ratio);
+    return device_pixel_ratio;
 }
 
 bool text_has_emoji_presentation(const QString& text)
@@ -2548,6 +2548,26 @@ public:
         const bool rhi_non_null                 = rhi != nullptr;
         const std::uint64_t prepare_thread      = current_thread_id();
 
+        qreal glyph_ratio = displayed_glyph_pixel_ratio(target);
+        if (qFuzzyCompare(static_cast<float>(glyph_ratio),
+                static_cast<float>(m_glyph_pixel_ratio)))
+        {
+            glyph_ratio = m_glyph_pixel_ratio;
+        }
+        auto atlas_configuration = glyph_atlas_runtime_configuration(
+            m_frame.font, glyph_ratio, m_frame.logical_dpi, rhi);
+        // A host may zoom arbitrarily. Keep rasterization inside the same
+        // texture and memory budget as the untransformed terminal.
+        if (!atlas_configuration.is_valid() && glyph_ratio > m_frame.device_pixel_ratio) {
+            glyph_ratio = m_frame.device_pixel_ratio;
+            atlas_configuration = glyph_atlas_runtime_configuration(
+                m_frame.font, glyph_ratio, m_frame.logical_dpi, rhi);
+        }
+        if (m_glyph_pixel_ratio != glyph_ratio) {
+            m_glyph_pixel_ratio = glyph_ratio;
+            m_retry->reset();
+        }
+
         bool coverage_texture_created = false;
         bool coverage_upload_recorded = false;
         bool raw_font_rasterized = false;
@@ -2568,7 +2588,7 @@ public:
         m_msdf_text_used_this_frame   = false;
         m_msdf_text_missed_this_frame = false;
 #endif
-        Atlas_prepare_result prepare_result = prepare_atlas_instances(rhi);
+        Atlas_prepare_result prepare_result = prepare_atlas_instances(atlas_configuration);
         bool prepared_generation_complete =
             prepare_result.frame_build.glyph_missed_instances == 0 &&
             prepare_result.frame_build.glyph_coverage_failures == 0 &&
@@ -2654,7 +2674,7 @@ public:
                 discard_pending_glyph_resources();
                 m_row_capacities = prepare_row_capacities;
                 discard_prepared_glyph_resolutions();
-                prepare_result = prepare_atlas_instances(rhi);
+                prepare_result = prepare_atlas_instances(atlas_configuration);
                 prepared_generation_complete =
                     prepare_result.frame_build.glyph_missed_instances == 0 &&
                     prepare_result.frame_build.glyph_coverage_failures == 0 &&
@@ -2740,6 +2760,7 @@ public:
             std::swap(m_committed_cache, m_cache);
             m_cache.reset();
             commit_prepare_state(prepare_result.commit);
+            m_committed_glyph_pixel_ratio = m_glyph_pixel_ratio;
             m_committed_frame      = m_frame;
             m_have_committed_frame = true;
             m_force_next_render_full_upload = false;
@@ -2916,6 +2937,35 @@ public:
     }
 
 private:
+    qreal displayed_glyph_pixel_ratio(QRhiRenderTarget* target) const
+    {
+        if (target == nullptr || projectionMatrix() == nullptr || matrix() == nullptr) {
+            return m_frame.device_pixel_ratio;
+        }
+
+        // The terminal grid uses the window's layout DPR. Rasterize the glyph
+        // mask at the height of one local unit in the actual render target.
+        const QMatrix4x4 mvp = *projectionMatrix() * *matrix();
+        if (!mvp.isAffine()) {
+            return m_frame.device_pixel_ratio;
+        }
+        const QSize pixels = target->pixelSize();
+        const float ratio = 0.5f * std::hypot(
+            mvp(0, 1) * pixels.width(), mvp(1, 1) * pixels.height());
+        if (!std::isfinite(ratio) || ratio <= 0.0f ||
+            qFuzzyCompare(ratio, static_cast<float>(m_frame.device_pixel_ratio)))
+        {
+            return m_frame.device_pixel_ratio;
+        }
+        return ratio;
+    }
+
+    bool glyph_density_changed() const
+    {
+        return m_have_committed_frame &&
+            m_committed_glyph_pixel_ratio != m_glyph_pixel_ratio;
+    }
+
     void request_prepare_retry()
     {
         if (const auto ticket = m_retry->failed()) {
@@ -4363,7 +4413,8 @@ private:
             });
     }
 
-    Atlas_prepare_result prepare_atlas_instances(QRhi* rhi)
+    Atlas_prepare_result prepare_atlas_instances(
+        const Glyph_atlas_runtime_configuration& atlas_configuration)
     {
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::prepare_atlas_instances");
 
@@ -4379,17 +4430,17 @@ private:
             m_row_capacities.rect_decoration.clear();
             m_row_capacities.rect_cursor.clear();
             m_row_capacities.rect_overlay.clear();
+        }
+        if (font_epoch_changed || glyph_density_changed()) {
             m_failed_visible_lazy_glyph_raster_keys.clear();
         }
         begin_prepared_text_cache_frame(font_epoch_changed);
         m_cache = m_committed_cache;
+        if (glyph_density_changed()) {
+            m_cache.reset();
+            discard_prepared_glyph_resolutions();
+        }
         m_cache.set_epoch(m_frame.font_epoch);
-        const Glyph_atlas_runtime_configuration atlas_configuration =
-            glyph_atlas_runtime_configuration(
-                m_frame.font,
-                m_frame.device_pixel_ratio,
-                m_frame.logical_dpi,
-                rhi);
         if (atlas_configuration.is_valid()) {
             (void)m_cache.configure(
                 atlas_configuration.page_size,
@@ -5532,8 +5583,7 @@ private:
 
     bool ensure_simple_text_cache(Atlas_prepare_result& result)
     {
-        const qreal normalized_device_pixel_ratio =
-            atlas_normalized_device_pixel_ratio(m_frame.device_pixel_ratio);
+        const qreal normalized_device_pixel_ratio = m_glyph_pixel_ratio;
         const QFont ascii_font =
             qsg_atlas_cell_stable_ascii_layout_font(m_frame.font);
         const QString font_key = ascii_font.key();
@@ -6127,8 +6177,7 @@ private:
             return false;
         }
 
-        const qreal device_pixel_ratio =
-            std::max<qreal>(1.0, m_frame.device_pixel_ratio);
+        const qreal device_pixel_ratio = m_glyph_pixel_ratio;
         const QSize page_size = m_cache.stats().page_size;
         const qreal inverse_page_width =
             1.0 / static_cast<qreal>(std::max(1, page_size.width()));
@@ -6252,8 +6301,7 @@ private:
             ++result.frame_build.emoji_presentation_runs;
         }
 
-        const qreal device_pixel_ratio =
-            std::max<qreal>(1.0, m_frame.device_pixel_ratio);
+        const qreal device_pixel_ratio = m_glyph_pixel_ratio;
         const QSize page_size = m_cache.stats().page_size;
         const qreal inverse_page_width =
             1.0 / static_cast<qreal>(std::max(1, page_size.width()));
@@ -6404,7 +6452,7 @@ private:
             prepared_text_font_key = prepared_text_cache_font_key(
                 m_frame.font,
                 m_frame.cell_metrics,
-                m_frame.device_pixel_ratio,
+                m_glyph_pixel_ratio,
                 m_frame.font_epoch);
         }
         const QByteArray cache_key = cache_usable
@@ -6448,7 +6496,7 @@ private:
                 run,
                 m_frame.font,
                 m_frame.cell_metrics,
-                m_frame.device_pixel_ratio,
+                m_glyph_pixel_ratio,
                 text_run_index,
                 cursor_text_run);
         result.render.shaped_glyph_records +=
@@ -6463,8 +6511,7 @@ private:
             return;
         }
 
-        const qreal device_pixel_ratio =
-            std::max<qreal>(1.0, m_frame.device_pixel_ratio);
+        const qreal device_pixel_ratio = m_glyph_pixel_ratio;
         const QSize page_size = m_cache.stats().page_size;
         const qreal inverse_page_width =
             1.0 / static_cast<qreal>(std::max(1, page_size.width()));
@@ -6813,7 +6860,7 @@ private:
                 m_render_dirty_row_ranges,
                 glyph_buffer_recreated,
                 m_render_force_full_reupload,
-                m_render_non_dirty_state_invalidation,
+                m_render_non_dirty_state_invalidation || glyph_density_changed(),
                 static_cast<int>(m_glyph_instances.size()),
                 !m_glyph_buffer_instances.empty(),
                 &m_glyph_buffer_row_stable_ranges,
@@ -7429,6 +7476,8 @@ private:
     std::shared_ptr<Bounded_render_retry>     m_retry =
         std::make_shared<Bounded_render_retry>();
     std::shared_ptr<Atlas_retry_completion>   m_retry_completion;
+    qreal                                    m_glyph_pixel_ratio = 1.0;
+    qreal                                    m_committed_glyph_pixel_ratio = 1.0;
     Captured_atlas_frame                     m_pending_frame;
     Captured_atlas_frame                     m_committed_frame;
     bool                                     m_have_committed_frame = false;

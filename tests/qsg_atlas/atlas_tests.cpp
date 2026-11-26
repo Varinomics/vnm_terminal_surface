@@ -11201,6 +11201,70 @@ bool pump_atlas_host_state_surface(
     return false;
 }
 
+Atlas_host_state_result test_glyphs_follow_display_scale(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(220, 160);
+
+    QQuickItem host(window.contentItem());
+    host.setTransformOrigin(QQuickItem::TopLeft);
+    VNM_TerminalSurface surface;
+    surface.setParentItem(&host);
+    configure_atlas_host_state_surface(surface, QSizeF(80.0, 60.0), 980U);
+    surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
+    // Keep the requested em size exact for the direct, double-size reference.
+    surface.set_font_advance_policy(vnm_terminal::Font_advance_policy::SNAP_ADVANCE_NEAREST);
+    window.show();
+
+    Atlas_host_state_result result;
+    const auto read_glyph_coverage = [&] {
+        const auto last_prepare = result.capture.report.prepare_count;
+        return pump_atlas_host_state_surface(app, window, surface, result.capture,
+            [last_prepare](const Atlas_host_state_capture& capture) {
+                return capture.report.prepare_count > last_prepare &&
+                    capture.report.render.atlas_used_bytes > 0U;
+            });
+    };
+    if (!read_glyph_coverage()) {
+        result.unsupported = atlas_host_backend_unusable(result.capture.report);
+        return result;
+    }
+    const auto layout_bytes = result.capture.report.render.atlas_used_bytes;
+    const auto initial_epoch = result.capture.report.captured_font_epoch;
+    std::uint64_t enlarged_bytes = 0;
+    for (const qreal scale : {2.0, 0.75, 1.0}) {
+        host.setScale(scale);
+        if (!read_glyph_coverage()) {
+            return result;
+        }
+        const auto bytes = result.capture.report.render.atlas_used_bytes;
+        if (scale == 2.0) {
+            enlarged_bytes = bytes;
+        }
+        if (!check((scale > 1.0 && bytes > layout_bytes) ||
+                    (scale < 1.0 && bytes < layout_bytes) ||
+                    (scale == 1.0 && bytes == layout_bytes),
+                "raster glyph coverage follows the physical display size in both directions") ||
+            !check(result.capture.report.captured_font_epoch == initial_epoch,
+                "presentation scaling preserves the terminal layout font"))
+        {
+            return result;
+        }
+    }
+
+    surface.set_font_size(surface.font_size() * 2.0);
+    if (!read_glyph_coverage() ||
+        !check(result.capture.report.render.atlas_used_bytes == enlarged_bytes,
+            "the enlarged glyph mask matches a font rendered directly at that size (" +
+                std::to_string(enlarged_bytes) + " vs " +
+                std::to_string(result.capture.report.render.atlas_used_bytes) + " bytes)"))
+    {
+        return result;
+    }
+    result.ok = true;
+    return result;
+}
+
 Atlas_host_state_result test_atlas_transformed_host_state(
     QGuiApplication& app)
 {
@@ -11757,6 +11821,9 @@ int test_atlas_host_state_smoke(QGuiApplication& app, const char* backend)
         return true;
     };
 
+    if (!run_case(test_glyphs_follow_display_scale(app))) {
+        return k_unsupported_backend_skip_return_code;
+    }
     if (!run_case(test_atlas_transformed_host_state(app))) {
         return k_unsupported_backend_skip_return_code;
     }
